@@ -146,6 +146,9 @@ export const App = {
   // 「真的在推流」的选手集合（由媒体服务器上报，见 refreshLiveHealth）；
   // null = 还没探测过，此时回退到状态里的兜底值
   liveNow: null,
+  // 主直播间（直播配置里的「默认流名」）有没有人在推流：true / false；
+  // null = 还没探测过（此时以状态里的 /api/state → live.streaming 为准）
+  liveMain: null,
   livePicked: null, // 最近一次解析出的机位对象（供局部刷新复用）
   events: [], // 届次列表缓存
   eventId: '', // 主赛事 ID（管理端设定的那一届；根路径就落在它身上）

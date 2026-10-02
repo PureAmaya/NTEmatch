@@ -259,8 +259,11 @@ export const Live = {
     await this.stop(false);
     this.room = target;
     if (!this.room) {
-      this.setCover('请选择正在直播的选手', '在上方机位列表中选择一位选手，即可自动切换到他的直播间');
-      this.setState('未选择');
+      this.setCover(
+        '没有任何人在直播',
+        '现在没有人在推流，所以这里不摆机位。有人开播后会自动出现，点一下即可播放。'
+      );
+      this.setState('无人直播');
       return;
     }
     if (st.enabled === false) {
@@ -350,17 +353,24 @@ export async function refreshLiveHealth() {
     App.liveHealth = await api('/live/health');
     // 「谁真的在推流」由媒体服务器上报；只有这里报出来的才显示「直播中」
     const next = new Set(Array.isArray(App.liveHealth.streaming) ? App.liveHealth.streaming : []);
+    // 主直播间（默认流名）：探测不到就是 null（未知），此时一律不给这一路信号
+    const main = App.liveHealth.streamingKnown ? Boolean(App.liveHealth.mainStreaming) : null;
     changed =
+      main !== App.liveMain ||
       !(App.liveNow instanceof Set) ||
       next.size !== App.liveNow.size ||
       [...next].some((pid) => !App.liveNow.has(pid));
     App.liveNow = next;
+    App.liveMain = main;
     log.info('直播信号状态', App.liveHealth);
   } catch (err) {
     log.warn('直播信号探测失败', err);
-    App.liveHealth = { ok: false, reason: err.message, streaming: [] };
-    changed = App.liveNow instanceof Set && App.liveNow.size > 0;
+    // streamingKnown: false = 「谁在推流」这份数据拿不到（前端据此说明「无法判断」）
+    App.liveHealth = { ok: false, streamingKnown: false, reason: err.message, streaming: [] };
+    changed =
+      App.liveMain !== null || (App.liveNow instanceof Set && App.liveNow.size > 0);
     App.liveNow = new Set();
+    App.liveMain = null;
   }
   // 只有「谁在推流」真的变了才重绘视图，避免每次轮询都重建 DOM
   if (hooks.onLiveHealth) hooks.onLiveHealth(changed);

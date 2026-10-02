@@ -77,7 +77,9 @@ async function goto(eventId = '', page = 'overview', { replace = false } = {}) {
     try {
       App.state = await api(`/events/${locked}/state`);
       App.liveInfo = null;
+      // 回看往届：一只机位都不摆（连主直播间的标记也清掉，免得串到这一届）
       App.liveNow = new Set();
+      App.liveMain = false;
       App.private = null;
       log.info('按路由看往届', locked, want);
     } catch (err) {

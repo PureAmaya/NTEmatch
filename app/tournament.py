@@ -94,28 +94,32 @@ def resolve_size(team_count: int, requested: int = 0, *, strict: bool = True) ->
 
 
 def group_count_for(team_count: int, per_match: int = 2) -> int:
-    """小组数：每组 4 队左右，且**尽量让每组的队数是同场数的整数倍**。
+    """小组数：**每组 4 队左右**，并尽量让每组都排得满整场。
 
-    ``per_match=2`` 时退化为「约 4 队一组」；``per_match=3/4`` 时会挑一个
+    ``per_match=2`` 时退化为「约 4 队一组」；``per_match=3/4`` 时优先挑一个
     让每组队数正好排满整场的组数（12 队 / 同场 3 → 2 组各 6 队），
     这样小组赛不会出现人数不齐的场次。
+
+    组数**不要求整除**队数，因此质数队数（7 / 11 / 13…）也能拆开：
+    7 队 → 4 + 3 两组，而不是被迫挤进一组打满 21 场单循环。
+    每组队数最多相差 1 队（大组在前）。
     """
     k = max(2, min(MAX_SIDES, per_match))
     if team_count <= max(2, k):
         return 1
     target = 4 if k == 2 else k * 2
-    best: tuple[int, int, int] | None = None
+    # 评分顺序：每组排不排得满整场 → 最大一组离目标多近 → 分得有多匀（余数小）→ 组数少
+    best: tuple[int, int, int, int] | None = None
     for groups in range(1, team_count + 1):
-        if team_count % groups:
+        if team_count // groups < k:             # 最小一组至少凑得出一场
             continue
-        per_group = team_count // groups
-        if per_group < k:
-            continue
-        full = 0 if (k == 2 or per_group % k == 0) else 1
-        score = (full, abs(per_group - target), groups)
+        largest = -(-team_count // groups)       # 最大一组的队数（向上取整）
+        even = team_count % groups == 0
+        full = 0 if (k == 2 or (even and largest % k == 0)) else 1
+        score = (full, abs(largest - target), team_count % groups, groups)
         if best is None or score < best:
             best = score
-    return best[2] if best else 1
+    return best[3] if best else 1
 
 
 def bracket_order(size: int) -> list[int]:
@@ -366,24 +370,45 @@ def heat_sizes(team_count: int, per_match: int) -> list[int]:
     return sorted(sizes, reverse=True)          # 人数多的场次排在前面
 
 
-def _heat_schedule(items: list[Any], per_match: int) -> list[list[list[Any]]]:
-    """圆桌轮转法：把 ``items`` 编排成若干轮，每轮由若干场「N 队同场」组成。
+def _pair_rounds(items: list[Any]) -> list[list[list[Any]]]:
+    """标准单循环：每两队**恰好相遇一次**（圆桌轮转）。
 
-    * ``per_match=2`` 时退化为标准单循环（每两队相遇一次）；
-    * ``per_match=3/4`` 时每场尽量 3~4 队同场，各队出场次数保持均衡；
-    * 队数不是 ``per_match`` 的整数倍时**均分到各场**（6 队 / 同场 4 → 3 + 3），
-      仍然排不下的队这一轮轮休。
+    两个要点，缺一就会漏场次：
 
-    返回 ``[[[同场队伍…], …], …]``（外层 = 轮次）。
+    1. 槽位要**折叠**成对——第 ``i`` 位 vs 倒数第 ``i`` 位（不是相邻两位成对），
+       再固定 0 号位把其余顺转一格；
+    2. 奇数队要补一个「轮空」占位凑成偶数槽位——圆桌法在奇数个槽位上
+       只转 n-1 步就回到原点，不补位会漏掉大半对阵（3 队只排出 2 场：
+       B 与 C 永远碰不上，A 连打两轮）。
+
+    补位后每队轮休一次，n 队排满 n(n-1)/2 场。
     """
+    slots: list[Any] = list(items)
+    if len(slots) % 2:
+        slots.append(None)                      # None = 轮空占位，这一轮该队轮休
+    count = len(slots)
+    half = count // 2
+    rounds: list[list[list[Any]]] = []
+    for _ in range(count - 1):
+        matches: list[list[Any]] = []
+        for slot in range(half):
+            real = [x for x in (slots[slot], slots[count - 1 - slot]) if x is not None]
+            if len(real) >= 2:
+                matches.append(real)
+        rounds.append(matches)
+        slots = [slots[0], slots[-1], *slots[1:-1]]   # 0 号位固定，其余顺转一格
+    return rounds
+
+
+def _multi_rounds(items: list[Any], per_match: int) -> list[list[list[Any]]]:
+    """多队同场（3~4 队一场）的轮转排法：每场尽量凑满 ``per_match`` 队。"""
     count = len(items)
-    if count < 2:
-        return []
     sizes = heat_sizes(count, per_match)
     if sum(sizes) > count:                      # 理论上不会发生，稳妥兜底
         sizes = [count]
-    arr = list(items)
+    arr: list[Any] = list(items)
     rounds: list[list[list[Any]]] = []
+    seen: set[frozenset[frozenset[int]]] = set()
     for _ in range(count - 1):
         matches: list[list[Any]] = []
         cursor = 0
@@ -394,10 +419,29 @@ def _heat_schedule(items: list[Any], per_match: int) -> list[list[list[Any]]]:
             cursor += size
             if len(chunk) >= 2:
                 matches.append(chunk)
-        if matches:
+        key = frozenset(frozenset(id(item) for item in match) for match in matches)
+        if matches and key not in seen:         # 奇数队会转回原点，别排第二遍同样的场
+            seen.add(key)
             rounds.append(matches)
         arr = [arr[0], arr[-1], *arr[1:-1]]
     return rounds
+
+
+def _heat_schedule(items: list[Any], per_match: int) -> list[list[list[Any]]]:
+    """把 ``items`` 编排成若干轮，每轮由若干场「N 队同场」组成。
+
+    * ``per_match=2`` → 标准单循环（每两队相遇一次，见 :func:`_pair_rounds`）；
+    * ``per_match=3/4`` → 每场尽量 3~4 队同场，各队出场次数保持均衡；
+    * 队数不是 ``per_match`` 的整数倍时**均分到各场**（6 队 / 同场 4 → 3 + 3），
+      仍然排不下的队这一轮轮休。
+
+    返回 ``[[[同场队伍…], …], …]``（外层 = 轮次）。
+    """
+    if len(items) < 2:
+        return []
+    if per_match <= 2:
+        return _pair_rounds(items)
+    return _multi_rounds(items, per_match)
 
 
 def assign_groups(teams: list[Team], group_count: int) -> list[Team]:

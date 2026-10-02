@@ -33,13 +33,22 @@ export function avatarUrl(player) {
 export const privateOf = (pid) => (pid && App.private?.players?.[pid]) || {};
 
 /**
+ * 某个机位的推流地址集合（仅管理端有值）。
+ *
+ * * 选手机位 → 该选手自己的流名那一套；
+ * * 主直播间 → 直播配置里「默认流名」那一套（``/api/private → defaultPush``）。
+ */
+export const pushEndpointsOf = (pid) =>
+  (isMainRoom(pid) ? App.private?.defaultPush : privateOf(pid).endpoints) || {};
+
+/**
  * 选手个人的推流地址。
  *
  * ``proto``：``whip``（WebRTC 套，默认）/ ``rtmp`` / ``rtsp``（后两者为 TCP 套）。
  * 地址只由选手自己的流名决定（整届固定），与在哪场比赛无关。
  */
 export const pushUrlOf = (pid, proto = 'whip') => {
-  const endpoints = privateOf(pid).endpoints || {};
+  const endpoints = pushEndpointsOf(pid);
   if (proto === 'rtmp') return endpoints.rtmpPush || '';
   if (proto === 'rtsp') return endpoints.rtspPush || '';
   return endpoints.whipPush || '';
@@ -108,9 +117,45 @@ export const livePlayers = () =>
 
 export const isLivePlayer = (pid) => Boolean(pid) && livePlayers().has(pid);
 
-/** 取某位选手的直播间地址集合（只有选手机位，无主直播间）。 */
+/**
+ * 主直播间的机位 ID。
+ *
+ * 它不是某位选手，而是「默认流名」那一路**总机位**（``直播配置 → 默认流名``，
+ * 见 :class:`models.StreamConfig`）。用常量而不是流名当 ID，免得与选手 ID 撞车；
+ * 真正的流名在机位对象的 ``key`` 里。
+ */
+export const MAIN_ROOM_ID = '__main__';
+export const isMainRoom = (pid) => pid === MAIN_ROOM_ID;
+
+/**
+ * 主直播间当前有没有人在推流。
+ *
+ * 探测不到（媒体服务器 API 不可达）或还没探测过 → ``false``：
+ * 宁可少显示这一路，也不让观众点进一个空流。
+ */
+export const isMainLive = () => {
+  const known = App.liveHealth ? App.liveMain : App.state?.live?.streaming;
+  return known === true;
+};
+
+/** 主直播间的播放地址集合（取自公开的源地址）；连地址都没有就没有这一路。 */
+export function mainRoom() {
+  const e = App.liveInfo || App.state?.live || {};
+  if (!e.originWhep && !e.originPlayPage) return null;
+  return {
+    key: e.key || 'stream',
+    main: true,
+    page: e.originPlayPage || '',
+    hlsPage: e.originHlsPage || '',
+    whep: e.originWhep || '',
+    hls: e.originHls || '',
+  };
+}
+
+/** 取一个机位的直播间地址集合（选手机位，或主直播间）。 */
 export function roomFor(pid) {
   if (!pid) return null;
+  if (isMainRoom(pid)) return mainRoom();
   return (App.state?.streams || {})[pid] || null;
 }
 

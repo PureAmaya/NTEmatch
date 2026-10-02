@@ -249,7 +249,8 @@ img { display: block; max-width: 100%; }
 /* 作者样式里的 display 会盖掉 [hidden] 附带的 display:none，凡是靠 JS 切 el.hidden
    的元素都必须在这里显式声明一次，否则「隐藏」根本不生效——直播封面原先就是这么
    一直捂着播放器（连带原生控件都点不到）的。 */
-.chip[hidden], .panel[hidden], .modal__foot[hidden], .stage-cover[hidden] { display: none !important; }
+.chip[hidden], .panel[hidden], .modal__foot[hidden], .stage-cover[hidden],
+.live-pick[hidden] { display: none !important; }
 .grid { display: grid; gap: var(--gap); grid-template-columns: 1fr; }
 
 .panel {
@@ -1020,6 +1021,16 @@ img { display: block; max-width: 100%; }
   border-bottom: 1px solid var(--line); background: rgba(6, 10, 16, .55);
 }
 .live-pick__empty { color: var(--txt-mute); font-family: var(--font-mono); font-size: 11.5px; padding: 4px 2px; }
+/* 一个在播机位都没有：整条只留这句话，不再摆一排点了没画面的空机位 */
+.live-pick__empty--none { display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap; }
+.live-pick__empty--none b { color: var(--txt); font-size: 12.5px; }
+/* 主直播间：不属于任何选手，描边与文字都区分开 */
+.live-chip--main { border-style: dashed; border-color: rgba(255, 216, 61, .5); }
+.live-chip--main .live-chip__name { color: var(--warn); }
+.live-chip--main.live-chip--active {
+  border-style: solid; border-color: var(--accent); background: rgba(34, 224, 232, .14);
+}
+.live-chip--main.live-chip--active .live-chip__name { color: #fff; }
 .live-chip {
   display: inline-flex; align-items: center; gap: 7px; flex: none; cursor: pointer;
   padding: 5px 9px 5px 5px; border: 2px solid rgba(34, 224, 232, .3); border-radius: 2px;

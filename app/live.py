@@ -129,6 +129,26 @@ async def streaming_player_ids(cfg: Config) -> list[str]:
     return [p.id for p in cfg.players if logic.clean_key(p.stream_key) in ready]
 
 
+def main_stream_key() -> str:
+    """主直播间的流名：``直播配置 → 默认流名``（默认 ``stream``）。
+
+    它不是某位选手的机位，而是「全场总机位」——谁在推这个流名，
+    谁就是主直播间；一个人都没推、只有它在推时，直播页只给出它这一路。
+    """
+    return logic.clean_key(store.snapshot().stream.stream_key) or "stream"
+
+
+async def main_stream_ready() -> bool | None:
+    """主直播间当前有没有人在推流；``None`` = 查不到（API 未配置 / 不可达）。
+
+    跟选手机位同一套判断：看媒体服务器上报的 ready 列表里有没有这个流名。
+    """
+    ready = await ready_paths()
+    if ready is None:
+        return None
+    return main_stream_key() in ready
+
+
 async def live_status_view() -> dict[str, Any]:
     """「谁在推流」这份数据的状态（供前端说明为什么没有直播中标记）。"""
     cfg = store.snapshot()
@@ -150,7 +170,12 @@ async def live_status_view() -> dict[str, Any]:
 
 
 def stream_endpoints() -> dict[str, Any]:
-    """公开的源地址集合（**只有播放地址**，推流地址属于凭据，仅在管理端出现）。"""
+    """公开的源地址集合（**只有播放地址**，推流地址属于凭据，仅在管理端出现）。
+
+    ``key`` 是**主直播间的流名**（``直播配置 → 默认流名``）。它本来就写在
+    下面这些播放地址里（``…/<流名>/whep``），所以不算额外泄露；
+    前端用它把「主直播间」当成一路独立机位来播放与切换。
+    """
     cfg = store.snapshot().stream
     base = (cfg.base_url or "").rstrip("/")
     hls = (cfg.hls_base or "").rstrip("/")
@@ -158,11 +183,13 @@ def stream_endpoints() -> dict[str, Any]:
     return {
         "enabled": cfg.enabled,
         "mode": cfg.mode,
+        "key": key,
         # 源站是否 HTTPS：HTTPS 站点上只能连 HTTPS 源，否则会被按混合内容拦掉
         "secure": base.startswith("https://"),
         "verifyTls": bool(cfg.verify_tls),
         "origin": base,
         "originPlayPage": f"{base}/{key}/" if base else "",
+        "originHlsPage": f"{hls}/{key}/" if hls else "",
         "originWhep": f"{base}/{key}/whep" if base else "",
         "originHls": cfg.hls_url or (f"{hls}/{key}/index.m3u8" if hls else ""),
         # 观众可切换的两种播放线路（都只是播放，不含推流凭据）
@@ -259,6 +286,8 @@ async def live_health() -> dict[str, Any]:
         # 正在推流的机位（选手 ID）：前端用它决定要不要显示「直播中」
         "streamingKnown": ready is not None,
         "streaming": await streaming_player_ids(cfg) if ready is not None else [],
+        # 主直播间（默认流名）是否有人在推：只有真的在推，前端才给出这一路信号
+        "mainStreaming": bool(ready) and main_stream_key() in (ready or set()),
         "api": {
             "configured": bool(api),
             "ok": ready is not None,

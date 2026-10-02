@@ -20,15 +20,19 @@ import {
   stateKey,
 } from './core.js';
 import {
+  MAIN_ROOM_ID,
   PUSH_TIP_LINE,
   avaHtml,
   boardHeadHtml,
   formChips,
   isLivePlayer,
+  isMainLive,
   kpiCard,
   livePlayers,
   liveTag,
+  mainRoom,
   privateOf,
+  pushEndpointsOf,
   pushTipsHtml,
   rankCell,
   roundBadge,
@@ -614,8 +618,8 @@ function treeBoxHtml(node, ctx) {
     `style="left:${node.x}px;top:${node.y}px;width:${BT.box}px;height:${BT.boxH}px" ` +
     `data-code="${esc(m.code)}" title="${esc(tip)}"${act}>` +
     `<div class="btree__top"><span class="btree__code">${esc(m.code)}</span>` +
-    // 对阵图里的 live 只是「排了直播」，进行中要再叠加 status 才叫「直播中」
-    `${liveBadgeHtml({ ...m, livePlaying: Boolean(m.live) && m.status === 'live' })}` +
+    // 对阵图节点只有简略字段，回公开状态里取同一场来数「在播机位」
+    `${liveBadgeHtml(roundByCode(m.code) || m)}` +
     (m.status === 'done' && m.duration
       ? `<span class="btree__top-info" title="用时">${esc(fmtDuration(m.duration))}</span>`
       : '') +
@@ -752,6 +756,16 @@ function groupSectionHtml(s) {
 }
 
 /* 多组并行：以卡片列出所有正在进行的对局 */
+
+/**
+ * 本场在播的机位数。
+ *
+ * 判定只有一条：**设置了推流流名，且媒体服务器确认在推流**（``isLivePlayer``）。
+ * 光配了流名、人还没开播的不算——界面上因此不会出现点了没反应的「直播入口」。
+ */
+const roundLiveCams = (rnd) =>
+  (rnd?.streams?.cast || []).filter((c) => isLivePlayer(c.playerId)).length;
+
 function renderNowPlaying(s) {
   const host = qs('#nowPlaying');
   const live = (s.rounds || []).filter((r) => r.status === 'live');
@@ -761,13 +775,13 @@ function renderNowPlaying(s) {
     return;
   }
   host.hidden = false;
-  const streaming = live.reduce(
-    (n, r) => n + [...r.sideA.players, ...r.sideB.players].filter((p) => p.hasStream).length,
-    0
-  );
+  const streaming = live.reduce((n, r) => n + roundLiveCams(r), 0);
   host.innerHTML =
     `<div class="panel__head"><h2>正在进行</h2>` +
-    `<span class="panel__hint">${live.length} 场并行 · ${streaming} 路可用直播</span></div>` +
+    // 没人真在推流时，一个字都不提「直播」
+    `<span class="panel__hint">${[`${live.length} 场并行`, streaming ? `${streaming} 路直播中` : '']
+      .filter(Boolean)
+      .join(' · ')}</span></div>` +
     `<div class="panel__body"><div class="now-grid">${live.map((r) => nowCardHtml(r)).join('')}</div></div>`;
 }
 
@@ -782,19 +796,19 @@ function nowSideHtml(side) {
 function nowCardHtml(r) {
   const sides = r.sides || [r.sideA, r.sideB];
   const all = sides.flatMap((side) => side.players || []);
-  const streamers = all.filter((p) => p.hasStream);
-  const ops = streamers.length
-    ? streamers
-        .map(
-          (p) =>
-            `<button class="btn btn--sm${isLivePlayer(p.id) ? ' btn--primary' : ''}" type="button" ` +
-            `data-act="watch" data-pid="${esc(p.id)}">` +
-            `${isLivePlayer(p.id) ? '直播中' : '观看'} · ${esc(p.name || p.id)}</button>`
-        )
-        .join('')
-    : `<span class="panel__hint">本局选手未配置推流流名</span>`;
+  // 只有**真的在推流**的选手才给观看入口；一个人都没推就不摆这一行
+  const ops = all
+    .filter((p) => isLivePlayer(p.id))
+    .map(
+      (p) =>
+        `<button class="btn btn--sm btn--primary" type="button" ` +
+        `data-act="watch" data-pid="${esc(p.id)}">直播中 · ${esc(p.name || p.id)}</button>`
+    )
+    .join('');
   const cast =
-    r.live && r.liveNote ? `<div class="now-card__cast">直播提示：${esc(r.liveNote)}</div>` : '';
+    r.liveNote && (roundLiveCams(r) || canEdit())
+      ? `<div class="now-card__cast">直播提示：${esc(r.liveNote)}</div>`
+      : '';
   return (
     `<div class="now-card">` +
     `<div class="now-card__head"><span class="round__no">${esc(r.label || r.code)}</span>` +
@@ -910,7 +924,8 @@ export function renderScheduleGrid(s) {
 /**
  * 一轮的标题（动态分类）：
  *
- * * 小组赛：``A 组 · 第 1 轮``（组名 + 轮次，不带场次，下面的卡片各自带场次）；
+ * * 小组赛：同一轮里只有一组时 ``A 组 · 第 1 轮``；**多组并行**时写
+ *   ``小组赛 · 第 1 轮``（否则标题写着 A 组，格子里却是 A/B 两组的比赛）；
  * * 胜者组：``十六强`` / ``八强`` / ``半决赛`` / ``胜者组决赛``；
  * * 败者组：``败者组第 N 轮`` / ``败者组决赛``；
  * * 总决赛：``总决赛``。
@@ -920,7 +935,10 @@ function roundBlockTitle(rows) {
   const parts = (first.label || '').split(' · ');
   const fallback = `第 ${first.bracketRound || 1} 轮`;
   if (first.stage === 'group') {
-    return parts.length >= 2 ? parts.slice(0, 2).join(' · ') : parts[0] || fallback;
+    const groups = [...new Set(rows.map((r) => (r.label || '').split(' · ')[0]).filter(Boolean))];
+    const round = parts[1] || fallback;
+    if (groups.length > 1) return `小组赛 · ${round}`;
+    return `${groups[0] || parts[0] || 'A 组'} · ${round}`;
   }
   return parts[0] || fallback;
 }
@@ -1184,13 +1202,21 @@ function resultStatsHtml(rnd) {
   return bits.join('');
 }
 
-/** 本场直播标识：进行中且开着开关才叫「直播中」，否则只是「已排直播」。 */
+/** 按比赛编号取公开状态里的那一场（对阵图只带简略字段，需要回这里取机位明细）。 */
+const roundByCode = (code) => (App.state?.rounds || []).find((r) => r.code === code) || null;
+
+/**
+ * 本场直播标识。
+ *
+ * **真的有人在推流**才叫「直播中」；「已排直播」只是管理端的排期提示，
+ * 观众看不到——否则赛程上会挂着一堆点了没反应的直播入口。
+ */
 function liveBadgeHtml(rnd) {
-  if (!rnd.live) return '';
-  if (rnd.livePlaying) {
+  if (roundLiveCams(rnd)) {
     return `<span class="badge badge--cast"><i class="dot"></i>直播中</span>`;
   }
-  return `<span class="badge badge--cast-plan">本场直播</span>`;
+  if (rnd?.live && canEdit()) return `<span class="badge badge--cast-plan">已排直播</span>`;
+  return '';
 }
 
 function matchOpsHtml(rnd) {
@@ -1240,10 +1266,13 @@ function matchCardHtml(s, rnd) {
     foot.push(`<span class="badge badge--win">${esc(reveal() ? label : '结果已封存')}</span>`);
   }
   if (multi) foot.push(`<span class="chip chip--multi">${sides.length} 队同场</span>`);
-  if (rnd.live) {
+  // 直播标记只按**真实推流**算（配了流名 + 媒体服务器确认在推）；
+  // 「已排直播」这种排期提示只在卡片头部给管理员看，观众这边一个字都不提
+  const cams = roundLiveCams(rnd);
+  if (cams) {
     foot.push(
-      `<span class="chip chip--cast" title="${esc(rnd.liveNote || '本场安排直播')}">` +
-        `${rnd.livePlaying ? '推流中' : '已排直播'}${rnd.liveNote ? ` · ${esc(rnd.liveNote)}` : ''}</span>`
+      `<span class="chip chip--cast" title="${esc(rnd.liveNote || '本场有多路信号在推流')}">` +
+        `${cams} 路直播中${rnd.liveNote ? ` · ${esc(rnd.liveNote)}` : ''}</span>`
     );
   }
   foot.push(resultStatsHtml(rnd));
@@ -1268,18 +1297,19 @@ function matchCardHtml(s, rnd) {
 }
 
 /**
- * 观众入口：这场比赛有机位时给一个「看这场」按钮（谁都能点）。
+ * 观众入口：这场**真的有人在推流**时，才给一个「看这场直播」按钮。
  *
  * 点了就切到直播页并选中这场——观众因此可以看**任意一场**，
- * 而不只是「正在进行」的那场。
+ * 而不只是「正在进行」的那场。只是「配了流名 / 排了直播」不算，
+ * 否则点进去只有一张「没有任何人在直播」的封面。
  */
 function watchRoundHtml(rnd) {
-  const cams = (rnd.streams?.cast || []).length;
+  const cams = roundLiveCams(rnd);
   if (!cams) return '';
   return (
     `<div class="round__ops round__ops--public">` +
     `<button class="btn btn--sm btn--primary" type="button" data-act="watch-round" ` +
-    `data-code="${esc(rnd.code)}">看这场直播（${cams} 路机位）</button></div>`
+    `data-code="${esc(rnd.code)}">看这场直播（${cams} 路在播）</button></div>`
   );
 }
 
@@ -1403,61 +1433,87 @@ export function renderRosterGrid(s) {
     : `<div class="empty"><b>没有匹配的选手</b>调整搜索条件，或清空搜索框</div>`;
 }
 
-/* ------------------------------ 直播 ---------------------------------- */
-/** 机位候选：所有配置了推流流名的选手（正在直播的排前面）。 */
+/* ------------------------------ 直播 ----------------------------------
+ *
+ * 一条硬规则：**只有「配了推流流名 + 媒体服务器确认在推流」才出现在界面上**。
+ * 没人推流时，直播页不摆任何机位，只留一句「没有任何人在直播」；
+ * 主直播间（直播配置里的「默认流名」）也只有它真的在推流时，
+ * 才作为一路独立机位出现——一个人都没播时，它就是唯一可选的那一路。
+ */
+/** 在播的选手机位：配了流名 **且** 真的在推流。 */
 function liveCandidates(s) {
   return (s.players || [])
-    .filter((p) => p.hasStream)
+    .filter((p) => p.hasStream && isLivePlayer(p.id))
     .map((p) => ({
       id: p.id,
       name: p.name || p.id,
       player: p,
-      live: isLivePlayer(p.id),
+      live: true,
       room: (s.streams || {})[p.id] || {},
       round: roundOfPlayer(s, p.id),
-    }))
-    .sort((a, b) => Number(b.live) - Number(a.live));
+    }));
 }
+
+/**
+ * 主直播间这一路机位（不属于任何选手）。
+ *
+ * 只有「默认流名」真的在推流、并且配了源地址时才给；
+ * ``id`` 用常量而不是流名，免得跟选手 ID 撞车，真正的流名在 ``room.key`` 里。
+ */
+function mainCandidate() {
+  if (!isMainLive()) return null;
+  const room = mainRoom();
+  if (!room) return null;
+  return {
+    id: MAIN_ROOM_ID,
+    name: '主直播间',
+    player: null,
+    live: true,
+    room,
+    round: null,
+    main: true,
+  };
+}
+
+/** 直播页的全部可播机位：主直播间（在播时）+ 在播的选手机位。 */
+const livePool = (s) => [mainCandidate(), ...liveCandidates(s)].filter(Boolean);
 
 const inRound = (r, pid) => [...r.sideA.players, ...r.sideB.players].some((p) => p.id === pid);
 
 /**
- * 直播页的比赛候选：**本届全部对局**（观众可以看任意一场，不限于正在进行的那场）。
+ * 直播页的比赛候选：**有在播机位的那些对局**（没人播的比赛不上条）。
  *
- * ``cams`` 用后端下发的该场机位（``rounds[].streams.cast``）来数，
- * 而不是「把每位选手算进他当前所在的那一场」——否则同一场比赛，
- * 赛程卡上写着有 2 路机位、直播页的选择条却显示「无机位」。
- *
- * 排序：进行中的最前 → 有机位的 → 未开始 → 已结束。
+ * ``cams`` 数的是「真的在推流」的机位，而不是配了几路流名——
+ * 否则选择条上会挂一堆点进去没画面的比赛。
+ * 排序：进行中的最前 → 在播机位多的 → 场次靠前。
  */
 function liveRoundCandidates(s) {
   const order = { live: 0, pending: 1, done: 2 };
   return (s.rounds || [])
-    .map((r) => ({ ...r, cams: (r.streams?.cast || []).length }))
+    .map((r) => ({ ...r, cams: roundLiveCams(r) }))
+    .filter((r) => r.cams > 0)
     .sort(
       (a, b) =>
         (order[a.status] ?? 9) - (order[b.status] ?? 9) ||
-        (b.cams > 0) - (a.cams > 0) ||
+        b.cams - a.cams ||
         (a.index || 0) - (b.index || 0)
     );
 }
 
-/** 比赛选择条：选中一场就只看这场的机位（选手的推流地址与比赛无关）。 */
-function roundChipsHtml(rounds, cands) {
+/** 比赛选择条：选中一场就只看这场的机位（主直播间不受它影响）。 */
+function roundChipsHtml(rounds, total) {
   if (!rounds.length) return '';
   const chip = (code, label, live, count) =>
     `<button type="button" class="live-chip live-chip--round${
       code === App.liveRound ? ' live-chip--active' : ''
-    }${live ? ' live-chip--live' : ''}${count ? '' : ' live-chip--empty'}" ` +
-    `data-act="live-round" data-code="${esc(code)}" title="${esc(label)}${count ? '' : '（这场还没有机位）'}">` +
+    }${live ? ' live-chip--live' : ''}" data-act="live-round" data-code="${esc(code)}" ` +
+    `title="${esc(label)}">` +
     `${live ? '<i class="dot"></i>' : ''}<span class="live-chip__name">${esc(label)}</span>` +
-    `<span class="live-chip__count">${count ? `${count} 路` : '无机位'}</span></button>`;
+    `<span class="live-chip__count">${count} 路在播</span></button>`;
   return (
     `<span class="live-pick__label">比赛</span>` +
-    chip('', '全部机位', false, cands.length) +
-    rounds
-      .map((r) => chip(r.code, r.label || r.code, r.status === 'live', r.cams))
-      .join('')
+    chip('', '全部机位', false, total) +
+    rounds.map((r) => chip(r.code, r.label || r.code, r.status === 'live', r.cams)).join('')
   );
 }
 
@@ -1471,14 +1527,25 @@ function roundOfPlayer(s, pid) {
   );
 }
 
+/** 没有任何在播机位时的提示（区分「确实没人播」与「探测不到」）。 */
+function liveEmptyHtml(s) {
+  const known = App.liveHealth ? App.liveHealth.streamingKnown : s.liveStatus?.known;
+  const hint =
+    known === false
+      ? '暂时无法判断有没有人在直播：媒体服务器 API 不可达，请管理员到「直播配置」里检查 API 地址与账号。'
+      : canEdit()
+        ? '让主播在 OBS 里推他自己的流名（选手名单里填的那个）；推上来后这里会自动出现，平时不摆空机位。'
+        : '等主播开播后再来看。';
+  return `<div class="live-pick__empty live-pick__empty--none"><b>没有任何人在直播</b>${esc(hint)}</div>`;
+}
+
 export function renderLive(s) {
-  const cands = liveCandidates(s);
+  const all = livePool(s); // 主直播间（在播时）+ 在播的选手机位
   const rounds = liveRoundCandidates(s);
-  // 选中的比赛（'' = 全部机位）；比赛已经不在候选里就回到全部
-  if (App.liveRound && !rounds.some((r) => r.code === App.liveRound)) {
-    App.liveRound = '';
-  }
-  // 选中某场：机位 = 该场出场的选手里配了流名的那些（用后端的 cast，保证与赛程卡一致）
+  // 选中的比赛（'' = 全部机位）；这场已经没人播了就回到全部
+  if (App.liveRound && !rounds.some((r) => r.code === App.liveRound)) App.liveRound = '';
+  // 选中某场：只看这场的选手机位（用后端的 cast，保证与赛程卡一致）。
+  // 主直播间不属于任何一场，切到某场比赛时它照样可选。
   const castIds = new Set(
     App.liveRound
       ? ((s.rounds || []).find((r) => r.code === App.liveRound)?.streams?.cast || []).map(
@@ -1486,13 +1553,16 @@ export function renderLive(s) {
         )
       : []
   );
-  const pool = App.liveRound ? cands.filter((c) => castIds.has(c.id)) : cands;
+  const pool = App.liveRound ? all.filter((c) => c.main || castIds.has(c.id)) : all;
   let picked = pool.find((c) => c.id === App.livePlayerId) || null;
-  if (App.livePlayerId && !picked) {
-    // 所选机位不在当前比赛里（或已失效）：自动切到这场比赛的第一个机位
-    App.livePlayerId = pool[0]?.id || null;
+  if (!picked) {
+    // 没选、或原来选的那路已经下播：自动落到第一路在播信号
+    // （否则观众打开直播页只能对着一张封面，得先自己猜着点一下）
     picked = pool[0] || null;
-    log.debug('机位选择已调整', App.livePlayerId);
+    if (App.livePlayerId !== (picked?.id ?? null)) {
+      log.debug('当前机位', picked?.id || '(没有任何人在直播)');
+    }
+    App.livePlayerId = picked?.id ?? null;
   }
 
   App.livePicked = picked;
@@ -1515,14 +1585,13 @@ export function renderLive(s) {
     if (App.view === 'live') Live.playSelected(s);
   }
 
-  qs('#liveRounds').innerHTML = roundChipsHtml(rounds, cands);
+  // 比赛条只在「有比赛有人在播」时才出现（没人播就整条收起来）
+  const roundBar = qs('#liveRounds');
+  roundBar.innerHTML = roundChipsHtml(rounds, all.length);
+  roundBar.hidden = !rounds.length;
   qs('#livePick').innerHTML = pool.length
     ? pool.map((c) => liveChipHtml(c, picked)).join('')
-    : `<div class="live-pick__empty">${
-        cands.length
-          ? '这场比赛还没有配置推流机位，换一场看看，或点「全部机位」'
-          : '尚无选手配置推流流名，请在管理端为选手填写「推流流名」'
-      }</div>`;
+    : liveEmptyHtml(s);
   qs('#stageMeta').innerHTML = picked ? vsLineHtml(picked) : '';
   qs('#pushPanel').innerHTML = pushPanelHtml(s, picked);
   qs('#liveInfoPanel').innerHTML = liveInfoHtml(s, picked);
@@ -1538,9 +1607,12 @@ export function focusLive(s) {
 
 function liveChipHtml(c, picked) {
   const active = picked && picked.id === c.id;
-  const cls = `live-chip${active ? ' live-chip--active' : ''}${c.live ? ' live-chip--live' : ''}`;
+  const cls =
+    `live-chip${active ? ' live-chip--active' : ''}${c.live ? ' live-chip--live' : ''}` +
+    `${c.main ? ' live-chip--main' : ''}`;
   return (
-    `<button type="button" class="${cls}" data-act="live-select" data-pid="${esc(c.id)}" title="${esc(c.name)}">` +
+    `<button type="button" class="${cls}" data-act="live-select" data-pid="${esc(c.id)}" ` +
+    `title="${esc(c.main ? '主直播间（直播配置里的默认流名）' : c.name)}">` +
     (c.player ? avaHtml(c.player, 'xs') : '<span class="ava ava--xs ava--placeholder">主</span>') +
     `<span class="live-chip__name">${esc(c.name)}</span>` +
     (c.live ? liveTag('LIVE') : '') +
@@ -1552,7 +1624,11 @@ function liveChipHtml(c, picked) {
 function vsLineHtml(picked) {
   const r = picked.round;
   if (!r) {
-    return `<div class="vs-line vs-line--idle"><span class="vs-line__tag">当前机位</span>${esc(picked.name)} · 暂无进行中的对局</div>`;
+    // 主直播间是「全场那一路」，不绑定某一场比赛
+    return picked.main
+      ? `<div class="vs-line vs-line--idle"><span class="vs-line__tag">主直播间</span>` +
+          `全场总机位（默认流名） · 不绑定某一场</div>`
+      : `<div class="vs-line vs-line--idle"><span class="vs-line__tag">当前机位</span>${esc(picked.name)} · 暂无进行中的对局</div>`;
   }
   const side = (sd) => {
     const own = sd.players.some((p) => p.id === picked.id);
@@ -1611,23 +1687,23 @@ function pushPanelHtml(s, picked) {
   const st = s.stream || {};
   const room = (picked && picked.room) || {};
   const admin = canEdit();
-  const priv = privateOf(picked?.id);
+  const main = Boolean(picked?.main);
+  // 主直播间走「默认流名」那一套推流地址，选手机位走选手自己的
+  const endpoints = pushEndpointsOf(picked?.id);
   // [标签, 值, 是否可复制, 复制提示类型]
   const rows = [];
   if (room.key) {
     rows.push(['机位', picked.name, false]);
-    // 推流标识 = 选手自己的流名：整届都用同一个地址，换比赛不用重推
-    rows.push(['推流标识', room.key, true]);
+    // 推流标识 = 选手自己的流名（主直播间 = 配置里的默认流名）：整届都用同一个地址
+    rows.push([main ? '主直播间流名' : '推流标识', room.key, true]);
     if (room.roundLabel) rows.push(['当前比赛', room.roundLabel, false]);
     // 内嵌观看页（源站）：https://live.shiyora.net:8889/<流名>/
     if (room.page) rows.push(['观看页（内嵌）', room.page, true]);
     // 推流（仅管理端；WHIP = WebRTC 套 = 优先，RTMP / RTSP = TCP 套 = 备选）
-    if (admin && priv.endpoints?.whipPush)
-      rows.push(['推流 WHIP（优先）', priv.endpoints.whipPush, true, 'push']);
-    if (admin && priv.endpoints?.rtmpPush)
-      rows.push(['推流 RTMP（备选）', priv.endpoints.rtmpPush, true, 'push']);
-    if (admin && priv.endpoints?.rtspPush)
-      rows.push(['推 RTSP·播（备选）', priv.endpoints.rtspPush, true, 'push']);
+    if (admin && endpoints.whipPush) rows.push(['推流 WHIP（优先）', endpoints.whipPush, true, 'push']);
+    if (admin && endpoints.rtmpPush) rows.push(['推流 RTMP（备选）', endpoints.rtmpPush, true, 'push']);
+    if (admin && endpoints.rtspPush)
+      rows.push(['推 RTSP·播（备选）', endpoints.rtspPush, true, 'push']);
     // 播放（源站直连）：WebRTC 套用 WHEP，TCP 套用 HLS。
     // HLS 给两条：地址到 /<流名>/ 为止的**播放页**（贴浏览器就能看）+ 播放列表（播放器用）
     rows.push(['播放 WHEP', room.whep, true]);
@@ -1648,16 +1724,21 @@ function pushPanelHtml(s, picked) {
               `</div>`
         )
         .join('')
-    : `<div class="empty"><b>未选择机位</b>选择一位选手即可查看其播放地址${
-        admin ? '与推流地址' : ''
+    : `<div class="empty"><b>没有任何人在直播</b>${
+        admin
+          ? '目前没有信号在推，所以这里不摆地址；有人开播后会自动出现。'
+          : '等主播开播后再来看。'
       }</div>`;
   const note = [
     st.note ? `<div class="notice" style="margin-top:10px">${esc(st.note)}</div>` : '',
     admin
       ? `<div class="panel__hint" style="margin-top:8px">推流<b>优先用 WHIP</b>（WebRTC 套，UDP，延迟最低），` +
-        `推不上去再用 RTMP / RTSP（TCP 套，抗抖动）。每位选手只要推自己的流名（这里 …/${esc(
-          room.key || '<流名>'
-        )}），整届赛事都用同一个地址，换比赛不用改；仅管理员可见。</div>` +
+        `推不上去再用 RTMP / RTSP（TCP 套，抗抖动）。${
+          main
+            ? `主直播间推的是直播配置里的<b>默认流名</b>（这里 …/${esc(room.key || '<流名>')}）。`
+            : `每位选手只要推自己的流名（这里 …/${esc(room.key || '<流名>')}），` +
+              `整届赛事都用同一个地址，换比赛不用改。`
+        }仅管理员可见。</div>` +
         pushTipsHtml()
       : `<div class="panel__hint" style="margin-top:8px">播放线路可在播放器上方切换：` +
         `WebRTC 延迟低、HLS 更稳（推流地址属于凭据，仅登录管理员可见）。</div>`,
@@ -1673,7 +1754,8 @@ export function liveInfoHtml(s, picked = null) {
   const e = App.liveInfo || {};
   const health = App.liveHealth;
   const liveRounds = (s.rounds || []).filter((r) => r.status === 'live');
-  const cameras = (s.players || []).filter((p) => p.hasStream).length;
+  // 配了流名的机位数（能不能播要看媒体服务器上报，见下面的「正在推流」）
+  const configured = (s.players || []).filter((p) => p.hasStream).length;
   // 两个端口分开回报：MediaMTX 的 WebRTC(8889) 与 HLS(8888) 是独立监听，
   // 地址写错时能一眼看出是哪一条要改
   const probes = health?.probes || {};
@@ -1687,7 +1769,8 @@ export function liveInfoHtml(s, picked = null) {
   };
   // 「正在推流」以媒体服务器上报为准：拿不到就直说，别给假的直播标记
   const live = s.liveStatus || {};
-  const nowCount = livePlayers().size;
+  // 在播 = 在推流的选手 + 主直播间（整数字）
+  const nowCount = livePlayers().size + (isMainLive() ? 1 : 0);
   const streamingText = !health
     ? `${nowCount} 路（未探测）`
     : live.known
@@ -1698,9 +1781,9 @@ export function liveInfoHtml(s, picked = null) {
     ['WebRTC 端口', health ? probeText('webrtc') : '未探测'],
     ['HLS 端口', health ? probeText('hls') : '未探测'],
     ['进行中', `${liveRounds.length} 场`],
-    ['直播机位', `${cameras} 路`],
+    ['已配置机位', `${configured} 路`],
     ['正在推流', streamingText],
-    ['当前机位', picked ? `${picked.name} · ${picked.room.key || '—'}` : '未选择'],
+    ['当前机位', picked ? `${picked.name} · ${picked.room.key || '—'}` : '没人直播'],
     ['源地址', e.origin || s.stream?.baseUrl || '—'],
   ];
   return (

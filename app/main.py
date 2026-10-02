@@ -402,6 +402,8 @@ async def api_state() -> dict[str, Any]:
     cfg = store.snapshot()
     state = build_public_state(cfg)
     state["live"] = live.stream_endpoints()
+    # 主直播间（默认流名）有没有人在推流；None = 查不到（API 未配置 / 不可达）
+    state["live"]["streaming"] = await live.main_stream_ready()
     # 「正在推流」以**媒体服务器上报**为准（MediaMTX /v3/paths/list 的 ready）：
     # 只有真的有人在推的机位才会被标成直播中；查不到就是没有。
     state["livePlayers"] = await live.streaming_player_ids(cfg)
