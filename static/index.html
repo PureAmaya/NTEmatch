@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN" data-accent="cyan" data-view="overview">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a1020">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="NTE 比赛（异环）通用赛事平台：自动分组、积分结算、选手档案与直播推流。">
+<title>NTE 比赛 · 赛事平台</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/nte.css">
+</head>
+<body>
+
+<div class="fx" aria-hidden="true">
+  <div class="fx__grid"></div>
+  <div class="fx__glow fx__glow--a"></div>
+  <div class="fx__glow fx__glow--b"></div>
+  <div class="fx__scan"></div>
+  <div class="fx__noise"></div>
+</div>
+
+<header class="hud">
+  <div class="hud__brand">
+    <span class="logo-plate" aria-hidden="true">
+      <svg class="mark" viewBox="0 0 48 48">
+        <defs>
+          <linearGradient id="markGrad" x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stop-color="#0ea5c6"/>
+            <stop offset="50%" stop-color="#22e0e8"/>
+            <stop offset="100%" stop-color="#ff2f8e"/>
+          </linearGradient>
+        </defs>
+        <polygon points="24,3 41.5,13 41.5,35 24,45 6.5,35 6.5,13" fill="none" stroke="url(#markGrad)" stroke-width="3.4" stroke-linejoin="round"/>
+        <circle cx="24" cy="24" r="9" fill="none" stroke="url(#markGrad)" stroke-width="2.6"/>
+        <path d="M14.6 24h18.8M24 14.6c4.2 5.5 4.2 13.3 0 18.8M24 14.6c-4.2 5.5-4.2 13.3 0 18.8" fill="none" stroke="url(#markGrad)" stroke-width="1.8" opacity=".9"/>
+      </svg>
+    </span>
+    <div class="hud__titles">
+      <h1 class="hud__title stroke" id="evtTitle" data-text="NTE 比赛">NTE 比赛</h1>
+      <p class="hud__sub" id="evtSub">NEVERNESS TO EVERNESS · MATCH</p>
+    </div>
+  </div>
+
+  <div class="hud__meta">
+    <span class="chip chip--event" id="chipEvent" title="正在看哪一届">—</span>
+    <span class="chip chip--time" id="chipEventTime" hidden title="赛事起止时间">—</span>
+    <span class="chip chip--past" id="chipPast" hidden data-act="route-home" role="button"
+          title="正在回看往届；点这里回到主赛事">—</span>
+    <button class="btn btn--icon" id="btnRefresh" type="button" title="立即同步" aria-label="立即同步">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="btn btn--ghost" id="btnAdmin" type="button">管理</button>
+  </div>
+</header>
+<div class="hud__stripes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+
+<nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
+  <span class="tabs__deco" aria-hidden="true"></span>
+  <button class="tab" role="tab" data-view="overview" aria-selected="true">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    <span>总览</span>
+  </button>
+  <button class="tab" role="tab" data-view="schedule" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    <span>赛程</span>
+  </button>
+  <button class="tab" role="tab" data-view="roster" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M3.2 19c.8-3.2 3.2-4.9 5.8-4.9S14 15.8 14.8 19M16.4 6.1a3 3 0 0 1 0 5.8M18 19c-.2-1.5-.8-2.8-1.6-3.8" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></svg>
+    <span>选手</span>
+  </button>
+  <button class="tab" role="tab" data-view="live" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5.5" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M16 11.4l5.2-3.1v7.4L16 12.6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
+    <span>直播</span>
+  </button>
+  <button class="tab" role="tab" data-view="events" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5zM5 10h14v3H5zM5 16h9v3H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+    <span>往届</span>
+  </button>
+  <button class="tab tab--admin" role="tab" data-view="admin" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.1-2.9 7.6-7 9-4.1-1.4-7-4.9-7-9V6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.2 12.2l2 2 3.6-3.9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>管理</span>
+  </button>
+</nav>
+
+<main class="stage" id="stage">
+
+  <section class="view" id="view-overview" data-view="overview">
+    <div class="kpi" id="kpiRow"></div>
+    <div class="panel panel--time" id="eventTimePanel" hidden></div>
+    <div class="panel" id="championBox" hidden></div>
+    <div class="panel" id="nowPlaying" hidden></div>
+    <div class="panel" id="bracketBoard"></div>
+    <div class="panel" id="standingsBoard"></div>
+    <div class="panel" id="formBoard"></div>
+    <div class="panel" id="rulesBoard" hidden></div>
+  </section>
+
+  <section class="view" id="view-schedule" data-view="schedule" hidden>
+    <div class="panel panel--toolbar" id="scheduleTools"></div>
+    <div id="scheduleGrid"></div>
+  </section>
+
+  <section class="view" id="view-roster" data-view="roster" hidden>
+    <div class="panel panel--toolbar" id="rosterTools"></div>
+    <div class="roster-grid" id="rosterGrid"></div>
+  </section>
+
+  <section class="view" id="view-live" data-view="live" hidden>
+    <div class="panel panel--stage" id="liveStage"></div>
+    <div class="grid grid--2">
+      <div class="panel" id="pushPanel"></div>
+      <div class="panel" id="liveInfoPanel"></div>
+    </div>
+  </section>
+
+  <section class="view" id="view-events" data-view="events" hidden>
+    <div class="panel" id="eventsPanel">
+      <div class="panel__head"><h2>往届</h2>
+        <span class="panel__hint">每一届一张卡片 · 点卡片进入那一届（往届只读回看，主赛事可编辑）</span></div>
+      <div class="panel__body" id="eventsList"></div>
+    </div>
+  </section>
+
+  <section class="view" id="view-admin" data-view="admin" hidden>
+    <div id="adminGate"></div>
+    <div id="adminPanel"></div>
+  </section>
+
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal__backdrop" data-close="1"></div>
+  <div class="modal__box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <header class="modal__head">
+      <h2 class="ol-w" id="modalTitle">标题</h2>
+      <button class="btn btn--icon btn--ghost" type="button" data-close="1" aria-label="关闭">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div class="modal__body" id="modalBody"></div>
+    <footer class="modal__foot" id="modalFoot"></footer>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

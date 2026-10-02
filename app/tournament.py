@@ -1,0 +1,992 @@
+"""赛制引擎：固定队伍 + 小组赛单循环 + 标准双败淘汰。
+
+   参与选手 ──随机组队──▶ T 支固定队伍（每队 team_size 人，全程不换人）
+     └─ 小组赛：分 G 组单循环，得出 1..T 的总排名
+         └─ 淘汰赛：总排名前 B 名晋级（B = 不大于 T 的最大 2 的幂，最小 2）
+             ├─ 胜者组 WB：单败淘汰，B/2 → B/4 → … → 1
+             ├─ 败者组 LB：胜者组落败者依次进入，共 2k-2 轮（minor / major 交替）
+             └─ 总决赛 GF：胜者组冠军 vs 败者组冠军（单场定胜负）
+
+   T ≤ 2 时跳过小组赛，直接进行总决赛。
+
+设计要点：淘汰赛每一场只声明「席位来源」（``src_a`` / ``src_b``）与胜负结果，
+双方阵容由 :func:`resolve_rounds` 依据上游结果推导——纯函数、可反复重算，
+因此「败者组成员随比赛进程自动生成」不存在中间状态错乱；
+上游结果被改写（重置）时，下游对局会在同一次前向遍历中自动作废。
+
+本模块不涉及 IO 与 Web 框架，便于单独测试。
+"""
+
+from __future__ import annotations
+
+import random
+from collections import defaultdict
+from collections.abc import Iterable
+from typing import Any
+
+from .logging_conf import get_logger
+from .models import MAX_SIDES, Player, Round, Rules, Side, Team
+
+log = get_logger("tournament")
+
+PALETTE = ("#22e0e8", "#ff2f8e", "#ffd83d", "#7d5cff", "#43e58a", "#ff8a3d", "#3db2ff", "#e05cff")
+
+# 淘汰赛轮次名称：按该轮开始时的剩余队数命名（十六强 / 八强 / 半决赛 …）
+ROUND_NAMES = {32: "三十二强", 16: "十六强", 8: "八强", 4: "半决赛", 2: "决赛"}
+
+STAGE_ORDER = {"league": 0, "group": 1, "wb": 2, "lb": 3, "gf": 4}
+STAGE_NAMES = {"league": "积分赛", "group": "小组赛", "wb": "胜者组", "lb": "败者组", "gf": "总决赛"}
+
+# 淘汰赛规模可选值（2 的幂）
+_MIN_SIZE = 2
+
+
+# --------------------------------------------------------------------------- #
+# 基础数学
+# --------------------------------------------------------------------------- #
+def power_of_two_floor(n: int) -> int:
+    """不大于 ``n`` 的最大 2 的幂（n ≤ 1 时为 1）。"""
+    if n <= 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def bracket_size(team_count: int) -> int:
+    """淘汰赛规模上限：不大于队伍数的最大 2 的幂，最小 2。
+
+    这样轮次名称自然落在「三十二强 / 十六强 / 八强 / 半决赛 / 决赛」上，
+    并且永远不会出现轮空（B ≤ 队伍数），双败结构因此保持完整。
+    """
+    return max(_MIN_SIZE, power_of_two_floor(max(_MIN_SIZE, team_count)))
+
+
+def size_options(team_count: int) -> list[int]:
+    """可选的淘汰赛规模：从 2 到可行上限的所有 2 的幂。"""
+    top = bracket_size(team_count)
+    out: list[int] = []
+    size = _MIN_SIZE
+    while size <= top:
+        out.append(size)
+        size *= 2
+    return out
+
+
+def resolve_size(team_count: int, requested: int = 0, *, strict: bool = True) -> int:
+    """确定实际使用的淘汰赛规模；未指定时取可行上限（最大 2 的幂）。
+
+    ``strict=True``（用户显式指定）时，非法值抛 ``ValueError``；
+    ``strict=False``（沿用配置里的偏好）时，不可行则回退到可行上限，
+    避免队伍数变化后旧设定把赛程生成卡住。
+    """
+    allowed = size_options(team_count)
+    if not requested:
+        return allowed[-1]
+    want = int(requested)
+    if want in allowed:
+        return want
+    if strict:
+        raise ValueError(
+            f"淘汰赛规模需为 2 的幂且不超过队伍数（{team_count} 支队可选："
+            + " / ".join(f"{s} 强" for s in allowed)
+            + "）"
+        )
+    return allowed[-1]
+
+
+def group_count_for(team_count: int, per_match: int = 2) -> int:
+    """小组数：每组 4 队左右，且**尽量让每组的队数是同场数的整数倍**。
+
+    ``per_match=2`` 时退化为「约 4 队一组」；``per_match=3/4`` 时会挑一个
+    让每组队数正好排满整场的组数（12 队 / 同场 3 → 2 组各 6 队），
+    这样小组赛不会出现人数不齐的场次。
+    """
+    k = max(2, min(MAX_SIDES, per_match))
+    if team_count <= max(2, k):
+        return 1
+    target = 4 if k == 2 else k * 2
+    best: tuple[int, int, int] | None = None
+    for groups in range(1, team_count + 1):
+        if team_count % groups:
+            continue
+        per_group = team_count // groups
+        if per_group < k:
+            continue
+        full = 0 if (k == 2 or per_group % k == 0) else 1
+        score = (full, abs(per_group - target), groups)
+        if best is None or score < best:
+            best = score
+    return best[2] if best else 1
+
+
+def bracket_order(size: int) -> list[int]:
+    """标准对阵表种子顺序：保证 1 号与 2 号只可能在决赛相遇。"""
+    order = [1]
+    while len(order) < size:
+        span = len(order) * 2
+        nxt: list[int] = []
+        for seed in order:
+            nxt.append(seed)
+            nxt.append(span + 1 - seed)
+        order = nxt
+    return order
+
+
+def wb_code(round_no: int, slot: int) -> str:
+    return f"WB-{round_no}-{slot}"
+
+
+def lb_code(round_no: int, slot: int) -> str:
+    return f"LB-{round_no}-{slot}"
+
+
+def wb_match_count(size: int, round_no: int) -> int:
+    return size >> round_no
+
+
+def lb_match_count(size: int, round_no: int) -> int:
+    """败者组第 ``round_no`` 轮场次；minor / major 交替使场次每两轮减半。"""
+    return size >> ((round_no + 1) // 2 + 1)
+
+
+def wb_round_title(size: int, round_no: int) -> str:
+    rounds = size.bit_length() - 1
+    if round_no == rounds:
+        return "胜者组决赛" if size >= 4 else "总决赛"
+    return ROUND_NAMES.get(size >> (round_no - 1), f"胜者组第 {round_no} 轮")
+
+
+def side_keys(count: int) -> list[str]:
+    """同场 N 队对应的 A/B/C/D 编号。"""
+    return [chr(ord("A") + i) for i in range(max(2, min(MAX_SIDES, count)))]
+
+
+# --------------------------------------------------------------------------- #
+# 结果判定：谁赢了 / 名次 / 名次分
+#
+# 「能填的都填，结果自动判定」：管理员只需录入各局小分或直接填比分，
+# 胜负、名次与名次分全部由这里推导，不再需要人工判断。
+# --------------------------------------------------------------------------- #
+def placement_points(side_count: int, rank: int) -> int:
+    """名次分：第 1 名得 ``side_count`` 分，依次递减，最低 1 分。
+
+    2 队即 2/1（等价于胜/负），3 队即 3/2/1，4 队即 4/3/2/1。
+    """
+    if rank <= 0:
+        return 0
+    return max(1, side_count - rank + 1)
+
+
+def judge_round(rnd: Round, *, allow_draw: bool = False) -> str:
+    """按录入内容自动判定本场胜负与名次，返回 winner（``""`` = 尚未确定）。
+
+    判定顺序：
+
+    1. 填了各局小分（2 队）→ 局分 = 各局胜负计数，得分 = 各局小分合计；
+    2. 否则比较 ``score``（比分 / 该场得分）；
+    3. 仍然相同再比 ``points``（小分 / 细则分）；
+    4. 还相同：2 队且允许平局 → ``DRAW``；多队并列第一 → 交回管理员指定。
+    """
+    sides = rnd.sides
+    count = len(sides)
+    if count == 2 and rnd.sets:
+        wins = [0, 0]
+        totals = [0, 0]
+        for item in rnd.sets:
+            totals[0] += item.a
+            totals[1] += item.b
+            if item.a > item.b:
+                wins[0] += 1
+            elif item.b > item.a:
+                wins[1] += 1
+        for i in (0, 1):
+            sides[i].score = wins[i]
+            sides[i].points = totals[i]
+
+    for side in sides:
+        side.rank = 0
+
+    # 弃权方一律垫底，并且不参与名次竞争
+    playing = [i for i, side in enumerate(sides) if not side.forfeit]
+    if not playing:
+        return ""
+
+    order = sorted(playing, key=lambda i: (-sides[i].score, -sides[i].points))
+    rank = 0
+    previous: tuple[int, int] | None = None
+    for position, i in enumerate(order, start=1):
+        current = (sides[i].score, sides[i].points)
+        if current != previous:
+            rank = position
+            previous = current
+        sides[i].rank = rank
+    for i in range(count):
+        if sides[i].forfeit:
+            sides[i].rank = len(playing) + 1
+
+    if not any(sides[i].score or sides[i].points for i in playing):
+        # 谁都没填比分：若只剩一方没弃权，直接判其获胜（弃权判罚）
+        if len(playing) == 1:
+            return chr(ord("A") + playing[0])
+        return ""
+
+    best = (sides[order[0]].score, sides[order[0]].points)
+    tied = [i for i in order if (sides[i].score, sides[i].points) == best]
+    if len(tied) > 1:
+        return "DRAW" if (count == 2 and allow_draw) else ""
+    return chr(ord("A") + order[0])
+
+
+def round_is_decided(rnd: Round) -> bool:
+    """本场是否已有明确胜者（平局也算已判定）。"""
+    return rnd.status == "done" and bool(rnd.winner)
+
+
+def source_text(ref: str) -> str:
+    """把席位引用翻译成展示文案。"""
+    if not ref:
+        return ""
+    if ref.startswith("seed:"):
+        return f"小组赛第 {ref[5:]} 名"
+    code, _, flag = ref.rpartition(":")
+    return f"{code} {'胜者' if flag == 'W' else '败者'}"
+
+
+# --------------------------------------------------------------------------- #
+# 组队：随机分配队友，之后固定不变
+# --------------------------------------------------------------------------- #
+def auto_form_teams(
+    players: Iterable[Player],
+    team_size: int = 2,
+    seed: int | None = None,
+    *,
+    merge_remainder: bool = False,
+    allow_substitutes: bool = True,
+) -> tuple[list[Team], list[str]]:
+    """把参与选手随机分成固定队伍（队友随机）。返回 ``(队伍, 提示)``。
+
+    ``merge_remainder=True`` 时把凑不满一队的零头**平均并入**已有队伍，
+    这样没人会被落下（队伍人数因此可能不相等）；默认仍按整队切分、
+    零头进候补池。
+
+    ``allow_substitutes=False``（锦标赛制）时**替补不进入队伍**——
+    固定队伍比赛没有替补上场的机会，留在候补池反而会让人误以为能替换。
+    """
+    size = max(1, team_size)
+    pool = [p for p in players if p.active and p.name]
+    if not allow_substitutes:
+        subs = [p for p in pool if p.substitute]
+        if subs:
+            log.info("锦标赛制忽略替补 %d 人", len(subs))
+        pool = [p for p in pool if not p.substitute]
+    rng = random.Random(seed if seed is not None else random.randrange(1_000_000))
+    shuffled = list(pool)
+    rng.shuffle(shuffled)
+
+    full = len(shuffled) // size
+    members_groups: list[list[Player]] = [
+        shuffled[i * size : (i + 1) * size] for i in range(full)
+    ]
+    leftover = shuffled[full * size :]
+
+    warnings: list[str] = []
+    if leftover and merge_remainder and members_groups:
+        for i, player in enumerate(leftover):
+            members_groups[i % len(members_groups)].append(player)
+        names = "、".join(p.display_name for p in leftover)
+        warnings.append(
+            f"{len(leftover)} 人凑不满整队（{names}），已平均并入前排队伍"
+            f"（部分队伍人数会多于 {size} 人）。"
+        )
+        leftover = []
+    elif leftover and not members_groups:
+        # 连一支队都凑不齐：直接全部组一队，避免「无法组队」
+        members_groups = [list(shuffled)]
+        leftover = []
+        warnings.append(f"参与选手不足 {size} 人，已把全部 {len(shuffled)} 人编为一队。")
+
+    teams = [_make_team(i + 1, members) for i, members in enumerate(members_groups)]
+
+    if not teams:
+        raise ValueError(f"参与选手不足 {size} 人，无法组队")
+    if leftover:
+        names = "、".join(p.display_name for p in leftover)
+        warnings.append(f"{len(leftover)} 人凑不满一队（{names}），本届作为替补不参与比赛。")
+    if len(teams) < 2:
+        warnings.append("目前只有 1 支队伍，至少需要 2 支队才能进行比赛。")
+    log.info(
+        "随机组队完成 | 选手=%d | 队伍=%d | 每队=%d 人 | 零头并入=%s",
+        len(pool),
+        len(teams),
+        size,
+        merge_remainder,
+    )
+    return teams, warnings
+
+
+def _make_team(index: int, members: list[Player]) -> Team:
+    names = [m.display_name for m in members]
+    short = "".join(n[0] for n in names if n)[:3] or f"T{index}"
+    return Team(
+        id=f"t{index:02d}",
+        name=" & ".join(names),
+        short=short,
+        color=PALETTE[(index - 1) % len(PALETTE)],
+        player_ids=[m.id for m in members],
+    )
+
+
+def team_of_player(teams: Iterable[Team], player_id: str) -> Team | None:
+    for team in teams:
+        if player_id in team.player_ids:
+            return team
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 小组赛
+# --------------------------------------------------------------------------- #
+def heat_sizes(team_count: int, per_match: int) -> list[int]:
+    """一轮里各场的队数：尽量均分，且每场至少 2 队、不超过 ``per_match``。
+
+    例：6 队 / 同场 4 → ``[3, 3]``（而不是 4 + 2）；5 队 / 同场 3 → ``[2, 3]``；
+    5 队 / 同场 2 → ``[2, 2]``（这一轮有 1 队轮休）。
+    """
+    k = max(2, min(MAX_SIDES, per_match))
+    count = max(2, team_count)
+    matches = max(1, -(-count // k))            # ceil(count / k)
+    while matches > 1 and matches * 2 > count:  # 保证每场至少 2 队
+        matches -= 1
+    sizes: list[int] = []
+    remaining = count
+    for index in range(matches):
+        left = matches - index
+        size = min(k, max(2, remaining // left))
+        sizes.append(size)
+        remaining -= size
+    return sorted(sizes, reverse=True)          # 人数多的场次排在前面
+
+
+def _heat_schedule(items: list[Any], per_match: int) -> list[list[list[Any]]]:
+    """圆桌轮转法：把 ``items`` 编排成若干轮，每轮由若干场「N 队同场」组成。
+
+    * ``per_match=2`` 时退化为标准单循环（每两队相遇一次）；
+    * ``per_match=3/4`` 时每场尽量 3~4 队同场，各队出场次数保持均衡；
+    * 队数不是 ``per_match`` 的整数倍时**均分到各场**（6 队 / 同场 4 → 3 + 3），
+      仍然排不下的队这一轮轮休。
+
+    返回 ``[[[同场队伍…], …], …]``（外层 = 轮次）。
+    """
+    count = len(items)
+    if count < 2:
+        return []
+    sizes = heat_sizes(count, per_match)
+    if sum(sizes) > count:                      # 理论上不会发生，稳妥兜底
+        sizes = [count]
+    arr = list(items)
+    rounds: list[list[list[Any]]] = []
+    for _ in range(count - 1):
+        matches: list[list[Any]] = []
+        cursor = 0
+        for size in sizes:
+            if cursor >= count:
+                break
+            chunk = arr[cursor : cursor + size]
+            cursor += size
+            if len(chunk) >= 2:
+                matches.append(chunk)
+        if matches:
+            rounds.append(matches)
+        arr = [arr[0], arr[-1], *arr[1:-1]]
+    return rounds
+
+
+def assign_groups(teams: list[Team], group_count: int) -> list[Team]:
+    """按顺序轮转分入 A/B/C… 组（队伍本身已随机，因此分组自然均衡）。"""
+    count = max(1, min(group_count, len(teams))) if teams else 1
+    letters = [chr(ord("A") + i) for i in range(count)]
+    for idx, team in enumerate(teams):
+        team.group = letters[idx % len(letters)]
+    return teams
+
+
+def build_group_rounds(
+    teams: list[Team], teams_per_match: int = 2, start_index: int = 1
+) -> list[Round]:
+    """生成小组赛对局（组内轮转；每场 ``teams_per_match`` 队同场）。"""
+    grouped: dict[str, list[Team]] = defaultdict(list)
+    for team in teams:
+        grouped[team.group or "A"].append(team)
+
+    rounds: list[Round] = []
+    index = start_index
+    for key in sorted(grouped):
+        for round_no, matches in enumerate(_heat_schedule(grouped[key], teams_per_match), start=1):
+            for slot, group in enumerate(matches, start=1):
+                rounds.append(
+                    Round(
+                        index=index,
+                        code=f"G-{key}-{round_no}-{slot}",
+                        stage="group",
+                        bracket_round=round_no,
+                        slot=slot,
+                        # 同一轮会有多场，标签必须带场次，否则几张卡看起来一模一样
+                        label=f"{key} 组 · 第 {round_no} 轮 · 第 {slot} 场",
+                        sides=[
+                            Side(
+                                team_id=team.id,
+                                player_ids=list(team.player_ids),
+                                label=team.short or team.label,
+                            )
+                            for team in group
+                        ],
+                    )
+                )
+                index += 1
+    return rounds
+
+
+def table_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    """小组赛排序：名次分 → 净胜分 → 总得分 → 队名（完全确定，无随机）。"""
+    return (-row["placement"], -row["diff"], -row["scored"], row["name"])
+
+
+def group_tables(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[str, Any]]]:
+    """小组赛积分表（按小组分组，已排序并标注名次）。
+
+    每场按**名次分**结算（2 队 = 2/1，3 队 = 3/2/1，4 队 = 4/3/2/1），
+    因此 2 队对阵与多队同场可以放在同一张表里比较。
+    """
+    rows: dict[str, dict[str, Any]] = {
+        t.id: {
+            "teamId": t.id,
+            "name": t.label,
+            "short": t.short or t.label,
+            "color": t.color,
+            "group": t.group or "A",
+            "played": 0,
+            "win": 0,
+            "lose": 0,
+            "placement": 0,
+            "scored": 0,
+            "conceded": 0,
+            "diff": 0,
+            "bestRank": 0,
+            "rank": 0,
+        }
+        for t in teams
+    }
+    for rnd in rounds:
+        if rnd.stage != "group" or rnd.status != "done" or not rnd.winner:
+            continue
+        parts = [s for s in rnd.sides if s.team_id in rows]
+        if len(parts) < 2:
+            continue
+        count = len(parts)
+        for side in parts:
+            row = rows[side.team_id]
+            others = sum(other.score for other in parts if other is not side)
+            row["played"] += 1
+            row["scored"] += side.score
+            row["conceded"] += others
+            # 平局没有名次，按并列末位参与名次分计算
+            place = side.rank or count
+            row["placement"] += placement_points(count, place)
+            if place == 1:
+                row["win"] += 1
+            elif rnd.winner != "DRAW":
+                row["lose"] += 1
+            if place and (not row["bestRank"] or place < row["bestRank"]):
+                row["bestRank"] = place
+
+    tables: dict[str, list[dict[str, Any]]] = {}
+    for key in sorted({r["group"] for r in rows.values()}):
+        bucket = [r for r in rows.values() if r["group"] == key]
+        for row in bucket:
+            row["diff"] = row["scored"] - row["conceded"]
+        bucket.sort(key=table_sort_key)
+        for pos, row in enumerate(bucket, start=1):
+            row["rank"] = pos
+        tables[key] = bucket
+    return tables
+
+
+def overall_ranking(tables: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """小组赛总排名：先所有小组第 1 名（按战绩），再所有第 2 名，依此类推。
+
+    这样「前 B 名晋级」等价于：各组名次靠前者优先，保证各组头名稳进淘汰赛。
+    """
+    depth = max((len(rows) for rows in tables.values()), default=0)
+    ranking: list[str] = []
+    for pos in range(depth):
+        chunk = [rows[pos] for rows in tables.values() if len(rows) > pos]
+        chunk.sort(key=table_sort_key)
+        ranking.extend(row["teamId"] for row in chunk)
+    return ranking
+
+
+def group_stage_done(rounds: list[Round]) -> bool:
+    group = [r for r in rounds if r.stage == "group"]
+    return bool(group) and all(r.status == "done" and r.winner for r in group)
+
+
+# --------------------------------------------------------------------------- #
+# 淘汰赛骨架（标准双败）
+# --------------------------------------------------------------------------- #
+def build_knockout_rounds(
+    size: int, start_index: int = 1, *, loser_bracket: bool = True
+) -> list[Round]:
+    """生成淘汰赛骨架（只有席位来源，阵容由 resolve 推导）。
+
+    ``loser_bracket=True``（默认）双败淘汰：
+
+    * 胜者组：``size/2 → size/4 → … → 1``；
+    * 败者组：共 ``2k-2`` 轮，奇数轮（minor）由败者组内部淘汰，
+      偶数轮（major）由败者组幸存者迎战胜者组同轮败者（反向配对，避免刚打完又相遇）；
+    * 总决赛：胜者组冠军 vs 败者组冠军。
+
+    ``loser_bracket=False`` 单败淘汰：只有胜者组，最后一轮直接就是决赛
+    （输一场即淘汰，没有败者组与总决赛）。
+    """
+    size = max(2, size)
+    if not loser_bracket:
+        return _build_single_elim(size, start_index)
+    if size == 2:
+        return [
+            Round(
+                index=start_index,
+                code="GF",
+                stage="gf",
+                bracket_round=1,
+                slot=1,
+                label="总决赛",
+                src_a="seed:1",
+                src_b="seed:2",
+            )
+        ]
+
+    rounds_count = size.bit_length() - 1
+    total_lb = max(0, 2 * rounds_count - 2)
+    order = bracket_order(size)
+
+    rounds: list[Round] = []
+    index = start_index
+
+    # ---- 胜者组 ----
+    for r in range(1, rounds_count + 1):
+        count = wb_match_count(size, r)
+        title = wb_round_title(size, r)
+        for m in range(1, count + 1):
+            if r == 1:
+                src_a = f"seed:{order[(m - 1) * 2]}"
+                src_b = f"seed:{order[(m - 1) * 2 + 1]}"
+            else:
+                src_a = f"{wb_code(r - 1, m * 2 - 1)}:W"
+                src_b = f"{wb_code(r - 1, m * 2)}:W"
+            # 胜者组首轮败者两两配对进败者组；之后每一轮的败者直接进入同序号的败者组 major 轮
+            loser_to = lb_code(1, (m + 1) // 2) if r == 1 else lb_code(2 * r - 2, m)
+            rounds.append(
+                Round(
+                    index=index,
+                    code=wb_code(r, m),
+                    stage="wb",
+                    bracket_round=r,
+                    slot=m,
+                    label=f"{title} · 第 {m} 场",
+                    src_a=src_a,
+                    src_b=src_b,
+                    winner_to=wb_code(r + 1, (m + 1) // 2) if r < rounds_count else "GF",
+                    loser_to=loser_to,
+                )
+            )
+            index += 1
+
+    # ---- 败者组 ----
+    for i in range(1, total_lb + 1):
+        count = lb_match_count(size, i)
+        major_wb_round = i // 2 + 1          # 偶数轮（major）对应的胜者组轮次
+        title = "败者组决赛" if i == total_lb else f"败者组第 {i} 轮"
+        for m in range(1, count + 1):
+            if i == 1:
+                # 首轮：胜者组第 1 轮的败者两两配对
+                src_a = f"{wb_code(1, m * 2 - 1)}:L"
+                src_b = f"{wb_code(1, m * 2)}:L"
+            elif i % 2 == 0:
+                # major：败者组幸存者 vs 胜者组同轮败者（反向配对，避免刚打完又相遇）
+                src_a = f"{lb_code(i - 1, m)}:W"
+                src_b = f"{wb_code(major_wb_round, count - m + 1)}:L"
+            else:
+                # minor：败者组内部淘汰
+                src_a = f"{lb_code(i - 1, m * 2 - 1)}:W"
+                src_b = f"{lb_code(i - 1, m * 2)}:W"
+            if i == total_lb:
+                winner_to = "GF"
+            elif lb_match_count(size, i + 1) == count:
+                winner_to = lb_code(i + 1, m)
+            else:
+                winner_to = lb_code(i + 1, (m + 1) // 2)
+            rounds.append(
+                Round(
+                    index=index,
+                    code=lb_code(i, m),
+                    stage="lb",
+                    bracket_round=i,
+                    slot=m,
+                    label=f"{title} · 第 {m} 场",
+                    src_a=src_a,
+                    src_b=src_b,
+                    winner_to=winner_to,
+                )
+            )
+            index += 1
+
+    # ---- 总决赛 ----
+    rounds.append(
+        Round(
+            index=index,
+            code="GF",
+            stage="gf",
+            bracket_round=1,
+            slot=1,
+            label="总决赛",
+            src_a=f"{wb_code(rounds_count, 1)}:W",
+            src_b=f"{lb_code(total_lb, 1)}:W",
+        )
+    )
+    return rounds
+
+
+def _build_single_elim(size: int, start_index: int = 1) -> list[Round]:
+    """单败淘汰：只有胜者组，最后一轮即决赛（输一场就淘汰）。"""
+    rounds_count = size.bit_length() - 1
+    order = bracket_order(size)
+    rounds: list[Round] = []
+    index = start_index
+    for r in range(1, rounds_count + 1):
+        count = wb_match_count(size, r)
+        for m in range(1, count + 1):
+            if r == 1:
+                src_a = f"seed:{order[(m - 1) * 2]}"
+                src_b = f"seed:{order[(m - 1) * 2 + 1]}"
+            else:
+                src_a = f"{wb_code(r - 1, m * 2 - 1)}:W"
+                src_b = f"{wb_code(r - 1, m * 2)}:W"
+            is_final = r == rounds_count
+            rounds.append(
+                Round(
+                    index=index,
+                    code="GF" if is_final else wb_code(r, m),
+                    stage="gf" if is_final else "wb",
+                    bracket_round=r,
+                    slot=m,
+                    label=(
+                        "决赛"
+                        if is_final
+                        else f"{wb_round_title(size, r)} · 第 {m} 场"
+                    ),
+                    src_a=src_a,
+                    src_b=src_b,
+                    # 输者直接淘汰：不写 winner_to（末轮）与 loser_to
+                    winner_to="" if is_final else wb_code(r + 1, (m + 1) // 2),
+                )
+            )
+            index += 1
+    return rounds
+
+
+def resolve_rounds(rounds: list[Round], seeds: list[str], teams: list[Team]) -> list[Round]:
+    """按已有结果推导淘汰赛双方（纯函数，可反复调用）。
+
+    ``seeds`` 是晋级队伍的 ``team_id`` 顺序（1 号种子在前）。
+    当前向遍历发现某场双方与已保存的不一致时，该场（以及其后所有对局）
+    的比分与状态会被清空——上游结果改了，下游自然重来。
+    """
+    by_id = {t.id: t for t in teams}
+    resolved = [r.model_copy(deep=True) for r in rounds]
+    by_code = {r.code: r for r in resolved if r.code}
+
+    def team_id_of(ref: str) -> str:
+        if not ref:
+            return ""
+        if ref.startswith("seed:"):
+            try:
+                pos = int(ref[5:])
+            except ValueError:
+                return ""
+            return seeds[pos - 1] if 1 <= pos <= len(seeds) else ""
+        code, _, flag = ref.rpartition(":")
+        source = by_code.get(code)
+        if source is None or source.status != "done" or not source.winner:
+            return ""
+        win_side = source.side_by_key(source.winner)
+        if win_side is None:
+            return ""
+        if flag == "W":
+            return win_side.team_id
+        # 「败者」只对 2 队对阵有唯一含义；淘汰赛恒为 2 队同场
+        others = [side for side in source.sides if side is not win_side]
+        return others[0].team_id if len(others) == 1 else ""
+
+    for rnd in resolved:
+        if rnd.stage in ("group", "league"):
+            continue          # 小组赛由赛制生成、积分制常规局由换人接口维护
+        decided = rnd.status == "done" or round_has_result(rnd)
+        replaced = False
+        for idx, ref in enumerate((rnd.src_a, rnd.src_b)):
+            side: Side = rnd.sides[idx]
+            tid = team_id_of(ref)
+            team = by_id.get(tid) if tid else None
+            players = list(team.player_ids) if team else []
+            label = (team.short or team.label) if team else ""
+            # 换了另一支队伍才算结构性变化；单纯的队员变动（替补）不推翻已打完的比赛
+            if side.team_id != tid:
+                replaced = True
+            side.team_id = tid
+            side.label = label
+            side.source = source_text(ref)
+            if not decided or replaced:
+                side.player_ids = players
+        if replaced and decided:
+            reset_round_result(rnd)
+    return resolved
+
+
+def round_has_result(rnd: Round) -> bool:
+    """本场是否已有任何录入痕迹（用于判断上游变化后是否需要作废）。"""
+    return bool(
+        rnd.winner
+        or rnd.status != "pending"
+        or rnd.sets
+        or any(side.score or side.points or side.rank or side.forfeit for side in rnd.sides)
+    )
+
+
+def reset_round_result(rnd: Round) -> None:
+    """清空一场比赛的比分 / 名次 / 弃权 / 用时（保留计划时间与直播设置）。"""
+    rnd.status = "pending"
+    rnd.winner = ""
+    rnd.sets = []
+    rnd.duration_minutes = 0
+    for side in rnd.sides:
+        side.score = 0
+        side.points = 0
+        side.rank = 0
+        side.forfeit = False
+    rnd.started_at = ""
+    rnd.finished_at = ""
+    rnd.locked = False
+
+
+# --------------------------------------------------------------------------- #
+# 组装
+# --------------------------------------------------------------------------- #
+def build_tournament(
+    teams: list[Team], rules: Rules
+) -> tuple[list[Round], list[str], dict[str, Any]]:
+    """生成完整赛程骨架（小组赛 + 淘汰赛）。返回 ``(对局, 提示, 概要)``。"""
+    if len(teams) < 2:
+        raise ValueError("至少需要 2 支队伍（即 4 名参与选手）才能生成赛程")
+
+    size = resolve_size(len(teams), rules.knockout_size, strict=False)
+    warnings: list[str] = []
+    if rules.knockout_size and rules.knockout_size != size:
+        warnings.append(
+            f"原设定的 {rules.knockout_size} 强超出当前 {len(teams)} 支队伍的可行范围，已改为 {size} 强。"
+        )
+    rounds: list[Round] = []
+    per_match = max(2, min(MAX_SIDES, rules.teams_per_match or 2))
+    loser_bracket = bool(rules.loser_bracket)
+
+    if len(teams) > 2:
+        group_count = rules.group_count or group_count_for(len(teams), per_match)
+        group_count = max(1, min(group_count, len(teams)))
+        assign_groups(teams, group_count)
+        rounds = build_group_rounds(teams, per_match, 1)
+        shape = "组 vs 组" if per_match == 2 else f"{per_match} 队同场"
+        warnings.append(
+            f"小组赛：{len(teams)} 支队分 {group_count} 组轮转，每场 {shape}，共 {len(rounds)} 场。"
+        )
+        small = [
+            key
+            for key in {t.group or "A" for t in teams}
+            if sum(1 for t in teams if (t.group or "A") == key) < per_match
+        ]
+        if small:
+            warnings.append(
+                f"{'、'.join(sorted(small))} 组成员不足 {per_match} 支队，这些场次按实际队数进行。"
+            )
+        eliminated = len(teams) - size
+        if eliminated > 0:
+            warnings.append(f"小组赛按名次分排名，前 {size} 名晋级淘汰赛，其余 {eliminated} 支队淘汰。")
+        else:
+            warnings.append(f"全部 {size} 支队晋级淘汰赛，小组赛用于确定种子顺位。")
+
+    knockout = build_knockout_rounds(size, len(rounds) + 1, loser_bracket=loser_bracket)
+    rounds.extend(knockout)
+    rounds_count = size.bit_length() - 1
+    if size >= 4 and loser_bracket:
+        warnings.append(
+            f"淘汰赛：{size} 强双败，胜者组 {rounds_count} 轮、败者组 {2 * rounds_count - 2} 轮，"
+            f"最后由胜者组冠军与败者组冠军争夺总冠军。"
+        )
+    elif size >= 4:
+        warnings.append(
+            f"淘汰赛：{size} 强单败（未开启败者组），输一场即淘汰，共 {rounds_count} 轮，"
+            f"最后一轮为决赛。"
+        )
+    elif loser_bracket:
+        warnings.append("队伍数不足 4 支：直接进行一场总决赛。")
+    else:
+        warnings.append("队伍数不足 4 支：直接进行一场决赛（单败）。")
+
+    summary = {
+        "size": size,
+        "teams": len(teams),
+        "teamsPerMatch": per_match,
+        "loserBracket": loser_bracket,
+        "groupMatches": len([r for r in rounds if r.stage == "group"]),
+        "knockoutMatches": len([r for r in rounds if r.stage != "group"]),
+        "total": len(rounds),
+    }
+    log.info(
+        "赛程已生成 | 队伍=%d | 淘汰赛规模=%d | 同场=%d | 败者组=%s | 小组赛场次=%d | 淘汰赛场次=%d",
+        len(teams),
+        size,
+        per_match,
+        loser_bracket,
+        summary["groupMatches"],
+        summary["knockoutMatches"],
+    )
+    return rounds, warnings, summary
+
+
+def size_from_rounds(rounds: list[Round]) -> int:
+    """从已生成的对局反推淘汰赛规模（无需再传赛制参数）。"""
+    wb = [r for r in rounds if r.stage == "wb"]
+    if not wb:
+        return 2 if any(r.code == "GF" for r in rounds) else 0
+    first = min(r.bracket_round for r in wb)
+    return sum(1 for r in wb if r.bracket_round == first) * 2
+
+
+def advance_seeds(teams: list[Team], rounds: list[Round]) -> list[str]:
+    """当前晋级淘汰赛的种子顺序（小组赛未结束时返回空列表）。"""
+    size = size_from_rounds(rounds) or bracket_size(len(teams))
+    if not any(r.stage == "group" for r in rounds):
+        return [t.id for t in teams][:size]
+    if not group_stage_done(rounds):
+        return []
+    tables = group_tables(teams, rounds)
+    return overall_ranking(tables)[:size]
+
+
+def resolve_tournament(teams: list[Team], rounds: list[Round]) -> list[Round]:
+    """按当前进程重算整份赛程（小组赛阵容保持原样，淘汰赛按结果推导）。"""
+    return resolve_rounds(rounds, advance_seeds(teams, rounds), teams)
+
+
+def phase_of(rounds: list[Round]) -> str:
+    if not rounds:
+        return "idle"
+    final = next((r for r in rounds if r.stage == "gf"), None)
+    if final is not None and final.status == "done" and final.winner:
+        return "finished"
+    group = [r for r in rounds if r.stage == "group"]
+    if group and not group_stage_done(rounds):
+        return "group"
+    return "knockout"
+
+
+def champion_of(teams: list[Team], rounds: list[Round]) -> Team | None:
+    final = next((r for r in rounds if r.stage == "gf"), None)
+    if final is None or final.status != "done" or not final.winner:
+        return None
+    side = final.side_by_key(final.winner)
+    if side is None:
+        return None
+    return next((t for t in teams if t.id == side.team_id), None)
+
+
+def live_or_next(rounds: list[Round]) -> list[Round]:
+    """当前正在进行的比赛；没有则给出最靠前的待开始比赛（用于首页「当前对阵」）。"""
+    playing = [r for r in rounds if r.status == "live"]
+    if playing:
+        return sorted(playing, key=lambda r: r.index)
+    for stage in ("group", "wb", "lb", "gf"):
+        pending = [r for r in rounds if r.stage == stage and r.status == "pending"]
+        ready = [r for r in pending if all(s.team_id for s in r.sides)]
+        if ready:
+            return sorted(ready, key=lambda r: r.index)
+        if pending and stage == "group":
+            return sorted(pending, key=lambda r: r.index)[:1]
+    return []
+
+
+def stage_progress(rounds: list[Round]) -> list[dict[str, Any]]:
+    """各阶段进度，供前端渲染进度条。"""
+    out: list[dict[str, Any]] = []
+    for stage in ("league", "group", "wb", "lb", "gf"):
+        bucket = [r for r in rounds if r.stage == stage]
+        if not bucket:
+            continue
+        done = sum(1 for r in bucket if r.status == "done")
+        out.append(
+            {
+                "stage": stage,
+                "name": STAGE_NAMES[stage],
+                "total": len(bucket),
+                "done": done,
+                "live": sum(1 for r in bucket if r.status == "live"),
+                "percent": round(done / len(bucket) * 100, 1),
+            }
+        )
+    return out
+
+
+def bracket_view(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[str, Any]]]:
+    """对阵图数据：按阶段与轮次分组，前端直接渲染。"""
+    grouped: dict[str, dict[int, list[Round]]] = {"wb": defaultdict(list), "lb": defaultdict(list), "gf": defaultdict(list)}
+    for rnd in rounds:
+        if rnd.stage in grouped:
+            grouped[rnd.stage][rnd.bracket_round].append(rnd)
+
+    def dump(bucket: dict[int, list[Round]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "round": round_no,
+                "title": items[0].label.split(" · ")[0] if items else f"第 {round_no} 轮",
+                "matches": [r.model_dump(by_alias=True) for r in sorted(items, key=lambda r: r.slot)],
+            }
+            for round_no, items in sorted(bucket.items())
+        ]
+
+    return {stage: dump(bucket) for stage, bucket in grouped.items()}
+
+
+def player_progress(teams: list[Team], rounds: list[Round]) -> dict[str, dict[str, Any]]:
+    """每位选手的赛况（所属队伍、出场、胜负），供选手页展示，替代原来的积分榜。"""
+    out: dict[str, dict[str, Any]] = {}
+    for team in teams:
+        for pid in team.player_ids:
+            out[pid] = {
+                "playerId": pid,
+                "teamId": team.id,
+                "teamName": team.name,
+                "group": team.group,
+                "played": 0,
+                "win": 0,
+                "lose": 0,
+                "forms": [],
+            }
+    for rnd in rounds:
+        if rnd.status != "done" or not rnd.winner:
+            continue
+        for side in rnd.sides:
+            won = rnd.key_of(side) == rnd.winner
+            for pid in side.player_ids:
+                row = out.get(pid)
+                if row is None:
+                    continue
+                row["played"] += 1
+                row["win" if won else "lose"] += 1
+                row["forms"].append("W" if won else "L")
+    return out

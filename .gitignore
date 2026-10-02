@@ -1,0 +1,91 @@
+# ==========================================================================
+# NTE 比赛 · 忽略规则
+# 原则：源码与 lock 文件必须入库；运行时数据（含管理 KEY、头像、日志）一律不入库。
+# ==========================================================================
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ---- 运行时数据（管理 KEY / 头像缓存 / 上传头像 / 日志）----
+# 数据库内含管理 KEY 与全部赛事数据，绝不能入库
+config/
+data/
+logs/
+*.log
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+*.db-journal
+
+# ---- 前端 / 构建产物 ----
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+web_modules/
+*.tsbuildinfo
+.cache/
+.parcel-cache/
+
+# ---- 环境与密钥 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+!.vscode/extensions.json
+*.swp
+*.swo
+*.swn
+*~
+*.orig
+*.rej
+
+# ---- 系统文件 ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ---- 备份与临时文件 ----
+*.bak
+*.backup
+*.tmp
+*.temp
+tmp/
+temp/
