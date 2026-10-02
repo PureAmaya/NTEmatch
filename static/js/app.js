@@ -378,7 +378,7 @@ async function init() {
   installStageDelegation();
   installTeamDnD();
   hooks.onAuthLost = () => {
-    renderAdmin();
+    renderAdmin({ force: true });
     renderPublic();
   };
   hooks.onLiveHealth = (changed = true) => {
@@ -388,7 +388,9 @@ async function init() {
     if (App.view === 'live') {
       qs('#liveInfoPanel').innerHTML = liveInfoHtml(App.state, App.livePicked || null);
     }
-    if (App.view === 'admin') renderAdmin();
+    // 管理页**不在这里重绘**：它整页是表单，15 秒一次的信号探测（以及切回
+    // 标签页时的那次）会把正在填的内容冲掉。管理页跟「谁在推流」无关，
+    // 它需要的数据在保存后由 hooksRenderAdmin 刷新。
   };
   hooks.gotoLive = (pid) => {
     App.livePlayerId = pid || null;

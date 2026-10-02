@@ -1314,7 +1314,7 @@ async function refreshEventsUI(force = false) {
   invalidateEvents();
   await loadEvents(force);
   if (App.view === 'events') await renderEventsView();
-  else if (App.view === 'admin') renderAdmin();
+  else if (App.view === 'admin') renderAdmin({ force: true });
 }
 
 function openEventNewModal() {
@@ -1564,7 +1564,9 @@ export async function uploadAvatarFile(input) {
 }
 
 function hooksRenderAdmin() {
-  if (App.view === 'admin') renderAdmin();
+  // 数据刚变过：强制刷新面板（普通重绘会被「指纹没变就不重建」挡掉，
+  // 而这里要的正是把服务端的新值显示出来；用户没保存的输入仍会被保住）
+  if (App.view === 'admin') renderAdmin({ force: true });
 }
 
 function refreshDiagIfAdmin() {
@@ -1654,7 +1656,7 @@ export async function handleAction(act, el) {
       localStorage.removeItem(TOKEN_KEY);
       App.private = null; // 清掉隐私数据（UUID / QQ / 推流地址）
       toast('已退出登录', 'info');
-      renderAdmin();
+      renderAdmin({ force: true });
       renderPublic();
       return;
     case 'admin-login':
@@ -1760,7 +1762,7 @@ export async function login(key) {
     await refreshPrivate();
     toast('登录成功', 'ok');
     log.info('管理登录成功');
-    renderAdmin();
+    renderAdmin({ force: true });
     renderPublic();
   } catch (err) {
     toast(err.message, 'err');

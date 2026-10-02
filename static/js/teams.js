@@ -29,8 +29,13 @@ function isOut(pid) {
   return set.size > 0 && !set.has(pid);
 }
 
+/** 后端队伍数据的指纹：只有它变了才重新载入草案（否则保住正在拖的改动）。 */
+const sourceKey = () => `${App.state?.revision ?? 0}|${(App.state?.teams || []).length}`;
+let loadedFrom = '';
+
 /** 从后端状态载入草案（丢弃未保存的改动）。 */
 export function load() {
+  loadedFrom = sourceKey();
   const list = App.state?.teams || [];
   T.teams = list.map((t) => ({
     id: t.id,
@@ -119,7 +124,9 @@ function shellHtml() {
 
 export function mount(host) {
   if (!host) return;
-  load();
+  // 管理面板重绘会重新挂载组队台：只有后端队伍数据真变了才重载草案，
+  // 否则保住正在拖的改动（保存 / 随机组队后版本号会变，那时才重载）
+  if (loadedFrom !== sourceKey()) load();
   host.innerHTML = shellHtml();
   log.debug('组队台已挂载', T.teams.length);
 }

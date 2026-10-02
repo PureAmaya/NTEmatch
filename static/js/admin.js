@@ -2,7 +2,7 @@
  * 只负责渲染与拉取诊断；表单提交/按钮动作由 actions.js 处理。
  */
 
-import { App, api, esc, fmtFull, hooks, isFinished, log, qs } from './core.js';
+import { App, api, esc, fmtFull, hooks, isFinished, log, qs, qsa, stateKey } from './core.js';
 import {
   avaHtml,
   fieldArea,
@@ -16,17 +16,105 @@ import {
 } from './ui.js';
 import { mount as mountTeams } from './teams.js';
 
-export function renderAdmin() {
+/* --------------------------- 面板渲染 ---------------------------
+ *
+ * 管理页整页都是表单，而 renderAdmin 会被很多事件触发（保存后、WS 推送、
+ * 切换届次、直播信号轮询…）。直接 innerHTML 重建会把「正在填、还没保存」
+ * 的内容冲掉——表现就是「界面隔一会儿弹一下，刚写的没了」。所以这里：
+ *
+ *   1. 状态指纹没变就**不重建**（force 可强制）；
+ *   2. 真要重建时，把用户改过（dirty）的输入、焦点与光标位置、滚动位置还回去。
+ *
+ * 只认「用户自己改过」的字段（input/change 事件打标记），程序写入的值不算，
+ * 免得跟服务端刚下发的新数据打架。
+ */
+let adminRenderedKey = '';
+let adminBound = false;
+
+const adminKey = () => `${App.eventId}|${App.token ? 'in' : 'out'}|${stateKey(App.state)}`;
+
+function bindDirtyTracking() {
+  if (adminBound) return;
+  adminBound = true;
+  ['#adminPanel', '#adminGate'].forEach((sel) => {
+    const host = qs(sel);
+    if (!host) return;
+    const mark = (e) => {
+      if (e.target?.name && e.target.dataset) e.target.dataset.dirty = '1';
+    };
+    host.addEventListener('input', mark);
+    host.addEventListener('change', mark);
+  });
+}
+
+function collectEdits(root) {
+  const out = [];
+  qsa('[data-dirty][name]', root).forEach((el) => {
+    if (el.type === 'file') return; // 文件控件的值还原不了，也不需要还原
+    out.push([el.name, el.type === 'checkbox' || el.type === 'radio' ? el.checked : el.value, el.type]);
+  });
+  return out;
+}
+
+function applyEdits(root, edits) {
+  edits.forEach(([name, value, type]) => {
+    const el = qs(`[name="${name}"]`, root);
+    if (!el) return;
+    if (type === 'checkbox' || type === 'radio') el.checked = Boolean(value);
+    else el.value = value;
+    el.dataset.dirty = '1'; // 下一次重建还要保住它
+  });
+}
+
+/** 光标所在输入框（重绘后把焦点与光标位置还回去，别让人输一半跳到别处）。 */
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el?.name) return null;
+  return { name: el.name, start: el.selectionStart ?? null, end: el.selectionEnd ?? null };
+}
+
+function restoreFocus(info) {
+  if (!info) return;
+  const el = qs(`[name="${info.name}"]`);
+  if (!el || el.disabled) return;
+  el.focus({ preventScroll: true });
+  if (info.start == null || !el.setSelectionRange) return;
+  try {
+    el.setSelectionRange(info.start, info.end ?? info.start);
+  } catch {
+    /* 某些 input 类型不支持选区，忽略 */
+  }
+}
+
+export function renderAdmin({ force = false } = {}) {
   const gate = qs('#adminGate');
   const panel = qs('#adminPanel');
+  if (!gate || !panel) return;
+  const key = adminKey();
+  // 指纹没变就不重建：一次多余的重绘比「少刷新一次」代价大得多
+  if (!force && key === adminRenderedKey) return;
+  adminRenderedKey = key;
+
+  bindDirtyTracking();
+  const edits = [...collectEdits(panel), ...collectEdits(gate)];
+  const focus = captureFocus();
+  const scrollY = window.scrollY;
+
   if (!App.token) {
     panel.innerHTML = '';
     gate.innerHTML = gateHtml();
-    return;
+  } else if (App.state) {
+    gate.innerHTML = '';
+    panel.innerHTML = adminPanelHtml(App.state);
+    mountTeams(qs('#teamHost'));
+  } else {
+    return; // 登录了但状态还没到：先不动，等状态到位指纹会变、再画
   }
-  gate.innerHTML = '';
-  panel.innerHTML = adminPanelHtml(App.state);
-  mountTeams(qs('#teamHost'));
+
+  applyEdits(panel, edits);
+  applyEdits(gate, edits);
+  restoreFocus(focus);
+  if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
   refreshDiagnostics();
 }
 
