@@ -700,31 +700,43 @@ export function bracketPanelHtml(s) {
   );
 }
 
-/* —— 小组赛积分表 + 晋级顺位（作为「对阵总览」里的一段，不再单独占面板）—— */
+/* —— 小组赛积分表 + 晋级顺位（作为「对阵总览」里的一段，不再单独占面板）——
+ *
+ * 按当前进度分三态渲染，不拿零数据糊人：
+ *   未开赛（一场没打）→ 名次列「—」，不摆晋级徽标、不摆晋级顺位块；
+ *   进行中            → 显示实时名次与积分，但晋级未定，仍不标「晋级 #N」；
+ *   全部打完          → 才标「晋级 #N」与晋级顺位。
+ * 名次列也按**各组自己**的进度走：这一组还没打过就没有名次可言。
+ */
 function groupSectionHtml(s) {
   const groups = s.groups || [];
   if (!groups.length) return '';
-  const ranking = s.ranking || [];
   const perMatch = Number(s.rules?.teamsPerMatch) || 2;
   const shape = perMatch === 2 ? '组 vs 组' : `${perMatch} 队同场`;
+  // 小组赛是否全部打完：只有打完才谈得上「晋级」
+  const stageDone = Boolean(s.format?.groupStageDone);
+  const ranking = stageDone ? s.ranking || [] : [];
+  const advMap = new Map(ranking.map((r) => [r.team.id, r]));
+  const anyPlayed = groups.some((g) => (g.rows || []).some((r) => r.played > 0));
   const head =
     `<h3 class="btree__sec">小组赛` +
     `<span class="panel__hint">${groups.length} 组轮转 · 每场 ${shape} · 按名次分 / 净胜分排名 · ` +
     `前 ${s.format?.size || 0} 名晋级</span></h3>`;
-  const advMap = new Map(ranking.map((r) => [r.team.id, r]));
   const tables = groups
-    .map(
-      (g) =>
+    .map((g) => {
+      const rows = g.rows || [];
+      const started = rows.some((r) => r.played > 0); // 这一组有过结果才排得了名次
+      return (
         `<div class="gtable"><div class="gtable__head"><b>${esc(g.key)} 组</b>` +
-        `<span>${(g.rows || []).length} 支队 · 每场 ${shape}</span></div>` +
+        `<span>${rows.length} 支队 · 每场 ${shape}${started ? '' : ' · 尚未开赛'}</span></div>` +
         `<div class="gtable__cols"><div>#</div><div>队伍</div><div>场次</div><div>胜</div><div>负</div>` +
         `<div title="第 1 名得分最高">名次分</div><div>净胜</div><div>名次</div></div>` +
-        (g.rows || [])
+        rows
           .map((row) => {
             const adv = advMap.get(row.teamId);
             return (
-              `<div class="gtable__row${row.rank === 1 ? ' gtable__row--top' : ''}">` +
-              `<div class="gtable__rank">${row.rank}</div>` +
+              `<div class="gtable__row${started && row.rank === 1 ? ' gtable__row--top' : ''}">` +
+              `<div class="gtable__rank">${started ? row.rank : '—'}</div>` +
               `<div class="gtable__team"><i style="background:${esc(row.color || 'var(--accent)')}"></i>` +
               `<span title="${esc(row.name)}">${esc(row.short || row.name)}</span>` +
               `${perMatch > 2 && row.bestRank ? `<small class="gtable__best">最好 #${row.bestRank}</small>` : ''}` +
@@ -732,26 +744,35 @@ function groupSectionHtml(s) {
               `<div>${row.played}</div><div>${row.win}</div><div>${row.lose}</div>` +
               `<div class="gtable__pts">${row.placement ?? 0}</div>` +
               `<div>${sign(row.diff)}</div>` +
-              `<div>${adv && adv.advanced ? `<span class="badge badge--done">晋级 #${adv.seed}</span>` : '<span class="panel__hint">—</span>'}</div>` +
+              `<div>${
+                stageDone && adv?.advanced
+                  ? `<span class="badge badge--done">晋级 #${adv.seed}</span>`
+                  : '<span class="panel__hint">—</span>'
+              }</div>` +
               `</div>`
             );
           })
           .join('') +
         `</div>`
-    )
+      );
+    })
     .join('');
-  const order =
-    `<div class="gorder"><div class="gorder__title">晋级顺位</div><div class="gorder__list">` +
-    (ranking.length
-      ? ranking
-          .map(
-            (r) =>
-              `<span class="gorder__item${r.advanced ? ' gorder__item--in' : ''}">` +
-              `<b>${r.seed}</b>${esc(r.team.short || r.team.name)}</span>`
-          )
-          .join('')
-      : '<span class="panel__hint">小组赛结束后生成</span>') +
-    `</div></div>`;
+  const order = stageDone
+    ? `<div class="gorder"><div class="gorder__title">晋级顺位</div><div class="gorder__list">` +
+      (ranking
+        .map(
+          (r) =>
+            `<span class="gorder__item${r.advanced ? ' gorder__item--in' : ''}">` +
+            `<b>${r.seed}</b>${esc(r.team.short || r.team.name)}</span>`
+        )
+        .join('') ||
+        '<span class="panel__hint">—</span>') +
+      `</div></div>`
+    : anyPlayed
+      ? // 打了一部分：名次还会变，先说清楚什么时候给顺位
+        `<div class="gorder"><div class="gorder__title">晋级顺位</div><div class="gorder__list">` +
+        `<span class="panel__hint">小组赛全部打完后生成</span></div></div>`
+      : ''; // 一场没打：整块不出现
   return head + `<div class="gtables">${tables}</div>` + order;
 }
 
