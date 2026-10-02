@@ -29,6 +29,7 @@ import {
   fieldText,
   privateOf,
   pushTipsHtml,
+  roundHasResult,
   roundStreamsOf,
 } from './ui.js';
 import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
@@ -339,6 +340,202 @@ function openWalkoverModal(rnd) {
           }
         };
       });
+    },
+  });
+}
+
+/* ---------------------- 小组赛对阵调整（开赛前） ---------------------- */
+
+/**
+ * 开赛前调整小组赛对阵：**点两个队徽即对调**。
+ *
+ * 只在同一组、同一轮内交换，因此每轮每队仍然只打一场、场次数与编号不变，
+ * 交换只影响「谁碰谁」。每个组给出「组合覆盖 X/Y」：重复组合会标出来但**不拦**——
+ * 要不要保留重复组合是组织者的自由（比如为了错开时间）。
+ * 「恢复默认」＝请服务端按分组算法重排，放弃手改。
+ */
+function openGroupPairingModal() {
+  const rounds = (App.state?.rounds || []).filter((r) => r.stage === 'group');
+  if (!rounds.length) {
+    toast('本届还没有小组赛', 'warn');
+    return;
+  }
+  if (App.state?.event?.locked) {
+    toast('比赛已开始（赛程结构已锁定），要改对阵请先解除锁定', 'warn', 7000);
+    return;
+  }
+  if (rounds.some((r) => roundHasResult(r))) {
+    toast('小组赛已经开打，对阵不能再改（先「重置」已录入的比赛）', 'warn', 7000);
+    return;
+  }
+  const teams = App.state?.teams || [];
+  const perMatch = Number(App.state?.rules?.teamsPerMatch) || 2;
+  const teamById = new Map(teams.map((t) => [t.id, t]));
+  const nameOf = (id) => teamById.get(id)?.short || teamById.get(id)?.name || id;
+  const colorOf = (id) => teamById.get(id)?.color || 'var(--accent)';
+  const groupOf = (rnd) => String(rnd.code || '').split('-')[1] || 'A';
+  const list = [...rounds].sort(
+    (a, b) =>
+      groupOf(a).localeCompare(groupOf(b)) ||
+      (a.bracketRound || 0) - (b.bracketRound || 0) ||
+      (a.slot || 0) - (b.slot || 0)
+  );
+  // 草案：code → 队伍 ID 顺序（与 sides 一一对应）；原值用来算「改了哪些」
+  let draft = new Map(list.map((r) => [r.code, (r.sides || []).map((s) => s.teamId)]));
+  let picked = null; // {code, index}：当前选中的队徽
+
+  const pairKeys = (ids) => {
+    const out = [];
+    for (let i = 0; i < ids.length; i += 1) {
+      for (let j = i + 1; j < ids.length; j += 1) out.push([ids[i], ids[j]].sort().join('~'));
+    }
+    return out;
+  };
+  /** 某个组的进度提示：2 队对阵报「组合覆盖」，多队同场按场次数报（两两组合对不齐）。 */
+  const groupHint = (key) => {
+    if (perMatch !== 2) {
+      const n = list.filter((r) => groupOf(r) === key).length;
+      return { text: `${n} 场 · 每场最多 ${perMatch} 队同场`, warn: false };
+    }
+    const need = new Set(pairKeys(teams.filter((t) => (t.group || 'A') === key).map((t) => t.id)));
+    const seen = [];
+    list
+      .filter((r) => groupOf(r) === key)
+      .forEach((r) => pairKeys(draft.get(r.code) || []).forEach((k) => seen.push(k)));
+    const covered = new Set(seen.filter((k) => need.has(k)));
+    const dup = seen.length - covered.size;
+    return {
+      text: `组合覆盖 ${covered.size}/${need.size}${dup ? ` · 重复 ${dup} 组` : ' · 无重复'}`,
+      warn: covered.size < need.size,
+    };
+  };
+
+  const renderBody = (bodyEl) => {
+    const blocks = [];
+    let key = '';
+    list.forEach((rnd) => {
+      const g = groupOf(rnd);
+      if (g !== key) {
+        key = g;
+        const hint = groupHint(g);
+        blocks.push(
+          `<div class="pair__head"><b>${esc(g)} 组</b>` +
+            `<span class="pair__cover${hint.warn ? ' pair__cover--dup' : ''}">${esc(hint.text)}</span></div>`
+        );
+      }
+      blocks.push(
+        `<div class="pair__row"><span class="pair__label">第 ${rnd.bracketRound} 轮</span>` +
+          (draft.get(rnd.code) || [])
+            .map((id, i) => {
+              const on = picked && picked.code === rnd.code && picked.index === i;
+              return (
+                `<button class="pair__team${on ? ' pair__team--on' : ''}" type="button" ` +
+                `data-pair="${esc(rnd.code)}" data-index="${i}" title="${esc(nameOf(id))}">` +
+                `<i style="background:${esc(colorOf(id))}"></i>${esc(nameOf(id))}</button>`
+              );
+            })
+            .join('<span class="pair__vs">vs</span>') +
+          `</div>`
+      );
+    });
+    bodyEl.innerHTML =
+      `<div class="notice">开赛前可以换对手：先点一个队徽，再点<b>同一组、同一轮</b>里的另一个队徽即可对调。` +
+      `每轮每队仍然只打一场，场次数与编号不变。</div>` +
+      `<div class="pair__wrap">${blocks.join('')}</div>`;
+  };
+
+  const clickTeam = (bodyEl, code, index) => {
+    if (!picked) {
+      picked = { code, index };
+      renderBody(bodyEl);
+      return;
+    }
+    if (picked.code === code && picked.index === index) {
+      picked = null;
+      renderBody(bodyEl);
+      return;
+    }
+    const a = list.find((r) => r.code === picked.code);
+    const b = list.find((r) => r.code === code);
+    if (!a || !b) return;
+    if (groupOf(a) !== groupOf(b) || (a.bracketRound || 0) !== (b.bracketRound || 0)) {
+      toast('只能在同一组、同一轮里对调（换轮次会打乱每轮的出场次数）', 'warn', 6000);
+      picked = { code, index };
+      renderBody(bodyEl);
+      return;
+    }
+    const listA = draft.get(picked.code);
+    const listB = draft.get(code);
+    const tmp = listA[picked.index];
+    listA[picked.index] = listB[index];
+    listB[index] = tmp;
+    picked = null;
+    renderBody(bodyEl);
+  };
+
+  /** 与后端原值不同的那些场次（保存时只提交它们）。 */
+  const changedRows = () =>
+    list
+      .filter((r) => (draft.get(r.code) || []).join('~') !== (r.sides || []).map((s) => s.teamId).join('~'))
+      .map((r) => ({ code: r.code, team_ids: draft.get(r.code) }));
+
+  Modal.open({
+    title: '调整小组赛对阵',
+    body: '<div id="pairBody"></div>',
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm" type="button" data-reset>恢复默认对阵</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-save>保存对阵</button>`,
+    onMount(bodyEl, footEl) {
+      renderBody(bodyEl);
+      bodyEl.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-pair]');
+        if (btn) clickTeam(bodyEl, btn.dataset.pair, Number(btn.dataset.index));
+      });
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-save]').onclick = async () => {
+        const rows = changedRows();
+        if (!rows.length) {
+          toast('对阵没有变化', 'info');
+          return;
+        }
+        try {
+          const res = await api('/tournament/group-pairings', {
+            method: 'POST',
+            auth: true,
+            body: { rounds: rows },
+          });
+          if (res.state) App.state = res.state;
+          Modal.close();
+          toast(`已保存 ${rows.length} 场新对阵`, 'ok', 5000);
+          renderPublic();
+          hooksRenderAdmin();
+        } catch (err) {
+          toast(err.message, 'err', 8000);
+        }
+      };
+      footEl.querySelector('[data-reset]').onclick = async () => {
+        if (!window.confirm('恢复成算法默认排法？手改过的对阵会被覆盖。')) return;
+        try {
+          const res = await api('/tournament/group-pairings', {
+            method: 'POST',
+            auth: true,
+            body: { reset: true },
+          });
+          if (res.state) App.state = res.state;
+          const now = new Map((res.state?.rounds || []).map((r) => [r.code, r]));
+          draft = new Map(
+            list.map((r) => [r.code, ((now.get(r.code) || r).sides || []).map((s) => s.teamId)])
+          );
+          picked = null;
+          renderBody(bodyEl);
+          renderPublic();
+          hooksRenderAdmin();
+          toast('已恢复默认对阵', 'ok', 5000);
+        } catch (err) {
+          toast(err.message, 'err', 8000);
+        }
+      };
     },
   });
 }
@@ -1675,6 +1872,9 @@ export async function handleAction(act, el) {
       return resetTeamBoard();
     case 'tournament-generate':
       return openTournamentModal();
+    case 'group-pairings':
+      // 开赛前换小组赛对手（开打后前后端都会拒绝）
+      return openGroupPairingModal();
     case 'rounds-clear':
     case 'tournament-clear': // 旧入口，两者都是「清空全部比赛」
       return clearAllRounds();

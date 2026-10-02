@@ -444,6 +444,15 @@ def _heat_schedule(items: list[Any], per_match: int) -> list[list[list[Any]]]:
     return _multi_rounds(items, per_match)
 
 
+def group_pairings(items: list[Any], per_match: int = 2) -> list[list[Any]]:
+    """小组赛的默认排法：按（轮次 → 场次）顺序**拍平**成一维。
+
+    与 :func:`build_group_rounds` 生成顺序一一对应，因此可以按位置写回每一局
+    ——「恢复默认对阵」用的就是它（手改过的安排会被覆盖）。
+    """
+    return [match for rnd in _heat_schedule(list(items), per_match) for match in rnd]
+
+
 def assign_groups(teams: list[Team], group_count: int) -> list[Team]:
     """按顺序轮转分入 A/B/C… 组（队伍本身已随机，因此分组自然均衡）。"""
     count = max(1, min(group_count, len(teams))) if teams else 1

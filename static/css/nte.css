@@ -1062,6 +1062,32 @@ img { display: block; max-width: 100%; }
 /* 卡面上的观众入口（看某一场的机位） */
 .round__ops--public { border-top: 1px dashed var(--line-2); }
 
+/* 开赛前调整小组赛对阵：点两个队徽对调 */
+.pair__wrap { margin-top: 10px; }
+.pair__head {
+  display: flex; align-items: baseline; gap: 9px; margin: 12px 0 4px;
+  padding-bottom: 4px; border-bottom: 1px solid var(--line);
+}
+.pair__head b { font-size: 13px; }
+.pair__cover { font-family: var(--font-mono); font-size: 10.5px; color: var(--txt-mute); }
+.pair__cover--dup { color: var(--warn); }
+.pair__row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0;
+  border-bottom: 1px dashed var(--line-2);
+}
+.pair__label {
+  flex: none; width: 52px; font-family: var(--font-mono); font-size: 10.5px; color: var(--txt-mute);
+}
+.pair__vs { font-size: 10px; color: var(--txt-mute); }
+.pair__team {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; padding: 4px 9px;
+  border: 2px solid rgba(126, 156, 186, .35); border-radius: 2px;
+  background: rgba(12, 20, 30, .9); color: var(--txt-dim); font-size: 12.5px;
+}
+.pair__team i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.pair__team:hover { border-color: var(--accent); color: var(--txt); }
+.pair__team--on { border-color: var(--accent); background: rgba(34, 224, 232, .14); color: #fff; }
+
 /* 23.4 对阵条（在画面下方，不压住视频，也不跟原生控制条打架） */
 .stage-meta { padding: 10px 12px 0; }
 .stage-meta:empty { display: none; }

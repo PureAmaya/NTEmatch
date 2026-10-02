@@ -208,6 +208,19 @@ export const ROUND_TEXT = { pending: '待开始', live: '进行中', done: '已�
 export const roundBadge = (status) =>
   `<span class="badge ${ROUND_BADGE[status] || 'badge--pending'}">${ROUND_TEXT[status] || esc(status)}</span>`;
 
+/**
+ * 这局是否已经有任何结果痕迹。
+ *
+ * 与后端 ``tournament.round_has_result`` 同一口径：动过比分 / 名次 / 弃权 / 状态
+ * 就算「已经开打」。小组赛对阵只允许在**一场都没开打**时调整，前后端都用它判断。
+ */
+export const roundHasResult = (rnd) =>
+  Boolean(rnd) &&
+  (rnd.status !== 'pending' ||
+    Boolean(rnd.winner) ||
+    (rnd.sets || []).length > 0 ||
+    (rnd.sides || []).some((s) => s.score || s.points || s.rank || s.forfeit));
+
 export function kpiCard(label, value, sub, barPercent) {
   const bar =
     barPercent === undefined

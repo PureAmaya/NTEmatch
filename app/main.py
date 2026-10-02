@@ -31,7 +31,7 @@ from .auth import auth, is_factory_key, sha256_hex
 from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
-from .models import Config, NTEModel, Player, Round, SetScore, Team
+from .models import MAX_SIDES, Config, NTEModel, Player, Round, SetScore, Team
 from .store import PROJECT_ROOT, store
 from .ws import hub
 
@@ -170,6 +170,20 @@ class SchedulePayload(NTEModel):
     mode: str = "rotate"
     total_rounds: int = 0
     seed: int | None = None
+
+
+class GroupPairingChange(NTEModel):
+    """一局小组赛的新阵容：按 side 顺序给出队伍 ID。"""
+
+    code: str
+    team_ids: list[str] = Field(default_factory=list)
+
+
+class GroupPairingsPayload(NTEModel):
+    """开赛前手动调整小组赛对阵。``reset=True`` 时按算法重排（放弃手改）。"""
+
+    rounds: list[GroupPairingChange] = Field(default_factory=list)
+    reset: bool = False
 
 
 class ScheduleAppendPayload(NTEModel):
@@ -1217,6 +1231,164 @@ async def api_tournament_generate(
         "teamsPerMatch": cfg.rules.teams_per_match,
         "loserBracket": cfg.rules.loser_bracket,
         "warnings": warnings,
+        "state": build_public_state(cfg),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 小组赛对阵：开赛前手动调整（换对手 / 恢复默认）
+#
+# 只动「哪支队在那场的哪一侧」，不动场次数与编号：同一组同一轮里每支队仍然
+# 只打一场，因此赛程结构、轮次标题、直播机位都照旧；交换只影响「谁碰谁」。
+# --------------------------------------------------------------------------- #
+def _group_key_of(rnd: dict[str, Any]) -> str:
+    """小组赛对局的组名：优先看编号 ``G-A-1-1``，其次看标签 ``A 组 · …``。"""
+    parts = str(rnd.get("code") or "").split("-")
+    if len(parts) >= 2 and parts[0] == "G":
+        return parts[1] or "A"
+    label = str(rnd.get("label") or "").split(" ")[0].replace("组", "")
+    return label or "A"
+
+
+def _set_side_team(side: dict[str, Any], team: dict[str, Any]) -> None:
+    """把一侧换成一支队：**阵容与显示名都要跟着换**（否则标签还是原来那支队）。"""
+    side["teamId"] = str(team.get("id") or "")
+    side["playerIds"] = [str(pid) for pid in (team.get("playerIds") or [])]
+    side["label"] = str(team.get("short") or team.get("name") or team.get("id") or "")
+
+
+def _group_rounds_by_key(rounds: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """按组名归拢小组赛对局，组内按（轮次 → 场次）排序。"""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for rnd in rounds:
+        if rnd.get("stage") == "group":
+            out.setdefault(_group_key_of(rnd), []).append(rnd)
+    for items in out.values():
+        items.sort(key=lambda r: (int(r.get("bracketRound") or 0), int(r.get("slot") or 0)))
+    return out
+
+
+def _reset_group_pairings(data: dict[str, Any]) -> int:
+    """把小组赛对阵恢复成算法默认排法（放弃手改），返回被改动的场次数。"""
+    teams = {str(t.get("id")): t for t in (data.get("teams") or []) if t.get("id")}
+    per_match = max(2, min(MAX_SIDES, int((data.get("rules") or {}).get("teamsPerMatch") or 2)))
+    by_group = _group_rounds_by_key(data.get("rounds") or [])
+    # 每组的队伍按**配置里的顺序**取：与生成赛程时的输入顺序一致，排出来就是默认表
+    order: dict[str, list[str]] = {}
+    for team in data.get("teams") or []:
+        tid = str(team.get("id") or "")
+        if tid:
+            order.setdefault(str(team.get("group") or "A"), []).append(tid)
+    changed = 0
+    for key, items in by_group.items():
+        plan = tournament.group_pairings(order.get(key) or [], per_match)
+        if len(plan) != len(items):
+            continue  # 数据与算法不一致（理论上不会）：保持原样更安全
+        for rnd, match in zip(items, plan):
+            sides = rnd.get("sides") or []
+            if len(sides) != len(match):
+                continue
+            if [str(s.get("teamId") or "") for s in sides] != list(match):
+                changed += 1
+            for side, tid in zip(sides, match):
+                _set_side_team(side, teams.get(tid, {}))
+    return changed
+
+
+def _validate_group_rounds(rounds: list[dict[str, Any]]) -> None:
+    """同一组同一轮里每支队最多出场一次（客户端只做对调，正常不会触发）。"""
+    seen: dict[tuple[str, int], set[str]] = {}
+    for rnd in rounds:
+        if rnd.get("stage") != "group":
+            continue
+        key = _group_key_of(rnd)
+        slot = (key, int(rnd.get("bracketRound") or 0))
+        bucket = seen.setdefault(slot, set())
+        for side in rnd.get("sides") or []:
+            tid = str(side.get("teamId") or "")
+            if not tid:
+                continue
+            if tid in bucket:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} 组第 {slot[1]} 轮里 {tid} 出现了两次：同一轮每支队只能打一场",
+                )
+            bucket.add(tid)
+
+
+@app.post("/api/tournament/group-pairings")
+async def api_group_pairings(
+    payload: GroupPairingsPayload, _: str = Depends(require_admin)
+) -> dict[str, Any]:
+    """**开赛前**手动调整小组赛对阵（换对手 / 恢复默认）。
+
+    * 只允许「还没开打」时调：已锁定返回 409，小组赛已有任何结果返回 400；
+    * 一次提交只换阵容，不改场次数与编号——同一组同一轮里每支队仍只打一场；
+    * ``reset=true`` 按分组算法重排回默认（放弃手改）。
+    """
+    cfg_now = store.snapshot()
+    if cfg_now.rules.format != "tournament":
+        raise HTTPException(status_code=400, detail="小组赛对阵只用于锦标赛制")
+    _require_unlocked("小组赛对阵")
+    group_now = [r for r in cfg_now.rounds if r.stage == "group"]
+    if not group_now:
+        raise HTTPException(status_code=400, detail="本届还没有小组赛，请先「生成赛程」")
+    played = next((r for r in group_now if tournament.round_has_result(r)), None)
+    if played is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"小组赛已经开打（{played.label or played.code} 已有结果），对阵不能再改；"
+                "要改请先「重置」这场比赛。"
+            ),
+        )
+    if not payload.reset and not payload.rounds:
+        raise HTTPException(status_code=400, detail="没有要调整的对阵")
+
+    def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+        rounds = data.get("rounds") or []
+        teams = {str(t.get("id")): t for t in (data.get("teams") or []) if t.get("id")}
+        by_code = {str(r.get("code") or ""): r for r in rounds if r.get("stage") == "group"}
+        if payload.reset:
+            _reset_group_pairings(data)
+        for change in payload.rounds:
+            rnd = by_code.get(change.code)
+            if rnd is None:
+                raise HTTPException(status_code=404, detail=f"小组赛对局 {change.code} 不存在")
+            sides = rnd.get("sides") or []
+            if len(change.team_ids) != len(sides):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{change.code} 需要 {len(sides)} 支队伍"
+                        f"（收到 {len(change.team_ids)} 支），场次数与编号不能改"
+                    ),
+                )
+            key = _group_key_of(rnd)
+            for side, tid in zip(sides, change.team_ids):
+                team = teams.get(tid)
+                if team is None:
+                    raise HTTPException(status_code=404, detail=f"队伍 {tid} 不存在")
+                if str(team.get("group") or "A") != key:
+                    raise HTTPException(
+                        status_code=400, detail=f"队伍 {tid} 不在 {key} 组，不能排进这一组"
+                    )
+                _set_side_team(side, team)
+        _validate_group_rounds(rounds)
+        return data
+
+    cfg = await store.mutate(_mutate, actor="web:group-pairings")
+    log.info(
+        "小组赛对阵已调整 | 届=%s | 手改 %d 局 | 恢复默认=%s",
+        store.current_id,
+        len(payload.rounds),
+        payload.reset,
+    )
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "reset": bool(payload.reset),
+        "changed": len(payload.rounds),
         "state": build_public_state(cfg),
     }
 

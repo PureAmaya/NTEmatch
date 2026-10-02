@@ -36,6 +36,7 @@ import {
   pushTipsHtml,
   rankCell,
   roundBadge,
+  roundHasResult,
   rulesPanelHtml,
   whoHtml,
 } from './ui.js';
@@ -860,9 +861,20 @@ function renderScheduleTools(s) {
       `<button class="btn btn--sm${statusFilter() === key ? ' btn--primary' : ''}" ` +
       `type="button" data-act="status-filter" data-status="${key}">${label}</button>`
   ).join('');
+  // 小组赛对阵只允许在**还没开打**时调整：未锁定 + 小组赛一场都没有结果（与后端同一口径）
+  const groupRounds = (s.rounds || []).filter((r) => r.stage === 'group');
+  const groupOpen =
+    groupRounds.length > 0 && !s.event?.locked && !groupRounds.some((r) => roundHasResult(r));
   const adminOps = canEdit()
     ? `<div class="tool-group" style="margin-left:auto">` +
       `<button class="btn btn--sm btn--primary" type="button" data-act="tournament-generate">生成赛程</button>` +
+      (groupOpen
+        ? `<button class="btn btn--sm" type="button" data-act="group-pairings" ` +
+          `title="开赛前换对手：点两个队徽即可对调（同一组、同一轮内）">调整小组赛对阵</button>`
+        : groupRounds.length
+          ? `<span title="比赛已开始或小组赛已有结果，对阵不能再改（先「重置」已录入的比赛）">` +
+            `<button class="btn btn--sm" type="button" disabled>调整小组赛对阵</button></span>`
+          : '') +
       `<button class="btn btn--sm" type="button" data-act="reload">同步配置</button></div>`
     : '';
   const done = (s.rounds || []).filter((r) => r.status === 'done').length;
