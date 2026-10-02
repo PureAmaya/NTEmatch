@@ -35,11 +35,14 @@ MIN_KEY_LEN = 6
 
 USAGE = """NTE 比赛 · 命令行
 
-  python -m app                          启动服务
-  python -m app --reset-key [新KEY]       重置管理 KEY（省略则随机生成）
-  python -m app --reset-key -e e002       重置指定届次的管理 KEY
-  python -m app --help                   显示本帮助
+  python -m app                            启动服务（默认 0.0.0.0:8000）
+  python -m app --port 8123                换个端口启动
+  python -m app --host 127.0.0.1 -p 8123   同时指定监听地址
+  python -m app --reset-key [新KEY]         重置管理 KEY（省略则随机生成）
+  python -m app --reset-key -e e002         重置指定届次的管理 KEY
+  python -m app --help                     显示本帮助
 
+端口与监听地址也可以走环境变量 NTE_PORT / NTE_HOST，命令行参数优先。
 忘记管理 KEY 时：先停止服务 → 执行 --reset-key → 用打印出的新 KEY 登录。
 """
 
@@ -61,10 +64,11 @@ def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 # --------------------------------------------------------------------------- #
 # 启动服务
 # --------------------------------------------------------------------------- #
-def serve() -> None:
+def serve(host: str | None = None, port: int | None = None) -> None:
     setup_logging()
-    host = os.getenv("NTE_HOST", "0.0.0.0")
-    port = int(os.getenv("NTE_PORT", "8000"))
+    # 命令行参数优先，其次环境变量，最后默认值
+    host = host or os.getenv("NTE_HOST", "0.0.0.0")
+    port = int(port if port is not None else os.getenv("NTE_PORT", "8000"))
     reload_enabled = os.getenv("NTE_RELOAD", "0").lower() in {"1", "true", "yes", "on"}
     log_level = (os.getenv("NTE_LOG_LEVEL") or "info").lower()
     workers = 1 if reload_enabled else int(os.getenv("NTE_WORKERS", "1"))
@@ -150,8 +154,45 @@ def reset_admin_key(new_key: str | None = None, event_id: str | None = None) -> 
 # --------------------------------------------------------------------------- #
 # 参数分发
 # --------------------------------------------------------------------------- #
+def _take_option(args: list[str], *names: str) -> tuple[str | None, list[str]]:
+    """取出 ``--name 值`` / ``--name=值`` 形式的选项，返回（值, 剩余参数）。
+
+    位置上随意（放在最后也行）；没出现则返回 ``None``。
+    """
+    rest: list[str] = []
+    found: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        hit = next((n for n in names if arg == n or arg.startswith(f"{n}=")), None)
+        if hit is None:
+            rest.append(arg)
+            index += 1
+            continue
+        if "=" in arg:
+            found = arg.split("=", 1)[1]
+            index += 1
+        else:
+            found = args[index + 1] if index + 1 < len(args) else ""
+            index += 2
+    return found, rest
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+
+    port_raw, args = _take_option(args, "--port", "-p")
+    host_raw, args = _take_option(args, "--host")
+    port: int | None = None
+    if port_raw is not None:
+        try:
+            port = int(port_raw)
+        except ValueError:
+            print(f"端口不合法: {port_raw}（应为一个 1~65535 的整数）")
+            return 2
+        if not 0 < port < 65536:
+            print(f"端口超出范围: {port}")
+            return 2
 
     if args and args[0] in {"-h", "--help", "help"}:
         print(USAGE)
@@ -176,5 +217,5 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE)
         return 2
 
-    serve()
+    serve(host=host_raw, port=port)
     return 0

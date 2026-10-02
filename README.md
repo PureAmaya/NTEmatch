@@ -12,6 +12,11 @@ uv sync
 
 # 启动服务（默认 0.0.0.0:8000）
 uv run python -m app
+
+# 换个端口 / 只监听本机
+uv run python -m app --port 8123
+uv run python -m app --host 127.0.0.1 -p 8123
+# 等价的环境变量写法：NTE_PORT=8123（命令行参数优先）
 ```
 
 浏览器打开 <http://127.0.0.1:8000> 即可。
@@ -612,8 +617,8 @@ webrtcEncryption: yes            # WHIP/WHEP 走 https://…:8889
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `NTE_HOST` | `0.0.0.0` | 监听地址 |
-| `NTE_PORT` | `8000` | 监听端口 |
+| `NTE_HOST` | `0.0.0.0` | 监听地址（可用 `--host` 覆盖） |
+| `NTE_PORT` | `8000` | 监听端口（可用 `--port` / `-p` 覆盖） |
 | `NTE_RELOAD` | `0` | 开启代码热重载（开发用） |
 | `NTE_WORKERS` | `1` | 工作进程数，多进程下 WebSocket 不跨进程广播 |
 | `NTE_LOG_LEVEL` | `INFO` | 日志级别 |

@@ -53,7 +53,6 @@ _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
 _NO_STORE = "no-store"
 _NO_CACHE = "no-cache"
 _VERSIONED_STATIC_RE = re.compile(r"^/static/v/[0-9a-f]{6,}/(?P<rest>.+)$")
-_DEV_RELOAD = os.getenv("NTE_RELOAD", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _compute_asset_version() -> str:
@@ -69,12 +68,15 @@ def _compute_asset_version() -> str:
     return digest.hexdigest()[:10]
 
 
-_ASSET_VERSION = _compute_asset_version()
-
-
 def asset_version() -> str:
-    """开发模式（热重载）下按需重算，避免改样式后被长缓存挡住。"""
-    return _compute_asset_version() if _DEV_RELOAD else _ASSET_VERSION
+    """每次都按当前静态文件重算版本号。
+
+    静态文件就十来个，stat 一遍的代价可以忽略，换来的是「改完前端刷新页面
+    就生效」：版本变了 → 首页里注入的 ``/static/v/<版本>/…`` 跟着变 → 浏览器
+    自然去取新包，**进程不重启也不会再继续发旧的 JS / CSS**。
+    （以前只在 NTE_RELOAD=1 时才重算，开发时极易踩到「代码改了但页面还跑旧包」。）
+    """
+    return _compute_asset_version()
 
 
 class EdgeCacheMiddleware:
