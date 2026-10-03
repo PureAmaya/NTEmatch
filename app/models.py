@@ -21,7 +21,8 @@ MAX_SIDES = 4
 MIN_TEAMS_PER_MATCH = 2
 RoundStatus = Literal["pending", "live", "done"]
 WinnerCode = Literal["", "A", "B", "DRAW"]
-StreamMode = Literal["auto", "webrtc", "hls", "flv", "embed"]
+# 观众的观看线路：webrtc = 8889（UDP，延迟最低）；hls = 8888（TCP，抗抖动）
+StreamMode = Literal["auto", "webrtc", "hls"]
 # league=积分制常规局；group=小组赛；wb=胜者组；lb=败者组；gf=总决赛（胜者组冠军 vs 败者组冠军）
 Stage = Literal["league", "group", "wb", "lb", "gf"]
 # 赛事赛制：league=积分制（均分排名）；tournament=锦标赛制（固定队伍 + 双败淘汰）
@@ -371,52 +372,50 @@ class Rules(NTEModel):
 
 
 class StreamConfig(NTEModel):
-    """MediaMTX 直播配置：**两套协议并存，各自都能推流与播放**。
+    """MediaMTX 直播配置：**推流只有 WHIP，观看只有 WebRTC 与 HLS**。
 
-    | 套别 | 推流 | 播放 | 传输 |
-    | --- | --- | --- | --- |
-    | WebRTC | WHIP（`https://…:8889/<流名>/whip`） | WHEP（`…/whep`） | UDP，延迟最低 |
-    | TCP | RTMP（`rtmp://…:1935/<流名>`）、RTSP（`rtsp://…:8554/<流名>`） | HLS（`https://…:8888/<流名>/index.m3u8`）、RTSP / RTMP | TCP，抗抖动 |
+    | 用途 | 地址 |
+    | --- | --- |
+    | 推流（WHIP，8889） | `https://…:8889/<流名>/whip` |
+    | 观看（WebRTC，8889） | `https://…:8889/<流名>` |
+    | 观看（HLS，8888） | `https://…:8888/<流名>` |
 
-    端口：8889 = WebRTC/HTTP（WHEP/WHIP），8888 = HLS，1935 = RTMP，8554 = RTSP。
-    RTMP 与 RTSP 的**推流与播放是同一个地址**（方向由客户端行为决定），
-    因此它们只出现在管理端，避免把可推流的路径暴露给观众。
+    端口：8889 = WebRTC（WHIP 推 / WebRTC 看），8888 = HLS。
+    地址只在端口上按流名区分，没有 ``/whep`` 之类的子路由。
+    推流地址带凭据，只出现在管理端，绝不进公开状态。
 
     地址是**源站地址**（不做反代，前端/播放器直连媒体服务器）。
 
-    **HTTP 系（WebRTC / HLS）默认走 HTTPS**：本站上 CDN 后是 HTTPS 页面，
-    用 ``http://`` 会被浏览器按混合内容拦掉，连内嵌播放页都打不开。
-    对应 MediaMTX 侧要开 ``webrtcEncryption: yes`` / ``hlsEncryption: yes``
-    并配置证书；``verify_tls`` 只影响本服务的**源站探测**（``/api/live/health``），
+    两条观看线路都是 HTTP 系，**默认走 HTTPS**：本站上 CDN 后是 HTTPS 页面，
+    用 ``http://`` 会被浏览器按混合内容拦掉。对应 MediaMTX 侧要开
+    ``webrtcEncryption: yes`` / ``hlsEncryption: yes`` 并配置证书；
+    ``verify_tls`` 只影响本服务的**源站探测**（``/api/live/health``），
     自签名证书时关掉即可——观众侧仍需要浏览器信任的证书。
-
-    RTMP / RTSP 是各自的协议，不涉及 HTTPS；若在 MediaMTX 上开了
-    ``rtmpEncryption`` / ``rtspEncryption``，直接把它们填成 ``rtmps://`` /
-    ``rtsps://`` 即可（代码只按冒号前的 scheme 处理，不做协议假设）。
     """
 
     enabled: bool = True
     provider: str = "mediamtx"
-    base_url: str = "https://live.shiyora.net:8889"      # WebRTC/HTTP 端口（WHEP/WHIP）
+    base_url: str = "https://live.shiyora.net:8889"      # WebRTC 端口（WHIP 推 / WebRTC 看）
     api_base: str = "http://live.shiyora.net:9997"       # MediaMTX 控制 API：读「谁真的在推流」
     # 控制 API 的 Basic 认证：mediamtx.yml 里配了 authInternalUsers 时必填
     # （``curl -u 用户名:密码``）。属于凭据：只在管理端下发，绝不进公开状态。
     api_user: str = ""
     api_pass: str = ""
-    rtmp_base: str = "rtmp://live.shiyora.net:1935"     # RTMP 根地址，用于按流名派生
-    rtsp_base: str = "rtsp://live.shiyora.net:8554"     # RTSP 根地址（TCP，推播同址）
     hls_base: str = "https://live.shiyora.net:8888"     # HLS 根地址，用于按流名派生
     stream_key: str = "stream"
     mode: StreamMode = "auto"
     verify_tls: bool = True     # 校验上游 HTTPS 证书；用自签名证书时关掉
-    rtmp_push: str = "rtmp://live.shiyora.net:1935/stream"
     whip_push: str = "https://live.shiyora.net:8889/stream/whip"
-    rtsp_url: str = "rtsp://live.shiyora.net:8554/stream"
-    hls_url: str = "https://live.shiyora.net:8888/stream/index.m3u8"
-    flv_url: str = ""
     poster: str = ""
     title: str = "赛事直播"
     note: str = ""
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _clean_mode(cls, value: Any) -> str:
+        """历史数据里可能有 flv / embed（已不再支持），一律回落到 auto。"""
+        candidate = str(value or "").strip().lower()
+        return candidate if candidate in ("auto", "webrtc", "hls") else "auto"
 
 
 class UiConfig(NTEModel):

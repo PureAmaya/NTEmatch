@@ -1,12 +1,13 @@
 """直播信息与源站探测。
 
 本模块**不做反代**：前端拿到的就是媒体服务器（MediaMTX）的**源地址**，
-直接去 ``https://<媒体服务器>:8889/<流名>/whep`` 拉 WebRTC、
-``https://<媒体服务器>:8888/<流名>/index.m3u8`` 拉 HLS。
+推流用 ``https://<媒体服务器>:8889/<流名>/whip``（WHIP），
+观看用 ``https://<媒体服务器>:8889/<流名>``（WebRTC）或
+``https://<媒体服务器>:8888/<流名>``（HLS）。
 
 因此有两件事需要媒体服务器侧配合（都在 README 里写明）：
 
-* **跨域**：WHEP 是浏览器直接 fetch 到另一个源，MediaMTX 默认会回
+* **跨域**：WebRTC 观看是浏览器直接 POST 到另一个源，MediaMTX 默认会回
   ``Access-Control-Allow-Origin: *``，无需额外配置；
 * **证书**：站点是 HTTPS 时浏览器不允许混用 ``http://`` 源（混合内容会被拦），
   所以源地址也要用 HTTPS 且证书要受浏览器信任——自签名证书只有服务端探测
@@ -59,16 +60,16 @@ async def aclose() -> None:
 
 
 # =========================================================================== #
-# 后台探测：**请求处理路径永不等待媒体服务器**
+# 按需探测：**请求处理路径永不等待媒体服务器**
 #
 # 媒体服务器（MediaMTX）不可达时，一次探测要一直等到超时才返回。以前
 # ``/api/state`` 会同步等 4 次这样的探测（主直播间 / 选手 / 成员频道 / 状态视图），
 # 媒体服务器没开时首屏就要卡十几秒 —— 而且只缓存成功结果，失败还会反复重试。
 #
-# 现在的分工：
-#   * 一个后台任务按固定间隔把「谁在推流」与「端口是否可达」问一遍，写进缓存；
+#   * 探测**按需触发**：只有前端在直播 / 频道页请求 ``/api/live/health`` 时才安排一次
+#     后台探测（``kick_refresh``），没人看直播时后端完全不做任何探测；
 #   * ``/api/state`` 与 ``/api/live/health`` **只读缓存**，因此永远毫秒级返回；
-#   * 只有显式 ``probe=1``（管理端「刷新信号」）才现场探测。
+#   * 只有显式 ``probe=1``（「刷新信号」）才现场同步探测。
 # =========================================================================== #
 #
 # ``ok`` 区分「探测成功」与「探测失败」，**失败结果同样要缓存**——否则同一页加载
@@ -82,23 +83,26 @@ _ready_cache: dict[str, Any] = {
 }
 # 单飞锁：同一时刻只允许一次真实探测，其余调用等它结束后复用结果（避免惊群）
 _ready_lock = asyncio.Lock()
-# 端口探测（WebRTC / HLS 两个端口）的最近结果，同样由后台任务刷新
+# 端口探测（WebRTC / HLS 两个端口）的最近结果，同样由按需刷新更新
 _health_cache: dict[str, Any] = {"at": float("-inf"), "probes": None}
 
 _READY_TTL_OK = 8.0        # 探测成功的结果可复用多久
 _READY_TTL_FAIL = 5.0      # 探测失败的结果可复用多久
 _READY_TIMEOUT = 3.0       # 控制 API 单次探测超时
 _PROBE_TIMEOUT = 4.0       # 端口探测单次超时
-_PROBE_TTL = 15.0          # 端口探测结果可复用多久（比控制 API 贵，刷新得慢一些）
+_PROBE_TTL = 60.0          # 端口探测结果可复用多久（比控制 API 贵，端口通不通也很少变）
 # 两次真实探测之间的最小间隔：即使调用方要求「强制刷新」，短时间内的并发请求也复用
 # 同一次结果。否则多人同时点「刷新信号」会在锁上串行排队（N 个客户端 × 超时）。
 _READY_MIN_INTERVAL = 0.5
 
-# 后台探测间隔。控制 API 每次都会探；端口探测走 _PROBE_TTL 节流。
-_PROBE_INTERVAL = 5.0
-_probe_task: asyncio.Task | None = None
+# 按需刷新的节流与新鲜度上限
+_REFRESH_MIN_INTERVAL = 1.0   # 两次按需刷新之间的最小间隔
+_SNAPSHOT_MAX_AGE = 30.0      # 缓存超过这么久没刷新就按「查不到」处理，不给过期的直播中标记
 
-# 失败日志节流：后台每 5 秒探一次，媒体服务器长期不可达时不能每轮都刷同一条 warning。
+_refresh_task: asyncio.Task | None = None
+_last_refresh = float("-inf")
+
+# 失败日志节流：无人值守时探测会反复失败，同一原因不能每轮都刷一条 warning。
 _FAIL_LOG_REPEAT = 60.0
 _fail_log: dict[str, Any] = {"at": float("-inf"), "reason": ""}
 
@@ -200,9 +204,17 @@ async def ready_paths(max_age: float | None = None) -> set[str] | None:
 def ready_paths_snapshot() -> set[str] | None:
     """**只读缓存**的推流路径集合：不发任何网络请求。
 
-    没探测过、或上次探测失败（媒体服务器不可达）时都是 ``None`` = 「查不到」。
-    新鲜度由后台任务负责（见 :func:`start_prober`），请求处理方直接拿走即可。
+    以下三种情况都返回 ``None``（= 查不到）：
+
+    * 还没探测过；
+    * 上次探测失败（媒体服务器未配置 / 不可达）；
+    * 缓存已经太旧（超过 ``_SNAPSHOT_MAX_AGE``）——没人看直播就不再刷新，
+      不能让最后一次结果永久挂成「直播中」。
+
+    新鲜度由按需刷新负责（见 :func:`kick_refresh`），请求处理方直接拿走即可。
     """
+    if time.monotonic() - _ready_cache["at"] > _SNAPSHOT_MAX_AGE:
+        return None
     return _ready_cache["paths"]
 
 
@@ -259,61 +271,76 @@ async def probe_ports(force: bool = False) -> dict[str, dict[str, Any]]:
         except httpx.HTTPError as exc:
             return name, {"ok": False, "reason": _friendly_error(exc), "url": url}
 
-    targets = (("webrtc", endpoints["originPlayPage"]), ("hls", endpoints["originHls"]))
+    targets = (
+        ("webrtc", endpoints["originWebrtc"]),
+        # HLS 只探**服务根地址**：去请求任何具体流路径都会让媒体服务器为那个路径
+        # 建一个 HLS 会话，没人直播时就会不停刷 "no stream is available on path '…'"。
+        # 根地址一样能验证端口与证书（返回 404 也算端口通）。
+        ("hls", endpoints["originHlsRoot"]),
+    )
     probes = dict(await asyncio.gather(*(one(name, url) for name, url in targets)))
     _health_cache.update({"at": time.monotonic(), "probes": probes})
     log.debug("直播源端口探测 | %s", probes)
     return probes
 
 
-async def _probe_loop() -> None:
-    """后台探测循环：把最新结果写进缓存，供请求处理方零等待读取。"""
-    while True:
+def probe_ports_snapshot() -> dict[str, dict[str, Any]]:
+    """**只读缓存**的端口探测结果；还没探过就是空字典（绝不等待网络）。"""
+    return _health_cache["probes"] or {}
+
+
+async def _refresh_once() -> None:
+    """把「谁在推流」与端口可达性各刷新一次。
+
+    异常一律吞掉（只记日志）：这是后台任务，挂掉不会再有人来重启它。
+    """
+    for label, coro in (
+        ("推流状态", ready_paths(max_age=0.0)),
+        ("源端口", probe_ports()),
+    ):
         try:
-            await ready_paths(max_age=0.0)
-            await probe_ports()
+            await coro
         except asyncio.CancelledError:
             raise
-        except Exception:  # 兜底：任何异常都不能让后台任务夭折
-            log.exception("直播后台探测异常（将在下一轮重试）")
-        await asyncio.sleep(_PROBE_INTERVAL)
+        except Exception:
+            log.exception("直播后台探测异常 | %s", label)
 
 
-def start_prober() -> None:
-    """启动直播后台探测任务（幂等）。
+def kick_refresh() -> None:
+    """安排一次**后台**探测，立刻返回；结果供下一次请求读取。
 
-    API 地址没配时会空转（``ready_paths`` 直接返回），几乎不产生开销。
+    这是「不卡前端」的关键：请求处理方只管调用，绝不等待探测完成。
+    幂等且带节流，所以前端轮询多频繁都不会把媒体服务器打爆。
     """
-    global _probe_task
-    if _probe_task is not None and not _probe_task.done():
+    global _refresh_task, _last_refresh
+    if _refresh_task is not None and not _refresh_task.done():
         return
-    _probe_task = asyncio.create_task(_probe_loop())
-    log.info(
-        "直播后台探测已启动 | 间隔=%.0fs | 控制 API=%s",
-        _PROBE_INTERVAL,
-        (store.snapshot().stream.api_base or "").strip() or "(未配置，跳过)",
-    )
+    now = time.monotonic()
+    if now - _last_refresh < _REFRESH_MIN_INTERVAL:
+        return
+    _last_refresh = now
+    _refresh_task = asyncio.create_task(_refresh_once())
 
 
-async def stop_prober() -> None:
-    """停止直播后台探测任务（幂等）；在关闭 HTTP 连接池之前调用。"""
-    global _probe_task
-    task, _probe_task = _probe_task, None
-    if task is None:
+async def stop_refresher() -> None:
+    """取消尚未跑完的探测任务（关闭 HTTP 连接池之前调用）。"""
+    global _refresh_task
+    task, _refresh_task = _refresh_task, None
+    if task is None or task.done():
         return
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
-    log.debug("直播后台探测已停止")
 
 
 # --------------------------------------------------------------------------- #
 # 推流白名单（MediaMTX ``authHTTPAddress`` 回调）
 #
-# 背景：媒体服务器的推流与播放**路径同名**（RTMP / RTSP 甚至同址），
-# 因此仅靠路径保密挡不住他人推流；而本站在直播页下方又是公开播放地址。
+# 背景：媒体服务器的推流与播放**路径同名**（同一个 ``/<流名>``，
+# 方向由客户端行为决定），因此仅靠路径保密挡不住他人推流；
+# 而本站在直播页下方又是公开播放地址。
 # 打开下面的 HTTP 鉴权后，媒体服务器每次推流都会来问一次本站：
 # 只有**在本站登记过流名**的人（选手 / 成员频道 / 主直播间默认流名）才放行。
 #
@@ -443,7 +470,10 @@ async def live_status_view() -> dict[str, Any]:
     elif not api:
         reason = "未配置 MediaMTX API 地址，无法判断谁在推流"
     elif not _ready_cache["attempted"]:
-        reason = "尚未探测到媒体服务器（后台正在重试）"
+        reason = "尚未检测：打开「直播」页后会自动检测推流状态"
+    elif _ready_cache["paths"] is not None:
+        # 上次探测是成功的，只是缓存过期了（离开直播页后不再刷新）
+        reason = "推流状态已过期：离开直播页后不再检测"
     else:
         # 把上次失败的真实原因带出去（鉴权失败 / 超时 / 端口不通…）
         reason = _ready_cache.get("reason") or "MediaMTX API 不可达，无法判断谁在推流"
@@ -456,10 +486,10 @@ async def live_status_view() -> dict[str, Any]:
 
 
 def stream_endpoints() -> dict[str, Any]:
-    """公开的源地址集合（**只有播放地址**，推流地址属于凭据，仅在管理端出现）。
+    """公开的源地址集合（**只有观看地址**，推流地址属于凭据，仅在管理端出现）。
 
     ``key`` 是**主直播间的流名**（``直播配置 → 默认流名``）。它本来就写在
-    下面这些播放地址里（``…/<流名>/whep``），所以不算额外泄露；
+    下面这些观看地址里（``…/<流名>``），所以不算额外泄露；
     前端用它把「主直播间」当成一路独立机位来播放与切换。
     """
     cfg = store.snapshot().stream
@@ -474,14 +504,16 @@ def stream_endpoints() -> dict[str, Any]:
         "secure": base.startswith("https://"),
         "verifyTls": bool(cfg.verify_tls),
         "origin": base,
-        "originPlayPage": f"{base}/{key}/" if base else "",
-        "originHlsPage": f"{hls}/{key}/" if hls else "",
-        "originWhep": f"{base}/{key}/whep" if base else "",
-        "originHls": cfg.hls_url or (f"{hls}/{key}/index.m3u8" if hls else ""),
+        # 观看地址就两条：8889（WebRTC）与 8888（HLS）
+        "originWebrtc": f"{base}/{key}" if base else "",
+        "originHls": f"{hls}/{key}" if hls else "",
+        # HLS 服务的**根地址**：端口探测专用。探测不去碰任何具体流路径——那会让媒体
+        # 服务器为该路径创建一个 HLS 会话，没人直播时日志会被刷屏（见 probe_ports）。
+        "originHlsRoot": f"{hls}/" if hls else "",
         # 观众可切换的两种播放线路（都只是播放，不含推流凭据）
         "protocols": [
             {"id": "webrtc", "label": "WebRTC", "note": "延迟最低（UDP）"},
-            {"id": "tcp", "label": "HLS", "note": "抗抖动（TCP，延迟略高）"},
+            {"id": "hls", "label": "HLS", "note": "抗抖动（TCP，延迟略高）"},
         ],
     }
 
@@ -537,17 +569,23 @@ def _friendly_error(exc: Exception) -> str:
 async def health_view(force: bool = False) -> dict[str, Any]:
     """组装「直播链路健康」视图（接口与后台任务共用）。
 
-    ``force=False``（默认）只读后台缓存，**不发任何网络请求**——
-    这个接口会被前端每 15 秒轮询一次，绝不能因为媒体服务器不可达而挂住。
+    ``force=False``（默认）**只读缓存并安排一次后台刷新**，本身不发任何网络请求——
+    这个接口会被前端在直播页轮询，绝不能因为媒体服务器不可达而挂住。
     """
     endpoints = stream_endpoints()
     if not endpoints["enabled"]:
         return {"ok": False, "reason": "disabled", "probes": {}}
     if force:
-        # 显式刷新：现场重新问一次控制 API（可能等到超时，但这是用户主动要求的）
+        # 显式刷新：现场探一次（可能等到超时，但这是用户主动要求的）
         await ready_paths(max_age=0.0)
+        probes = await probe_ports(force=True)
+    else:
+        # 只读缓存 + 安排一次后台刷新：本次先返回手里的值，新结果下次轮询生效。
+        # 冷启动时 probes 是空的，用 pending 告诉前端「后台正在探」，别当成探测失败。
+        kick_refresh()
+        probes = probe_ports_snapshot()
+    pending = not probes
     verify = bool(endpoints["verifyTls"])
-    probes = await probe_ports(force=force)
     cfg = store.snapshot()
     api = (cfg.stream.api_base or "").strip()
     ready = ready_paths_snapshot() if api else None
@@ -557,7 +595,9 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         if not api:
             api_reason = "未配置 MediaMTX API 地址（默认 :9997），无法判断谁在推流"
         elif not _ready_cache["attempted"]:
-            api_reason = "尚未探测到媒体服务器（后台正在重试）"
+            api_reason = "尚未检测：正在向媒体服务器查询推流状态"
+        elif _ready_cache["paths"] is not None:
+            api_reason = "推流状态已过期：离开直播页后不再检测"
         else:
             api_reason = _ready_cache.get("reason") or "MediaMTX API 不可达：请确认 api: yes 且端口已开放"
     out: dict[str, Any] = {
@@ -567,6 +607,8 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         "secure": endpoints["secure"],
         "verifyTls": verify,
         "probes": probes,
+        # 端口还在后台探测中（冷启动）：前端据此缩短下一次轮询，别显示成「探测失败」
+        "pending": pending,
         # 正在推流的机位（选手 ID）：前端用它决定要不要显示「直播中」
         "streamingKnown": known,
         "streaming": await streaming_player_ids(cfg) if known else [],
@@ -576,7 +618,9 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         "mainStreaming": bool(ready) and main_stream_key() in (ready or set()),
         "api": {"configured": bool(api), "ok": known, "url": api, "reason": api_reason},
     }
-    if not out["ok"]:
+    if pending:
+        out["reason"] = "正在检测源站端口…"
+    elif not out["ok"]:
         out["reason"] = probes.get("webrtc", {}).get("reason") or "直播源不可达"
     return out
 

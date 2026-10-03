@@ -334,8 +334,8 @@ async def lifespan(app: FastAPI):
     store.on_change(on_config_change)
     # 启动时先算一次，保证新连接的客户端立刻拿到数据
     await hub.broadcast_state(build_public_state(store.snapshot()))
-    # 直播探测放后台跑：接口只读缓存，媒体服务器不可达时也不会拖住任何请求
-    live.start_prober()
+    # 直播探测按需触发（前端在直播 / 频道页请求 /api/live/health 时才探一次），
+    # 因此这里不启动任何常驻任务，没人看直播时后端不做任何探测。
     cfg = store.snapshot()
     log.info("=" * 68)
     log.info("NTE 比赛平台已启动 | 当前届: %s (%s)", cfg.event.name, store.current_id)
@@ -357,8 +357,8 @@ async def lifespan(app: FastAPI):
     finally:
         await store.stop()
         await avatars.aclose()
-        # 先停后台探测，再关连接池：否则任务可能在关池的瞬间发起请求
-        await live.stop_prober()
+        # 先收掉还没跑完的探测任务，再关连接池：否则它可能在关池的瞬间发起请求
+        await live.stop_refresher()
         await live.aclose()
         log.info("服务已停止")
 
@@ -429,8 +429,8 @@ async def api_state() -> dict[str, Any]:
     cfg = store.snapshot()
     state = build_public_state(cfg)
     state["live"] = live.stream_endpoints()
-    # 以下几项**只读后台缓存**（见 live.start_prober）：本接口是页面首屏的必经
-    # 之路，绝不能因为媒体服务器不可达而卡住。真实探测由后台任务负责。
+    # 以下几项**只读缓存**（探测由直播 / 频道页按需触发，见 live.kick_refresh）：
+    # 本接口是页面首屏的必经之路，绝不能因为媒体服务器不可达而卡住。
     #
     # 主直播间（默认流名）有没有人在推流；None = 查不到（API 未配置 / 不可达）
     state["live"]["streaming"] = await live.main_stream_ready()
@@ -721,11 +721,11 @@ async def api_private(_: str = Depends(require_admin)) -> dict[str, Any]:
         "players": players,
         "channels": channels,
         "rounds": rounds,
-        # **完整**直播配置（含 WHIP/RTMP/RTSP/HLS 根地址与流名）：
+        # **完整**直播配置（含 WHIP 推流地址、HLS 根地址与控制 API 凭据）：
         # 公开状态里这些字段被白名单剥掉了，管理端表单必须从这里取，
         # 否则表单是空的、一保存就把根地址清成空字符串。
         "stream": stream.dump(),
-        # 两套协议的列定义（WebRTC / TCP），前端据此渲染复制表格
+        # 推流 / 观看的协议列定义（WebRTC / HLS），前端据此渲染复制表格
         "protocols": logic.protocol_sets(stream),
         "baseUrl": stream.base_url,
         "enabled": stream.enabled,

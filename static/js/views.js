@@ -65,7 +65,7 @@ const STATUS_FILTERS = [
   ['live', '进行中'],
   ['done', '已结束'],
 ];
-const STREAM_MODE_LABEL = { auto: '自动', webrtc: 'WebRTC', hls: 'HLS', flv: 'FLV', embed: '网页内嵌' };
+const STREAM_MODE_LABEL = { auto: '自动', webrtc: 'WebRTC', hls: 'HLS' };
 
 const LEAGUE_FILTERS = [
   ['all', '全部'],
@@ -1574,6 +1574,37 @@ function liveEmptyHtml(s) {
   return `<div class="live-pick__empty live-pick__empty--none"><b>没有任何人在直播</b>${esc(hint)}</div>`;
 }
 
+/** 正在检测推流状态：给一段加载动画，别让用户对着「没有任何人在直播」干等。 */
+function liveLoadingHtml() {
+  return (
+    `<div class="ldg">` +
+    `<span class="ldg__bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>` +
+    `<span class="ldg__msg">正在检测推流状态…</span></div>`
+  );
+}
+
+/** 连续检测失败：说清现状并给一个手动重试入口（不再自动重试，等服务器恢复）。 */
+function liveFailHtml(message) {
+  const detail = message || '已连续 3 次未取到推流状态';
+  return (
+    `<div class="ldg ldg--err">` +
+    `<span class="ldg__bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>` +
+    `<span class="ldg__msg"><b>获取失败，等待服务器修复</b>${esc(detail)}</span>` +
+    `<button class="btn btn--sm" type="button" data-act="live-health-retry">重试</button></div>`
+  );
+}
+
+/**
+ * 检测进行中的占位：按状态给「加载动画 / 获取失败 / 确实没人播」。
+ *
+ * 关键是不把「还没检测出结果」说成「没有任何人在直播」——那会误导观众。
+ */
+function livePendingHtml(s) {
+  if (App.liveHealthState === 'error') return liveFailHtml(App.liveHealth?.reason);
+  if (App.liveHealthState === 'ok') return liveEmptyHtml(s);
+  return liveLoadingHtml();
+}
+
 export function renderLive(s) {
   const all = livePool(s); // 主直播间（在播时）+ 在播的选手机位
   const rounds = liveRoundCandidates(s);
@@ -1610,6 +1641,8 @@ export function renderLive(s) {
     canEdit() ? 'admin' : 'guest',
     App.livePlayerId || '',
     picked ? picked.room.key || '' : '',
+    // 没有机位时，舞台封面按检测状态显示（检测中 / 获取失败 / 确实没人播）
+    pool.length ? '' : App.liveHealthState,
   ].join('|');
   const stage = qs('#liveStage');
   let rebuilt = false;
@@ -1626,7 +1659,7 @@ export function renderLive(s) {
   roundBar.hidden = !rounds.length;
   qs('#livePick').innerHTML = pool.length
     ? pool.map((c) => liveChipHtml(c, picked)).join('')
-    : liveEmptyHtml(s);
+    : livePendingHtml(s);
   qs('#stageMeta').innerHTML = picked ? vsLineHtml(picked) : '';
   qs('#pushPanel').innerHTML = pushPanelHtml(s, picked);
   qs('#liveInfoPanel').innerHTML = liveInfoHtml(s, picked);
@@ -1700,17 +1733,16 @@ function stageHtml(s) {
     `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
     `<span class="stage-bar__label">线路</span>` +
     `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="live-proto" data-proto="webrtc" title="优先：WebRTC / WHEP，走 UDP，延迟最低">WebRTC<sup>优先</sup></button>` +
+    `data-act="live-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
     `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="live-proto" data-proto="hls" title="备选：HLS 走 TCP，抗抖动，延迟略高">HLS</button>` +
+    `data-act="live-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
     `</div>` +
     `<div class="stage-bar__right">` +
     `<button class="btn btn--sm" type="button" data-act="live-open">打开源页</button>` +
-    // 推流地址属于凭据，只给登录后的管理端；内容跟随当前线路（WebRTC→WHIP / TCP→RTMP）
+    // 推流地址属于凭据，只给登录后的管理端；推流只有 WHIP 一种
     (canEdit()
       ? `<button class="btn btn--sm" type="button" data-act="live-copy-push" ` +
-        `title="复制当前线路对应的推流地址 · ${esc(PUSH_TIP_LINE)}">` +
-        `复制推流（${App.liveProto === 'hls' ? 'RTMP' : 'WHIP'}）</button>`
+        `title="复制 WHIP 推流地址 · ${esc(PUSH_TIP_LINE)}">复制推流（WHIP）</button>`
       : '') +
     `<button class="btn btn--sm" type="button" data-act="live-copy">复制播放地址</button>` +
     `<button class="btn btn--sm" type="button" data-act="live-refresh">刷新信号</button>` +
@@ -1732,18 +1764,11 @@ function pushPanelHtml(s, picked) {
     // 推流标识 = 选手自己的流名（主直播间 = 配置里的默认流名）：整届都用同一个地址
     rows.push([main ? '主直播间流名' : '推流标识', room.key, true]);
     if (room.roundLabel) rows.push(['当前比赛', room.roundLabel, false]);
-    // 内嵌观看页（源站）：https://live.shiyora.net:8889/<流名>/
-    if (room.page) rows.push(['观看页（内嵌）', room.page, true]);
-    // 推流（仅管理端；WHIP = WebRTC 套 = 优先，RTMP / RTSP = TCP 套 = 备选）
-    if (admin && endpoints.whipPush) rows.push(['推流 WHIP（优先）', endpoints.whipPush, true, 'push']);
-    if (admin && endpoints.rtmpPush) rows.push(['推流 RTMP（备选）', endpoints.rtmpPush, true, 'push']);
-    if (admin && endpoints.rtspPush)
-      rows.push(['推 RTSP·播（备选）', endpoints.rtspPush, true, 'push']);
-    // 播放（源站直连）：WebRTC 套用 WHEP，TCP 套用 HLS。
-    // HLS 给两条：地址到 /<流名>/ 为止的**播放页**（贴浏览器就能看）+ 播放列表（播放器用）
-    rows.push(['播放 WHEP', room.whep, true]);
-    rows.push(['HLS 播放页', room.hlsPage, true]);
-    rows.push(['HLS 播放列表', room.hls, true]);
+    // 推流（仅管理端）：只有 WHIP 一种，地址是 8889 那条加 /whip
+    if (admin && endpoints.whipPush) rows.push(['推流 WHIP', endpoints.whipPush, true, 'push']);
+    // 观看地址就两条：8889（WebRTC）与 8888（HLS），打开就能看，播放器也用它们
+    rows.push(['观看 8889', room.webrtc, true]);
+    rows.push(['观看 8888', room.hls, true]);
   }
   const body = rows.length
     ? rows
@@ -1767,8 +1792,7 @@ function pushPanelHtml(s, picked) {
   const note = [
     st.note ? `<div class="notice" style="margin-top:10px">${esc(st.note)}</div>` : '',
     admin
-      ? `<div class="panel__hint" style="margin-top:8px">推流<b>优先用 WHIP</b>（WebRTC 套，UDP，延迟最低），` +
-        `推不上去再用 RTMP / RTSP（TCP 套，抗抖动）。${
+      ? `<div class="panel__hint" style="margin-top:8px">推流<b>只有 WHIP</b>（WebRTC，UDP，延迟最低）。${
           main
             ? `主直播间推的是直播配置里的<b>默认流名</b>（这里 …/${esc(room.key || '<流名>')}）。`
             : `每位选手只要推自己的流名（这里 …/${esc(room.key || '<流名>')}），` +
@@ -1796,7 +1820,8 @@ export function liveInfoHtml(s, picked = null) {
   const probes = health?.probes || {};
   const probeText = (name) => {
     const probe = probes[name];
-    if (!probe) return '—';
+    // 冷启动时服务端把探测放在后台，这里先显示「检测中」而不是一个像是失败的空值
+    if (!probe) return health?.pending ? '检测中…' : '—';
     if (probe.ok) {
       return probe.status === 404 ? '端口通（当前无此流）' : `就绪（HTTP ${probe.status}）`;
     }
@@ -1871,9 +1896,9 @@ function channelStageHtml(s, picked) {
     `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
     `<span class="stage-bar__label">线路</span>` +
     `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="channel-proto" data-proto="webrtc" title="优先：WebRTC / WHEP，走 UDP，延迟最低">WebRTC<sup>优先</sup></button>` +
+    `data-act="channel-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
     `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="channel-proto" data-proto="hls" title="备选：HLS 走 TCP，抗抖动，延迟略高">HLS</button>` +
+    `data-act="channel-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
     `</div>` +
     `<div class="stage-bar__right">` +
     `<button class="btn btn--sm" type="button" data-act="channel-open">打开源页</button>` +
@@ -2028,7 +2053,16 @@ export function renderChannels(s) {
     rebuilt = true;
   }
   const pickEl = qs('#channelPick');
-  if (pickEl) pickEl.innerHTML = channelChipsHtml(pool, picked);
+  if (pickEl) {
+    // 没有可播频道时按检测状态给提示；已拿到结果就保持原样（空串）
+    pickEl.innerHTML = pool.length
+      ? channelChipsHtml(pool, picked)
+      : App.liveHealthState === 'error'
+        ? liveFailHtml(App.liveHealth?.reason)
+        : App.liveHealthState === 'ok'
+          ? ''
+          : liveLoadingHtml();
+  }
   const metaEl = qs('#channelMeta');
   if (metaEl) metaEl.innerHTML = channelMetaHtml(picked);
 

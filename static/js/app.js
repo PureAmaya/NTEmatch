@@ -23,7 +23,13 @@ import {
 } from './core.js';
 import { PUSH_TIP_LINE } from './ui.js';
 import { installDnD as installTeamDnD } from './teams.js';
-import { ChannelLive, installStageDelegation, Live, refreshLiveHealth } from './live.js';
+import {
+  ChannelLive,
+  installStageDelegation,
+  Live,
+  startLiveHealth,
+  stopLiveHealth,
+} from './live.js';
 import {
   focusLive,
   liveInfoHtml,
@@ -137,16 +143,19 @@ function setView(view, { silent = false } = {}) {
   if (view === 'live') {
     ChannelLive.stop(false);
     if (App.state) focusLive(App.state);
-    refreshLiveHealth();
   } else if (view === 'channels') {
     Live.stop(false);
     if (App.state) renderChannels(App.state);
-    refreshLiveHealth();
   } else {
     Live.stop(false);
     ChannelLive.stop(false);
     if (App.state) renderView(view, App.state);
   }
+  // 推流检测只在直播 / 频道页运行：进页面开始，离开就停（后端随之不再探测）。
+  // 首次初始化时 App.state 还没到手，这里不启动——等路由把状态拉回来后的那次
+  // setView 再启动，避免「启动得太早、进直播页反而要等一个轮询周期」。
+  if ((view === 'live' || view === 'channels') && App.state) startLiveHealth();
+  else if (view !== 'live' && view !== 'channels') stopLiveHealth();
 
   if (view === 'admin') renderAdmin();
   // 记下已渲染的视图与指纹（切页本身就重建过 DOM，避免随后一次推送再重建一遍）
@@ -369,16 +378,13 @@ function bindStatic() {
     if (App.state) renderOverview(App.state);
   });
 
+  // 「谁真的在推流」是媒体服务器侧的变化，不会走 WebSocket，只能在直播 / 频道页定时问。
+  // 标签页切走就停掉轮询，切回来（且仍在这两个页面）立刻补一次。
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && ws && ws.readyState === WebSocket.OPEN) ws.send('state');
-    // 回到页面时顺手刷新直播状态
-    if (!document.hidden) refreshLiveHealth();
+    if (document.hidden) stopLiveHealth();
+    else if (App.view === 'live' || App.view === 'channels') startLiveHealth();
   });
-
-  // 「谁真的在推流」是媒体服务器侧的变化，不会走 WebSocket，只能定时问一次
-  setInterval(() => {
-    if (!document.hidden) refreshLiveHealth();
-  }, 15000);
 }
 
 /* --------------------------- 初始化 --------------------------- */
@@ -432,9 +438,6 @@ async function init() {
 
   await loadInitial();
   connectWS();
-  // 服务端把直播探测放在后台跑，首屏拿到的可能是「还没探到」；
-  // 这里补一次（只读服务端缓存，毫秒级）把「直播中」标记补齐，不阻塞任何渲染。
-  void refreshLiveHealth();
   renderAdmin();
 
   log.info('前端已就绪', 'api', API, 'view', App.view);

@@ -407,11 +407,9 @@ export function adminPanelHtml(s) {
       '默认播放线路',
       stream.mode,
       [
-        ['auto', '自动（WebRTC → 网页兜底）'],
-        ['webrtc', 'WebRTC / WHEP（UDP，低延迟）'],
-        ['hls', 'HLS（TCP，抗抖动）'],
-        ['embed', '网页内嵌'],
-        ['flv', 'FLV'],
+        ['auto', '自动（WebRTC，不通再退 HLS）'],
+        ['webrtc', 'WebRTC（8889，UDP，低延迟）'],
+        ['hls', 'HLS（8888，TCP，抗抖动）'],
       ],
       { hint: '观众还能在直播页自行切换线路，不必改这里' }
     ) +
@@ -422,11 +420,12 @@ export function adminPanelHtml(s) {
     fieldSwitch('verifyTls', '校验源站 HTTPS 证书', stream.verifyTls !== false, {
       hint: '只影响「信号探测」；自签名证书时关掉。观众侧仍需浏览器信任的证书',
     }) +
-    `<div class="notice" style="grid-column:1/-1"><b>两套协议并存，各自都能推流与播放：</b>` +
-    `WebRTC 套（WHIP 推 / WHEP 播，UDP）延迟最低；TCP 套（RTMP / RTSP 推，HLS / RTSP 播）抗抖动；` +
-    `播放与推流都用下面的<b>源地址</b>（本站不做反代），因此站点是 HTTPS 时源站也要 HTTPS。</div>` +
+    `<div class="notice" style="grid-column:1/-1"><b>推流只有 WHIP；观众看直播只有两个地址：</b>` +
+    `<code>&lt;WebRTC 根地址&gt;/&lt;流名&gt;/</code>（8889）与 <code>&lt;HLS 根地址&gt;/&lt;流名&gt;/</code>（8888），` +
+    `打开就能看，播放器用的也是这两个。地址都是<b>源站地址</b>（本站不做反代），` +
+    `因此站点是 HTTPS 时源站也要 HTTPS。</div>` +
     `<div style="grid-column:1/-1">${fieldText('baseUrl', 'WebRTC 根地址', stream.baseUrl, {
-      hint: '8889 端口：WHIP 推流 / WHEP 播放，例如 https://live.example.com:8889',
+      hint: '8889 端口：WHIP 推流 + 观众观看地址，例如 https://live.example.com:8889',
     })}</div>` +
     `<div style="grid-column:1/-1">${fieldText('apiBase', 'MediaMTX API 地址', stream.apiBase, {
       hint: '默认 http://live.example.com:9997（mediamtx.yml 里 api: yes）。' +
@@ -441,20 +440,11 @@ export function adminPanelHtml(s) {
       type: 'password',
       hint: '属于凭据：只存服务端、只在管理端下发，观众端拿不到',
     })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('rtmpBase', 'RTMP 根地址（TCP）', stream.rtmpBase, {
-      hint: '1935 端口：OBS 经典推流，例如 rtmp://live.example.com:1935',
+    `<div style="grid-column:1/-1">${fieldText('hlsBase', 'HLS 根地址', stream.hlsBase, {
+      hint: '8888 端口：观众观看地址，例如 https://live.example.com:8888',
     })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('rtspBase', 'RTSP 根地址（TCP）', stream.rtspBase, {
-      hint: '8554 端口：推流与播放同址，例如 rtsp://live.example.com:8554；留空则不显示 RTSP',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('hlsBase', 'HLS 根地址（TCP）', stream.hlsBase, {
-      hint: '8888 端口：浏览器可直接播放，例如 https://live.example.com:8888',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('whipPush', '默认流名的 WHIP 地址', stream.whipPush)}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('rtmpPush', '默认流名的 RTMP 地址', stream.rtmpPush)}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('rtspUrl', '默认流名的 RTSP 地址', stream.rtspUrl)}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('hlsUrl', '默认流名的 HLS 播放列表', stream.hlsUrl, {
-      hint: '播放器 / hls.js 用的是这个（…/<流名>/index.m3u8）；给人看的是播放页 …/<流名>/',
+    `<div style="grid-column:1/-1">${fieldText('whipPush', '默认流名的 WHIP 地址', stream.whipPush, {
+      hint: '主直播间（默认流名）的推流地址；选手 / 频道各自的地址由他们自己的流名派生',
     })}</div>` +
     `<div style="grid-column:1/-1">${fieldText('poster', '封面图 URL', stream.poster)}</div>` +
     `<div style="grid-column:1/-1">${fieldArea('note', '备注', stream.note)}</div>` +

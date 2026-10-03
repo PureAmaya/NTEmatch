@@ -141,6 +141,10 @@ export const App = {
   state: null,
   liveInfo: null,
   liveHealth: null,
+  // 直播信号检测的状态机：idle（还没检测）/ loading（检测中）/ ok / error（连续失败到上限）
+  // 只在直播 / 频道页推进，见 live.js 的 startLiveHealth / stopLiveHealth
+  liveHealthState: 'idle',
+  liveHealthFails: 0, // 连续失败次数
   livePlayerId: null, // 当前选中的直播机位（选手 ID）
   liveRound: '', // 观众选中的比赛（对局编号）；'' = 全部机位
   // 「真的在推流」的选手集合（由媒体服务器上报，见 refreshLiveHealth）；

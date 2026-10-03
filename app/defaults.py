@@ -51,8 +51,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stream": {
         "enabled": True,
         "provider": "mediamtx",
-        # HTTP 系（WebRTC / HLS）默认 HTTPS：本站上 CDN 后是 HTTPS 页面，
-        # http:// 会被浏览器当混合内容拦掉（含内嵌播放页与 WHEP 拉流）。
+        # 两条观看线路都是 HTTP 系，默认 HTTPS：本站上 CDN 后是 HTTPS 页面，
+        # http:// 会被浏览器当混合内容拦掉（WebRTC 与 HLS 观看都会失败）。
         "baseUrl": "https://live.shiyora.net:8889",
         # MediaMTX 的控制 API（默认 :9997）：用来查「谁真的在推流」，
         # 只有媒体服务器上报 ready 的机位才会显示「直播中」
@@ -60,23 +60,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 控制 API 的 Basic 认证（mediamtx.yml 配了 authInternalUsers 才需要）
         "apiUser": "",
         "apiPass": "",
-        "rtmpBase": "rtmp://live.shiyora.net:1935",
-        "rtspBase": "rtsp://live.shiyora.net:8554",
         "hlsBase": "https://live.shiyora.net:8888",
         "streamKey": "stream",
         "mode": "auto",
         # 只影响本服务的源站探测（/api/live/health）；自签名证书时关掉
         "verifyTls": True,
-        "rtmpPush": "rtmp://live.shiyora.net:1935/stream",
         "whipPush": "https://live.shiyora.net:8889/stream/whip",
-        "rtspUrl": "rtsp://live.shiyora.net:8554/stream",
-        "hlsUrl": "https://live.shiyora.net:8888/stream/index.m3u8",
-        "flvUrl": "",
         "poster": "",
         "title": "赛事直播",
         "note": (
-            "支持 WebRTC(WHEP) 与 HLS 观看（均为 HTTPS），推流可用 OBS 的 RTMP 或 WHIP 方式；"
-            "媒体服务器需开启 webrtcEncryption / hlsEncryption 并配置证书。"
+            "推流用 WHIP（OBS 30+）；观看有两个地址：8889（WebRTC）与 8888（HLS），"
+            "均为 HTTPS。媒体服务器需开启 webrtcEncryption / hlsEncryption 并配置证书。"
         ),
     },
     "ui": {

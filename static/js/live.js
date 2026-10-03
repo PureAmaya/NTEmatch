@@ -1,4 +1,4 @@
-/* 直播播放控制器：WebRTC(WHEP) 优先，HLS / 网页内嵌兜底。
+/* 直播播放控制器：观看线路两条——8889（WebRTC）优先，8888（HLS）兜底。
  * 仅依赖核心层；对外暴露 Live 与事件委托安装函数。
  */
 
@@ -6,16 +6,15 @@ import { App, LIVE_PROTO_KEY, api, copyText, hooks, isAdmin, log, qs, toast } fr
 import { PUSH_TIP_LINE, pushUrlOf, roomFor } from './ui.js';
 
 /**
- * 内嵌观看地址：用媒体服务器自带的播放页 ``<base>/<标识>/``
- * （如 ``https://live.shiyora.net:8889/G-A-1-1-p3/``）。
+ * 当前线路对应的**观看地址**：HLS 给 8888 那条，否则给 8889 那条。
  *
+ * 两条都是「端口 + 流名」，直接打开就能看，也是播放器用的地址。
  * 地址就是源站地址，不做反代；站点是 HTTPS 时源站也必须是 HTTPS，
- * 否则浏览器会按混合内容拦掉（此时提示改用 WebRTC/HLS 线路）。
+ * 否则浏览器会按混合内容拦掉。
  */
-function embedUrl(room) {
-  // 观众选了 HLS 线路就给 HLS 播放页（地址到 /<流名>/ 为止），否则给 WebRTC 播放页
-  if (App.liveProto === 'hls' && room?.hlsPage) return room.hlsPage;
-  return room?.page || App.liveInfo?.originPlayPage || '';
+function watchUrlOf(room) {
+  if (App.liveProto === 'hls' && room?.hls) return room.hls;
+  return room?.webrtc || App.liveInfo?.originWebrtc || '';
 }
 
 /** hls.js 的 CDN 地址；只在浏览器没有原生 HLS 时才按需加载。 */
@@ -61,8 +60,6 @@ const LIVE_IDS = {
   video: '#liveVideo',
   cover: '#liveCover',
   state: '#liveState',
-  frame: '#stageFrame',
-  embed: 'liveEmbed',
 };
 
 /** 成员频道板块的播放器：同一套实现，只是元素落在另一个容器里。 */
@@ -71,12 +68,10 @@ const CHANNEL_IDS = {
   video: '#channelVideo',
   cover: '#channelCover',
   state: '#channelState',
-  frame: '#channelFrame',
-  embed: 'channelEmbed',
 };
 
 /**
- * 直播播放控制器（WebRTC/WHEP 优先，HLS / 网页内嵌兜底）。
+ * 直播播放控制器（8889 / WebRTC 优先，8888 / HLS 兜底）。
  *
  * 抽成可复用工厂：比赛直播页与成员频道板块各持有一个实例，互不干扰——
  * 元素 id 不同，实例状态（pc / token / 正在播的机位）也各自独立。
@@ -100,7 +95,7 @@ function makePlayer(ids) {
     if (el) el.textContent = text;
   },
 
-  setCover(title, msg, action) {
+  setCover(title, msg) {
     const cover = q(ids.cover);
     const video = this.el();
     if (!cover) return;
@@ -109,43 +104,17 @@ function makePlayer(ids) {
     cover.innerHTML =
       `<div class="stage-cover__noise"></div>` +
       `<div class="stage-cover__title">${title}</div>` +
-      `<div class="stage-cover__msg">${msg}</div>` +
-      (action
-        ? `<button class="btn btn--sm btn--primary" type="button" data-cover-act="${action.act}">${action.label}</button>`
-        : '');
+      `<div class="stage-cover__msg">${msg}</div>`;
   },
 
   hideCover() {
     const cover = q(ids.cover);
     const video = this.el();
     if (cover) cover.hidden = true;
-    // 有内嵌 iframe 时不要把空的 video 露出来（它会盖住 iframe 的下半张脸）
-    if (video) video.hidden = Boolean(q(`#${ids.embed}`));
+    if (video) video.hidden = false;
   },
 
-  embed(url) {
-    const frame = q(ids.frame);
-    if (!frame || !url) {
-      this.setCover('无法内嵌', '缺少直播源地址，请检查管理端配置');
-      return;
-    }
-    const old = q(`#${ids.embed}`);
-    if (old) old.remove();
-    const video = this.el();
-    if (video) video.hidden = true;
-    const el = document.createElement('iframe');
-    el.id = ids.embed;
-    el.src = url;
-    el.allow = 'autoplay; fullscreen; picture-in-picture';
-    el.setAttribute('allowfullscreen', '');
-    frame.appendChild(el);
-    // 关键：必须把遮罩收掉，否则那层噪点/渐变会盖在 iframe 上——画面全被挡住
-    this.hideCover();
-    this.setState('网页内嵌');
-    log.info('直播使用网页内嵌', url);
-  },
-
-  /** HLS：Safari 原生直放；其它浏览器临时取 hls.js（失败再退到内嵌播放页）。 */
+  /** HLS：Safari 原生直放；其它浏览器临时取 hls.js（失败只能改用 WebRTC 线路）。 */
   async hls(url) {
     const video = this.el();
     if (!video || !url) {
@@ -181,10 +150,10 @@ function makePlayer(ids) {
         if (!data?.fatal) return;
         log.warn('HLS 播放出错', data.type, data.details);
         this.destroyHls();
-        this.setCover('HLS 播放失败', `${data.details || data.type}；可改用网页内嵌`, {
-          act: 'embed',
-          label: '改用网页播放',
-        });
+        this.setCover(
+          'HLS 播放失败',
+          `${data.details || data.type}；可在播放器上方把线路切到 WebRTC 再试`
+        );
         this.setState('HLS 失败');
       });
       inst.loadSource(url);
@@ -195,10 +164,10 @@ function makePlayer(ids) {
       log.info('直播使用 HLS（hls.js）', url);
     } catch (err) {
       log.warn('hls.js 不可用', err);
-      this.setCover('当前浏览器不支持 HLS', `${err.message || err}；可改用网页内嵌`, {
-        act: 'embed',
-        label: '改用网页播放',
-      });
+      this.setCover(
+        '当前浏览器不支持 HLS',
+        `${err.message || err}；可在播放器上方把线路切到 WebRTC 再试`
+      );
       this.setState('HLS 不可用');
     }
   },
@@ -213,8 +182,9 @@ function makePlayer(ids) {
     this.hlsInst = null;
   },
 
-  async whep(url) {
-    if (!url) throw new Error('缺少 WHEP 信令地址');
+  /** WebRTC 观看：向「8889 观看地址」POST 一次 SDP 换回 answer。 */
+  async webrtc(url) {
+    if (!url) throw new Error('缺少 WebRTC 观看地址');
     const video = this.el();
     if (!video) throw new Error('播放器尚未就绪');
     this.hideCover();
@@ -264,7 +234,7 @@ function makePlayer(ids) {
     if (!res.ok) throw new Error(`信令失败 HTTP ${res.status}`);
     await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
     this.setState('WebRTC 播放中');
-    log.info('直播使用 WebRTC(WHEP)', url);
+    log.info('直播使用 WebRTC', url);
   },
 
   /** 播放一个机位；room 为 key_endpoints 结果。 */
@@ -278,7 +248,6 @@ function makePlayer(ids) {
     // 所以这里一定要比 mode——只比机位的话，点「HLS / WebRTC」会像没反应。
     const video = this.el();
     const alive =
-      Boolean(q(`#${ids.embed}`)) ||
       this.pc?.connectionState === 'connected' ||
       Boolean(video && video.src && !video.paused);
     if (target && alive && this.playing.key === target.key && this.playing.mode === mode) {
@@ -288,6 +257,21 @@ function makePlayer(ids) {
     await this.stop(false);
     this.room = target;
     if (!this.room) {
+      // 检测还没出结果 / 拿不到结果时，别直接说「没有任何人在直播」——那是误导
+      const state = App.liveHealthState;
+      if (state === 'idle' || state === 'loading') {
+        this.setCover('正在检测推流状态…', '检测完成后会自动列出正在推流的机位，不用手动刷新。');
+        this.setState('检测中');
+        return;
+      }
+      if (state === 'error') {
+        this.setCover(
+          '获取推流状态失败',
+          `${App.liveHealth?.reason || '已连续 3 次未取到推流状态'}；请等服务器恢复后在下方点「重试」。`
+        );
+        this.setState('检测失败');
+        return;
+      }
       this.setCover(
         '没有任何人在直播',
         '现在没有人在推流，所以这里不摆机位。有人开播后会自动出现，点一下即可播放。'
@@ -302,14 +286,13 @@ function makePlayer(ids) {
     }
     this.setState(mode === 'hls' ? '切换到 HLS…' : '连接中…');
     try {
-      // 源站地址直连：whep = WebRTC 拉流，hls = HLS 兜底（用播放列表 index.m3u8）
-      if (mode === 'embed' || mode === 'flv') this.embed(embedUrl(this.room));
-      else if (mode === 'hls') await this.hls(this.room.hls);
+      // 源站地址直连：webrtc = 8889 观看地址，hls = 8888 观看地址
+      if (mode === 'hls') await this.hls(this.room.hls);
       else {
         try {
-          await this.whep(this.room.whep);
+          await this.webrtc(this.room.webrtc);
         } catch (err) {
-          // 自动模式：WebRTC 不通就先退到 HLS（TCP，抗抖动），再不行才用内嵌页
+          // 自动模式：WebRTC 不通就退到 HLS（TCP，抗抖动）；手动选了 WebRTC 就直接报错
           if (mode !== 'auto') throw err;
           log.warn('WebRTC 不可用，改用 HLS', err);
           await this.hls(this.room.hls);
@@ -320,10 +303,10 @@ function makePlayer(ids) {
     } catch (err) {
       log.warn('直播播放失败', mode, err);
       if (mode === 'auto') {
-        this.setCover('直播连接失败', `${err.message || err}；可改用网页播放`, {
-          act: 'embed',
-          label: '网页播放',
-        });
+        this.setCover(
+          '直播连接失败',
+          `${err.message || err}；可在播放器上方手动切换 WebRTC / HLS 线路再试`
+        );
       } else {
         this.setCover('直播连接失败', err.message || String(err));
       }
@@ -363,9 +346,6 @@ function makePlayer(ids) {
         log.debug('重置 video 异常', err);
       }
     }
-    const embedEl = q(`#${ids.embed}`);
-    if (embedEl) embedEl.remove();
-
     if (manual) {
       this.setState('已停止');
       this.setCover('已停止播放', '点击「播放」重新连接直播信号');
@@ -381,16 +361,105 @@ export const Live = makePlayer(LIVE_IDS);
 /** 成员频道板块的播放器（元素在 ``#channelStage`` 里）。 */
 export const ChannelLive = makePlayer(CHANNEL_IDS);
 
-/**
- * 拉一次直播链路健康视图。
+/* --------------------------- 直播信号检测 ---------------------------
  *
- * 服务端默认**只读后台缓存**（毫秒级返回，不会因为媒体服务器不可达而挂住）；
+ * **只在直播 / 频道页运行**：进入这两个页面才开始检测，离开就停。
+ * 没人看直播时既不轮询、后端也不做任何探测。
+ *
+ * 检测结果分四种状态（``App.liveHealthState``）：
+ *   idle    → 还没检测过
+ *   loading → 正在检测（界面显示加载动画）
+ *   ok      → 拿到了推流状态
+ *   error   → 连续失败达到上限，界面显示「获取失败」，不再自动重试
+ *
+ * 关键：每次请求都是「服务端只读缓存、毫秒级返回」，探测本身在服务端后台做，
+ * 所以这里永远不会把界面卡住。
+ */
+export const LIVE_HEALTH_MAX_FAILS = 3;
+const LIVE_HEALTH_INTERVAL = 15000;   // 有人在播：勤一点，观众不必等太久才看到新机位
+const LIVE_HEALTH_IDLE = 60000;       // 没人在播：慢一点，别一直敲媒体服务器
+const LIVE_HEALTH_RETRY = 3000;       // 失败后 / 等待后台探测结果时的重试间隔
+
+let healthRunning = false;
+let healthTimer = null;
+let healthInFlight = false;
+
+/** 进入直播 / 频道页：开始检测（幂等；已排期或正在请求时不重复发）。 */
+export function startLiveHealth() {
+  healthRunning = true;
+  if (healthTimer !== null || healthInFlight) return;
+  log.debug('开始检测直播信号');
+  void healthTick();
+}
+
+/** 离开直播 / 频道页：停止检测，也不再刷新「直播中」标记。 */
+export function stopLiveHealth() {
+  if (!healthRunning && healthTimer === null) return;
+  healthRunning = false;
+  clearTimeout(healthTimer);
+  healthTimer = null;
+  log.debug('停止检测直播信号');
+}
+
+/**
+ * 用户显式要求重新检测（「刷新信号」按钮 / 失败后的「重试」）：
+ * 清掉失败计数，让服务端现场探测一次，并恢复轮询。
+ */
+export async function probeLiveHealth() {
+  App.liveHealthFails = 0;
+  if (App.liveHealthState === 'error') App.liveHealthState = 'loading';
+  healthRunning = true;
+  clearTimeout(healthTimer);
+  healthTimer = null;
+  if (healthInFlight) return false; // 已有一次检测在跑，让它自己收尾即可
+  return healthTick(true);
+}
+
+/** 当前有没有人在推流（选手机位 / 成员频道 / 主直播间三者任一）。 */
+const anyoneStreaming = () =>
+  App.liveMain === true ||
+  (App.liveNow instanceof Set && App.liveNow.size > 0) ||
+  (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0);
+
+async function healthTick(probe = false) {
+  const ok = await refreshLiveHealth({ probe });
+  if (!healthRunning) return ok;
+  // 连续失败到上限就停手：界面显示「获取失败，等待服务器修复」，等用户手动重试
+  if (App.liveHealthState === 'error') {
+    healthRunning = false;
+    return ok;
+  }
+  // 没人在播时把间隔拉长（服务端探测很轻，但没必要一直敲媒体服务器）；
+  // 服务端后台还在探端口（pending）时短间隔催一下，避免面板一直显示「未探测」。
+  const pending = ok && App.liveHealth?.pending === true;
+  const delay = !ok || pending ? LIVE_HEALTH_RETRY : anyoneStreaming() ? LIVE_HEALTH_INTERVAL : LIVE_HEALTH_IDLE;
+  clearTimeout(healthTimer);
+  healthTimer = setTimeout(() => {
+    healthTimer = null;
+    void healthTick();
+  }, delay);
+  return ok;
+}
+
+/**
+ * 拉一次直播链路健康视图；返回本次是否成功。
+ *
+ * 服务端默认**只读缓存**（毫秒级返回，探测在服务端后台跑，不会挂住界面）；
  * 只有用户显式点「刷新信号」时才传 ``probe`` 让服务端现场重新探测一次。
  */
 export async function refreshLiveHealth({ probe = false } = {}) {
   // 按路由回看往届：不探测、也不显示任何「直播中」标记
-  if (App.routeEvent) return;
+  if (App.routeEvent) return true;
+  if (healthInFlight) return true;
+  healthInFlight = true;
+  const prevState = App.liveHealthState;
+  // 首次检测显示加载动画（已有结果时不要闪一下，直接用旧数据渲染）
+  if (App.liveHealthState === 'idle') {
+    App.liveHealthState = 'loading';
+    if (hooks.onLiveHealth) hooks.onLiveHealth(true);
+  }
   let changed = false;
+  let ok = false;
   // 集合是否与上一轮不同（与顺序无关）
   const setDiff = (prev, next) =>
     !(prev instanceof Set) || prev.size !== next.size || [...next].some((x) => !prev.has(x));
@@ -411,10 +480,16 @@ export async function refreshLiveHealth({ probe = false } = {}) {
     App.liveNow = next;
     App.liveChannelsNow = nextChannels;
     App.liveMain = main;
+    App.liveHealthFails = 0;
+    App.liveHealthState = 'ok';
+    ok = true;
     log.info('直播信号状态', App.liveHealth);
   } catch (err) {
     log.warn('直播信号探测失败', err);
-    // streamingKnown: false = 「谁在推流」这份数据拿不到（前端据此说明「无法判断」）
+    App.liveHealthFails += 1;
+    // 连续失败到上限就停在 error：界面显示「获取失败，等待服务器修复」
+    App.liveHealthState = App.liveHealthFails >= LIVE_HEALTH_MAX_FAILS ? 'error' : 'loading';
+    // 拿不到数据就不要挂「直播中」标记（宁可少显示，也不给假的）
     App.liveHealth = {
       ok: false,
       streamingKnown: false,
@@ -429,9 +504,14 @@ export async function refreshLiveHealth({ probe = false } = {}) {
     App.liveNow = new Set();
     App.liveChannelsNow = new Set();
     App.liveMain = null;
+  } finally {
+    healthInFlight = false;
   }
-  // 只有「谁在推流」真的变了才重绘视图，避免每次轮询都重建 DOM
+  // 检测状态本身变了（检测中 → 已获取 / 检测中 → 获取失败）也要重绘，提示才会跟着换；
+  // 其余情况只有「谁在推流」真的变了才重绘，避免每次轮询都重建 DOM。
+  if (prevState !== App.liveHealthState) changed = true;
   if (hooks.onLiveHealth) hooks.onLiveHealth(changed);
+  return ok;
 }
 
 /** 在 #liveStage 上安装一次点击委托（舞台会被重建，故委托挂在稳定祖先上）。 */
@@ -439,13 +519,6 @@ export function installStageDelegation() {
   const stage = qs('#liveStage');
   if (!stage) return;
   stage.addEventListener('click', (e) => {
-    const cover = e.target.closest('[data-cover-act]');
-    if (cover) {
-      if (cover.dataset.coverAct === 'embed') {
-        Live.embed(embedUrl(Live.room));
-      }
-      return;
-    }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const act = btn.dataset.act;
@@ -472,35 +545,32 @@ export function installStageDelegation() {
     if (act === 'live-play') Live.playSelected(App.state);
     else if (act === 'live-stop') Live.stop(true);
     else if (act === 'live-open') {
-      const url = embedUrl(Live.room);
+      const url = watchUrlOf(Live.room);
       if (url) window.open(url, '_blank', 'noopener');
     } else if (act === 'live-copy') {
-      // 复制哪条播放地址跟随当前线路：HLS 给播放页（…/<流名>/），WebRTC 给 WHEP
+      // 复制观看地址：跟随当前线路给 8888 或 8889 那一条
       const url =
-        (App.liveProto === 'hls' ? Live.room?.hlsPage : Live.room?.whep) ||
-        Live.room?.whep ||
-        App.liveInfo?.originWhep ||
+        (App.liveProto === 'hls' ? Live.room?.hls : Live.room?.webrtc) ||
+        Live.room?.webrtc ||
+        App.liveInfo?.originWebrtc ||
         '';
       copyText(url).then((ok) =>
         toast(ok ? `已复制播放地址：${url}` : '复制失败', ok ? 'ok' : 'err', ok ? 6000 : 3600)
       );
     } else if (act === 'live-copy-push') {
-      // 推流地址只在管理端私有数据里，用户端拿不到；
-      // 复制哪一套跟随当前播放线路：WebRTC 线路配 WHIP，HLS（TCP）线路配 RTMP。
+      // 推流地址只在管理端私有数据里，用户端拿不到；推流只有 WHIP 一种
       if (!isAdmin()) {
         toast('推流地址仅管理员可见', 'warn');
         return;
       }
-      // 推流优先 WHIP：默认复制 WHIP，只有观众切到 HLS 线路时才给 TCP 套的 RTMP
-      const proto = App.liveProto === 'hls' ? 'rtmp' : 'whip';
-      const url = pushUrlOf(App.livePlayerId, proto);
+      const url = pushUrlOf(App.livePlayerId);
       if (!url) {
-        toast(`该选手还没有 ${proto.toUpperCase()} 推流地址（在「选手」页编辑该选手填推流流名）`, 'warn', 6000);
+        toast('该机位还没有 WHIP 推流地址（在「选手」页编辑该选手填推流流名）', 'warn', 6000);
         return;
       }
       copyText(url).then((ok) => {
         if (!ok) return toast('复制失败', 'err');
-        return toast(`${proto.toUpperCase()} 推流地址已复制 · ${PUSH_TIP_LINE}`, 'ok', 9000);
+        return toast(`WHIP 推流地址已复制 · ${PUSH_TIP_LINE}`, 'ok', 9000);
       });
     } else if (act === 'live-proto') {
       // 观众自行切换播放线路：再点一次同一线路 = 恢复默认（跟随服务端配置）
@@ -524,7 +594,10 @@ export function installStageDelegation() {
       Live.playSelected(App.state);
     } else if (act === 'live-refresh') {
       // 用户显式要求刷新：让服务端现场重新探测（可能要等媒体服务器超时，但这是主动操作）
-      refreshLiveHealth({ probe: true }).then(() => Live.playSelected(App.state));
+      probeLiveHealth().then(() => Live.playSelected(App.state));
+    } else if (act === 'live-health-retry') {
+      // 「获取失败」提示里的重试：清零失败计数并现场探一次
+      probeLiveHealth().then(() => Live.playSelected(App.state));
     }
   });
 }

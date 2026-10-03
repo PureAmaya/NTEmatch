@@ -42,17 +42,11 @@ export const pushEndpointsOf = (pid) =>
   (isMainRoom(pid) ? App.private?.defaultPush : privateOf(pid).endpoints) || {};
 
 /**
- * 选手个人的推流地址。
+ * 某个机位的推流地址（只有 WHIP 一种）。
  *
- * ``proto``：``whip``（WebRTC 套，默认）/ ``rtmp`` / ``rtsp``（后两者为 TCP 套）。
- * 地址只由选手自己的流名决定（整届固定），与在哪场比赛无关。
+ * 地址只由该机位自己的流名决定（整届固定），与在哪场比赛无关。
  */
-export const pushUrlOf = (pid, proto = 'whip') => {
-  const endpoints = pushEndpointsOf(pid);
-  if (proto === 'rtmp') return endpoints.rtmpPush || '';
-  if (proto === 'rtsp') return endpoints.rtspPush || '';
-  return endpoints.whipPush || '';
-};
+export const pushUrlOf = (pid) => pushEndpointsOf(pid).whipPush || '';
 
 /**
  * 某场比赛的机位信息（本场出场的每位选手 + 他们各自的固定地址），仅管理端可见。
@@ -70,10 +64,9 @@ export const roundStreamsOf = (code) => (code && App.private?.rounds?.[code]) ||
  * 所以凡是出现推流地址的地方都要提醒一次。
  */
 export const PUSH_TIPS = [
-  '优先用 <b>WHIP</b>（WebRTC / UDP）：延迟最低、弱网下表现最好，OBS 30+ 原生支持；',
-  '备选 <b>RTMP / RTSP</b>（TCP）：只在 WHIP 推不上去时再用，延迟略高但更稳；',
+  '推流只有 <b>WHIP</b> 一种（WebRTC / UDP）：延迟最低、弱网下表现最好，OBS 30+ 原生支持；',
   'OBS 里把 <b>B 帧 / B-frames 设为 0</b>，关键帧间隔（Keyframe Interval）设 2 秒，编码器用 H.264；',
-  '开了 B 帧会让 WebRTC 推流花屏、卡顿甚至连不上（HLS / RTMP 观看侧同样受益）。',
+  '开了 B 帧会让 WebRTC 推流花屏、卡顿甚至连不上（HLS 观看侧同样受影响）。',
 ];
 
 /** 一行版：复制按钮的 title、复制后的提醒。 */
@@ -138,16 +131,14 @@ export const isMainLive = () => {
   return known === true;
 };
 
-/** 主直播间的播放地址集合（取自公开的源地址）；连地址都没有就没有这一路。 */
+/** 主直播间的观看地址集合（取自公开的源地址）；连地址都没有就没有这一路。 */
 export function mainRoom() {
   const e = App.liveInfo || App.state?.live || {};
-  if (!e.originWhep && !e.originPlayPage) return null;
+  if (!e.originWebrtc && !e.originHls) return null;
   return {
     key: e.key || 'stream',
     main: true,
-    page: e.originPlayPage || '',
-    hlsPage: e.originHlsPage || '',
-    whep: e.originWhep || '',
+    webrtc: e.originWebrtc || '',
     hls: e.originHls || '',
   };
 }

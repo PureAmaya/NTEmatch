@@ -1024,6 +1024,34 @@ img { display: block; max-width: 100%; }
 /* 一个在播机位都没有：整条只留这句话，不再摆一排点了没画面的空机位 */
 .live-pick__empty--none { display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap; }
 .live-pick__empty--none b { color: var(--txt); font-size: 12.5px; }
+
+/* 直播信号检测的加载 / 失败占位（放在机位选择条里，不遮挡其它内容）。
+   动画只走 transform / opacity，不触发布局，也不影响页面其它部分的响应。 */
+.ldg {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px;
+  width: 100%; padding: 18px 14px; text-align: center;
+  font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .1em; color: var(--txt-mute);
+}
+.ldg__bars { display: inline-flex; align-items: flex-end; gap: 3px; height: 15px; }
+.ldg__bars i {
+  width: 3px; height: 100%; background: var(--accent); border-radius: 1px;
+  transform-origin: bottom; animation: ldgBar 1.05s ease-in-out infinite;
+}
+.ldg__bars i:nth-child(2) { animation-delay: .13s; }
+.ldg__bars i:nth-child(3) { animation-delay: .26s; }
+.ldg__bars i:nth-child(4) { animation-delay: .39s; }
+@keyframes ldgBar {
+  0%, 100% { transform: scaleY(.22); opacity: .4; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+.ldg__msg { max-width: 52ch; line-height: 1.6; }
+.ldg__msg b {
+  display: block; color: var(--txt); font-family: var(--font-ui); font-size: 13px;
+  letter-spacing: .04em; margin-bottom: 3px;
+}
+/* 获取失败：换警示色并停掉动画（不再假装还在转） */
+.ldg--err .ldg__bars i { background: var(--warn); animation: none; transform: scaleY(.3); opacity: .8; }
+.ldg--err .btn { margin-top: 2px; }
 /* 主直播间：不属于任何选手，描边与文字都区分开 */
 .live-chip--main { border-style: dashed; border-color: rgba(255, 216, 61, .5); }
 .live-chip--main .live-chip__name { color: var(--warn); }
@@ -1607,7 +1635,7 @@ img { display: block; max-width: 100%; }
 /* 28.5 本场推流 / 播放地址表（管理端弹窗，按协议套分表） */
 .streams { margin-top: 10px; border: 1px solid var(--line); background: rgba(8, 12, 19, .42); }
 .streams--webrtc { border-left: 3px solid var(--accent); }
-.streams--tcp { border-left: 3px solid var(--amber); }
+.streams--hls { border-left: 3px solid var(--amber); }
 .streams__title {
   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
   padding: 7px 9px; border-bottom: 1px solid var(--line);
@@ -1615,7 +1643,7 @@ img { display: block; max-width: 100%; }
 }
 .streams__title > b { font-family: var(--font-disp); font-size: 12.5px; letter-spacing: .1em; }
 .streams--webrtc .streams__title > b { color: var(--accent); }
-.streams--tcp .streams__title > b { color: var(--amber); }
+.streams--hls .streams__title > b { color: var(--amber); }
 .streams__title > span { font-size: 11px; color: var(--txt-mute); }
 .streams__col { letter-spacing: .04em; }
 .streams__row {
@@ -1759,7 +1787,7 @@ img { display: block; max-width: 100%; }
   font-family: var(--font-disp); font-size: 10px; letter-spacing: .1em;
 }
 .streams__badge--webrtc { border-color: rgba(47, 224, 138, .7); color: var(--ok); }
-.streams__badge--tcp { color: var(--txt-mute); }
+.streams__badge--hls { color: var(--txt-mute); }
 
 /* 32.2 线路切换按钮上的「优先」角标（用继承色，选中态下也清晰） */
 .stage-bar__mid sup { margin-left: 3px; font-size: 9px; letter-spacing: .04em; opacity: .8; }

@@ -234,7 +234,7 @@ def public_player(player: Player, *, has_stream: bool | None = None) -> dict[str
 # 哪台机位对应哪场比赛是「组织信息」，由对局里出场的选手决定，
 # 观众在直播页按比赛筛选机位即可。
 #
-# 播放地址（WHEP / HLS）可对用户端公开；**推流地址（WHIP / RTMP）只在管理端出现**。
+# 观看地址（8889 / 8888）可对用户端公开；**推流地址（WHIP）只在管理端出现**。
 # --------------------------------------------------------------------------- #
 def clean_key(text: str) -> str:
     """推流路径片段：只保留字母数字与 - _，避免拼出越界路径。"""
@@ -272,10 +272,11 @@ def current_round_of(cfg: Config, player_id: str) -> Round | None:
     return max(containing, key=lambda r: r.index)
 
 
-# 播放相关字段白名单：推流凭据（whipPush / rtmpPush）绝不外发。
-# 全是**媒体服务器的源地址**（不做反代），前端直连：
-#   ``page`` = 自带播放页（内嵌观看）、``whep`` = WebRTC 拉流、``hls`` = HLS。
-PLAY_ENDPOINT_KEYS = ("key", "page", "whep", "hlsPage", "hls")
+# 对外可见地址的字段白名单。全是**媒体服务器的源地址**（不做反代），前端直连：
+#   ``webrtc`` = ``<baseUrl>/<流名>``（8889）观看；
+#   ``hls``    = ``<hlsBase>/<流名>``（8888）观看。
+# 观看地址就是「端口 + 流名」，没有 ``/whep`` 之类的子路由。
+PLAY_ENDPOINT_KEYS = ("key", "webrtc", "hls")
 
 
 # 对外可见的直播配置字段（白名单，避免日后新增字段时又把凭据漏出去）。
@@ -296,100 +297,79 @@ PUBLIC_STREAM_FIELDS = (
 def public_stream_config(stream: StreamConfig) -> dict[str, Any]:
     """对外可见的直播配置。
 
-    白名单式剥离：默认流名、WHIP / RTMP 推流地址、RTMP / HLS 源地址都不下发，
+    白名单式剥离：默认流名、WHIP 推流地址、HLS 根地址都不下发，
     用户端只需要「是否启用 / 播放模式 / 展示文案 / 播放器同源地址」。
     """
     data = stream.dump()
     return {key: data[key] for key in PUBLIC_STREAM_FIELDS if key in data}
 
 
-# 推流凭据：WHIP（WebRTC）与 RTMP / RTSP（TCP）——仅管理端可见
-PUSH_ENDPOINT_KEYS = ("key", "whipPush", "rtmpPush", "rtspPush")
+# 推流凭据：只有 WHIP（WebRTC / UDP）——仅管理端可见
+PUSH_ENDPOINT_KEYS = ("key", "whipPush")
 
 
 def push_endpoints(stream: StreamConfig, key: str) -> dict[str, str]:
-    """推流地址（WHIP / RTMP / RTSP）——**仅管理端可见**，绝不下发用户端。"""
+    """推流地址（WHIP）——**仅管理端可见**，绝不下发用户端。"""
     full = key_endpoints(stream, key)
     return {name: full[name] for name in PUSH_ENDPOINT_KEYS if full.get(name)}
 
 
 def protocol_sets(stream: StreamConfig) -> list[dict[str, Any]]:
-    """**两套协议**的列定义（不含具体地址），供管理端渲染复制表格。
+    """推流与观看的**协议列定义**（不含具体地址），供管理端渲染复制表格。
 
-    两套都能推流与播放，各取所长：
+    * ``webrtc``（8889）：``/<流名>/whip`` 推流 + ``/<流名>`` 观看（UDP，延迟最低）；
+    * ``hls``（8888）：``/<流名>`` 观看（TCP，抗抖动）。
 
-    * ``webrtc``：WHIP 推流 / WHEP 播放（UDP）——延迟最低，弱网下可能抖；
-    * ``tcp``：RTMP 推流、RTSP 推·播 / HLS 播放（TCP）——抗抖动，
-      其中 HLS 任何浏览器都能直接播，RTSP / RTMP 供 VLC、ffplay、OBS 等工具使用。
-
-    只返回**已配置**的协议列（没填 RTSP 根地址就不会出现 RTSP 列）。
-    每一列带 ``kind``：``push`` 推流 / ``play`` 播放 / ``both`` 推播同址，
+    只返回**已配置**的协议列。每一列带 ``kind``：``push`` 推流 / ``play`` 观看，
     具体地址按流名放在各行的 ``endpoints`` 里（见 :func:`key_endpoints`）。
     """
     base = (stream.base_url or "").strip()
-    rtmp = (stream.rtmp_base or "").strip()
-    rtsp = (stream.rtsp_base or "").strip()
     hls = (stream.hls_base or "").strip()
-
-    webrtc_cols = [
-        {
-            "key": "whipPush",
-            "label": "WHIP 推流（优先）",
-            "kind": "push",
-            "hint": "优先用这个：OBS 30+ 原生支持，记得把 B 帧设为 0",
-        },
-        {"key": "whep", "label": "WHEP 播放", "kind": "play", "hint": "网页播放器"},
-    ]
-    tcp_cols = [
-        {"key": "rtmpPush", "label": "RTMP 推流", "kind": "push", "hint": "备选：OBS 经典模式"},
-        {"key": "rtspPush", "label": "RTSP 推 · 播", "kind": "both", "hint": "备选：VLC / ffplay"},
-        # HLS 分两条：给人看的播放页（地址到 /<流名>/ 为止）与给播放器用的列表
-        {"key": "hlsPage", "label": "HLS 播放页", "kind": "play", "hint": "浏览器直接打开就能看，地址到 /<流名>/ 为止"},
-        {"key": "hls", "label": "HLS 播放列表", "kind": "play", "hint": "播放器 / hls.js 用（…/index.m3u8）"},
-    ]
 
     sets: list[dict[str, Any]] = []
     if base:
         sets.append(
             {
                 "id": "webrtc",
-                "label": "WebRTC 套 · UDP",
-                # 推流优先用这一套：延迟最低，WHIP 是 OBS 30+ 的原生协议
+                "label": "WebRTC · 8889",
                 "preferred": True,
                 "badge": "优先",
-                "note": "延迟最低（约 1 秒）；推流请优先用这里的 WHIP（OBS 里不要开 B 帧）",
-                "columns": webrtc_cols,
+                "note": "推流用 /whip；观众打开不带 /whip 的那一条即可（延迟最低）",
+                "columns": [
+                    {
+                        "key": "whipPush",
+                        "label": "WHIP 推流",
+                        "kind": "push",
+                        "hint": "选手 / 频道在 OBS 里填这个地址；记得把 B 帧设为 0",
+                    },
+                    {"key": "webrtc", "label": "观看 8889", "kind": "play", "hint": "浏览器直接打开就能看"},
+                ],
             }
         )
-    if rtmp or rtsp or hls:
+    if hls:
         sets.append(
             {
-                "id": "tcp",
-                "label": "TCP 套 · 抗抖动",
+                "id": "hls",
+                "label": "HLS · 8888",
                 "preferred": False,
                 "badge": "备选",
-                "note": "WHIP 推不上去时再用：走 TCP 不易丢帧（延迟 2~10 秒）；RTMP / RTSP 推流与播放同址",
+                "note": "走 TCP 不易丢帧（延迟 2~10 秒）；观众打开 8888 的那一条即可",
                 "columns": [
-                    col
-                    for col in tcp_cols
-                    if {"rtmpPush": rtmp, "rtspPush": rtsp, "hlsPage": hls, "hls": hls}.get(col["key"])
+                    {"key": "hls", "label": "观看 8888", "kind": "play", "hint": "浏览器直接打开就能看"},
                 ],
             }
         )
     return sets
 
 
-def play_endpoints(stream: StreamConfig, key: str, *, compact: bool = False) -> dict[str, str]:
-    """只取**源站播放地址**（媒体服务器直连），不含任何推流地址。
+def play_endpoints(stream: StreamConfig, key: str) -> dict[str, str]:
+    """只取**观看地址**（媒体服务器直连），不含推流地址。
 
-    ``compact=True`` 时只保留前端实际用到的地址（WHEP / HLS 播放页 / HLS 播放列表 /
-    内嵌观看页），避免状态体过大——每场比赛都会带一份。
+    返回 :data:`PLAY_ENDPOINT_KEYS` 那几个键（8889 与 8888 各一条），数量很少，
+    调用方无需再裁剪。
     """
     full = key_endpoints(stream, key)
-    names = (
-        ("key", "page", "whep", "hlsPage", "hls") if compact else PLAY_ENDPOINT_KEYS
-    )
-    return {name: full[name] for name in names if full.get(name)}
+    return {name: full[name] for name in PLAY_ENDPOINT_KEYS if full.get(name)}
 
 
 def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str, Any]:
@@ -436,7 +416,7 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
             "playerId": pid,
             "name": players[pid].name or pid,
             "key": player_stream_key(players[pid]),
-            "play": play_endpoints(cfg.stream, player_stream_key(players[pid]), compact=True),
+            "play": play_endpoints(cfg.stream, player_stream_key(players[pid])),
         }
         for pid in round_player_ids(rnd)
         if pid in players and players[pid].stream_key
@@ -921,41 +901,29 @@ def validate_config(cfg: Config) -> list[str]:
 # 直播地址派生（按流名生成推流 / 播放地址，支持多组并行各自推流）
 # --------------------------------------------------------------------------- #
 def key_endpoints(stream: StreamConfig, key: str) -> dict[str, str]:
-    """按流名派生**两套协议**的源站地址（媒体服务器直连，不做反代）。
+    """按流名派生**推流与观看**的源站地址（媒体服务器直连，不做反代）。
 
-    两套都能推流与播放：
+    一共三个地址，都只在端口上按流名区分，没有 ``/whep`` 这类子路由：
 
-    * WebRTC（UDP）：``whipPush`` 推流 / ``whep`` 播放，延迟最低；
-    * TCP：``rtmpPush`` / ``rtspPush`` 推流，``hls`` / ``rtspPlay`` / ``rtmpPlay`` 播放。
+    * 推流（WHIP，8889）：``{baseUrl}/{流名}/whip``；
+    * 观看（WebRTC，8889）：``{baseUrl}/{流名}``；
+    * 观看（HLS，8888）：``{hlsBase}/{流名}``。
 
-    ⚠️ RTMP 与 RTSP 的推流与播放**是同一个地址**（方向由客户端决定），
-    所以 ``rtmpPush``/``rtmpPlay``（及 rtsp 对应项）值相同；
-    对外只下发 WebRTC / HLS 的播放地址，避免暴露可推流路径。
+    ``whipPush`` 属于凭据，只走 :func:`push_endpoints` 下发管理端；
+    两个观看地址走 :func:`play_endpoints`，可对用户端公开。
     """
     key = (key or "").strip().strip("/")
     if not key:
         return {}
     base = (stream.base_url or "").rstrip("/")
-    rtmp = (stream.rtmp_base or "").rstrip("/")
-    rtsp = (stream.rtsp_base or "").rstrip("/")
     hls = (stream.hls_base or "").rstrip("/")
     return {
         "key": key,
-        # —— WebRTC 套（UDP）——
+        # —— 8889：推流多一个 /whip，观看就是流名本身 ——
         "whipPush": f"{base}/{key}/whip" if base else "",
-        "whep": f"{base}/{key}/whep" if base else "",
-        "page": f"{base}/{key}/" if base else "",
-        # —— TCP 套：RTMP（推播同址）——
-        "rtmpPush": f"{rtmp}/{key}" if rtmp else "",
-        "rtmpPlay": f"{rtmp}/{key}" if rtmp else "",
-        # —— TCP 套：RTSP（推播同址）——
-        "rtspPush": f"{rtsp}/{key}" if rtsp else "",
-        "rtspPlay": f"{rtsp}/{key}" if rtsp else "",
-        # —— TCP 套：HLS（只能播放，浏览器可直接播）——
-        # ``hlsPage``  = 媒体服务器的 HLS 播放页，地址到 ``/<流名>/`` 为止，贴浏览器就能看
-        # ``hls``      = 播放列表（``index.m3u8``），给 hls.js / 原生 Safari 播放用
-        "hlsPage": f"{hls}/{key}/" if hls else "",
-        "hls": f"{hls}/{key}/index.m3u8" if hls else "",
+        "webrtc": f"{base}/{key}" if base else "",
+        # —— 8888：只能观看 ——
+        "hls": f"{hls}/{key}" if hls else "",
     }
 
 
@@ -1002,8 +970,8 @@ def channel_view(cfg: Config, channel: Channel) -> dict[str, Any]:
         "avatar": channel.avatar,
         "hasAvatar": channel.has_avatar_source,
         "hasStream": bool(key),
-        # 播放地址（WHEP / HLS / 内嵌页）——源站直连，不含推流凭据
-        "play": play_endpoints(cfg.stream, key, compact=True) if key else {},
+        # 观看地址（8889 / 8888）——源站直连，不含推流凭据
+        "play": play_endpoints(cfg.stream, key) if key else {},
     }
 
 

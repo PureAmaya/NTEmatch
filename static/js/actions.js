@@ -38,7 +38,7 @@ import {
 import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
 import { invalidateEvents, loadEvents, renderEventsView } from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
-import { ChannelLive, refreshLiveHealth } from './live.js';
+import { ChannelLive, probeLiveHealth } from './live.js';
 import { focusLive, renderChannels, renderPublic } from './views.js';
 
 /** 按对局编号（WB-1-2）或序号定位一场比赛。 */
@@ -606,21 +606,21 @@ function openRoundLiveModal(rnd) {
 
   const tables = sets.length
     ? sets.map(block).join('')
-    : `<div class="notice notice--warn">还没有配置直播根地址（WebRTC / RTMP / RTSP / HLS），` +
+    : `<div class="notice notice--warn">还没有配置直播根地址（WebRTC / HLS），` +
       `请到「直播配置」里填写。</div>`;
 
   Modal.open({
     title: `直播地址 · ${rnd.label || rnd.code}`,
     body:
-      // 推流地址就在下面：先把「优先 WHIP / 关掉 B 帧」讲清楚
+      // 推流地址就在下面：先把「WHIP / 关掉 B 帧」讲清楚
       pushTipsHtml() +
       tables +
       (cast.length
         ? `<div class="notice" style="margin-top:10px">本场有 ${cast.length} 路选手机位：` +
-          `<b>推流优先用 WebRTC 套的 WHIP</b>（延迟最低），推不上去再用 TCP 套` +
-          `（RTMP / RTSP 推，HLS / RTSP 播）。选手的地址整届固定，换比赛不用重推。</div>`
+          `<b>推流用 WHIP</b>（WebRTC / UDP，延迟最低）；观看有 WebRTC 与 HLS 两条线路，` +
+          `观众可自行切换。选手的地址整届固定，换比赛不用重推。</div>`
         : `<div class="notice notice--warn" style="margin-top:10px">本场选手都还没有推流流名，` +
-          `可在「选手」页点该选手的「编辑」填推流流名（每位必须唯一），填好后这里会自动生成两套地址。</div>`) +
+          `可在「选手」页点该选手的「编辑」填推流流名（每位必须唯一），填好后这里会自动生成推流与播放地址。</div>`) +
       `<div class="notice" style="margin-top:10px">推流地址只在管理端显示，观众只会拿到播放地址；` +
       `观众在直播页按<b>比赛</b>筛选机位。</div>`,
     footer: `<button class="btn btn--sm btn--ghost" type="button" data-close>关闭</button>`,
@@ -1671,9 +1671,8 @@ function openPlayerEditModal(player, defaults = {}) {
       }) +
       fieldText('streamKey', '推流流名（必须唯一）', priv.streamKey || '', {
         hint: priv.endpoints?.whipPush
-          ? `优先 WHIP：${priv.endpoints.whipPush}` +
-            `；备选 RTMP：${priv.endpoints.rtmpPush || '未配置'}（整届固定，换比赛不用重推）。` +
-            PUSH_TIP_LINE
+          ? `该选手的 WHIP 推流地址：${priv.endpoints.whipPush}` +
+            `（整届固定，换比赛不用重推）。${PUSH_TIP_LINE}`
           : `每位选手互不相同；它就是这位选手的推流地址，如 tom → …/tom/whip（整届固定）。${PUSH_TIP_LINE}`,
       }) +
       fieldText('qq', 'QQ（可选）', priv.qq || '', { hint: '仅服务端用于取头像' }) +
@@ -1810,7 +1809,7 @@ function openChannelModal(channel) {
       fieldText('role', '常驻角色 / 称号', channel?.role || '', { ph: '展示用，可留空' }) +
       fieldText('streamKey', '推流流名（必须唯一）', priv.streamKey || '', {
         hint: priv.endpoints?.whipPush
-          ? `优先 WHIP：${priv.endpoints.whipPush}；备选 RTMP：${priv.endpoints.rtmpPush || '未配置'}。${PUSH_TIP_LINE}`
+          ? `该频道的 WHIP 推流地址：${priv.endpoints.whipPush}。${PUSH_TIP_LINE}`
           : `全局唯一（与任何选手流名也不能重复）；它就是这位群友的推流地址，如 tom → …/tom/whip（常驻，不用改）。${PUSH_TIP_LINE}`,
       }) +
       fieldText('qq', 'QQ（可选）', priv.qq || '', { hint: '仅服务端用于取头像' }) +
@@ -1947,14 +1946,14 @@ export async function handleAction(act, el) {
       return;
     case 'channel-open': {
       const room = channelOf(App.channelId)?.play || {};
-      const url = (App.liveProto === 'hls' ? room.hlsPage : room.page) || room.page || '';
+      const url = (App.liveProto === 'hls' ? room.hls : room.webrtc) || room.webrtc || '';
       if (url) window.open(url, '_blank', 'noopener');
       return;
     }
     case 'channel-copy': {
       const room = channelOf(App.channelId)?.play || {};
-      // 复制哪条播放地址跟随当前线路：HLS 给播放页（…/<流名>/），WebRTC 给 WHEP
-      const url = (App.liveProto === 'hls' ? room.hlsPage : room.whep) || room.whep || '';
+      // 复制观看地址：跟随当前线路给 8888 或 8889 那一条
+      const url = (App.liveProto === 'hls' ? room.hls : room.webrtc) || room.webrtc || '';
       copyText(url).then((ok) =>
         toast(ok ? `已复制播放地址：${url}` : '复制失败', ok ? 'ok' : 'err', ok ? 6000 : 3600)
       );
@@ -1972,8 +1971,15 @@ export async function handleAction(act, el) {
       return;
     }
     case 'channel-refresh':
-      // 显式刷新：让服务端现场重新探测一次信号
-      refreshLiveHealth({ probe: true }).then(() => watchChannel(App.channelId));
+      // 显式刷新：清零失败计数并让服务端现场重新探测一次信号
+      probeLiveHealth().then(() => watchChannel(App.channelId));
+      return;
+    case 'live-health-retry':
+      // 「获取失败，等待服务器修复」里的重试按钮（直播页走舞台委托，这里是频道页）
+      probeLiveHealth().then(() => {
+        if (App.view === 'channels' && App.state) renderChannels(App.state);
+        else renderPublic();
+      });
       return;
     case 'channel-notice-edit':
       return openChannelNoticeModal();

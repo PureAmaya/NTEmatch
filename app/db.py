@@ -94,17 +94,11 @@ CREATE TABLE IF NOT EXISTS event_stream (
   api_base   TEXT NOT NULL DEFAULT '',
   api_user   TEXT NOT NULL DEFAULT '',
   api_pass   TEXT NOT NULL DEFAULT '',
-  rtmp_base  TEXT NOT NULL DEFAULT '',
-  rtsp_base  TEXT NOT NULL DEFAULT '',
   hls_base   TEXT NOT NULL DEFAULT '',
   stream_key TEXT NOT NULL DEFAULT 'stream',
   mode       TEXT NOT NULL DEFAULT 'auto',
   verify_tls INTEGER NOT NULL DEFAULT 1,
-  rtmp_push  TEXT NOT NULL DEFAULT '',
   whip_push  TEXT NOT NULL DEFAULT '',
-  rtsp_url   TEXT NOT NULL DEFAULT '',
-  hls_url    TEXT NOT NULL DEFAULT '',
-  flv_url    TEXT NOT NULL DEFAULT '',
   poster     TEXT NOT NULL DEFAULT '',
   title      TEXT NOT NULL DEFAULT '',
   note       TEXT NOT NULL DEFAULT ''
@@ -273,7 +267,7 @@ def _upgrade_stream_https(stream: dict[str, Any]) -> dict[str, Any]:
     """把旧默认的 http://live.shiyora.net… 升到 https（幂等，只动默认 host）。"""
     out = dict(stream)
     upgraded: list[str] = []
-    for field in ("baseUrl", "hlsBase", "whipPush", "hlsUrl"):
+    for field in ("baseUrl", "hlsBase", "whipPush"):
         raw = str(out.get(field) or "")
         for origin in _LEGACY_PLAIN_ORIGINS:
             if raw.startswith(origin):
@@ -302,8 +296,6 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         "loser_bracket": "INTEGER NOT NULL DEFAULT 1",
     },
     "event_stream": {
-        "rtsp_base": "TEXT NOT NULL DEFAULT ''",
-        "rtsp_url": "TEXT NOT NULL DEFAULT ''",
         "verify_tls": "INTEGER NOT NULL DEFAULT 1",
         # MediaMTX 控制 API：用来查「谁真的在推流」
         "api_base": "TEXT NOT NULL DEFAULT ''",
@@ -339,6 +331,33 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 
+# 已废弃的列：RTMP / RTSP / FLV 支持已从代码里移除，旧库启动时一并清掉。
+# SQLite 的 DROP COLUMN 需要 3.35+（Python 3.11 自带的通常满足）；不支持时
+# 静默跳过——留着这几列不影响功能，模型已经不认它们了。
+_OBSOLETE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "event_stream": ("rtmp_base", "rtsp_base", "rtmp_push", "rtsp_url", "hls_url", "flv_url"),
+}
+
+
+def _drop_columns(conn: sqlite3.Connection) -> None:
+    """删除已废弃的列（幂等）：让旧库跟上当前结构，而不是一直留着死列。"""
+    dropped: list[str] = []
+    for table, columns in _OBSOLETE_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for name in columns:
+            if name not in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN {name}")
+                dropped.append(f"{table}.{name}")
+            except sqlite3.OperationalError as exc:
+                log.warning("废弃列删除失败（忽略，不影响功能） | %s.%s | %s", table, name, exc)
+    if dropped:
+        log.warning("数据库结构已清理 | 删除废弃列=%s", ", ".join(dropped))
+
+
 def _ensure_columns(conn: sqlite3.Connection) -> None:
     """按需补列（幂等）：让旧数据库无缝升级到新赛制结构。"""
     added: list[str] = []
@@ -352,6 +371,8 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
                 added.append(f"{table}.{name}")
     if added:
         log.warning("数据库结构已升级 | 新增列=%s", ", ".join(added))
+    # 补列之后再删废弃列（两者互不重叠；顺序反过来也能跑）
+    _drop_columns(conn)
 
 
 def init_db(path: Path) -> None:
@@ -505,18 +526,12 @@ def save_event(
             # 控制 API 的 Basic 认证（属于凭据，只在管理端下发）
             "api_user": stream.get("apiUser", ""),
             "api_pass": stream.get("apiPass", ""),
-            "rtmp_base": stream.get("rtmpBase", ""),
-            "rtsp_base": stream.get("rtspBase", ""),
             "hls_base": stream.get("hlsBase", ""),
             "stream_key": stream.get("streamKey", "stream"),
             "mode": stream.get("mode", "auto"),
             # 是否校验上游 HTTPS 证书（自签名证书时关闭）
             "verify_tls": int(bool(stream.get("verifyTls", True))),
-            "rtmp_push": stream.get("rtmpPush", ""),
             "whip_push": stream.get("whipPush", ""),
-            "rtsp_url": stream.get("rtspUrl", ""),
-            "hls_url": stream.get("hlsUrl", ""),
-            "flv_url": stream.get("flvUrl", ""),
             "poster": stream.get("poster", ""),
             "title": stream.get("title", ""),
             "note": stream.get("note", ""),
@@ -916,17 +931,11 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
                 "apiBase": stream["api_base"],
                 "apiUser": stream["api_user"],
                 "apiPass": stream["api_pass"],
-                "rtmpBase": stream["rtmp_base"],
-                "rtspBase": stream["rtsp_base"],
                 "hlsBase": stream["hls_base"],
                 "streamKey": stream["stream_key"],
                 "mode": stream["mode"],
                 "verifyTls": bool(stream["verify_tls"]),
-                "rtmpPush": stream["rtmp_push"],
                 "whipPush": stream["whip_push"],
-                "rtspUrl": stream["rtsp_url"],
-                "hlsUrl": stream["hls_url"],
-                "flvUrl": stream["flv_url"],
                 "poster": stream["poster"],
                 "title": stream["title"],
                 "note": stream["note"],
