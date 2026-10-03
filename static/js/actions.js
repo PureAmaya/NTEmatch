@@ -36,7 +36,12 @@ import {
   roundStreamsOf,
 } from './ui.js';
 import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
-import { invalidateEvents, loadEvents, renderEventsView } from './events.js';
+import {
+  invalidateEvents,
+  loadEvents,
+  renderEventsGroups,
+  renderHomeGroups,
+} from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
 import { ChannelLive, probeLiveHealth } from './live.js';
 import { channelRooms, focusLive, renderChannels, renderPublic } from './views.js';
@@ -1515,7 +1520,8 @@ async function clearAllRounds() {
 async function refreshEventsUI(force = false) {
   invalidateEvents();
   await loadEvents(force);
-  if (App.view === 'events') await renderEventsView();
+  if (App.view === 'events') renderEventsGroups();
+  else if (App.view === 'home') renderHomeGroups(App.state);
   else if (App.view === 'manage') renderAdmin({ force: true });
 }
 
@@ -1534,8 +1540,8 @@ function openEventNewModal() {
       ]) +
       fieldSwitch('copyRoster', '沿用当前届的选手 / 参与名单 / 队伍 / 规则 / 直播 / 界面配置', true) +
       `</div>` +
-      `<div class="notice" style="margin-top:10px">新建后会立即切换到新的一届，原赛事完整保留在「往届」中；` +
-      `赛制决定比赛界面与赛程生成方式，之后也可在管理端切换（切换会清空赛程）。</div>`,
+      `<div class="notice" style="margin-top:10px">新建后直接进入新的一届，原赛事完整保留在「全部赛事」里；` +
+      `赛制决定比赛界面与赛程生成方式，之后也可在赛事管理里切换（切换会清空赛程）。</div>`,
     footer:
       `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
       `<button class="btn btn--sm btn--primary" type="button" data-submit>创建并切换</button>`,
@@ -1559,13 +1565,13 @@ function openEventNewModal() {
           });
           Modal.close();
           toast(
-            `已创建并切换到「${res.name}」（${res.format === 'league' ? '积分制' : '锦标赛制'}）`,
+            `已创建「${res.name}」（${res.format === 'league' ? '积分制' : '锦标赛制'}），正在进入`,
             'ok',
             5000
           );
           await refreshEventsUI(true);
-          // 新的一届直接成为主赛事：地址换成它的路由，继续吃实时推送
-          if (hooks.goto) await hooks.goto('', App.view, { replace: true });
+          // 直接进入新建的这一届（它同时成了后端「当前届」，所以进去就能编辑）
+          if (hooks.goto) await hooks.goto(res.eventId || '', 'overview');
           else if (hooks.refreshState) await hooks.refreshState();
         } catch (err) {
           toast(err.message, 'err');
@@ -1612,42 +1618,19 @@ async function patchEvent(id, patch) {
   }
 }
 
-async function switchEvent(id) {
-  if (!id) return;
-  const event = App.events.find((e) => e.id === id);
-  if (event?.current) {
-    toast('已经是主赛事', 'info');
-    return;
-  }
-  if (
-    !window.confirm(
-      `把「${event?.name || id}」设为主赛事？同期只会有一个主赛事，原来的那个自动让位；` +
-        `根路径 / 与整站（总览 / 赛程 / 选手 / 直播）都会变成这一届。`
-    )
-  )
-    return;
-  try {
-    const res = await api(`/events/${id}/switch`, { method: 'POST', auth: true });
-    toast(`「${res.name || id}」已设为主赛事`, 'ok');
-    await refreshEventsUI(true);
-    // 它成了主赛事：地址换成它的路由（不再是「锁定的往届」），继续吃实时推送
-    if (hooks.goto) await hooks.goto(id, App.view, { replace: true });
-    else if (hooks.refreshState) await hooks.refreshState();
-  } catch (err) {
-    toast(err.message, 'err');
-  }
-}
-
 async function deleteEvent(id) {
   const event = App.events.find((e) => e.id === id);
   if (!window.confirm(`确认删除「${event?.name || id}」？该届的名单、赛程与成绩会一并删除，无法恢复。`)) return;
   try {
-    const res =     await api(`/events/${id}`, { method: 'DELETE', auth: true });
+    const res = await api(`/events/${id}`, { method: 'DELETE', auth: true });
     toast('已删除该届赛事', 'ok');
     await refreshEventsUI(true);
-    // 删掉的可能是正在看的那一届，甚至就是主赛事：统一回到主赛事的同一页
-    if (hooks.goto) await hooks.goto('', App.view, { replace: true });
-    else if (hooks.refreshState) await hooks.refreshState();
+    // 删掉的若正是正在看的那一届（或它已是后端的当前届）：回主页；否则就地刷新
+    if (App.routeEvent === id || res.current === id) {
+      await hooks.goto?.('', 'home', { replace: true });
+    } else if (hooks.refreshState) {
+      await hooks.refreshState();
+    }
     log.info('已删除届次', id, '当前届', res.current);
   } catch (err) {
     toast(err.message, 'err');
@@ -1803,6 +1786,8 @@ function watchChannel(id) {
   App.channelId = id || null;
   const channel = channelOf(id);
   if (App.state) renderChannels(App.state);
+  // 地址跟着换成 /channels/<推流 ID>（用 replaceState，不新增历史）
+  hooks.syncChannelUrl?.(channel?.play?.key || '');
   if (!channel) return;
   if (isChannelLive(channel.id)) {
     ChannelLive.playRoom(channel.play || null);
@@ -2014,18 +1999,32 @@ export async function handleAction(act, el) {
     case 'channel-del':
       return deleteChannel(el.dataset.id);
     case 'route-home':
-      // 回到「当前届」路由的同一页（根路径只跟管理员选定的当前届走）
-      return hooks.goto?.('', App.view);
+      // 主页是唯一总入口：比赛 / 频道 / 全部赛事 / 我的 / 服务器都从这里进出
+      return hooks.goto?.('', 'home');
+    case 'route-channels':
+      return hooks.goto?.('', 'channels');
+    case 'route-events':
+      return hooks.goto?.('', 'events');
     case 'route-user':
       return hooks.goto?.('', 'user');
     case 'route-server':
       return hooks.goto?.('', 'server');
+    case 'group-toggle': {
+      // 主页 / 全部赛事页的分组折叠：只切一个 class，交给 CSS 过渡，不重绘
+      const key = el.dataset.group;
+      if (!key) return;
+      const open = !(App.homeOpen[key] !== false);
+      App.homeOpen[key] = open;
+      el.setAttribute('aria-expanded', String(open));
+      el.closest('.home-group')?.classList.toggle('is-open', open);
+      return;
+    }
     case 'event-new':
       return openEventNewModal();
     case 'event-refresh':
       return refreshEventsUI(true);
     case 'event-view': {
-      // 点卡片 = 换到这一届的路由（默认停在当前这一页，往届页正好切成它的详情）
+      // 点卡片 = 进入这一届（卡片统一带 data-page="overview"，落在它的总览页）
       const id = el.dataset.id;
       if (!id) return;
       return hooks.goto?.(id, el.dataset.page || App.view);
@@ -2039,8 +2038,6 @@ export async function handleAction(act, el) {
       if (win) win.opener = null; // 别把本站的 window 引用交给新页面
       return;
     }
-    case 'event-switch':
-      return switchEvent(el.dataset.id);
     case 'event-rename':
       return openEventRenameModal(el.dataset.id);
     case 'event-close':
@@ -2078,8 +2075,13 @@ export async function handleAction(act, el) {
       renderAdmin({ force: true });
       renderPublic();
       return;
-    case 'admin-login':
-      return login(qs('#adminKey')?.value || '');
+    case 'admin-login': {
+      // 赛事管理 / 服务器 / 我的 三个门禁各有一个密钥框，必须取「按钮所在门禁」里的那个；
+      // 全局 qs('#adminKey') 会命中文档里最靠前的（隐藏的赛事管理页）空框，永远提示「请输入密钥」。
+      const gate = el.closest('.gate') || document;
+      const input = gate.querySelector('input[type="password"]') || qs('#adminKey');
+      return login(input?.value || '');
+    }
     case 'event-start':
       return startEvent();
     case 'event-unlock':
@@ -2411,16 +2413,12 @@ export async function handleForm(formEl) {
       return;
     }
     try {
-      const res = await api('/admin/key', {
+      await api('/admin/key', {
         method: 'POST',
         auth: true,
-        body: { key: values.key, storeHash: Boolean(values.storeHash) },
+        body: { key: values.key },
       });
-      toast(
-        res.mode === 'sha256' ? 'KEY 已更新（仅存哈希），请用新 KEY 重新登录' : 'KEY 已更新，请用新 KEY 重新登录',
-        'ok',
-        6000
-      );
+      toast('KEY 已更新（加盐 PBKDF2 存储），请用新 KEY 重新登录', 'ok', 6000);
       App.token = '';
       localStorage.removeItem(TOKEN_KEY);
       renderAdmin();

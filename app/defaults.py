@@ -82,6 +82,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ranked": True,
         "title": "NTE 比赛",
         "subtitle": "NEVERNESS TO EVERNESS · MATCH",
+        # 比赛简介（≤30 字，可留空；留空则主界面与往届列表都不显示）
+        "brief": "",
         "venue": "",
         "organizer": "",
         # 留空 = 尚未登记开赛时间（界面显示「时间待定」），开始比赛时自动补上

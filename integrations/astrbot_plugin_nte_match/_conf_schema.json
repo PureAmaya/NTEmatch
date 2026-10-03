@@ -1,0 +1,22 @@
+{
+  "base_url": {
+    "description": "NTE 比赛站点地址（不带尾部斜杠）",
+    "type": "string",
+    "default": "http://127.0.0.1:8000"
+  },
+  "api_token": {
+    "description": "查询 API 令牌（在站点「服务器 → QQ 机器人 → 查询接口令牌」里生成，形如 nte_xxx）",
+    "type": "string",
+    "default": ""
+  },
+  "timeout": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "default": 10
+  },
+  "reply_prefix": {
+    "description": "回复前缀（贴到最前面，便于在群里认出是哪个机器人在说话）",
+    "type": "string",
+    "default": ""
+  }
+}

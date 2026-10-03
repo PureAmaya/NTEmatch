@@ -28,6 +28,7 @@ import {
   rulebookBodyHtml,
 } from './ui.js';
 import { mount as mountTeams } from './teams.js';
+import { qqbotPushPanelHtml, refreshQqbotStatusBox } from './members.js';
 
 /* --------------------------- 面板渲染 ---------------------------
  *
@@ -140,6 +141,7 @@ export function renderAdmin({ force = false } = {}) {
   restoreFocus(focus);
   if (window.scrollY !== scrollY) window.scrollTo(0, scrollY);
   refreshDiagnostics();
+  void refreshQqbotStatusBox();
 }
 
 /** 当前赛制是否为积分制。 */
@@ -367,22 +369,19 @@ function formatPanelHtml(s) {
 
 export function adminPanelHtml(s) {
   if (!s) return `<div class="panel"><div class="empty"><b>状态未就绪</b>请稍候</div></div>`;
-  // 正在按链接回看往届：接口都按「当前届」设计，这里不给任何管理入口，
-  // 否则一次手滑就会把数据写到正在进行的届上。
-  // 管理界面只负责「当前这一届」：不是主赛事时不给任何编辑入口，只留两件事——
-  // 把它设为主赛事（随后整站就都在它身上），或者回主赛事。
+  // 只读查看（别人的届 / 未登录）：写接口都作用在「当前届」上，这里不给任何管理入口，
+  // 否则一次手滑就写到别的届上去了。
   if (s.readOnly) {
     return (
-      `<div class="panel"><div class="panel__head"><h2>往届 · 只读</h2>` +
-      `<span class="panel__hint">${esc(s.eventId || '')} · 不是主赛事</span></div>` +
+      `<div class="panel"><div class="panel__head"><h2>只读查看</h2>` +
+      `<span class="panel__hint">${esc(s.eventId || '')} · 不是你的届</span></div>` +
       `<div class="panel__body">` +
-      `<div class="notice">现在看的是往届 <b>${esc(s.eventName || s.eventId || '')}</b>，` +
-      `管理操作已停用（接口都是按主赛事设计的，避免误写到别人头上）。` +
-      `要改它，就把它设为主赛事——同期只会有一个主赛事，原来的那个自动让位。</div>` +
+      `<div class="notice">现在看的是 <b>${esc(s.eventName || s.eventId || '')}</b>：` +
+      `它不归你管（或你还未登录），所以整页都是只读的。` +
+      `需要编辑就用自己的账号进入自己创建的届。</div>` +
       `<div class="tool-group" style="margin-top:10px">` +
-      `<button class="btn btn--sm btn--primary" type="button" data-act="event-switch" ` +
-      `data-id="${esc(s.eventId || '')}">设为主赛事</button>` +
-      `<button class="btn btn--sm" type="button" data-act="route-home">回到主赛事</button>` +
+      `<button class="btn btn--sm" type="button" data-act="route-events">全部赛事</button>` +
+      `<button class="btn btn--sm" type="button" data-act="route-home">回主页</button>` +
       `</div></div></div>`
     );
   }
@@ -402,6 +401,11 @@ export function adminPanelHtml(s) {
       ['active', '进行中'],
       ['closed', '已结束'],
     ]) +
+    fieldText('brief', '比赛简介', evt.brief, {
+      ph: '一句话介绍这一届（可留空）',
+      maxlength: 30,
+      hint: '≤30 字。留空则总览与主页 / 全部赛事的卡片都不显示这一项',
+    }) +
     fieldSelect(
       'sport',
       '比赛类型',
@@ -485,12 +489,13 @@ export function adminPanelHtml(s) {
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存直播配置</button></div></form>`;
 
   const keyForm =
-    `<form class="form form--2" data-form="admin-key">` +
+    `<div class="notice">一律以<b>加盐 PBKDF2</b> 存储（明文与无盐哈希都不落库），` +
+    `也不会出现在「导出配置」的文件里。</div>` +
+    `<form class="form form--2" data-form="admin-key" style="margin-top:10px">` +
     fieldText('key', '新的管理 KEY', '', {
       type: 'password',
       hint: '至少 6 位。保存后所有管理会话立即失效，需用新 KEY 重新登录。',
     }) +
-    fieldSwitch('storeHash', '只保存 sha256 哈希（推荐，文件里不留明文）', true) +
     `<div class="form-actions" style="grid-column:1/-1">` +
     `<button class="btn btn--primary" type="submit">更新管理 KEY</button></div></form>`;
 
@@ -501,6 +506,8 @@ export function adminPanelHtml(s) {
     lockPanelHtml(s) +
     formatPanelHtml(s) +
     panelHtml('赛事信息', '公开展示', eventForm) +
+    // 推送到群：赛事管理员（自己创建的届）与服务器管理员都能用
+    (canManageEvents() && !finished ? qqbotPushPanelHtml(s) : '') +
     panelHtml(
       '比赛规则',
       isLeague(s) ? '积分制' : '双败淘汰制',
@@ -527,12 +534,14 @@ export function adminPanelHtml(s) {
     // 服务器主 KEY 属于服务器级：只有服务器管理员能改
     (isServerAdmin() ? panelHtml('管理 KEY', '服务器主密钥', keyForm) : '') +
     panelHtml(
-      '主赛事',
-      `${esc(s.eventName || s.eventId || '')} · 同期只有一个`,
-      `<div class="notice">这是当前的<b>主赛事</b>：访问根路径 <code>/</code> 会自动跳到它，` +
-        `观众端默认也看它。要换成别的届，到「往届」页打开那一届，在它的管理页点「设为主赛事」` +
-        `（原来的主赛事自动让位）；新建一届也会直接成为新的主赛事。</div>` +
+      '赛事地址',
+      `${esc(s.eventId || 'e000')} · 独立路由`,
+      `<div class="notice">这一届有自己的独立地址 <code>/${esc(s.eventId || 'e000')}</code>：` +
+        `可以刷新、收藏、分享；页签里的「主页」随时回到总入口。` +
+        `全部届次在主页的「管理赛事」里。</div>` +
         `<div class="tool-group" style="margin-top:10px">` +
+        `<button class="btn btn--sm" type="button" data-act="route-events">全部赛事</button>` +
+        `<button class="btn btn--sm" type="button" data-act="route-home">回主页</button>` +
         `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新届次列表</button>` +
         `</div>`
     ) +
@@ -726,13 +735,14 @@ export async function refreshDiagnostics() {
     const d = await api('/diagnostics', { auth: true });
     const kv = [
       ['数据库', d.databasePath],
-      ['主赛事', `${d.eventName || '—'}（${d.eventId || '—'}）· ${d.eventStatus || 'active'} · 共 ${d.eventCount ?? 1} 届`],
+      ['当前届', `${d.eventName || '—'}（${d.eventId || '—'}）· ${d.eventStatus || 'active'} · 共 ${d.eventCount ?? 1} 届`],
       ['版本', d.revision],
       ['更新时间', d.updatedAt || '—'],
       ['在线客户端', d.ws?.online ?? 0],
       ['广播次数', d.ws?.broadcasts ?? 0],
       ['头像缓存', `${d.avatarCache?.files ?? 0} 文件 / ${Math.round((d.avatarCache?.bytes || 0) / 1024)} KB`],
       ['鉴权模式', d.adminKeyMode],
+      ['待升级凭据', d.legacyCredentials ? `${d.legacyCredentials} 位成员仍是旧格式` : '无'],
       ['赛制状态', scheduleQualityText()],
     ]
       .map(([k, v]) => `<div class="kv__row"><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`)

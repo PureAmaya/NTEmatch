@@ -6,6 +6,7 @@ import {
   App,
   canEdit,
   canManageEvents,
+  DEFAULT_TAGLINE,
   esc,
   fmtDuration,
   fmtFull,
@@ -19,6 +20,7 @@ import {
   qsa,
   reveal,
   sign,
+  siteName,
   stateKey,
 } from './core.js';
 import {
@@ -45,7 +47,7 @@ import {
   rulesPanelHtml,
   whoHtml,
 } from './ui.js';
-import { renderEventsView } from './events.js';
+import { renderEventsView, renderHome } from './events.js';
 import { ChannelLive, Live } from './live.js';
 import { renderServerPage, renderUserPage } from './members.js';
 
@@ -120,38 +122,27 @@ export function applyTheme(s) {
 
 export function renderHeader(s) {
   const evt = s.event || {};
+  // 只在赛事路由上谈「比赛」：主页 / 频道 / 全部赛事 / 我的 / 服务器都只认站点名称
+  const onEvent = Boolean(App.routeEvent);
+  const title = onEvent ? s.eventName || evt.name || s.eventId || '—' : siteName(s);
   const titleEl = qs('#evtTitle');
-  titleEl.textContent = evt.title || 'NTE 比赛';
-  titleEl.dataset.text = titleEl.textContent;
-  qs('#evtSub').textContent = evt.subtitle || 'NEVERNESS TO EVERNESS · MATCH';
+  titleEl.textContent = title;
+  titleEl.dataset.text = title;
+  qs('#evtSub').textContent = onEvent ? evt.subtitle || DEFAULT_TAGLINE : DEFAULT_TAGLINE;
+
   const chipEvent = qs('#chipEvent');
   if (chipEvent) {
-    const name = s.eventName || evt.name || s.eventId || '—';
-    const kind = isLeague(s) ? '积分制' : '锦标赛制';
-    chipEvent.textContent = `${name} · ${kind}`;
-    chipEvent.title = `正在看：${name}（${kind} · ${s.eventStatus || evt.status || 'active'}）`;
+    chipEvent.hidden = !onEvent;
+    if (onEvent) {
+      const kind = isLeague(s) ? '积分制' : '锦标赛制';
+      chipEvent.textContent = `${title} · ${kind}`;
+      chipEvent.title = `正在看：${title}（${kind} · ${s.eventStatus || evt.status || 'active'}）`;
+    }
   }
-  document.title = `${evt.name || evt.title || '赛事平台'} | NTE 比赛`;
+  // 浏览器标签：赛事页「届名 | 站点名」，其它页面就是站点名
+  document.title = onEvent ? `${title} | ${siteName(s)}` : siteName(s);
 
   renderEventTimeChip(s);
-  renderPastChip(s);
-}
-
-/**
- * 「往届回看」芯片：按链接（``/<届 ID>``）看某一届时显示，点一下回当前届。
- *
- * 有了它，一条链接就能看一届，也能随时看清「现在看的是哪一届」。
- */
-function renderPastChip(s) {
-  const chip = qs('#chipPast');
-  if (!chip) return;
-  if (!App.routeEvent) {
-    chip.hidden = true;
-    return;
-  }
-  chip.hidden = false;
-  chip.textContent = `往届回看 · ${s.eventName || App.routeEvent}`;
-  chip.title = `正在回看「${s.eventName || App.routeEvent}」；点这里回到主赛事`;
 }
 
 /* ---------------------------- 赛事时间 -------------------------------- */
@@ -174,7 +165,8 @@ function renderEventTimeChip(s) {
   const chip = qs('#chipEventTime');
   if (!chip) return;
   const t = s.eventTime;
-  if (!t) {
+  // 与比赛无关的页面不显示「进行中 · 开始时间未登记」这类赛事信息
+  if (!App.routeEvent || !t) {
     chip.hidden = true;
     return;
   }
@@ -223,6 +215,7 @@ function eventTimePanelHtml(s) {
 
 /* ------------------------------ 总览 ---------------------------------- */
 export function renderOverview(s) {
+  setPanel('eventBrief', briefPanelHtml(s));
   if (s.ranked === false) {
     renderCasualOverview(s);
     return;
@@ -232,6 +225,20 @@ export function renderOverview(s) {
     return;
   }
   renderTournamentOverview(s);
+}
+
+/**
+ * 比赛简介（≤30 字）：由赛事创办者撰写，**留空就整块不显示**。
+ */
+function briefPanelHtml(s) {
+  const brief = String(s.event?.brief || '').trim();
+  if (!brief) return '';
+  return (
+    `<div class="brief">` +
+    `<span class="brief__tag">简介</span>` +
+    `<p class="brief__text">${esc(brief)}</p>` +
+    `</div>`
+  );
 }
 
 /**
@@ -1946,7 +1953,7 @@ export function liveInfoHtml(s, picked = null) {
 /* ---------------------------- 成员频道（日常直播） ----------------------------
  *
  * 与比赛直播是**两套独立的东西**：成员频道是常驻的「群友自播」位，跟赛事
- * 届次无关——没有比赛时也能一直开着播，开赛锁定 / 往届回看都照看不误。
+ * 届次无关——没有比赛时也能一直开着播，开赛锁定 / 只读查看某一届都照看不误。
  * 播放器复用同一套实现（live.js 的 ChannelLive），只是元素落在 #channelStage 里。
  */
 /** 可见频道：停用的只对管理员可见（否则停用后就再也启不回来）。 */
@@ -2238,8 +2245,31 @@ export function renderChannels(s) {
   return rebuilt;
 }
 
+/* ---------------------------- 错误页（403 / 404） ---------------------------- */
+
+/**
+ * 找不到 / 没权限时的一屏：说清楚发生了什么，并给一条回主页的路。
+ *
+ * 内容由路由填在 ``App.denied``（{ code, title, desc }）；它自己也算独立页，
+ * 所以页签里只剩「主页」——不会给出任何不该有的入口。
+ */
+export function renderDenied() {
+  const host = qs('#deniedBody');
+  if (!host) return;
+  const d = App.denied || {};
+  host.innerHTML =
+    `<div class="deny">` +
+    `<div class="deny__code" aria-hidden="true">${esc(d.code || '403')}</div>` +
+    `<h1 class="deny__title">${esc(d.title || '这里进不去')}</h1>` +
+    (d.desc ? `<p class="deny__desc">${esc(d.desc)}</p>` : '') +
+    `<div class="tool-group">` +
+    `<button class="btn btn--primary" type="button" data-act="route-home">回主页</button>` +
+    `</div></div>`;
+}
+
 /* ------------------------------ 总调度 -------------------------------- */
 const VIEW_RENDERERS = {
+  home: renderHome,
   overview: renderOverview,
   schedule: renderSchedule,
   roster: renderRoster,
@@ -2248,6 +2278,7 @@ const VIEW_RENDERERS = {
   events: renderEventsView,
   server: renderServerPage,
   user: renderUserPage,
+  denied: renderDenied,
 };
 
 /** 只渲染指定视图；切页时按需渲染，避免隐藏视图做无谓的 DOM 重建。 */
@@ -2258,23 +2289,40 @@ export function renderView(view, s = App.state) {
 }
 
 /**
- * 页签可用性：已完结的届、回看的往届都没有直播页。
+ * 页签可用性。
  *
- * 每次状态刷新都对一遍（包括 WebSocket 推来的变更：管理员刚把这一届标记结束，
- * 观众这边的直播页签也要立刻收掉）。
+ * 页签只有两类，分界线就是「当前是不是在看某一届」：
+ *
+ * * 赛事路由（``/e001…``）→ 主页 + 总览 / 赛程 / 选手 / 直播（+ 有权限时的赛事管理）；
+ * * 独立页（主页 / 频道 / 全部赛事 / 我的 / 服务器）→ 只剩「主页」。
+ *
+ * 「主页」页签永远在，因为它是回到总入口的唯一出口。每次状态刷新都对一遍
+ * （包括 WebSocket 推来的变更：管理员刚把这一届标记结束，观众这边的直播页签
+ * 也要立刻收掉）。
  */
-export function syncTabs(s) {
+export function syncTabs(s, page = App.view) {
   // 单个页签的可见性：需要收起且当前正停在该页时，回落到总览
   const setTab = (view, allow) => {
     const tab = qsa('.tab').find((t) => t.dataset.view === view);
     if (!tab || tab.hidden === !allow) return;
     tab.hidden = !allow;
-    if (!allow && App.view === view) hooks.goto?.(App.routeEvent, 'overview', { replace: true });
+    if (!allow && App.view === view) {
+      hooks.goto?.(App.routeEvent, 'overview', { replace: true });
+    }
   };
-  // 直播页：已完结的届 / 往届回看时收起
-  setTab('live', liveAvailable(s));
-  // 赛事管理页：**登录了且有权限**才出现；未登录 / 身份未到手一律收起
-  setTab('manage', Boolean(App.me) && canManageEvents());
+  // 主页本身就是总入口，页签栏整个收起来（不留一条只有一个「主页」的条）。
+  // 用传进来的目标页判断：goto 里这一步发生在 setView 之前，此刻 App.view 还是旧值。
+  const tabs = qs('#tabs');
+  if (tabs) tabs.hidden = page === 'home';
+  const onEvent = Boolean(App.routeEvent);
+  // 赛事页签：只有在看某一届时才出现（比赛与频道之间不能直接互跳，都得经过主页）
+  setTab('overview', onEvent);
+  setTab('schedule', onEvent);
+  setTab('roster', onEvent);
+  // 直播页：这一届已完结（或正在只读查看别人的届）时收起
+  setTab('live', onEvent && liveAvailable(s) && !s.readOnly);
+  // 赛事管理页：登录了、有权限、而且这一届确实归自己管（只读的届不给编辑入口）
+  setTab('manage', onEvent && Boolean(App.me) && canManageEvents() && !s.readOnly);
 }
 
 const PERMISSION_TEXT = {

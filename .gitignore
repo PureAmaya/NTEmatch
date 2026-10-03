@@ -36,6 +36,8 @@ coverage.xml
 config/
 data/
 logs/
+# 数据备份同样含密钥与全部数据（见「备份」面板），绝不入库
+backups/
 *.log
 *.sqlite3
 *.sqlite3-shm

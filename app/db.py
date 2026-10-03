@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS events (
   status        TEXT NOT NULL DEFAULT 'active',
   title         TEXT NOT NULL DEFAULT '',
   subtitle      TEXT NOT NULL DEFAULT '',
+  brief         TEXT NOT NULL DEFAULT '',
   venue         TEXT NOT NULL DEFAULT '',
   organizer     TEXT NOT NULL DEFAULT '',
   start_time    TEXT NOT NULL DEFAULT '',
@@ -104,10 +105,12 @@ CREATE TABLE IF NOT EXISTS event_stream (
   note       TEXT NOT NULL DEFAULT ''
 );
 
+-- key_hash = 加盐 PBKDF2（新格式）；key / key_sha256 是历史明文 / 无盐哈希，只为兼容旧库
 CREATE TABLE IF NOT EXISTS event_admin (
   event_id   TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
   key        TEXT NOT NULL DEFAULT '',
-  key_sha256 TEXT NOT NULL DEFAULT ''
+  key_sha256 TEXT NOT NULL DEFAULT '',
+  key_hash   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS players (
@@ -229,7 +232,8 @@ CREATE TABLE IF NOT EXISTS channels (
 );
 
 -- 成员（全局账号）：**不挂在任何一届**，跨届共享。
--- key_sha256 / bearer_sha256 是密钥与 WHIP Bearer 令牌的哈希，明文永不落库。
+-- key_hash / bearer_hash 是密钥与 WHIP Bearer 令牌的**加盐**哈希，明文永不落库；
+-- key_sha256 / bearer_sha256 是历史无盐格式，只为让老库继续可校验（轮换即升级）。
 CREATE TABLE IF NOT EXISTS members (
   uid           TEXT PRIMARY KEY,
   name          TEXT NOT NULL DEFAULT '',
@@ -243,6 +247,8 @@ CREATE TABLE IF NOT EXISTS members (
   active        INTEGER NOT NULL DEFAULT 1,
   created_at    TEXT NOT NULL DEFAULT '',
   updated_at    TEXT NOT NULL DEFAULT '',
+  key_hash      TEXT NOT NULL DEFAULT '',
+  bearer_hash   TEXT NOT NULL DEFAULT '',
   key_sha256    TEXT NOT NULL DEFAULT '',
   bearer_sha256 TEXT NOT NULL DEFAULT ''
 );
@@ -318,6 +324,8 @@ def _upgrade_stream_https(stream: dict[str, Any]) -> dict[str, Any]:
 
 _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
     "events": {
+        # 比赛简介（≤30 字，留空则不展示）
+        "brief": "TEXT NOT NULL DEFAULT ''",
         "end_time": "TEXT NOT NULL DEFAULT ''",
         "locked": "INTEGER NOT NULL DEFAULT 0",
         "locked_at": "TEXT NOT NULL DEFAULT ''",
@@ -342,6 +350,15 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         # 控制 API 的 Basic 认证（mediamtx.yml 里配了 authInternalUsers 才需要）
         "api_user": "TEXT NOT NULL DEFAULT ''",
         "api_pass": "TEXT NOT NULL DEFAULT ''",
+    },
+    "members": {
+        # 加盐哈希（新格式）；同表的 *_sha256 是历史无盐格式，仅为兼容旧库保留
+        "key_hash": "TEXT NOT NULL DEFAULT ''",
+        "bearer_hash": "TEXT NOT NULL DEFAULT ''",
+    },
+    "event_admin": {
+        # 服务器主管理 KEY 的加盐 PBKDF2（新格式）
+        "key_hash": "TEXT NOT NULL DEFAULT ''",
     },
     "teams": {"group_name": "TEXT NOT NULL DEFAULT ''"},
     "rounds": {
@@ -483,13 +500,14 @@ def save_event(
     conn.execute(
         """
         INSERT INTO events (
-            id, name, status, title, subtitle, venue, organizer, start_time, end_time,
+            id, name, status, title, subtitle, brief, venue, organizer, start_time, end_time,
             locked, locked_at, rules_text, logo_text, owner_uid, hidden, sport, ranked,
             created_at, updated_at, revision, players_count, rounds_count, played_count, champion
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, status = excluded.status, title = excluded.title,
-            subtitle = excluded.subtitle, venue = excluded.venue, organizer = excluded.organizer,
+            subtitle = excluded.subtitle, brief = excluded.brief,
+            venue = excluded.venue, organizer = excluded.organizer,
             start_time = excluded.start_time, end_time = excluded.end_time,
             locked = excluded.locked, locked_at = excluded.locked_at,
             rules_text = excluded.rules_text, logo_text = excluded.logo_text,
@@ -505,6 +523,7 @@ def save_event(
             event.get("status", "active"),
             event.get("title", ""),
             event.get("subtitle", ""),
+            event.get("brief", ""),
             event.get("venue", ""),
             event.get("organizer", ""),
             event.get("startTime", ""),
@@ -595,6 +614,7 @@ def save_event(
             "event_id": event_id,
             "key": admin.get("key", ""),
             "key_sha256": admin.get("keySha256", ""),
+            "key_hash": admin.get("keyHash", ""),
         },
     )
 
@@ -770,6 +790,7 @@ def update_event_meta(conn: sqlite3.Connection, event_id: str, patch: dict[str, 
             "hidden",
             "sport",
             "ranked",
+            "brief",
         }
     }
     if not fields:
@@ -787,7 +808,7 @@ def update_event_meta(conn: sqlite3.Connection, event_id: str, patch: dict[str, 
 def list_events(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, name, status, title, subtitle, start_time, end_time,
+        SELECT id, name, status, title, subtitle, brief, start_time, end_time,
                locked, locked_at, owner_uid, hidden, sport, ranked,
                created_at, updated_at, revision,
                players_count, rounds_count, played_count, champion
@@ -801,6 +822,7 @@ def list_events(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "status": row["status"],
             "title": row["title"],
             "subtitle": row["subtitle"],
+            "brief": row["brief"],
             "startTime": row["start_time"],
             "endTime": row["end_time"],
             "locked": bool(row["locked"]),
@@ -958,6 +980,7 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             "status": ev["status"],
             "title": ev["title"],
             "subtitle": ev["subtitle"],
+            "brief": ev["brief"],
             "venue": ev["venue"],
             "organizer": ev["organizer"],
             "startTime": ev["start_time"],
@@ -1021,6 +1044,7 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
         "admin": {
             "key": admin["key"] if admin else "",
             "keySha256": admin["key_sha256"] if admin else "",
+            "keyHash": admin["key_hash"] if admin else "",
         },
         "participants": participants,
         "teams": teams,
@@ -1138,6 +1162,8 @@ def _member_row(row: sqlite3.Row) -> dict[str, Any]:
         "active": bool(row["active"]),
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
+        "keyHash": row["key_hash"],
+        "bearerHash": row["bearer_hash"],
         "keySha256": row["key_sha256"],
         "bearerSha256": row["bearer_sha256"],
     }
@@ -1168,6 +1194,8 @@ def upsert_member(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
             "active": int(bool(row.get("active", True))),
             "created_at": row.get("createdAt", ""),
             "updated_at": row.get("updatedAt", ""),
+            "key_hash": row.get("keyHash", ""),
+            "bearer_hash": row.get("bearerHash", ""),
             "key_sha256": row.get("keySha256", ""),
             "bearer_sha256": row.get("bearerSha256", ""),
         },

@@ -402,10 +402,12 @@ export function rulesPanelHtml(s) {
 
 /* ------------------------------ 表单字段 ------------------------------ */
 export function fieldText(name, label, value, opts = {}) {
-  const { ph = '', type = 'text', hint = '' } = opts;
+  const { ph = '', type = 'text', hint = '', maxlength = 0 } = opts;
+  const limit = Number(maxlength) || 0;
   return (
     `<div class="field"><label for="f-${name}">${esc(label)}</label>` +
-    `<input id="f-${name}" name="${name}" type="${type}" value="${esc(value ?? '')}" placeholder="${esc(ph)}">` +
+    `<input id="f-${name}" name="${name}" type="${type}" value="${esc(value ?? '')}"` +
+    ` placeholder="${esc(ph)}"${limit ? ` maxlength="${limit}"` : ''}>` +
     (hint ? `<span class="field__hint">${esc(hint)}</span>` : '') +
     `</div>`
   );

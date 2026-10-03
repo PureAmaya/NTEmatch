@@ -26,6 +26,7 @@ import {
   toast,
 } from './core.js';
 import { PUSH_TIP_LINE } from './ui.js';
+import { loadEvents, renderEventsGroups, renderHomeGroups } from './events.js';
 import { installDnD as installTeamDnD } from './teams.js';
 import {
   ChannelLive,
@@ -35,6 +36,7 @@ import {
   stopLiveHealth,
 } from './live.js';
 import {
+  channelRooms,
   focusLive,
   liveInfoHtml,
   renderChannels,
@@ -46,76 +48,115 @@ import {
 } from './views.js';
 import { renderAdmin } from './admin.js';
 import { handleAction, handleForm, login, uploadAvatarFile } from './actions.js';
-import { refreshMeData, refreshServerData, renderMemberGrid } from './members.js';
+import {
+  refreshMeData,
+  refreshServerData,
+  renderMemberGrid,
+  uploadBackupFile,
+} from './members.js';
 
-/* --------------------------- 路由（届 + 页面） ---------------------------
+/* --------------------------- 路由（主页 + 赛事 + 独立页） ---------------------------
  *
- * 一届 = 一条路由，形如 ``/<届 ID>/<页面>``，每一页都能刷新 / 收藏 / 分享：
+ * **主页（``/``）是唯一的总入口**：全部届次按状态分组 + 频道卡片。
  *
- *   /e001          e001 · 总览            /e001/schedule  e001 · 赛程
- *   /e001/admin    e001 · 管理            /events         往届（不属于任何一届）
+ *   主赛事的旧概念已取消——主页列出全部届次，谁都不特殊。
  *
- * * 路由指向**主赛事** → 跟着主赛事走（吃实时推送；主赛事被换掉会自动跟着换地址）；
- *   指向别的届 → 锁定它只读回看，所有管理入口收起；
- * * 根路径 ``/`` 不留任何东西：自动跳到主赛事的路由（如 ``/e001``）；
- * * 已完结的届 / 往届回看没有直播页，访问它会回落到总览。
+ * 赛事页形如 ``/<届 ID>/<页面>``（``/e001``、``/e001/schedule``），
+ * 独立页不带届 ID（``/channels``、``/events``、``/user``、``/admin``）。
+ * **比赛与频道之间不能直接互跳**，都得经过主页，所以页签只有两类：
+ * 赛事页是「主页 + 总览 / 赛程 / 选手 / 直播（+ 赛事管理）」，其它页面只有「主页」。
  *
- * 「进哪一届 + 看哪一页」只有这一个入口（goto），地址栏、数据、视图一起换，
- * 浏览器前进/后退也走它。
+ * 后端仍有一个「当前届」（所有写接口的作用对象）：进入某届时**若你有那一届的
+ * 管理权限**就静默切过去，于是「打开哪一届就能改哪一届」；没有权限（别人的届 /
+ * 未登录）就只读查看，并且忽略服务端推送。
  */
-/** 生效中的路由：eventId 为空 = 跟主赛事走（吃实时推送），非空 = 锁定该届只读回看。 */
-let route = { eventId: '', page: 'overview' };
+/** 生效中的路由：``eventId`` 非空 = 正在看某一届，为空 = 独立页。 */
+let route = { eventId: '', page: 'home', channelId: '' };
 
-async function goto(eventId = '', page = 'overview', { replace = false } = {}) {
-  const want = PAGES.includes(page) ? page : 'overview';
-  // 独立页（往届 / 服务器 / 我的）不属于任何一届：地址不带届 ID
-  const standalone = STANDALONE_PAGES.includes(want);
-  let id = standalone ? '' : String(eventId || App.eventId || '');
-  if (id && !App.events.some((e) => e.id === id)) {
-    if (id !== route.eventId) toast(`没有这一届：${id}`, 'warn', 6000);
-    id = '';
+/**
+ * 直接落到错误页（403 / 404）。
+ *
+ * **地址栏保持原样**：错的地址留着更诚实（刷新还是这一屏，也方便把链接发给管理员看），
+ * 所以这里既不 pushState 也不 replaceState。它自己算独立页，页签里只剩「主页」。
+ */
+async function gotoDenied(info) {
+  App.denied = info;
+  App.routeEvent = '';
+  App.private = null;
+  if (!App.state) {
+    try {
+      applyState(await api('/state'), { force: true });
+    } catch (err) {
+      log.warn('状态加载失败', err);
+    }
   }
-  // 指向主赛事 = 跟着主赛事走（继续吃实时推送）；指向别的届 = 锁定那一届只读回看。
-  // 两种情况地址里都带届 ID，所以刷新 / 收藏 / 分享永远落在同一届上。
-  const locked = id && id !== App.eventId ? id : '';
-  const switchedEvent = App.routeEvent !== locked;
-  App.routeEvent = locked;
+  route = { eventId: '', page: 'denied', channelId: '' };
+  if (App.state) syncTabs(App.state, 'denied');
+  setView('denied', { silent: true });
+  renderPublic();
+  log.info('进入错误页', info.code, info.title);
+}
+
+async function goto(eventId = '', page = 'home', { replace = false, channelId = '' } = {}) {
+  const want = PAGES.includes(page) ? page : 'home';
+  const standalone = STANDALONE_PAGES.includes(want);
+  const id = standalone ? '' : String(eventId || '');
+
+  // 需要权限的入口：没权限直接给错误页，而不是悄悄回落到别的页面
+  if (want === 'events' && !canManageEvents()) {
+    return gotoDenied({
+      code: '403',
+      title: '「全部赛事」只对赛事管理员开放',
+      desc:
+        '这一页里有新建 / 重命名 / 封存 / 删除等操作，需要赛事管理员或服务器管理员权限。' +
+        '看比赛本身不需要权限——直接在主页点某一届就行。',
+    });
+  }
+  if (want === 'server' && !isServerAdmin()) {
+    return gotoDenied({
+      code: '403',
+      title: '服务器管理仅限服务器管理员',
+      desc:
+        '成员、届次、备份、QQ 机器人、直播封禁这些都是服务器级设置。' +
+        '如果你只是想改自己的资料，请从右上角「头像 + 用户名」进「我的」。',
+    });
+  }
+  if (want === 'manage' && !canManageEvents()) {
+    return gotoDenied({
+      code: '403',
+      title: '没有赛事管理权限',
+      desc: '这一届的管理页需要赛事管理员或服务器管理员权限。赛程与战况仍然可以在总览 / 赛程页看。',
+    });
+  }
+
+  // 赛事页必须带届 ID（``/overview`` 这种是手敲的）→ 回主页
+  if (!standalone && !id) return goto('', 'home', { replace: true });
+  // 深链 / 刷新进来时届次列表可能还没到手，先补一次再判断这一届存不存在
+  if (id && !App.events.length) await loadEvents();
+  if (id && !App.events.some((e) => e.id === id)) {
+    return gotoDenied({
+      code: '404',
+      title: `没有这一届：${id}`,
+      desc: '它可能已经被删除；如果它被设成了「隐藏」，则只有服务器管理员能看到。',
+    });
+  }
+
+  const switchedEvent = App.routeEvent !== id;
+  App.routeEvent = id;
   if (switchedEvent) {
     App.livePlayerId = null;
     Live.stop(false);
+    ChannelLive.stop(false);
   }
 
-  if (locked) {
-    // 锁定某一届：管理入口由状态里的 readOnly 收起，服务端推送也不再接收
+  if (standalone) {
+    // 独立页也要一份状态：站点名称 / 主题 / 频道与成员直播间都在里面
     try {
-      App.state = await api(`/events/${locked}/state`);
-      App.liveInfo = null;
-      // 回看往届：一只机位都不摆（连主直播间的标记也清掉，免得串到这一届）
-      App.liveNow = new Set();
-      App.liveMain = false;
-      App.private = null;
-      log.info('按路由看往届', locked, want);
-    } catch (err) {
-      log.error('往届状态加载失败', err);
-      toast(err.message, 'err');
-      return goto('', want, { replace: true });
-    }
-  } else {
-    try {
-      // force：切届时版本号可能刚好相同，必须重绘
       applyState(await api('/state'), { force: true });
     } catch (err) {
       log.error('状态加载失败', err);
       toast(err.message, 'err');
     }
-    try {
-      App.liveInfo = (await api('/live/info')).endpoints || App.liveInfo;
-    } catch (err) {
-      log.warn('直播信息加载失败', err);
-    }
-    // 隐私字段 / 推流地址只对有赛事管理权限的人拉（普通成员会被 403）
-    if (canManageEvents()) await refreshPrivate();
-    // 独立页各自的额外数据：服务器管理（成员 + 配置）/ 个人（我的资料）
     if (want === 'server') {
       // 每次进入本页重新拉一次，并复位「只试一次」标记
       App.serverTried = false;
@@ -123,35 +164,104 @@ async function goto(eventId = '', page = 'overview', { replace = false } = {}) {
       await refreshServerData({ silent: true });
     } else if (want === 'user') {
       await refreshMeData();
+    } else if (want === 'home') {
+      // 主页全靠届次列表：每次进入都重取，别拿旧缓存（否则会先闪一下「还没有赛事」）
+      await loadEvents(true);
+    } else if (want === 'channels' && channelId) {
+      // 深链 /channels/<推流 ID>：按流名选中那一路（找不到就照常落到第一个在播的）
+      const room = channelRooms(App.state).find((c) => (c.play || {}).key === channelId);
+      if (room) App.channelId = room.id;
+      else toast(`没有推流 ID 为「${channelId}」的直播间`, 'warn', 6000);
+    }
+  } else {
+    const entry = App.events.find((e) => e.id === id);
+    const owned = isServerAdmin() || Boolean(entry?.ownerUid && entry.ownerUid === App.me?.uid);
+    const canEditThis = Boolean(App.me) && canManageEvents() && owned;
+    // 有权限就直接切到这一届：后端「当前届」只是写接口的作用对象，不是「主赛事」
+    if (canEditThis && id !== App.eventId) {
+      try {
+        await api(`/events/${id}/switch`, { method: 'POST', auth: true });
+        App.eventId = id;
+      } catch (err) {
+        log.warn('切换届次失败，按只读处理', err.message);
+      }
+    }
+    if (id === App.eventId) {
+      try {
+        // force：切届时版本号可能刚好相同，必须重绘
+        applyState(await api('/state'), { force: true });
+      } catch (err) {
+        log.error('状态加载失败', err);
+        toast(err.message, 'err');
+      }
+      try {
+        App.liveInfo = (await api('/live/info')).endpoints || App.liveInfo;
+      } catch (err) {
+        log.warn('直播信息加载失败', err);
+      }
+      // 隐私字段 / 推流地址只对有赛事管理权限的人拉（普通成员会被 403）
+      if (canManageEvents()) await refreshPrivate();
+    } else {
+      // 别人的届 / 未登录 / 已封存：只读查看这一届，且不吃服务端推送
+      try {
+        App.state = await api(`/events/${id}/state`);
+        App.liveInfo = null;
+        // 只读回看：一只机位都不摆（连主直播间的标记也清掉，免得串到这一届）
+        App.liveNow = new Set();
+        App.liveMain = false;
+        App.private = null;
+        log.info('只读查看这一届', id, want);
+      } catch (err) {
+        log.error('届次状态加载失败', err);
+        toast(err.message, 'err');
+        return goto('', 'home', { replace: true });
+      }
     }
   }
 
-  // 页面可用性要等状态到手才能定（已完结的届没有直播页）→ 不可用就回落到总览
-  const pg = pageAvailable(want, App.state) ? want : 'overview';
-  route = { eventId: standalone ? '' : id, page: pg };
-  const path = routePath(route.eventId, pg);
+  // 只读查看别人的届时，管理页直接给错误页（点卡片进来的是总览，不受影响）
+  if (want === 'manage' && App.state?.readOnly) {
+    return gotoDenied({
+      code: '403',
+      title: '这一届不归你管',
+      desc:
+        '赛事管理员只能管理自己创建的届，服务器管理员可以管理全部届次。' +
+        '赛程、战况与选手名单都还能正常查看。',
+    });
+  }
+
+  // 页面可用性要等状态到手才能定（已完结的届没有直播页）→ 不可用就回落
+  const pg = pageAvailable(want, App.state) ? want : standalone ? 'home' : 'overview';
+  // 只有「地址里本来就给了推流 ID」时才把它留在 URL 里（/channels/<流名>）；
+  // 从主页点「频道」进来时不改地址，免得后退键变得更绕。在页面里换台由
+  // hooks.syncChannelUrl 用 replaceState 更新，不新增历史。
+  const chKey = pg === 'channels' && channelId ? channelId : '';
+  route = { eventId: standalone ? '' : id, page: pg, channelId: chKey };
+  const path = routePath(route.eventId, pg, chKey);
   if (location.pathname !== path) history[replace ? 'replaceState' : 'pushState']({ ...route }, '', path);
 
-  // 先把页签可见性同步好，否则 setView 会因为「页签被收起来」而回落到总览
-  if (App.state) syncTabs(App.state);
+  // 先把页签可见性同步好，否则 setView 会因为「页签被收起来」而回落到总览。
+  // 这里必须把目标页传进去：此刻 App.view 还是上一页的值。
+  if (App.state) syncTabs(App.state, pg);
   setView(pg, { silent: true });
   renderPublic();
   renderAdmin();
-  log.debug('路由', path, '届', route.eventId || '(主赛事)');
+  log.debug('路由', path, '届', route.eventId || '(独立页)');
 }
 
 window.addEventListener('popstate', (ev) => {
   const r = parseRoute();
-  const page = r.page || ev.state?.page || 'overview';
-  goto(r.eventId, page, { replace: true });
+  const page = r.page || ev.state?.page || (r.eventId ? 'overview' : 'home');
+  goto(r.eventId, page, { replace: true, channelId: r.channelId });
 });
 
 /* --------------------------- 视图切换 --------------------------- */
 function setView(view, { silent = false } = {}) {
   // 页签被收起来的页面不能进（如已完结的届没有直播页）。
-  // 注意：`server` / `user` 已经**没有页签**了（并进顶栏），只认「存在但被收起」。
+  // 独立页（主页 / 频道 / 全部赛事 / 我的 / 服务器）本来就没有对应的赛事页签，
+  // 它们**不存在同名页签**，因此这里的兜底不会误伤。
   const tab = qsa('.tab').find((t) => t.dataset.view === view);
-  if (tab && tab.hidden) view = 'overview';
+  if (tab && tab.hidden) view = App.routeEvent ? 'overview' : 'home';
   App.view = view;
   document.documentElement.dataset.view = view;
   qsa('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.view === view)));
@@ -235,8 +345,8 @@ function connectWS() {
       return;
     }
     if (msg.type === 'state' && msg.data) {
-      // 正在按路由回看往届：服务端推的是「当前届」，直接忽略，别把页面拽回去
-      if (App.routeEvent) return;
+      // 正在只读查看另一届：服务端推的是「当前届」，忽略它，别把页面拽回去
+      if (App.routeEvent && App.routeEvent !== msg.data.eventId) return;
       applyState(msg.data);
     } else if (msg.type === 'pong') {
       log.debug('心跳回包');
@@ -275,14 +385,9 @@ function scheduleRender() {
  */
 function applyState(data, { force = false } = {}) {
   if (data.live) App.liveInfo = data.live;
-  // 主赛事被换人了（管理端设定了新的主赛事）：跟着走，并把地址栏拨到新主赛事的路由
-  if (!App.routeEvent && data.eventId && data.eventId !== App.eventId) {
-    log.info('主赛事已切换', App.eventId, '→', data.eventId);
-    App.eventId = data.eventId;
-    App.events = []; // 届列表里的「主赛事」标记要重取
-    goto('', route.page, { replace: true });
-    return;
-  }
+  // 后端「当前届」（写接口的作用对象）变了：只记下来，**不跳页**——
+  // 主页列出全部届次，没有「主赛事」这回事，不该因为别人切换而打断当前阅读。
+  if (data.eventId) App.eventId = data.eventId;
   const changed = App.state?.revision !== data.revision;
   App.state = data;
   if (changed) log.info('状态已更新', 'revision', data.revision);
@@ -308,18 +413,24 @@ async function loadInitial() {
     log.warn('届次列表加载失败', err);
   }
   const r = parseRoute();
-  await goto(r.eventId, r.page || App.view || 'overview', { replace: true });
+  // 只给了届次（/e001）就补总览；什么都没有（/）就是主页
+  await goto(r.eventId, r.page || (r.eventId ? 'overview' : 'home'), {
+    replace: true,
+    channelId: r.channelId,
+  });
 }
 
 /* --------------------------- 事件装配 --------------------------- */
 function bindStatic() {
-  // 页签 = 路由：切页只换「页面段」，届次段原样保留（看往届时就在往届里翻页）
+  // 页签 = 路由：切页只换「页面段」，届次段原样保留（在一届里翻页不会换届）
   qsa('.tab').forEach((tab) => {
     tab.addEventListener('click', () => goto(route.eventId, tab.dataset.view));
   });
 
   qs('#btnRefresh').addEventListener('click', async () => {
-    if (ws && ws.readyState === WebSocket.OPEN && !App.routeEvent) ws.send('state');
+    // 在看别人的届（只读）时别去要「当前届」的推送，那会是一份用不上的数据
+    const wantsPush = !App.routeEvent || App.routeEvent === App.eventId;
+    if (ws && ws.readyState === WebSocket.OPEN && wantsPush) ws.send('state');
     await hooks.refreshState();
     toast('已同步最新状态', 'ok', 2000);
   });
@@ -388,6 +499,22 @@ function bindStatic() {
     if (App.state) renderRosterGrid(App.state);
   });
 
+  // 主页 / 全部赛事页的搜索：防抖，且只重绘分组列表（不重建搜索框，免得丢焦点）
+  let homeTimer = null;
+  const searchTargets = {
+    homeSearch: () => renderHomeGroups(App.state),
+    eventsSearch: () => renderEventsGroups(),
+  };
+  const onEventsSearch = (e) => {
+    const run = searchTargets[e.target.id];
+    if (!run) return;
+    App.homeSearch = e.target.value;
+    clearTimeout(homeTimer);
+    homeTimer = setTimeout(run, 120);
+  };
+  qs('#homeBody')?.addEventListener('input', onEventsSearch);
+  qs('#eventsBoard')?.addEventListener('input', onEventsSearch);
+
   // 管理端表单提交
   qs('#adminPanel').addEventListener('submit', (e) => {
     if (!e.target.dataset.form) return;
@@ -421,23 +548,23 @@ function bindStatic() {
     renderMemberGrid();
   });
 
-  // 头像文件选择（选手编辑弹窗与批量名单共用）
+  // 头像文件选择（选手编辑弹窗与批量名单共用）+ 备份上传还原
   document.addEventListener('change', (e) => {
     const file = e.target.closest('[data-role="avatar-file"]');
     if (file) uploadAvatarFile(file);
+    const backupFile = e.target.closest('[data-role="backup-file"]');
+    if (backupFile) uploadBackupFile(backupFile);
     // 参与名单勾选：同步卡片的「未参与」样式
     const pick = e.target.closest('[data-role="participant"]');
     if (pick) pick.closest('.pick')?.classList.toggle('pick--off', !pick.checked);
   });
 
-  // 门禁：回车登录
-  qs('#adminGate').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') login(qs('#adminKey')?.value || '');
-  });
-  // 服务器 / 个人页门禁：回车登录
-  ['#serverBody', '#userBody'].forEach((sel) => {
+  // 门禁：回车登录。三个门禁（赛事管理 / 服务器 / 我的）各有一个密钥框，
+  // 只认「焦点所在门禁」里的密码输入，别去全局找 id（会命中隐藏页面里的空框）。
+  ['#adminGate', '#serverBody', '#userBody'].forEach((sel) => {
     qs(sel).addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && e.target.id === 'adminKey') login(e.target.value || '');
+      if (e.key !== 'Enter' || e.target.type !== 'password' || !e.target.closest('.gate')) return;
+      login(e.target.value || '');
     });
   });
 
@@ -487,6 +614,15 @@ async function init() {
     if (!App.state) return;
     const rebuilt = focusLive(App.state);
     if (!rebuilt) Live.playSelected(App.state);
+  };
+  // 在页面里换台时把地址更新成 /channels/<推流 ID>：用 replaceState，不新增历史，
+  // 于是「刷新 / 收藏 / 分享」掉的都是当前这一路直播间。
+  hooks.syncChannelUrl = (key = '') => {
+    if (App.view !== 'channels') return;
+    const path = routePath('', 'channels', key || '');
+    if (location.pathname === path) return;
+    route = { eventId: '', page: 'channels', channelId: key || '' };
+    history.replaceState({ ...route }, '', path);
   };
   // 供 actions / events 等模块切路由（届 + 页面），避免它们反向依赖本模块
   hooks.goto = goto;

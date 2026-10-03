@@ -10,6 +10,7 @@
  */
 
 import {
+  API,
   App,
   TOKEN_KEY,
   api,
@@ -56,16 +57,20 @@ export async function refreshServerData({ silent = false } = {}) {
     return null;
   }
   try {
-    const [members, config, guard] = await Promise.all([
+    const [members, config, guard, backups, qqbot] = await Promise.all([
       api('/members', { auth: true }),
       api('/server/config', { auth: true }),
       api('/server/login-guard', { auth: true }),
+      api('/backups', { auth: true }),
+      api('/qqbot', { auth: true }),
     ]);
     App.server = {
       members: members.members || [],
       duplicates: members.duplicates || {},
       config,
       guard,
+      backups,
+      qqbot,
       at: Date.now(),
     };
     log.debug('服务器数据已加载', App.server.members.length, '位成员');
@@ -83,8 +88,8 @@ const serverGateHtml = () =>
   `<div class="gate__title">服务器管理</div>` +
   `<p class="gate__desc">这里是服务器级管理（成员 / 届次 / 直播封禁 / 自定义 HTML）。` +
   `请用<b>服务器管理员密钥</b>登录后使用。</p>` +
-  `<div class="field"><label for="adminKey">登录密钥</label>` +
-  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入服务器管理员密钥"></div>` +
+  `<div class="field"><label for="serverKey">登录密钥</label>` +
+  `<input id="serverKey" type="password" autocomplete="current-password" placeholder="请输入服务器管理员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
   `<p class="gate__hint">密钥在服务启动日志里（首次启动自动生成）；` +
   `服务器管理员有且只有一个，忘记可在成员管理里轮换。` +
@@ -131,8 +136,14 @@ function memberCardHtml(m) {
     );
   }
   if (m.active === false) tags.push('<span class="badge badge--lose">停用</span>');
-  if (m.hasKey) tags.push('<span class="badge badge--pending" title="已配置登录密钥">密钥</span>');
-  if (m.hasBearer) tags.push('<span class="badge badge--pending" title="已配置 Bearer 令牌">令牌</span>');
+  if (m.hasKey) tags.push('<span class="badge badge--pending" title="已配置登录密钥（加盐哈希）">密钥</span>');
+  if (m.hasBearer) tags.push('<span class="badge badge--pending" title="已配置 Bearer 令牌（加盐哈希）">令牌</span>');
+  if (m.legacyCredential) {
+    // 老库里的凭据是无盐 sha256；服务端拿不到明文，只能靠轮换升级
+    tags.push(
+      '<span class="badge badge--lose" title="凭据仍是历史无盐格式，点「换密钥 / 换令牌」轮换一次即可升级为加盐哈希">凭据待升级</span>'
+    );
+  }
 
   const meta = [m.uid, m.gameUuid ? `游戏 ${m.gameUuid}` : '', m.streamId ? `推流 ${m.streamId}` : '']
     .filter(Boolean)
@@ -187,12 +198,19 @@ export function renderMemberGrid() {
 
 function membersPanelHtml() {
   const dups = Object.entries(App.server?.duplicates || {});
+  const legacy = App.server?.legacyCredentials || [];
+  const legacyNotice = legacy.length
+    ? `<div class="notice notice--warn" style="margin-bottom:10px">有 <b>${legacy.length}</b> 位成员的凭据还是` +
+      `<b>历史无盐格式</b>（老版本写的）。服务端拿不到明文、无法自动升级——在成员卡上点一次` +
+      `「换密钥 / 换令牌」轮换即可切换到<b>加盐哈希</b>（新值会弹窗显示，记得转告本人）。</div>`
+    : '';
   const dupNotice = dups.length
     ? `<div class="notice notice--warn" style="margin-bottom:10px">有 <b>${dups.length}</b> 个推流 ID 重复：` +
       `${esc(dups.slice(0, 3).map(([k]) => k).join('、'))}${dups.length > 3 ? ' 等' : ''}。` +
       `重复会串流，请改掉其中一个。</div>`
     : '';
   const body =
+    legacyNotice +
     dupNotice +
     `<div class="tool-group" style="margin-bottom:10px">` +
     `<div class="field" style="min-width:200px"><input id="memberSearch" type="search" ` +
@@ -219,9 +237,6 @@ function membersPanelHtml() {
 function eventAdminCard(e) {
   const ops =
     `<div class="evt-card__ops">` +
-    (e.current
-      ? `<span class="panel__hint">主赛事</span>`
-      : `<button class="btn btn--sm btn--primary" type="button" data-act="event-switch" data-id="${esc(e.id)}">设为主赛事</button>`) +
     `<button class="btn btn--sm" type="button" data-act="event-rename" data-id="${esc(e.id)}">重命名</button>` +
     (e.status === 'closed'
       ? `<button class="btn btn--sm" type="button" data-act="event-reopen" data-id="${esc(e.id)}">恢复进行</button>`
@@ -232,7 +247,7 @@ function eventAdminCard(e) {
     `<button class="btn btn--sm btn--danger" type="button" data-act="event-delete" data-id="${esc(e.id)}">删除</button>` +
     `</div>`;
   return (
-    `<article class="evt-card evt-card--act${e.current ? ' evt-card--on' : ''}">` +
+    `<article class="evt-card evt-card--act">` +
     `<div class="evt-card__head">` +
     `<button class="evt-card__name" type="button" data-act="event-view" data-id="${esc(e.id)}" data-page="overview">` +
     `${esc(e.name || e.id)}</button>` +
@@ -254,12 +269,279 @@ function eventsPanelHtml() {
     `<div class="tool-group" style="margin-bottom:10px">` +
     `<button class="btn btn--sm btn--primary" type="button" data-act="event-new">新建一届</button>` +
     `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新届次</button>` +
-    `<span class="panel__hint">历届（含进行中与未来）：可关闭 / 隐藏 / 切换 / 重命名 / 删除</span>` +
+    `<span class="panel__hint">全部届次（含进行中与未来）：可封存 / 隐藏 / 重命名 / 删除</span>` +
     `</div>` +
     (events.length
       ? `<div class="evt-grid">${events.map(eventAdminCard).join('')}</div>`
       : `<div class="empty"><b>暂无赛事</b>点「新建一届」开始</div>`);
   return panelHtml('届次管理', '全部届次 · 服务器统一管理', body);
+}
+
+/** 站点名称（全局）：顶栏、浏览器标签与主页都用它。 */
+function sitePanelHtml() {
+  const body =
+    `<form class="form" data-form="site">` +
+    fieldText('siteName', '站点名称', App.state?.siteName || '', {
+      ph: 'NTE 比赛',
+      hint: '显示在顶栏左侧、浏览器标签与主页标题；与比赛无关的页面都用它。留空回落默认值。',
+    }) +
+    `<div class="form-actions"><button class="btn btn--primary" type="submit">保存站点名称</button></div>` +
+    `</form>`;
+  return panelHtml('站点', '全局 · 服务器级', body);
+}
+
+/** 备份里的「原因」怎么念给用户看。 */
+const BACKUP_REASON = { manual: '手动', auto: '自动', 'pre-restore': '还原前' };
+
+function backupReasonText(it) {
+  const reason = String(it.reason || '');
+  if (reason.startsWith('upload')) return '上传的备份';
+  return BACKUP_REASON[reason] || reason || '—';
+}
+
+function backupSizeText(bytes) {
+  const n = Number(bytes) || 0;
+  return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+/** 数据备份：打包 / 下载 / 还原 / 上传还原 / 周期性自动备份。 */
+function backupPanelHtml() {
+  const b = App.server?.backups;
+  if (!b) return '';
+  const s = b.settings || {};
+  const items = b.backups || [];
+  const rows = items.length
+    ? `<div class="bak-list">` +
+      items
+        .map(
+          (it) =>
+            `<div class="bak">` +
+            `<div class="bak__main">` +
+            `<div class="bak__name">${esc(it.name)}</div>` +
+            `<div class="bak__meta">${esc(fmtFull(it.createdAt))} · ${backupSizeText(it.size)} · ` +
+            `${esc(backupReasonText(it))}` +
+            (it.avatars ? ` · 头像 ${it.avatars}` : '') +
+            (it.ok ? '' : ' · <b>清单损坏</b>') +
+            `</div></div>` +
+            `<div class="tool-group">` +
+            `<button class="btn btn--sm" type="button" data-act="backup-download" data-name="${esc(it.name)}">下载</button>` +
+            `<button class="btn btn--sm" type="button" data-act="backup-restore" data-name="${esc(it.name)}">还原</button>` +
+            `<button class="btn btn--sm btn--danger" type="button" data-act="backup-delete" data-name="${esc(it.name)}">删除</button>` +
+            `</div></div>`
+        )
+        .join('') +
+      `</div>`
+    : `<div class="empty"><b>还没有备份</b>点上面的「立即备份」生成第一份——` +
+      `备份会打包整个数据库与头像目录。</div>`;
+
+  const nextText = !s.enabled ? '未开启' : b.nextRunAt ? fmtFull(b.nextRunAt) : '尽快';
+  const body =
+    `<div class="notice">一份备份 = <b>全部数据</b>：所有届次与赛程、成员与凭据、直播封禁、` +
+    `自定义 HTML、本地上传的头像（QQ 头像缓存不算，它可再生）。` +
+    `文件保存在服务器上的 <code>${esc(b.dir || '')}</code>。</div>` +
+    `<div class="notice notice--warn" style="margin-top:8px"><b>还原会覆盖当前全部数据</b>：` +
+    `服务端会先自动打一份「还原前」的安全备份，还原完成后<b>所有会话失效</b>，需要重新登录。</div>` +
+    `<form class="form form--2" data-form="backup" style="margin-top:10px">` +
+    fieldSwitch('enabled', '开启周期性自动备份', s.enabled === true) +
+    fieldNum('intervalHours', '备份间隔（小时）', s.intervalHours ?? 24, { hint: '1 ~ 720' }) +
+    fieldNum('keep', '最多保留份数', s.keep ?? 7, { hint: '超出后按时间从旧到新自动删除' }) +
+    `<div style="grid-column:1/-1" class="form-actions">` +
+    `<button class="btn btn--primary" type="submit">保存备份设置</button></div>` +
+    `</form>` +
+    `<div class="notice" style="margin-top:10px">下次自动备份：<b>${esc(nextText)}</b>` +
+    (s.lastRunAt ? `（上次 ${esc(fmtFull(s.lastRunAt))}）` : '') +
+    `</div>` +
+    `<div class="tool-group" style="margin-top:10px">` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="backup-create">立即备份</button>` +
+    `<button class="btn btn--sm" type="button" data-act="backup-upload">上传备份并还原</button>` +
+    `<input id="backupFile" data-role="backup-file" type="file" accept=".zip,application/zip" hidden>` +
+    `<span class="panel__hint" style="margin-left:auto">上传上限 ${b.maxUploadMb || 256} MB</span>` +
+    `</div>` +
+    `<div style="margin-top:10px">${rows}</div>`;
+  return panelHtml('备份', items.length ? `${items.length} 份` : '尚无备份', body);
+}
+
+/**
+ * 查询接口令牌：给配套的 AstrBot 插件用（命令 + LLM 工具）。
+ *
+ * 令牌只存**加盐哈希**，明文只在生成那一次弹出；重置后旧令牌立即失效。
+ */
+function botTokenBlockHtml(q) {
+  return (
+    `<div class="panel__divider" style="margin:12px 0;border-top:1px solid var(--line)"></div>` +
+    `<div class="notice">配套插件 <code>astrbot_plugin_nte_match</code>（见项目里 <code>integrations/</code>）` +
+    `可以把赛事数据做成<b>群命令</b>，也能注册成 <b>LLM 工具</b>让机器人自己调用。` +
+    `它需要一个只读查询令牌：</div>` +
+    `<dl class="kv" style="margin-top:10px">` +
+    `<div class="kv__row"><dt>查询 API</dt><dd>${q.hasBotToken ? '已启用（令牌不可查看）' : '未启用'}</dd></div>` +
+    `<div class="kv__row"><dt>接口前缀</dt><dd><code>/api/bot/query</code> · <code>/api/bot/events</code> · <code>/api/bot/participants</code></dd></div>` +
+    `</dl>` +
+    `<div class="tool-group" style="margin-top:10px">` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="qqbot-token-new">` +
+    `${q.hasBotToken ? '重置令牌' : '生成令牌'}</button>` +
+    `<button class="btn btn--sm btn--danger" type="button" data-act="qqbot-token-clear"` +
+    `${q.hasBotToken ? '' : ' disabled'}>清除令牌（关闭查询）</button>` +
+    `</div>` +
+    `<div class="notice" style="margin-top:8px">把站点地址与令牌填进插件配置即可。` +
+    `令牌<b>只显示一次</b>，重置后旧令牌立即失效。<br>` +
+    `插件的「比赛召集」用消息链发 <b>At 组件</b>，是<b>真正的 @</b>；` +
+    `而页面上「发送到群」受 AstrBot OpenAPI 限制只能把 @ 写进文本。</div>`
+  );
+}
+
+/** 限流额度一行（服务器面板用；数据来自 /api/qqbot 的 limit）。 */
+function limitLineHtml(limit = App.server?.qqbot?.limit) {
+  if (!limit) return '';
+  if (limit.cooldownLeft > 0) {
+    return ` · 限流中：还需等 <b>${limit.cooldownLeft}</b> 秒`;
+  }
+  return ` · 本小时已推 <b>${limit.usedLastHour}</b>／${limit.maxPerHour} 次`;
+}
+
+/* ------------------------------ 推送到群 ------------------------------ */
+const PUSH_KINDS = [
+  ['event', '比赛信息', '名字 / 赛制 / 时间 / 人数 / 简介 / 是否排名'],
+  ['live', '当前直播', '主直播间是否开播 + 正在推流的选手 / 成员机位（全局信息，不挑届次）'],
+  ['progress', '赛程进度', '已赛多少、正在打谁 vs 谁'],
+  ['call', '召集参赛', '@ 参与名单里的 QQ，请他们到场准备'],
+  ['result', '比赛结果', '冠军 / 榜单 + 逐场比分'],
+  ['detail', '单届详情', '信息 + 进度 + 结果（选定场次就细说那一场）'],
+  ['list', '全部比赛列表', '所有届次；过长会自动分段，可分页'],
+];
+
+/**
+ * 赛事管理页里的「推送到群」面板（赛事管理员 / 服务器管理员都能用）。
+ *
+ * 只做两件事：**预览**与**发送**；发送目标就是当前这一届。
+ */
+export function qqbotPushPanelHtml(s) {
+  const rounds = (s.rounds || []).filter((r) => r.code).slice(0, 60);
+  const body =
+    `<div class="notice" id="qqbotStatus">正在检查群推送配置…</div>` +
+    `<div class="form form--2" style="margin-top:10px">` +
+    `<div class="field"><label for="qqbotKind">推送内容</label><select id="qqbotKind">` +
+    PUSH_KINDS.map(([v, t]) => `<option value="${v}">${t}</option>`).join('') +
+    `</select><span class="field__hint" id="qqbotKindHint">${esc(PUSH_KINDS[0][2])}</span></div>` +
+    `<div class="field"><label for="qqbotRef">指定场次（可选）</label><select id="qqbotRef">` +
+    `<option value="">（不指定）</option>` +
+    rounds
+      .map((r) => `<option value="${esc(r.code)}">${esc(r.label || r.code)}</option>`)
+      .join('') +
+    `</select><span class="field__hint">选「单届详情」时用它细说某一场</span></div>` +
+    `<div class="field"><label for="qqbotPage">列表页码</label>` +
+    `<input id="qqbotPage" type="number" min="1" value="1">` +
+    `<span class="field__hint">仅「全部比赛列表」用</span></div>` +
+    `</div>` +
+    `<div class="tool-group" style="margin-top:10px">` +
+    `<button class="btn btn--sm" type="button" data-act="qqbot-preview">预览</button>` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="qqbot-push">发送到群</button>` +
+    `<span class="panel__hint" style="margin-left:auto">「预览」不会真的发送</span>` +
+    `</div>` +
+    `<textarea id="qqbotPreview" class="qqbot-preview" readonly rows="8" ` +
+    `placeholder="点「预览」看看要发什么…"></textarea>`;
+  return panelHtml('推送到群', '当前这一届 · QQ 机器人', body);
+}
+
+/** 拉一次推送状态并填进状态条（面板渲染后调用）。 */
+export async function refreshQqbotStatusBox() {
+  const box = qs('#qqbotStatus');
+  if (!box) return;
+  try {
+    const st = await api('/qqbot/status', { auth: true });
+    const quota = st.limit
+      ? st.limit.cooldownLeft > 0
+        ? ` · 限流中：还需等 <b>${st.limit.cooldownLeft}</b> 秒`
+        : ` · 本小时已推 <b>${st.limit.usedLastHour}</b>／${st.limit.maxPerHour} 次`
+      : '';
+    if (st.ready) {
+      box.className = 'notice';
+      box.innerHTML =
+        `已就绪 · 目标会话 <code>${esc(st.umo)}</code> · @ 方式 <b>${esc(st.atMode || 'cq')}</b>` +
+        quota;
+      return;
+    }
+    const missing = [
+      st.enabled ? '' : '未启用（到「服务器 → QQ 机器人」打开开关）',
+      st.hasKey ? '' : '缺少 AstrBot API Key',
+      st.umo ? '' : '缺少目标群',
+    ].filter(Boolean);
+    box.className = 'notice notice--warn';
+    box.innerHTML = `还不能发送：${esc(missing.join(' · '))}。仅服务器管理员可改这些设置。`;
+  } catch (err) {
+    box.className = 'notice notice--warn';
+    box.textContent = `推送状态获取失败：${err.message}`;
+  }
+}
+
+function qqbotPushQuery() {
+  return {
+    kind: qs('#qqbotKind')?.value || 'event',
+    ref: qs('#qqbotRef')?.value || '',
+    page: Number(qs('#qqbotPage')?.value) || 1,
+  };
+}
+
+/** QQ 机器人（AstrBot）推送设置：仅服务器管理员。 */
+function qqbotPanelHtml() {
+  const q = App.server?.qqbot?.settings || {};
+  const body =
+    `<div class="notice">把<b>比赛信息 / 赛程进度 / 召集参赛 / 比赛结果 / 比赛列表</b>推到 QQ 群。` +
+    `对接的是 <b>AstrBot OpenAPI</b>：API Key 在 AstrBot 的「设置 → OpenAPI」里创建（形如 <code>abk_xxx</code>）。` +
+    `Key 只存服务端，接口不回显、也不进「导出配置」。</div>` +
+    `<form class="form form--2" data-form="qqbot" style="margin-top:10px">` +
+    fieldSwitch('enabled', '启用群推送', q.enabled === true) +
+    fieldText('baseUrl', 'AstrBot 地址', q.baseUrl || 'https://bot.shiyora.net', {
+      hint: '不带尾部斜杠，例如 https://bot.shiyora.net',
+    }) +
+    fieldText('apiKey', 'AstrBot API Key', '', {
+      type: 'password',
+      ph: q.hasKey ? '已配置（留空 = 不修改）' : 'abk_xxx',
+      hint: '留空表示保持已保存的 Key 不变',
+    }) +
+    fieldText('umo', '目标群', q.umoRaw || '', {
+      ph: '123456789 或 aiocqhttp:GroupMessage:123456789',
+      hint: '只填群号时会按下面的平台拼成完整 UMO',
+    }) +
+    fieldText('platform', '平台适配器', q.platform || 'aiocqhttp', {
+      hint: '只填群号时用它拼 UMO；QQ（OneBot v11 / NapCat）用 aiocqhttp',
+    }) +
+    fieldSelect(
+      'atMode',
+      '@ 的方式',
+      q.atMode || 'cq',
+      [
+        ['cq', 'CQ 码 [CQ:at,qq=…]（OneBot v11 推荐）'],
+        ['text', '纯文本 @QQ号'],
+        ['none', '不 @，只列名字'],
+      ],
+      { hint: 'AstrBot 的 OpenAPI 没有 at 消息段，所以 @ 写在文本里；点「发送测试消息」一试就知道哪种生效' }
+    ) +
+    fieldNum('maxChars', '单条上限（字符）', q.maxChars ?? 1200, { hint: '超出自动分段发送' }) +
+    fieldNum('timeout', '请求超时（秒）', q.timeout ?? 10) +
+    fieldNum('cooldownSeconds', '两次推送的最小间隔（秒）', q.cooldownSeconds ?? 20, {
+      hint: '防止手滑连点；0 = 不限制间隔',
+    }) +
+    fieldNum('maxPerHour', '每小时最多推送（次）', q.maxPerHour ?? 30, {
+      hint: '按自然小时计；防长时间高频刷群',
+    }) +
+    fieldNum('maxParts', '单次最多分段（段）', q.maxParts ?? 8, {
+      hint: '一次推送最多切几段；超出会被拒绝（改用分页更合适）',
+    }) +
+    `<div class="form-actions" style="grid-column:1/-1">` +
+    `<button class="btn btn--primary" type="submit">保存推送设置</button>` +
+    `<button class="btn" type="button" data-act="qqbot-test">发送测试消息</button></div>` +
+    `</form>` +
+    `<div class="notice" style="margin-top:10px">当前目标会话：<code>${esc(q.umo || '未设置')}</code>` +
+    (q.hasKey ? ' · API Key 已配置' : ' · <b>未配置 API Key</b>') +
+    (q.enabled ? '' : ' · <b>未启用</b>') +
+    limitLineHtml() +
+    `</div>` +
+    `<div class="notice" style="margin-top:8px"><b>限流</b>：预览不占额度；「发送到群」与「发送测试消息」都占。` +
+    `一次推送无论切成几段只算 <b>1 次</b>，分段之间另各停 0.5 秒。</div>` +
+    `<div class="notice" style="margin-top:8px">所有出站消息都会<b>纯文本化</b>：QQ 不认 Markdown，` +
+    `星号 / 井号 / 表格竖线在发送前就被收拾干净。</div>` +
+    botTokenBlockHtml(q);
+  return panelHtml('QQ 机器人', 'AstrBot 群推送 · 服务器级', body);
 }
 
 function serverConfigPanelHtml() {
@@ -336,13 +618,15 @@ function loginGuardPanelHtml() {
 }
 
 function serverKeyPanelHtml() {
+  const mode = App.server?.config?.adminKeyMode || '';
   const body =
-    `<form class="form form--2" data-form="admin-key">` +
+    `<div class="notice">主管理 KEY 一律以<b>加盐 PBKDF2（12 万次迭代）</b>存储，` +
+    `明文与无盐哈希都不再落库${mode && mode !== 'pbkdf2_sha256' ? `。当前库里的还是 <b>${esc(mode)}</b> 格式，设一次新 KEY 即可升级` : ''}。</div>` +
+    `<form class="form form--2" data-form="admin-key" style="margin-top:10px">` +
     fieldText('key', '新的服务器主管理 KEY', '', {
       type: 'password',
       hint: '至少 6 位。保存后所有管理会话立即失效，需用新 KEY 重新登录。',
     }) +
-    fieldSwitch('storeHash', '只保存 sha256 哈希（推荐，文件里不留明文）', true) +
     `<div class="form-actions" style="grid-column:1/-1">` +
     `<button class="btn btn--primary" type="submit">更新主管理 KEY</button></div></form>`;
   return panelHtml('管理 KEY', '服务器主密钥（与成员密钥独立）', body);
@@ -352,11 +636,12 @@ function serverStatusPanelHtml() {
   const cfg = App.server?.config;
   if (!cfg) return '';
   const kv = [
+    ['站点名称', esc(App.state?.siteName || '—')],
     ['服务器管理员', esc(App.me?.name || '—')],
     ['成员总数', cfg.members ?? 0],
     ['赛事管理员', cfg.admins ?? 0],
+    ['届次总数', (App.events || []).length],
     ['直播封禁', cfg.bans ?? 0],
-    ['当前主赛事', `${esc(cfg.eventName || '—')}（${esc(cfg.eventId || '—')}）`],
   ];
   const body =
     `<dl class="kv">` +
@@ -417,8 +702,11 @@ export function renderServerPage() {
   }
   host.innerHTML =
     serverStatusPanelHtml() +
+    sitePanelHtml() +
     membersPanelHtml() +
     eventsPanelHtml() +
+    backupPanelHtml() +
+    qqbotPanelHtml() +
     loginGuardPanelHtml() +
     serverConfigPanelHtml() +
     serverKeyPanelHtml();
@@ -431,8 +719,8 @@ const userGateHtml = () =>
   `<div class="gate__title">我的</div>` +
   `<p class="gate__desc">用你的<b>成员密钥</b>登录后，可修改头像 / 名字 / 游戏 UUID / 推流 ID / 直播间名字，` +
   `并轮换自己的密钥与 Bearer 令牌。</p>` +
-  `<div class="field"><label for="adminKey">成员密钥</label>` +
-  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥"></div>` +
+  `<div class="field"><label for="userKey">成员密钥</label>` +
+  `<input id="userKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
   `<p class="gate__hint">没有密钥？请联系服务器管理员在成员管理里为您创建。` +
   `<br>服务器主管理 KEY 见服务启动日志（默认 <b>NTE-ADMIN</b>）。` +
@@ -778,6 +1066,123 @@ export async function handleMemberAction(act, el) {
       await refreshServerData();
       renderServerPage();
       return true;
+    case 'backup-create': {
+      try {
+        await api('/backups', { method: 'POST', auth: true });
+        toast('已创建备份', 'ok');
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
+      return true;
+    }
+    case 'backup-upload':
+      qs('#backupFile')?.click();
+      return true;
+    case 'backup-download':
+      window.open(
+        `${API}/backups/${encodeURIComponent(el.dataset.name || '')}/download?token=${encodeURIComponent(App.token)}`,
+        '_blank',
+        'noopener'
+      );
+      return true;
+    case 'backup-restore': {
+      const name = el.dataset.name || '';
+      if (!window.confirm(restoreConfirmText(`「${name}」`))) return true;
+      try {
+        await api(`/backups/${encodeURIComponent(name)}/restore`, { method: 'POST', auth: true });
+        afterRestore();
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
+      return true;
+    }
+    case 'backup-delete': {
+      const name = el.dataset.name || '';
+      if (!window.confirm(`确认删除备份「${name}」？`)) return true;
+      try {
+        await api(`/backups/${encodeURIComponent(name)}`, { method: 'DELETE', auth: true });
+        toast('备份已删除', 'ok');
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      return true;
+    }
+    case 'qqbot-token-new': {
+      if (
+        App.server?.qqbot?.settings?.hasBotToken &&
+        !window.confirm('重置令牌会让旧令牌立即失效（插件需同步更新），继续？')
+      ) {
+        return true;
+      }
+      try {
+        const res = await api('/qqbot/bot-token', { method: 'POST', auth: true });
+        showSecretModal(res.token, '', '查询接口令牌（仅此一次）');
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
+      return true;
+    }
+    case 'qqbot-token-clear': {
+      if (!window.confirm('清除令牌后插件将无法查询，继续？')) return true;
+      try {
+        await api('/qqbot/bot-token', { method: 'DELETE', auth: true });
+        toast('查询令牌已清除', 'ok');
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      return true;
+    }
+    case 'qqbot-test': {
+      try {
+        const res = await api('/qqbot/test', { method: 'POST', auth: true, body: {} });
+        toast(
+          res.ok ? `测试消息已发送到 ${res.umo}` : `发送失败：${res.detail || '未知原因'}`,
+          res.ok ? 'ok' : 'err',
+          8000
+        );
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
+      return true;
+    }
+    case 'qqbot-preview': {
+      const q = qqbotPushQuery();
+      try {
+        const res = await api(`/qqbot/preview?${new URLSearchParams(q).toString()}`, { auth: true });
+        const box = qs('#qqbotPreview');
+        if (box) {
+          box.value = res.parts
+            .map((part, i) => (res.parts.length > 1 ? `— 第 ${i + 1} 段 —\n${part}` : part))
+            .join('\n\n');
+        }
+        toast(
+          `预览完成：${res.parts.length} 段` + (res.pages > 1 ? `（列表共 ${res.pages} 页）` : ''),
+          'ok'
+        );
+      } catch (err) {
+        toast(err.message, 'err', 7000);
+      }
+      return true;
+    }
+    case 'qqbot-push': {
+      const q = qqbotPushQuery();
+      if (!window.confirm('确认把这条消息发送到群里？')) return true;
+      try {
+        const res = await api('/qqbot/push', { method: 'POST', auth: true, body: q });
+        toast(`已发送到群（${res.sent}/${res.total} 段）`, 'ok', 6000);
+      } catch (err) {
+        toast(err.message, 'err', 9000);
+      }
+      return true;
+    }
     case 'member-add':
       openMemberModal(null);
       return true;
@@ -872,6 +1277,20 @@ export async function handleMemberForm(formEl) {
     }
     return true;
   }
+  if (name === 'site') {
+    const v = collectForm(formEl);
+    try {
+      const res = await api('/site/name', { method: 'PUT', auth: true, body: { name: v.siteName } });
+      toast(`站点名称已更新为「${res.siteName}」`, 'ok');
+      // 服务端会广播一次状态，这里再主动同步一遍，保证顶栏与标签页立刻换名字
+      await refreshServerData({ silent: true });
+      if (hooks.refreshState) await hooks.refreshState();
+      else renderServerPage();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+    return true;
+  }
   if (name === 'login-guard') {
     const v = collectForm(formEl);
     try {
@@ -881,6 +1300,54 @@ export async function handleMemberForm(formEl) {
       renderServerPage();
     } catch (err) {
       toast(err.message, 'err', 7000);
+    }
+    return true;
+  }
+  if (name === 'backup') {
+    const v = collectForm(formEl);
+    try {
+      await api('/backups/settings', {
+        method: 'PUT',
+        auth: true,
+        body: {
+          enabled: v.enabled === true,
+          intervalHours: Number(v.intervalHours) || 24,
+          keep: Number(v.keep) || 7,
+        },
+      });
+      toast('备份设置已保存', 'ok');
+      await refreshServerData();
+      renderServerPage();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+    return true;
+  }
+  if (name === 'qqbot') {
+    const v = collectForm(formEl);
+    try {
+      await api('/qqbot', {
+        method: 'PUT',
+        auth: true,
+        body: {
+          enabled: v.enabled === true,
+          baseUrl: v.baseUrl,
+          apiKey: v.apiKey,
+          umo: v.umo,
+          platform: v.platform,
+          atMode: v.atMode,
+          maxChars: Number(v.maxChars) || 1200,
+          timeout: Number(v.timeout) || 10,
+          cooldownSeconds: Number(v.cooldownSeconds) || 0,
+          maxPerHour: Number(v.maxPerHour) || 30,
+          maxParts: Number(v.maxParts) || 8,
+        },
+      });
+      toast('群推送设置已保存', 'ok');
+      await refreshServerData();
+      renderServerPage();
+    } catch (err) {
+      toast(err.message, 'err');
     }
     return true;
   }
@@ -916,6 +1383,49 @@ export async function handleMemberForm(formEl) {
     return true;
   }
   return false;
+}
+
+/* ------------------------------ 备份：还原收尾 ------------------------------ */
+/** 还原前的二次确认文案（上传与列表里的「还原」共用）。 */
+function restoreConfirmText(what) {
+  return (
+    `确认用 ${what} 还原？\n\n` +
+    '当前全部数据（届次 / 赛程 / 成员 / 头像…）都会被这份备份覆盖。\n' +
+    '服务端会先自动打一份「还原前」的安全备份，万一还原错了还能倒回来。\n\n' +
+    '还原完成后所有会话失效，需要重新登录。'
+  );
+}
+
+/** 还原后的收尾：凭据可能已变，清掉本地会话并重载（本机访问会自动免登录回来）。 */
+function afterRestore() {
+  toast('已还原，正在重新登录…', 'ok', 6000);
+  App.token = '';
+  localStorage.removeItem(TOKEN_KEY);
+  App.me = null;
+  App.server = null;
+  App.serverTried = false;
+  setTimeout(() => location.reload(), 800);
+}
+
+/** 上传一份备份并还原（请求体就是原始 zip 字节）。 */
+export async function uploadBackupFile(input) {
+  const file = input.files && input.files[0];
+  input.value = ''; // 立刻清空，允许连续选同一个文件
+  if (!file) return;
+  if (!window.confirm(restoreConfirmText(`「${file.name}」（${backupSizeText(file.size)}）`))) return;
+  try {
+    const res = await fetch(`${API}/backups/upload?name=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'X-NTE-Token': App.token },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || data.detail || `上传失败 (HTTP ${res.status})`);
+    log.warn('已从上传的备份还原', data);
+    afterRestore();
+  } catch (err) {
+    toast(err.message, 'err', 8000);
+  }
 }
 
 /** 拉取 /api/me 并写入 App.me（含成员视图）。 */

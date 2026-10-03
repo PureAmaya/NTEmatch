@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import random
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 from urllib.parse import quote
 
@@ -27,9 +28,20 @@ from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
-from . import avatars, league, live, logic, login_guard, tournament
+from . import (
+    avatars,
+    backup,
+    backup_api,
+    bot_api,
+    league,
+    live,
+    logic,
+    login_guard,
+    qqbot_api,
+    tournament,
+)
 from . import members as members_api
-from .auth import Session, auth, is_factory_key, sha256_hex
+from .auth import Session, admin_key_mode, auth, hash_password, is_factory_key
 from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
@@ -325,6 +337,8 @@ def build_public_state(cfg: Config) -> dict[str, Any]:
     state["eventId"] = store.current_id
     state["eventName"] = cfg.event.name or cfg.event.title
     state["eventStatus"] = cfg.event.status
+    # 站点名称（全局，服务器管理员设定）：顶栏 / 浏览器标签 / 主页都用它
+    state["siteName"] = store.site_name()
     state["channels"] = logic.channel_views(cfg, store.channels())
     # 频道板块的公告（全局，纯展示）：放异环相关的说明 / 活动文案
     state["channelNotice"] = store.channel_notice()
@@ -362,6 +376,8 @@ async def lifespan(app: FastAPI):
     store.on_change(on_config_change)
     # 启动时先算一次，保证新连接的客户端立刻拿到数据
     await hub.broadcast_state(build_public_state(store.snapshot()))
+    # 周期性自动备份：常驻巡检，到点才真的打包（没开启时只是每 5 分钟看一眼设置）
+    backup_task = asyncio.create_task(backup.auto_backup_loop())
     # 直播探测按需触发（前端在直播 / 频道页请求 /api/live/health 时才探一次），
     # 因此这里不启动任何常驻任务，没人看直播时后端不做任何探测。
     cfg = store.snapshot()
@@ -383,6 +399,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        backup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await backup_task
         await store.stop()
         await avatars.aclose()
         # 先收掉还没跑完的探测任务，再关连接池：否则它可能在关池的瞬间发起请求
@@ -421,6 +440,9 @@ app.add_middleware(EdgeCacheMiddleware)
 
 app.include_router(live.router)
 app.include_router(members_api.router)
+app.include_router(backup_api.router)
+app.include_router(qqbot_api.router)
+app.include_router(bot_api.router)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -523,7 +545,10 @@ async def api_diagnostics(_: Session = Depends(require_event)) -> dict[str, Any]
         "avatarCache": avatars.cache_stats(),
         "live": live.stream_endpoints(),
         "issues": validate_config(cfg),
-        "adminKeyMode": "sha256" if cfg.admin.key_sha256 else "plain",
+        # 主管理 KEY 的存储形态：pbkdf2_sha256（推荐）/ sha256（历史无盐）/ plain / unset
+        "adminKeyMode": admin_key_mode(cfg.admin),
+        # 还有几位成员的凭据是历史无盐格式（建议轮换）
+        "legacyCredentials": len(store.legacy_credential_members()),
     }
 
 
@@ -665,15 +690,13 @@ async def api_admin_key(
     raw = (payload.key or "").strip()
     if len(raw) < 6:
         raise HTTPException(status_code=400, detail="管理 KEY 至少 6 位")
-    patch = (
-        {"admin": {"key": "", "keySha256": sha256_hex(raw)}}
-        if payload.store_hash
-        else {"admin": {"key": raw, "keySha256": ""}}
-    )
+    # 一律写**加盐 PBKDF2**：明文与无盐 sha256 都不再落库（payload.store_hash 已无意义，
+    # 保留字段只为兼容旧前端）
+    patch = {"admin": {"key": "", "keySha256": "", "keyHash": hash_password(raw)}}
     await store.update(patch, actor="web:admin-key")
     revoked = auth.revoke_all()
-    log.warning("管理 KEY 已更新 | 模式=%s | 已注销会话=%d", "sha256" if payload.store_hash else "plain", revoked)
-    return {"ok": True, "mode": "sha256" if payload.store_hash else "plain", "reauth": True}
+    log.warning("管理 KEY 已更新（加盐 PBKDF2） | 已注销会话=%d", revoked)
+    return {"ok": True, "mode": "pbkdf2_sha256", "reauth": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -724,6 +747,7 @@ async def api_event_state(
     state["eventId"] = event_id
     state["eventName"] = cfg.event.name or cfg.event.title
     state["eventStatus"] = cfg.event.status
+    state["siteName"] = store.site_name()
     state["readOnly"] = event_id != store.current_id
     # 成员频道是全局的：回看往届时也照样展示（它们不属于任何一届）
     state["channels"] = logic.channel_views(cfg, store.channels())
@@ -1171,9 +1195,16 @@ async def api_reload(_: Session = Depends(require_current_event)) -> dict[str, A
 
 @app.get("/api/export")
 async def api_export(_: Session = Depends(require_current_event)) -> Response:
-    """导出当前届为 JSON（备份 / 迁移用；也可作为导入他处的快照）。"""
+    """导出当前届为 JSON（备份 / 迁移用；也可作为导入他处的快照）。
+
+    **不含任何凭据**：主管理 KEY（``admin``，可能含哈希甚至历史明文）在这里剥掉，
+    成员凭据也只在 ``members`` 表里、不属于届配置。导出的文件可以随便传阅。
+    """
     cfg = store.snapshot()
-    payload = json.dumps(cfg.dump(), ensure_ascii=False, indent=2)
+    data = cfg.dump()
+    data.pop("admin", None)     # 服务器主管理 KEY 属于服务器级，绝不进导出文件
+    data.pop("members", None)   # 兜底：万一哪天届配置里混进成员凭据
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
     filename = f"{store.current_id}-{cfg.event.name or 'event'}.json"
     return Response(
         content=payload,
@@ -1365,6 +1396,25 @@ async def api_channel_notice(
     """设置「频道」板块的公告 / 异环相关内容（全局，与届次无关）。"""
     text = await store.set_channel_notice(payload.text, actor="web:channel-notice")
     return {"ok": True, "notice": text, "state": build_public_state(store.snapshot())}
+
+
+class SiteNamePayload(NTEModel):
+    """站点名称（全局，服务器管理员设定；留空 = 回落默认值）。"""
+
+    name: str = ""
+
+
+@app.put("/api/site/name")
+async def api_site_name(
+    payload: SiteNamePayload, _: Session = Depends(require_server)
+) -> dict[str, Any]:
+    """设置站点名称（仅服务器管理员）。
+
+    它**不属于任何一届**（全局 meta）：顶栏、浏览器标签与主页都用它，
+    所以改完立刻广播一次状态，所有在线页面当场换名字。
+    """
+    name = await store.set_site_name(payload.name, actor="web:site-name")
+    return {"ok": True, "siteName": name, "state": build_public_state(store.snapshot())}
 
 
 @app.delete("/api/channels/{channel_id}")

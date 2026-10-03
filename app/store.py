@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import re
 import secrets
@@ -31,12 +30,13 @@ from pathlib import Path
 from typing import Any
 
 from . import db, league, tournament
-from .auth import sha256_hex
+from .auth import hash_secret, verify_secret
 from .defaults import default_config
 from .logging_conf import get_logger
 from .login_guard import DEFAULT_SETTINGS as GUARD_DEFAULTS
 from .login_guard import GUARD_KEYS
 from .models import Channel, Config, LiveBan, Member, Player
+from .qqbot import DEFAULT_SETTINGS as QQBOT_DEFAULTS
 
 log = get_logger("store")
 
@@ -89,6 +89,10 @@ _EVENT_ID_RE = re.compile(r"^e\d{3,}$")
 
 # 全局 meta 键：「频道」板块的公告 / 异环相关内容（不属于任何一届）
 CHANNEL_NOTICE_KEY = "channel_notice"
+# 全局 meta 键：站点名称（服务器管理员设定；顶栏、浏览器标签、主页都用它）
+SITE_NAME_KEY = "site_name"
+DEFAULT_SITE_NAME = "NTE 比赛"
+SITE_NAME_MAX = 24
 # 全局 meta 键：服务器管理员注入的自定义 HTML（用于接入统计 / 数据采集脚本）
 CUSTOM_HTML_KEY = "custom_html"
 # 全局 meta 键：「历届选手 → 成员」的一次性迁移是否已执行（幂等，避免每次启动都扫全库）
@@ -150,10 +154,14 @@ class ConfigStore:
         self._live_bans: list[LiveBan] = []
         # 频道板块的公告（全局，纯展示文案）
         self._channel_notice: str = ""
+        # 站点名称（全局；服务器管理员设定，空 = 用默认值）
+        self._site_name: str = ""
         # 服务器管理员注入的自定义 HTML（全局，用于数据采集）
         self._custom_html: str = ""
         # 登录失败限制（类 fail2ban）配置（全局；运行时计数在 login_guard 模块）
         self._guard: dict[str, Any] = dict(GUARD_DEFAULTS)
+        # QQ 机器人（AstrBot）推送配置（全局；含 API Key，只进不出）
+        self._qqbot: dict[str, Any] = dict(QQBOT_DEFAULTS)
         self._running = False
         # 出厂示例名单是否在本次载入中被清理（需要在启动时写回数据库）
         self._demo_purged = False
@@ -177,11 +185,14 @@ class ConfigStore:
         self._members = await asyncio.to_thread(self._load_members_sync)
         self._live_bans = await asyncio.to_thread(self._load_live_bans_sync)
         self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
+        self._site_name = await asyncio.to_thread(self._load_site_name_sync)
         self._custom_html = await asyncio.to_thread(self._load_custom_html_sync)
         self._guard = await asyncio.to_thread(self._load_login_guard_sync)
+        self._qqbot = await asyncio.to_thread(self._load_qqbot_sync)
         await self.ensure_server_admin()
         # 一次性迁移：历届所有选手都转成成员并建立关联（权限默认「成员」）
         await self.migrate_players_to_members()
+        self.report_legacy_credentials()
         if self._demo_purged:
             # 把出厂示例名单的清理结果落盘：数据库里也不该留这些假数据，
             # 顺便刷新 events 表缓存的选手数（往届列表会读它）
@@ -304,6 +315,28 @@ class ConfigStore:
         with db.connect(self._db_path) as conn:
             return db.get_meta(conn, CHANNEL_NOTICE_KEY)
 
+    def site_name(self) -> str:
+        """站点名称（服务器管理员设定）；没设过就用默认值。"""
+        return (self._site_name or "").strip() or DEFAULT_SITE_NAME
+
+    async def set_site_name(self, name: str, actor: str = "api") -> str:
+        """设置站点名称（写入全局 meta，并广播一次，让所有在线页面立刻换名字）。"""
+        clean = " ".join((name or "").split())[:SITE_NAME_MAX]
+        async with self._lock:
+            await asyncio.to_thread(self._set_site_name_sync, clean)
+            self._site_name = clean
+        log.info("站点名称已更新 | %s", clean or f"(清空，回落默认 {DEFAULT_SITE_NAME})")
+        await self._notify(self._config, f"site:name:{actor}")
+        return self.site_name()
+
+    def _load_site_name_sync(self) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, SITE_NAME_KEY)
+
+    def _set_site_name_sync(self, name: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, SITE_NAME_KEY, name)
+
     def _set_channel_notice_sync(self, text: str) -> None:
         with db.connect(self._db_path) as conn:
             db.set_meta(conn, CHANNEL_NOTICE_KEY, text)
@@ -348,18 +381,39 @@ class ConfigStore:
         return next((m for m in self._members if m.stream_id == key), None)
 
     def member_by_key(self, key: str) -> Member | None:
-        """按登录密钥定位成员：sha256 后常量时间比较，避免时序侧信道。"""
+        """按登录密钥定位成员。
+
+        每条成员都有自己的随机盐，必须逐条校验（新格式是 HMAC，一次也就微秒级）。
+        这里**不提前返回**——把整张表都过一遍，避免用耗时差异泄露「命中了第几条」。
+        """
         raw = (key or "").strip()
         if not raw:
             return None
-        digest = sha256_hex(raw)
+        found: Member | None = None
         for m in self._members:
-            if m.key_sha256 and hmac.compare_digest(m.key_sha256, digest):
-                return m
-        return None
+            stored = m.key_stored
+            if stored and verify_secret(raw, stored) and found is None:
+                found = m
+        return found
 
     def server_admin(self) -> Member | None:
         return next((m for m in self._members if m.permission == "server_admin"), None)
+
+    def legacy_credential_members(self) -> list[Member]:
+        """凭据还是**历史无盐格式**的成员（只能靠轮换升级，因为服务端拿不到明文）。"""
+        return [m for m in self._members if m.legacy_credentials]
+
+    def report_legacy_credentials(self) -> int:
+        """把「还有几个成员的凭据是无盐旧格式」记进日志（管理端也会提示轮换）。"""
+        legacy = self.legacy_credential_members()
+        if legacy:
+            log.warning(
+                "有 %d 位成员的凭据仍是历史无盐格式（建议在成员管理里轮换一次，"
+                "轮换后即为加盐哈希）：%s",
+                len(legacy),
+                "、".join(m.display_name for m in legacy[:5]) + ("…" if len(legacy) > 5 else ""),
+            )
+        return len(legacy)
 
     async def save_member(
         self, member: Member, *, new_key: bool = False, new_bearer: bool = False
@@ -381,14 +435,19 @@ class ConfigStore:
             bearer_plain = new_bearer_token() if gen_bearer else ""
             if current is not None:
                 data.created_at = current.created_at or now_iso()
+                data.key_hash = current.key_hash
+                data.bearer_hash = current.bearer_hash
                 data.key_sha256 = current.key_sha256
                 data.bearer_sha256 = current.bearer_sha256
             else:
                 data.created_at = data.created_at or now_iso()
             if key_plain:
-                data.key_sha256 = sha256_hex(key_plain)
+                # 新凭据一律写成**加盐**格式，并清掉历史无盐值（避免两套并存）
+                data.key_hash = hash_secret(key_plain)
+                data.key_sha256 = ""
             if bearer_plain:
-                data.bearer_sha256 = sha256_hex(bearer_plain)
+                data.bearer_hash = hash_secret(bearer_plain)
+                data.bearer_sha256 = ""
             data.updated_at = now_iso()
             await asyncio.to_thread(self._save_member_sync, data)
             rest = [m for m in self._members if m.uid != data.uid]
@@ -659,6 +718,56 @@ class ConfigStore:
         return removed
 
     # ------------------------------------------------------------------ #
+    # 服务器级配置：QQ 机器人（AstrBot）推送
+    #
+    # 设置存在数据库 meta 里（跟着备份 / 还原走），其中 AstrBot 的 API Key 属于
+    # 凭据：接口层只回「配没配」，绝不回明文。
+    # ------------------------------------------------------------------ #
+    def qqbot_settings(self) -> dict[str, Any]:
+        """QQ 机器人推送配置快照（含 API Key，**只给服务端用**）。"""
+        return dict(self._qqbot)
+
+    async def set_qqbot(
+        self, patch: dict[str, Any], actor: str = "api", *, internal: bool = False
+    ) -> dict[str, Any]:
+        """更新 QQ 机器人配置（只接受已知键；apiKey 传空串 = 不改）。
+
+        ``internal=True`` 时才允许写**只由服务端生成**的字段（如查询 API 令牌哈希）。
+        """
+        from . import qqbot  # 局部导入，避免模块级循环依赖
+
+        payload = {**(patch or {}), "__internal__": True} if internal else (patch or {})
+        async with self._lock:
+            merged = qqbot.normalize_settings(payload, self._qqbot)
+            self._qqbot = merged
+            await asyncio.to_thread(
+                self._set_meta_sync, qqbot.QQBOT_KEY, json.dumps(merged, ensure_ascii=False)
+            )
+        log.warning(
+            "QQ 机器人设置已更新 | 启用=%s | 目标=%s | @方式=%s",
+            merged.get("enabled"),
+            qqbot.resolved_umo(merged) or "(未设置)",
+            merged.get("atMode"),
+        )
+        await self._notify(self._config, f"server:qqbot:{actor}")
+        return merged
+
+    def _load_qqbot_sync(self) -> dict[str, Any]:
+        """读 QQ 机器人配置（JSON），坏数据一律回落到默认值。"""
+        from . import qqbot
+
+        with db.connect(self._db_path) as conn:
+            raw = db.get_meta(conn, qqbot.QQBOT_KEY)
+        if not raw:
+            return dict(QQBOT_DEFAULTS)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            log.warning("QQ 机器人配置无法解析，已回落到默认值")
+            return dict(QQBOT_DEFAULTS)
+        return qqbot.merge_settings(data if isinstance(data, dict) else {})
+
+    # ------------------------------------------------------------------ #
     # 服务器级配置：自定义 HTML（全局，用于接入统计 / 数据采集）
     # ------------------------------------------------------------------ #
     def custom_html(self) -> str:
@@ -768,6 +877,40 @@ class ConfigStore:
             log.info("配置载入完成 | reason=%s | 届=%s | revision=%d", reason, self._current, cfg.revision)
         await self._notify(cfg, f"reload:{reason}")
         return cfg
+
+    async def reload_all(self, reason: str = "manual") -> Config:
+        """把**全部**持久化状态重新读进内存（还原备份之后调用）。
+
+        比 :meth:`reload` 多覆盖：当前届 ID、届次结构升级、成员 / 封禁 / 频道 /
+        公告 / 自定义 HTML / 登录限制——还原后库里的「当前届」很可能跟内存里的
+        不是同一届，只重载当前届是不够的。
+        """
+        async with self._lock:
+            await asyncio.to_thread(db.init_db, self._db_path)
+            await asyncio.to_thread(self._migrate_sync)
+            current = await asyncio.to_thread(self._read_current_sync)
+            if not current:
+                current = await asyncio.to_thread(self._create_blank_sync)
+            self._current = current
+            self._config = await asyncio.to_thread(self._load_sync, current)
+            self._channels = await asyncio.to_thread(self._load_channels_sync)
+            self._members = await asyncio.to_thread(self._load_members_sync)
+            self._live_bans = await asyncio.to_thread(self._load_live_bans_sync)
+            self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
+            self._site_name = await asyncio.to_thread(self._load_site_name_sync)
+            self._custom_html = await asyncio.to_thread(self._load_custom_html_sync)
+            self._guard = await asyncio.to_thread(self._load_login_guard_sync)
+            self._qqbot = await asyncio.to_thread(self._load_qqbot_sync)
+            await self.ensure_server_admin()
+            self.report_legacy_credentials()
+        log.warning(
+            "已从数据库全量重载 | reason=%s | 届=%s | 成员=%d",
+            reason,
+            self._current,
+            len(self._members),
+        )
+        await self._notify(self._config, f"reload-all:{reason}")
+        return self._config
 
     async def update(self, patch: dict[str, Any], actor: str = "api") -> Config:
         """按 patch 合并更新（字典深合并、列表替换），并落盘。"""

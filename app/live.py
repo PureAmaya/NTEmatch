@@ -20,7 +20,6 @@ MediaMTX 的 HLS 与 WebRTC 是**两个独立端口**（``8888`` / ``8889``）�
 from __future__ import annotations
 
 import asyncio
-import hmac
 import time
 from typing import Any
 from urllib.parse import parse_qs
@@ -30,7 +29,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import model_validator
 
 from . import logic
-from .auth import sha256_hex
+from .auth import verify_secret
 from .logging_conf import get_logger
 from .models import Config, LiveBan, NTEModel, StreamConfig
 from .store import store
@@ -257,6 +256,93 @@ async def streaming_member_uids() -> list[str]:
     return [m.uid for m in store.members() if logic.clean_key(m.stream_id) in ready]
 
 
+# 直播各路的称呼（群里 / 推送里展示用）
+LIVE_KIND_LABEL = {
+    "main": "主直播间",
+    "player": "选手机位",
+    "member": "成员直播间",
+    "channel": "成员频道",
+}
+# 同一个流名常常同时对应「选手 / 成员 / 频道」（本来就常是同一个人），
+# 展示时只留信息最全的那一层：选手带比赛上下文，其次成员，最后频道。
+_LIVE_KIND_RANK = {"channel": 1, "member": 2, "player": 3}
+
+
+async def collect_live(*, force: bool = True) -> dict[str, Any]:
+    """汇总「当前谁在直播」：主直播间 + 选手机位 + 成员直播间 + 成员频道。
+
+    与页面请求不同，**这里会真的探一次**（``force=True``）：查询 API / 推送预览都是
+    「有人此刻想知道」才触发的，值得等那最多 3 秒——单飞锁保证并发也只打一次媒体
+    服务器（见 :func:`ready_paths`）；页面每帧都要渲染，所以只能读缓存。
+
+    返回的 ``items`` 已按「主直播间 → 选手机位 → 成员直播间 → 成员频道」排好，
+    同一个流名只出现一次。查不到状态时 ``known=False``，并把原因放在 ``reason``。
+    """
+    cfg = store.snapshot()
+    ready = await ready_paths(max_age=0.0) if force else ready_paths_snapshot()
+    known = ready is not None
+    keys = ready or set()
+    status = await live_status_view()
+    main_key = main_stream_key()
+
+    entries: dict[str, dict[str, Any]] = {}
+
+    def put(stream_key: str, kind: str, name: str, title: str = "", note: str = "") -> None:
+        key = logic.clean_key(stream_key)
+        if not key or key not in keys:
+            return
+        old = entries.get(key)
+        if old is not None and _LIVE_KIND_RANK.get(str(old.get("kind")), 0) >= _LIVE_KIND_RANK[kind]:
+            return
+        entries[key] = {
+            "key": key,
+            "kind": kind,
+            "name": name or key,
+            "title": title or "",
+            "note": note or "",
+            "play": logic.play_endpoints(cfg.stream, key),
+        }
+
+    for channel in store.channels():
+        # 停用的频道在访客端本来就不展示，这里也不列（否则停用后还会出现在群里）
+        if channel.active:
+            put(channel.stream_key, "channel", channel.display_name, channel.title)
+    for member in store.members():
+        if member.active:
+            put(member.stream_id, "member", member.display_name, member.room_title)
+    # 选手机位：顺带带上他当前所在的对局，群里就不用再查一次
+    rounds = logic.player_round_map(cfg)
+    for player in cfg.players:
+        rnd = rounds.get(player.id)
+        put(
+            logic.player_stream_key(player),
+            "player",
+            player.display_name,
+            note=(rnd.label or rnd.code) if rnd is not None else "",
+        )
+
+    order = {"main": 0, "player": 1, "member": 2, "channel": 3}
+    items = sorted(entries.values(), key=lambda e: (order.get(str(e["kind"]), 9), str(e["name"])))
+    main_live = bool(main_key) and main_key in keys
+    main = {
+        "key": main_key,
+        "live": main_live,
+        "play": logic.play_endpoints(cfg.stream, main_key) if main_key else {},
+    }
+    # 主直播间不是「某个人」，但同样是可观看到的独立一路：没和别人重名就插到最前
+    if main_live and main_key not in entries:
+        items.insert(0, {**main, "kind": "main", "name": "主直播间", "title": "", "note": ""})
+    return {
+        "known": known,
+        "reason": "" if known else (status.get("reason") or "媒体服务器不可达，无法判断谁在推流"),
+        "enabled": bool(cfg.stream.enabled),
+        "main": main,
+        "items": items,
+        "total": len(items),
+        "streamingPaths": status.get("count") or 0,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 端口探测与后台刷新
 # --------------------------------------------------------------------------- #
@@ -470,9 +556,10 @@ def authorize_publish(key: str, token: str) -> tuple[bool, str]:
     if member is not None:
         if not member.active:
             return False, "该成员已被停用"
-        if not member.bearer_sha256:
+        if not member.bearer_stored:
             return False, "该成员未配置推流令牌"
-        if not token or not hmac.compare_digest(sha256_hex(token), member.bearer_sha256):
+        # 逐条随机盐，必须按该成员的存储值校验；比较是常量时间的
+        if not token or not verify_secret(token, member.bearer_stored):
             return False, "Bearer 令牌不正确"
         return True, ""
     if key in registered_push_keys():

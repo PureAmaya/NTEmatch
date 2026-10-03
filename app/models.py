@@ -37,6 +37,8 @@ SideKey = Literal["A", "B", "C", "D"]
 MAX_SIDES = 4
 # 每场同场竞技的队伍数：2 = 组vs组，3 = 组vs组vs组，4 = 四队同场
 MIN_TEAMS_PER_MATCH = 2
+# 比赛简介的字数上限（按字符计，中英文同规）：界面用 maxlength 挡，服务端再截一次兜底
+MAX_BRIEF_CHARS = 30
 RoundStatus = Literal["pending", "live", "done"]
 WinnerCode = Literal["", "A", "B", "DRAW"]
 # 观众的观看线路：webrtc = 8889（UDP，延迟最低）；hls = 8888（TCP，抗抖动）
@@ -194,12 +196,13 @@ class Channel(NTEModel):
 class Member(NTEModel):
     """服务器成员（全局，跨届共享）。
 
-    成员是本站的「账号」：``uid`` 是网站用户 UUID（全局唯一，创建时自动生成），
-    ``key_sha256`` 是登录密钥的哈希（密钥是成员的登录凭证），
-    ``bearer_sha256`` 是 WHIP 推流 Bearer 令牌的哈希。
+    成员是本站的「账号」：``uid`` 是网站用户 UUID（全局唯一，创建时自动生成）。
 
-    密钥与令牌**只由服务端随机生成**，生成后明文只回给前端一次；此后一概以
-    sha256 存储、不再下发，只能「轮换」（轮换后旧值立即失效）。
+    凭据一律**加盐**存储，明文永不落库、也永不回传（只在生成 / 轮换那一次显示）：
+
+    * ``key_hash`` / ``bearer_hash``：加盐哈希（``hmac_sha256$盐$摘要``，见 ``auth.hash_secret``）；
+    * ``key_sha256`` / ``bearer_sha256``：**历史无盐格式**，只为老库能继续校验而保留，
+      轮换一次即自动升级（接口会把「还有几条待轮换」报给管理端）。
 
     ``stream_id`` 是这位成员的推流 ID（也是他在媒体服务器上的推流路径），
     与令牌一起构成推流凭据；只有两者同时正确才允许推流（见 ``live`` 模块）。
@@ -217,8 +220,30 @@ class Member(NTEModel):
     active: bool = True
     created_at: str = ""
     updated_at: str = ""
-    key_sha256: str = ""
-    bearer_sha256: str = ""
+    key_hash: str = ""         # 加盐哈希（新格式，推荐）
+    bearer_hash: str = ""      # 加盐哈希（新格式，推荐）
+    key_sha256: str = ""       # 历史无盐格式（兼容旧库）
+    bearer_sha256: str = ""    # 历史无盐格式（兼容旧库）
+
+    @property
+    def key_stored(self) -> str:
+        """登录密钥的存储值（优先加盐的新格式）。"""
+        return self.key_hash or self.key_sha256
+
+    @property
+    def bearer_stored(self) -> str:
+        """Bearer 令牌的存储值（优先加盐的新格式）。"""
+        return self.bearer_hash or self.bearer_sha256
+
+    @property
+    def legacy_credentials(self) -> list[str]:
+        """还在用**历史无盐格式**的凭据名（管理端据此提示轮换）。"""
+        names = []
+        if self.key_sha256 and not self.key_hash:
+            names.append("key")
+        if self.bearer_sha256 and not self.bearer_hash:
+            names.append("bearer")
+        return names
 
     @field_validator("qq")
     @classmethod
@@ -247,9 +272,11 @@ class Member(NTEModel):
         字段名统一走 camelCase 别名（与全站 JSON 约定一致）。
         """
         data: dict[str, Any] = self.model_dump(by_alias=True, include=list(PUBLIC_MEMBER_FIELDS))
-        data["hasKey"] = bool(self.key_sha256)
-        data["hasBearer"] = bool(self.bearer_sha256)
+        data["hasKey"] = bool(self.key_stored)
+        data["hasBearer"] = bool(self.bearer_stored)
         data["hasAvatar"] = self.has_avatar_source
+        # 注：「凭据是不是历史无盐格式」属于内部细节，只在管理端视图里补（见 members._member_public），
+        # 不放进这里的公开结构，免得访客也能看出谁的凭据是旧的。
         return data
 
     def private(self) -> dict[str, Any]:
@@ -443,6 +470,9 @@ class EventInfo(NTEModel):
     sport: str = "volleyball"
     # 排名开关：关 = 娱乐记录模式（只记录场次与分数，不排名、不晋级、不判冠军）
     ranked: bool = True
+    # 比赛简介：由赛事创办者撰写，**允许留空**；留空时主界面与往届列表都不显示这一项。
+    # 长度上限 30 个字（按字符计，中英文同规）。
+    brief: str = ""
     title: str = "NTE 比赛"
     subtitle: str = "NEVERNESS TO EVERNESS · MATCH"
     venue: str = ""
@@ -462,6 +492,16 @@ class EventInfo(NTEModel):
         """类型 key 只保留安全字符，避免拼进 HTML / 路径。"""
         clean = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in "-_")
         return clean[:32] or "volleyball"
+
+    @field_validator("brief")
+    @classmethod
+    def _clean_brief(cls, value: str) -> str:
+        """比赛简介：合并空白并**硬性截到 30 字**（界面用 maxlength 挡在前面）。
+
+        这里刻意「截断」而不是「报错」：简介是随时可改的展示文案，
+        没必要因为多打一个字就让整个赛事信息存不进去。
+        """
+        return " ".join(str(value or "").split())[:MAX_BRIEF_CHARS]
 
 
 class Rules(NTEModel):
@@ -556,10 +596,16 @@ class UiConfig(NTEModel):
 
 
 class AdminConfig(NTEModel):
-    """管理 KEY。``key_sha256`` 非空时优先校验哈希，明文 key 不会被下发到前端。"""
+    """服务器主管理 KEY。
+
+    ``key_hash`` 是**加盐 PBKDF2**（``pbkdf2_sha256$迭代$盐$摘要``，新格式，推荐）；
+    ``key_sha256`` / ``key`` 只为历史数据兼容而保留（无盐哈希 / 明文），
+    一旦重新设置 KEY 就会切换成 ``key_hash``。
+    """
 
     key: str = ""
     key_sha256: str = ""
+    key_hash: str = ""
 
 
 class Config(NTEModel):

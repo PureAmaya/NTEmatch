@@ -21,7 +21,7 @@ import sys
 import uvicorn
 
 from . import db
-from .auth import sha256_hex
+from .auth import hash_password
 from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger, setup_logging
 from .store import DB_PATH
@@ -128,10 +128,12 @@ def reset_admin_key(new_key: str | None = None, event_id: str | None = None) -> 
             print(f"管理 KEY 至少 {MIN_KEY_LEN} 位，请重新执行。")
             return 1
 
+        # 加盐 PBKDF2：命令行重置同样不写明文、也不写无盐哈希
         conn.execute(
-            "INSERT INTO event_admin (event_id, key, key_sha256) VALUES (?, '', ?) "
-            "ON CONFLICT(event_id) DO UPDATE SET key = '', key_sha256 = excluded.key_sha256",
-            (target, sha256_hex(key)),
+            "INSERT INTO event_admin (event_id, key, key_sha256, key_hash) VALUES (?, '', '', ?) "
+            "ON CONFLICT(event_id) DO UPDATE SET key = '', key_sha256 = '', "
+            "key_hash = excluded.key_hash",
+            (target, hash_password(key)),
         )
 
     log.warning("管理 KEY 已通过命令行重置 | 届=%s", target)

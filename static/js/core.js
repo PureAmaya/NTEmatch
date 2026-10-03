@@ -27,6 +27,9 @@ export const LIVE_PROTO_KEY = 'nte:liveProto';
  */
 export const stateKey = (s) => (s ? `${s.revision ?? 0}|${s.event?.name || ''}` : '');
 export const API = '/api';
+/** 站点默认名称与默认副标题（服务器管理员可在「服务器 → 站点」里改名称）。 */
+export const DEFAULT_SITE_NAME = 'NTE 比赛';
+export const DEFAULT_TAGLINE = 'NEVERNESS TO EVERNESS · MATCH';
 
 export const qs = (sel, root = document) => root.querySelector(sel);
 export const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -167,9 +170,17 @@ export const App = {
   channelId: null,
   channelPicked: null,
   events: [], // 届次列表缓存
-  eventId: '', // 主赛事 ID（管理端设定的那一届；根路径就落在它身上）
-  // 路由锁定的届（如 /e002 且它不是主赛事）：非空时整站看这一届，且不接受推送
+  // 后端「当前届」：写接口的作用对象（进某一届时若你有权限会自动切过去）。
+  // 它不再是「主赛事」这种用户概念——主页列出全部届次，谁都不特殊。
+  eventId: '',
+  // 路由锁定的届：赛事页恒等于地址栏里的届 ID；独立页（主页 / 频道 / …）为空。
+  // 非空且与 eventId 不同 = 正在只读查看另一届，此时忽略服务端推送。
   routeEvent: '',
+  // 主页 / 全部赛事页的搜索词与分组展开状态（'active' / 'draft' / 'closed'）
+  homeSearch: '',
+  homeOpen: { active: true, draft: true, closed: false },
+  // 错误页内容：{ code, title, desc }——找不到 / 没权限时由路由填好，denied 页只管渲染
+  denied: null,
   // 管理端专用私有数据（选手 UUID / QQ / 推流流名 / 推流地址）。
   // 公开状态里不含这些字段，登录后单独取，未登录时为 null。
   private: null,
@@ -178,7 +189,7 @@ export const App = {
   // 选手 ID → 时间戳：点过「刷新头像」后给图片地址加参数，绕过浏览器缓存
   avatarBust: {},
   token: localStorage.getItem(TOKEN_KEY) || '',
-  view: localStorage.getItem(VIEW_KEY) || 'overview',
+  view: localStorage.getItem(VIEW_KEY) || 'home',
   online: false,
   filter: 'all',
   search: '',
@@ -219,22 +230,42 @@ export const isFinished = (s) => {
 };
 
 /**
- * 直播页可用吗。
+ * 站点名称（服务器管理员设定，全局）。
  *
- * 只有「主赛事 + 还没完结」才有直播：往届回看一律没有（比赛都结束了，
- * 不可能还在推流），已完结的届也没有；筹备中 / 进行中都保留。
+ * 与比赛无关的页面（主页 / 频道 / 赛事列表 / 我的 / 服务器）顶栏显示它，
+ * 浏览器标签也用它；进了某一届才换成那一届的名字。
  */
-export const liveAvailable = (s) => !App.routeEvent && !isFinished(s);
-
-/** 某个页面在当前状态下可用吗（目前只有直播页会随届次状态消失）。 */
-export const pageAvailable = (page, s) => page !== 'live' || liveAvailable(s);
+export const siteName = (s = App.state) => s?.siteName || DEFAULT_SITE_NAME;
 
 /**
- * 能改动数据吗：登录了，而且**不是在回看往届**、也**不是已完结的届**。
+ * 直播页可用吗：**这一届还没完结**就有（筹备中 / 进行中都保留）。
  *
- * 接口都是按主赛事设计的（没有届次参数），所以回看往届时必须把所有管理入口
- * 收起来——否则一次手滑就会写到主赛事上；已完结的届只留只读信息，要改先把
- * 它恢复成「进行中」。
+ * 已完结（标了 closed 或登记了结束时间）就没有直播页——比赛都结束了，
+ * 不可能还在推流。
+ */
+export const liveAvailable = (s) => !isFinished(s);
+
+/**
+ * 页面在当前状态下可用吗。
+ *
+ * 赛事页（总览 / 赛程 / 选手 / 直播 / 赛事管理）要挂在某一届上；其中
+ * 「直播」随届次状态消失、「赛事管理」要有赛事管理权限。独立页永远可用。
+ */
+export const pageAvailable = (page, s) => {
+  if (STANDALONE_PAGES.includes(page)) return true;
+  // 只读查看别人的届时，直播页签与赛事管理一样收起来（判定与 views.syncTabs 对齐）
+  if (page === 'live') return liveAvailable(s) && !s?.readOnly;
+  if (page === 'manage') return canManageEvents();
+  return ['overview', 'schedule', 'roster'].includes(page);
+};
+
+/**
+ * 能改动数据吗：登录了、有赛事管理权限，而且**不是只读查看**（别人的届 / 未登录）、
+ * 也**不是已完结的届**。
+ *
+ * 写接口都作用在「后端当前届」上（没有届次参数），所以进入某届时若有权限会先把它
+ * 切过去；没有权限就只能只读，所有管理入口一并收起。已完结的届只留只读信息，
+ * 要改先把它恢复成「进行中」。
  */
 export const canEdit = () =>
   Boolean(App.token) && canManageEvents() && !App.state?.readOnly && !isFinished();
@@ -242,60 +273,88 @@ export const canEdit = () =>
 /* --------------------------------- 路由 --------------------------------- */
 /** 页面段：地址栏里的页名，与 index.html 的 .tab[data-view] 一一对应。 */
 export const PAGES = [
+  'home',
   'overview',
   'schedule',
   'roster',
   'live',
+  'manage',
   'channels',
   'events',
-  'manage',
   'server',
   'user',
 ];
-/** 不属于任何一届的独立页（地址不带届 ID）。 */
-export const STANDALONE_PAGES = ['events', 'server', 'user'];
+/**
+ * 不属于任何一届的独立页（地址不带届 ID）。
+ *
+ * 这里的分界线就是「页签长什么样」：**只有赛事页（overview…manage）能看到
+ * 总览 / 赛程 / 选手 / 直播**；独立页（主页 / 频道 / 赛事列表 / 服务器 / 我的）
+ * 页签里只剩一个「主页」——比赛与频道之间不能直接互跳，都得经过主页。
+ */
+export const STANDALONE_PAGES = ['home', 'channels', 'events', 'server', 'user', 'denied'];
 export const PAGE_LABEL = {
+  home: '主页',
   overview: '总览',
   schedule: '赛程',
   roster: '选手',
   live: '直播',
   channels: '频道',
-  events: '往届',
+  events: '全部赛事',
   manage: '赛事管理',
   server: '服务器',
   user: '我的',
 };
 
 /**
- * 解析地址栏：``/<届 ID>/<页面>``，两段都可以缺省。
+ * 解析地址栏。
  *
- * * 带届 ID     → 就是那一届：``/e001``、``/e001/schedule``
- * * 只有页面段  → 独立页（``/events`` 往届），或主赛事的短链（``/admin``）
- * * 什么都没有  → 根路径，由 ``goto`` 跳到主赛事的路由
+ * * ``/``                    → 主页（不属于任何一届）
+ * * ``/e001``、``/e001/schedule`` → 某一届的页面
+ * * ``/events``、``/admin``、``/user`` → 独立页
+ * * ``/channels``            → 频道模块
+ * * ``/channels/<推流 ID>``  → 直接打开那个直播间（第二段是**推流 ID / 流名**，不是届次）
+ *
+ * ``page`` 为空表示「只给了届次，没给页面段」（由调用方补默认页）。
  */
 export function parseRoute(path = location.pathname) {
   const segs = String(path).split('/').filter(Boolean);
+  if (!segs.length) return { eventId: '', page: '', channelId: '' };
+  const decode = (raw) => {
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw; // 非法转义就按原样处理
+    }
+  };
+  // 频道是独立模块：/channels 与 /channels/<推流 ID>
+  if (segs[0].toLowerCase() === 'channels') {
+    return { eventId: '', page: 'channels', channelId: segs[1] ? decode(segs[1]) : '' };
+  }
   let eventId = '';
   let page = '';
   segs.forEach((seg) => {
-    let s = seg;
-    try {
-      s = decodeURIComponent(seg);
-    } catch {
-      /* 非法转义就按原样处理 */
-    }
+    let s = decode(seg);
     // /admin 固定 = 服务器管理页（与届次无关）；赛事管理是 /<届>/manage
     if (s === 'admin' && segs.length === 1) s = 'server';
     if (!page && PAGES.includes(s)) page = s;
     else if (!eventId && /^[A-Za-z0-9_-]{2,40}$/.test(s)) eventId = s;
   });
-  return { eventId, page };
+  return { eventId, page, channelId: '' };
 }
 
-/** 拼地址：届 ID 缺省时回落到「主赛事」的短链（根路径 / 或 /events 这类独立页）。 */
-export function routePath(eventId = '', page = 'overview') {
+/**
+ * 拼地址。届次段缺省时就是独立页（``/``、``/channels``、``/events``…）。
+ *
+ * ``channelId`` 是**推流 ID / 流名**（不是内部频道 ID）——它就是观众能在别处
+ * 看到的那串名字，所以分享出去的链接别人也能对上。
+ */
+export function routePath(eventId = '', page = 'overview', channelId = '') {
   const p = PAGES.includes(page) ? page : 'overview';
-  // 服务器管理页固定 /admin（独立于任何一届）；个人页固定 /user
+  if (p === 'home') return '/';
+  if (p === 'channels') {
+    return channelId ? `/channels/${encodeURIComponent(channelId)}` : '/channels';
+  }
+  if (p === 'events') return '/events';
   if (p === 'server') return '/admin';
   if (p === 'user') return '/user';
   if (!eventId) return p === 'overview' ? '/' : `/${p}`;

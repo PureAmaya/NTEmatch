@@ -16,7 +16,10 @@
 
   --txt: #e6f0ff;
   --txt-dim: #93a7c1;
-  --txt-mute: #5e7186;
+  /* 第三级文字：深色面板上要看得清，就不能再暗下去。
+     原值 #5e7186 在面板上的对比度只有约 3.9:1（低于小字要求的 4.5:1），
+     现在约 4.8:1；仍是三级层次里最弱的一档，不至于抢正文。 */
+  --txt-mute: #6d8098;
 
   --cyan: #22e0e8;
   --violet: #7d5cff;
@@ -272,8 +275,42 @@ img { display: block; max-width: 100%; }
    的元素都必须在这里显式声明一次，否则「隐藏」根本不生效——直播封面原先就是这么
    一直捂着播放器（连带原生控件都点不到）的。 */
 .chip[hidden], .panel[hidden], .modal__foot[hidden], .stage-cover[hidden],
-.live-pick[hidden], .btn[hidden], .hud__me[hidden] { display: none !important; }
+.live-pick[hidden], .btn[hidden], .hud__me[hidden], .tabs[hidden] { display: none !important; }
 .grid { display: grid; gap: var(--gap); grid-template-columns: 1fr; }
+
+/* 群推送预览（等宽，保留换行，方便照抄到群里核对） */
+.qqbot-preview {
+  width: 100%; margin-top: 10px; padding: 10px;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  color: var(--txt-dim); background: rgba(6, 10, 16, .72);
+  border: 1px solid var(--line); border-radius: 2px; resize: vertical; white-space: pre-wrap;
+}
+.qqbot-preview:focus { outline: none; border-color: var(--accent); }
+
+/* 比赛简介（往届卡片里的那一行；留空则整行不渲染） */
+.evt-card__brief {
+  margin: 6px 0 2px; font-size: 12.5px; line-height: 1.5; color: var(--txt-dim);
+  border-left: 2px solid var(--line-2); padding-left: 8px;
+}
+
+/* 比赛简介（总览页顶部，≤30 字；留空则整块不渲染） */
+.brief { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.brief__tag {
+  flex: none; padding: 2px 8px; border: 1px solid var(--line-2); border-radius: 2px;
+  font-size: 11px; font-weight: 700; letter-spacing: .12em; color: var(--accent);
+}
+.brief__text { margin: 0; font-size: 14px; line-height: 1.6; color: var(--txt); }
+
+/* 备份列表（/admin → 备份）：一行一份，文件名用等宽便于辨认 */
+.bak-list { display: flex; flex-direction: column; gap: 8px; }
+.bak {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 10px; border: 1px solid var(--line); background: rgba(9, 14, 22, .6);
+}
+.bak:hover { border-color: var(--line-2); }
+.bak__main { flex: 1; min-width: 220px; }
+.bak__name { font-family: var(--font-mono); font-size: 12.5px; color: var(--txt); word-break: break-all; }
+.bak__meta { margin-top: 2px; font-size: 11.5px; color: var(--txt-mute); }
 
 .panel {
   position: relative;
@@ -602,18 +639,27 @@ img { display: block; max-width: 100%; }
 .form--2 { grid-template-columns: 1fr; }
 .field { display: grid; gap: 5px; min-width: 0; }
 .field > label {
-  font-family: var(--font-mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--txt-mute);
+  /* 标签要「一眼能找到字段」：比说明文字亮、字号上来一档，
+     字距从 .14em 收到 .08em——中文在等宽大间距下会散得看不清。 */
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--txt-dim);
 }
 .field input, .field select, .field textarea {
   width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 2px;
   background: rgba(8, 12, 20, .85); color: var(--txt); font-size: 13.5px;
   transition: border-color .15s, box-shadow .15s;
 }
+/* 占位符别用浏览器默认的灰（在暗色输入框里几乎看不见） */
+.field input::placeholder, .field textarea::placeholder { color: var(--txt-mute); opacity: 1; }
 .field input:focus, .field select:focus, .field textarea:focus {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
 }
 .field textarea { resize: vertical; min-height: 66px; line-height: 1.5; }
-.field__hint { font-size: 11px; color: var(--txt-mute); }
+/* 字段说明：比标签淡一档但仍要读得清（≈6:1），字号 + 行高一起给足 */
+.field__hint {
+  font-size: 11.5px; line-height: 1.5;
+  color: color-mix(in srgb, var(--txt-dim) 72%, var(--txt-mute));
+}
 .field--switch { grid-auto-flow: column; align-items: center; justify-content: start; gap: 9px; }
 .field--switch > label { order: 2; cursor: pointer; text-transform: none; letter-spacing: .04em; font-family: var(--font-ui); font-size: 12.5px; color: var(--txt-dim); }
 .switch { position: relative; width: 40px; height: 21px; flex: none; }
@@ -1191,12 +1237,7 @@ img { display: block; max-width: 100%; }
   border: 2px solid rgba(34, 224, 232, .22); border-radius: 2px;
   background: rgba(13, 19, 30, .9); padding: 10px;
 }
-/* 主赛事（管理端设定的那一届）：只有它高亮，根路径就落在它身上 */
-.evt-card--on {
-  border-color: var(--accent); background: rgba(17, 27, 42, .95);
-  box-shadow: 0 0 0 1px rgba(34, 224, 232, .38), 0 0 22px rgba(34, 224, 232, .1);
-}
-.evt-card--on .evt-card__name { color: #fff; }
+/* 注：不再有「主赛事」，因此也没有 `.evt-card--on` 这种高亮——所有届次一视同仁 */
 /* 整张卡可点：切到这一届 */
 .evt-card--act { cursor: pointer; transition: border-color .15s, background .15s; }
 .evt-card--act:hover { border-color: var(--accent); background: rgba(18, 27, 42, .92); }
@@ -1854,4 +1895,168 @@ body:has(.modal:not([hidden])) .fx__grid { animation-play-state: paused; }
 .pcard--live:hover { filter: drop-shadow(6px 6px 0 rgba(255, 47, 142, .5)); }
 .pcard--live .pcard__band {
   background: repeating-linear-gradient(115deg, var(--magenta) 0 10px, #05080e 10px 20px);
+}
+
+/* ==========================================================================
+   35. 错误页（403 / 404）：找不到或没权限时的一屏
+   ========================================================================== */
+
+@keyframes denyIn {
+  from { opacity: 0; transform: translateY(10px) scale(.985); }
+  to { opacity: 1; transform: none; }
+}
+.deny {
+  position: relative; overflow: hidden; text-align: center;
+  padding: 40px 20px; border: 1px solid var(--line); border-radius: 2px;
+  background:
+    radial-gradient(120% 140% at 50% 0%, rgba(255, 47, 142, .1), transparent 62%),
+    rgba(13, 19, 30, .9);
+  animation: denyIn .32s cubic-bezier(.2, .7, .3, 1) both;
+}
+.deny::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent-2), transparent);
+}
+.deny__code {
+  font-family: var(--font-disp); font-size: clamp(44px, 12vw, 84px); font-weight: 700;
+  line-height: 1; letter-spacing: .06em; color: transparent;
+  -webkit-text-stroke: 1.5px color-mix(in srgb, var(--accent) 62%, transparent);
+  text-shadow: 0 0 28px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.deny__title { margin-top: 10px; font-size: clamp(17px, 3.4vw, 22px); font-weight: 700; color: #fff; }
+.deny__desc { margin: 8px auto 0; max-width: 56ch; font-size: 13px; line-height: 1.7; color: var(--txt-dim); }
+.deny .tool-group { margin-top: 18px; justify-content: center; }
+@media (prefers-reduced-motion: reduce) { .deny { animation: none; } }
+
+/* ==========================================================================
+   36. 主页与全部赛事页（全部届次按状态分组 · 可折叠 · 可搜索）
+   ========================================================================== */
+
+.home { display: grid; gap: var(--gap); }
+/* 主页整条页签栏是收起来的，底部留给它的那截空间也一并收掉 */
+html[data-view="home"] body { padding-bottom: 28px; }
+
+/* 35.1 头部：站点名 + 一句说明 + 三个统计 */
+.home-hero {
+  position: relative; overflow: hidden;
+  padding: 20px 18px; border: 1px solid var(--line); border-radius: 2px;
+  background:
+    radial-gradient(120% 150% at 10% 0%, rgba(34, 224, 232, .13), transparent 62%),
+    rgba(13, 19, 30, .9);
+}
+/* 一道斜向条纹，呼应 HUD 的切角语言；纯装饰、不吃事件 */
+.home-hero::after {
+  content: ""; position: absolute; right: -40px; top: -30px; width: 220px; height: 160px;
+  background: repeating-linear-gradient(115deg, rgba(34, 224, 232, .16) 0 8px, transparent 8px 18px);
+  transform: rotate(8deg); pointer-events: none; opacity: .5;
+}
+.home-hero--slim { padding: 16px 18px; }
+.home-hero__kicker {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .22em;
+  text-transform: uppercase; color: var(--accent);
+}
+.home-hero__title {
+  margin-top: 3px;
+  font-family: var(--font-disp); font-size: clamp(23px, 4.6vw, 34px); font-weight: 700;
+  letter-spacing: .03em; line-height: 1.15; color: #fff;
+  text-shadow: 0 0 22px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+.home-hero__desc { margin-top: 6px; max-width: 62ch; font-size: 12.5px; color: var(--txt-dim); }
+.home-hero__stats { margin-top: 13px; display: flex; flex-wrap: wrap; gap: 8px; }
+.home-stat {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 5px 12px; border: 1px solid var(--line-2); border-radius: 2px;
+  background: rgba(6, 10, 16, .62);
+}
+.home-stat b { font-family: var(--font-disp); font-size: 19px; font-weight: 700; color: #fff; }
+.home-stat span { font-size: 11.5px; color: var(--txt-dim); }
+.home-stat--live b { color: var(--magenta); text-shadow: 0 0 16px rgba(255, 47, 142, .5); }
+
+/* 35.2 入口卡：频道 +（有权限时的）管理赛事 */
+.home-entries { display: grid; gap: var(--gap); grid-template-columns: 1fr; }
+@media (min-width: 700px) { .home-entries { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.home-entry {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; cursor: pointer;
+  padding: 13px 15px; border: 1px solid var(--line-2); border-radius: 2px;
+  background: rgba(13, 19, 30, .9); color: var(--txt); font: inherit;
+  transition: transform .18s ease, border-color .18s, box-shadow .18s, background .18s;
+}
+.home-entry:hover {
+  transform: translateY(-2px); border-color: var(--accent);
+  background: rgba(17, 27, 42, .95); box-shadow: var(--glow);
+}
+.home-entry__icon { display: inline-flex; flex: none; color: var(--accent); }
+.home-entry__icon svg { width: 25px; height: 25px; }
+.home-entry__text { display: grid; gap: 2px; min-width: 0; }
+.home-entry__text b { font-size: 14.5px; letter-spacing: .02em; }
+.home-entry__text span { font-size: 12px; color: var(--txt-dim); }
+.home-entry__go {
+  margin-left: auto; flex: none; font-size: 22px; line-height: 1; color: var(--txt-dim);
+  transition: transform .18s ease, color .18s;
+}
+.home-entry:hover .home-entry__go { transform: translateX(3px); color: var(--accent); }
+.home-entry--admin .home-entry__icon { color: var(--violet); }
+
+/* 35.3 搜索框（与工具条同一行） */
+.home-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.home-search { position: relative; flex: 1 1 220px; display: flex; align-items: center; min-width: 0; }
+.home-search svg {
+  position: absolute; left: 10px; width: 15px; height: 15px; color: var(--txt-mute); pointer-events: none;
+}
+.home-search input {
+  width: 100%; padding: 9px 12px 9px 32px;
+  border: 1px solid var(--line); border-radius: 2px;
+  background: rgba(8, 12, 20, .85); color: var(--txt); font-size: 13px;
+}
+.home-search input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* 35.4 分组：组长一行可点，展开用 grid-template-rows 过渡（纯 CSS、只动高度） */
+.home-group {
+  border: 1px solid var(--line); border-radius: 2px;
+  background: rgba(13, 19, 30, .72); overflow: hidden;
+}
+.home-group + .home-group { margin-top: 10px; }
+.home-group__head {
+  display: flex; align-items: center; gap: 10px; width: 100%; cursor: pointer;
+  padding: 11px 14px; border: 0; background: transparent; color: var(--txt);
+  font: inherit; text-align: left; transition: background .16s;
+}
+.home-group__head:hover { background: rgba(34, 224, 232, .06); }
+.home-group__caret {
+  flex: none; width: 0; height: 0;
+  border-left: 5px solid currentColor; border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  color: var(--txt-mute); transition: transform .2s ease, color .2s;
+}
+.home-group.is-open .home-group__caret { transform: rotate(90deg); color: var(--accent); }
+.home-group__label {
+  font-family: var(--font-disp); font-size: 15px; font-weight: 700; letter-spacing: .06em;
+}
+.home-group__count {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .06em; color: var(--txt-dim);
+  padding: 1px 7px; border: 1px solid var(--line-2); border-radius: 2px;
+}
+.home-group__body {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows .28s cubic-bezier(.2, .7, .3, 1);
+}
+.home-group.is-open .home-group__body { grid-template-rows: 1fr; }
+.home-group__inner { min-height: 0; overflow: hidden; padding: 0 12px 12px; }
+
+/* 35.5 卡片入场：一次错峰上浮（只看 transform / opacity，不触发重排） */
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.evt-grid--anim > .evt-card {
+  animation: cardIn .3s cubic-bezier(.2, .7, .3, 1) both;
+  animation-delay: calc(min(var(--i, 0), 8) * 34ms);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .evt-grid--anim > .evt-card { animation: none; }
+  .home-group__body { transition: none; }
+  .home-entry:hover { transform: none; }
 }

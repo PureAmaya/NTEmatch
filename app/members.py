@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from . import avatars, live, logic, login_guard
-from .auth import Session, auth
+from .auth import Session, admin_key_mode, auth
 from .logging_conf import get_logger
 from .models import LiveBan, Member, NTEModel
 from .security import (
@@ -154,6 +154,8 @@ def _member_public(member: Member, session: Session, *, self_view: bool = False)
     )
     if session.is_server or self_view:
         view.update(member.private())
+        # 仅管理端 / 本人可见：凭据是否还是历史无盐格式（提示轮换用）
+        view["legacyCredential"] = bool(member.legacy_credentials)
     return view
 
 
@@ -174,6 +176,8 @@ async def api_members(session: Session = Depends(require_event)) -> dict[str, An
         "canManage": session.is_server,
         # 推流 ID / 流名重复（成员之间、以及成员与传统频道之间）：管理端据此高亮提示
         "duplicates": logic.duplicate_streams(members, store.channels()),
+        # 凭据仍是历史无盐格式的成员（只能靠轮换升级，管理端提示用）
+        "legacyCredentials": [m.uid for m in members if m.legacy_credentials],
     }
 
 
@@ -373,6 +377,9 @@ async def api_server_config(session: Session = Depends(require_server)) -> dict[
         "customHtmlKey": "custom_html",
         "eventId": store.current_id,
         "eventName": cfg.event.name or cfg.event.title,
+        # 主管理 KEY 的存储形态（pbkdf2_sha256 / 历史 sha256 / plain）
+        "adminKeyMode": admin_key_mode(cfg.admin),
+        "legacyCredentials": len(store.legacy_credential_members()),
     }
 
 

@@ -43,10 +43,8 @@
   </div>
 
   <div class="hud__meta">
-    <span class="chip chip--event" id="chipEvent" title="正在看哪一届">—</span>
+    <span class="chip chip--event" id="chipEvent" title="正在看哪一届" hidden>—</span>
     <span class="chip chip--time" id="chipEventTime" hidden title="赛事起止时间">—</span>
-    <span class="chip chip--past" id="chipPast" hidden data-act="route-home" role="button"
-          title="正在回看往届；点这里回到主赛事">—</span>
     <button class="btn btn--icon" id="btnRefresh" type="button" title="立即同步" aria-label="立即同步">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
@@ -63,6 +61,10 @@
 
 <nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
   <span class="tabs__deco" aria-hidden="true"></span>
+  <button class="tab tab--home" role="tab" data-view="home" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.4 12 4.4l8 7V20H4z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.6 20v-5.4h4.8V20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
+    <span>主页</span>
+  </button>
   <button class="tab" role="tab" data-view="overview" aria-selected="true">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
     <span>总览</span>
@@ -79,14 +81,6 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5.5" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M16 11.4l5.2-3.1v7.4L16 12.6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
     <span>直播</span>
   </button>
-  <button class="tab" role="tab" data-view="channels" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7.5 4.2v9.6L12 21l-7.5-4.2V7.2z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.7 9.2l4.9 2.8-4.9 2.8z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
-    <span>频道</span>
-  </button>
-  <button class="tab" role="tab" data-view="events" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5zM5 10h14v3H5zM5 16h9v3H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
-    <span>往届</span>
-  </button>
   <button class="tab tab--admin" role="tab" data-view="manage" aria-selected="false">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.1-2.9 7.6-7 9-4.1-1.4-7-4.9-7-9V6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.2 12.2l2 2 3.6-3.9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
     <span>赛事管理</span>
@@ -95,8 +89,13 @@
 
 <main class="stage" id="stage">
 
+  <section class="view" id="view-home" data-view="home" hidden>
+    <div id="homeBody"></div>
+  </section>
+
   <section class="view" id="view-overview" data-view="overview">
     <div class="kpi" id="kpiRow"></div>
+    <div class="panel panel--brief" id="eventBrief" hidden></div>
     <div class="panel panel--time" id="eventTimePanel" hidden></div>
     <div class="panel" id="championBox" hidden></div>
     <div class="panel" id="nowPlaying" hidden></div>
@@ -132,11 +131,7 @@
   </section>
 
   <section class="view" id="view-events" data-view="events" hidden>
-    <div class="panel" id="eventsPanel">
-      <div class="panel__head"><h2>往届</h2>
-        <span class="panel__hint">每一届一张卡片 · 点卡片进入那一届（往届只读回看，主赛事可编辑）</span></div>
-      <div class="panel__body" id="eventsList"></div>
-    </div>
+    <div id="eventsBoard"></div>
   </section>
 
   <section class="view" id="view-manage" data-view="manage" hidden>
@@ -150,6 +145,10 @@
 
   <section class="view" id="view-user" data-view="user" hidden>
     <div id="userBody"></div>
+  </section>
+
+  <section class="view" id="view-denied" data-view="denied" hidden>
+    <div id="deniedBody"></div>
   </section>
 
 </main>

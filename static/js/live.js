@@ -446,8 +446,9 @@ async function healthTick(probe = false) {
  * 只有用户显式点「刷新信号」时才传 ``probe`` 让服务端现场重新探测一次。
  */
 export async function refreshLiveHealth({ probe = false } = {}) {
-  // 按路由回看往届：不探测、也不显示任何「直播中」标记
-  if (App.routeEvent) return true;
+  // 只读查看**另一届**（不是后端当前届）时不探测，也不显示任何「直播中」标记；
+  // 在看当前届时正常探测（event 页是看比赛直播的主场，不能因为 routeEvent 有值就停）
+  if (App.routeEvent && App.routeEvent !== App.eventId) return true;
   if (healthInFlight) return true;
   healthInFlight = true;
   const prevState = App.liveHealthState;

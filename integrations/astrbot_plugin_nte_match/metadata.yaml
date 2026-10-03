@@ -1,0 +1,7 @@
+name: astrbot_plugin_nte_match
+display_name: NTE 比赛
+desc: 把 NTE 比赛平台的赛事列表 / 信息 / 进度 / 结果接进群聊；既能当群命令直接运行，也会注册成 LLM 工具供机器人自动调用。
+help: 发送「比赛帮助」查看可用命令。
+version: 1.0.0
+author: NTE 比赛平台
+repo: ""
