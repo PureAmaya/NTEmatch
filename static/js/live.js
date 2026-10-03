@@ -56,23 +56,52 @@ function waitIceComplete(pc, timeout = 3000) {
   });
 }
 
-export const Live = {
-  pc: null,
-  token: 0,
-  room: null, // 当前机位的地址集合（key_endpoints 结果）
-  // 正在播的「机位 + 线路」：只有两者都没变、且画面确实还活着时才跳过重连
-  playing: { key: '', mode: '' },
-  hlsInst: null, // hls.js 实例（非原生 HLS 的浏览器才有）
+const LIVE_IDS = {
+  stage: '#liveStage',
+  video: '#liveVideo',
+  cover: '#liveCover',
+  state: '#liveState',
+  frame: '#stageFrame',
+  embed: 'liveEmbed',
+};
 
-  el: () => qs('#liveVideo'),
+/** 成员频道板块的播放器：同一套实现，只是元素落在另一个容器里。 */
+const CHANNEL_IDS = {
+  stage: '#channelStage',
+  video: '#channelVideo',
+  cover: '#channelCover',
+  state: '#channelState',
+  frame: '#channelFrame',
+  embed: 'channelEmbed',
+};
+
+/**
+ * 直播播放控制器（WebRTC/WHEP 优先，HLS / 网页内嵌兜底）。
+ *
+ * 抽成可复用工厂：比赛直播页与成员频道板块各持有一个实例，互不干扰——
+ * 元素 id 不同，实例状态（pc / token / 正在播的机位）也各自独立。
+ */
+function makePlayer(ids) {
+  // 只在本播放器的容器内查找元素，两个板块的同名结构不会互相串到
+  const q = (sel) => ((ids.stage && qs(ids.stage)) || document).querySelector(sel);
+  return {
+    ids,
+    pc: null,
+    token: 0,
+    room: null, // 当前机位的地址集合（key_endpoints 结果）
+    // 正在播的「机位 + 线路」：只有两者都没变、且画面确实还活着时才跳过重连
+    playing: { key: '', mode: '' },
+    hlsInst: null, // hls.js 实例（非原生 HLS 的浏览器才有）
+
+  el: () => q(ids.video),
 
   setState(text) {
-    const el = qs('#liveState');
+    const el = q(ids.state);
     if (el) el.textContent = text;
   },
 
   setCover(title, msg, action) {
-    const cover = qs('#liveCover');
+    const cover = q(ids.cover);
     const video = this.el();
     if (!cover) return;
     if (video) video.hidden = true;
@@ -87,25 +116,25 @@ export const Live = {
   },
 
   hideCover() {
-    const cover = qs('#liveCover');
+    const cover = q(ids.cover);
     const video = this.el();
     if (cover) cover.hidden = true;
     // 有内嵌 iframe 时不要把空的 video 露出来（它会盖住 iframe 的下半张脸）
-    if (video) video.hidden = Boolean(qs('#liveEmbed'));
+    if (video) video.hidden = Boolean(q(`#${ids.embed}`));
   },
 
   embed(url) {
-    const frame = qs('#stageFrame');
+    const frame = q(ids.frame);
     if (!frame || !url) {
       this.setCover('无法内嵌', '缺少直播源地址，请检查管理端配置');
       return;
     }
-    const old = qs('#liveEmbed');
+    const old = q(`#${ids.embed}`);
     if (old) old.remove();
     const video = this.el();
     if (video) video.hidden = true;
     const el = document.createElement('iframe');
-    el.id = 'liveEmbed';
+    el.id = ids.embed;
     el.src = url;
     el.allow = 'autoplay; fullscreen; picture-in-picture';
     el.setAttribute('allowfullscreen', '');
@@ -249,7 +278,7 @@ export const Live = {
     // 所以这里一定要比 mode——只比机位的话，点「HLS / WebRTC」会像没反应。
     const video = this.el();
     const alive =
-      Boolean(qs('#liveEmbed')) ||
+      Boolean(q(`#${ids.embed}`)) ||
       this.pc?.connectionState === 'connected' ||
       Boolean(video && video.src && !video.paused);
     if (target && alive && this.playing.key === target.key && this.playing.mode === mode) {
@@ -334,7 +363,7 @@ export const Live = {
         log.debug('重置 video 异常', err);
       }
     }
-    const embedEl = qs('#liveEmbed');
+    const embedEl = q(`#${ids.embed}`);
     if (embedEl) embedEl.remove();
 
     if (manual) {
@@ -343,33 +372,62 @@ export const Live = {
       log.info('直播已手动停止');
     }
   },
-};
+  };
+}
 
-export async function refreshLiveHealth() {
+/** 比赛直播页的播放器（元素在 ``#liveStage`` 里）。 */
+export const Live = makePlayer(LIVE_IDS);
+
+/** 成员频道板块的播放器（元素在 ``#channelStage`` 里）。 */
+export const ChannelLive = makePlayer(CHANNEL_IDS);
+
+/**
+ * 拉一次直播链路健康视图。
+ *
+ * 服务端默认**只读后台缓存**（毫秒级返回，不会因为媒体服务器不可达而挂住）；
+ * 只有用户显式点「刷新信号」时才传 ``probe`` 让服务端现场重新探测一次。
+ */
+export async function refreshLiveHealth({ probe = false } = {}) {
   // 按路由回看往届：不探测、也不显示任何「直播中」标记
   if (App.routeEvent) return;
   let changed = false;
+  // 集合是否与上一轮不同（与顺序无关）
+  const setDiff = (prev, next) =>
+    !(prev instanceof Set) || prev.size !== next.size || [...next].some((x) => !prev.has(x));
   try {
-    App.liveHealth = await api('/live/health');
+    App.liveHealth = await api(`/live/health${probe ? '?probe=1' : ''}`);
     // 「谁真的在推流」由媒体服务器上报；只有这里报出来的才显示「直播中」
     const next = new Set(Array.isArray(App.liveHealth.streaming) ? App.liveHealth.streaming : []);
+    // 成员频道（日常直播）：同一次探测里也回报哪些频道在推流
+    const nextChannels = new Set(
+      Array.isArray(App.liveHealth.streamingChannels) ? App.liveHealth.streamingChannels : []
+    );
     // 主直播间（默认流名）：探测不到就是 null（未知），此时一律不给这一路信号
     const main = App.liveHealth.streamingKnown ? Boolean(App.liveHealth.mainStreaming) : null;
     changed =
       main !== App.liveMain ||
-      !(App.liveNow instanceof Set) ||
-      next.size !== App.liveNow.size ||
-      [...next].some((pid) => !App.liveNow.has(pid));
+      setDiff(App.liveNow, next) ||
+      setDiff(App.liveChannelsNow, nextChannels);
     App.liveNow = next;
+    App.liveChannelsNow = nextChannels;
     App.liveMain = main;
     log.info('直播信号状态', App.liveHealth);
   } catch (err) {
     log.warn('直播信号探测失败', err);
     // streamingKnown: false = 「谁在推流」这份数据拿不到（前端据此说明「无法判断」）
-    App.liveHealth = { ok: false, streamingKnown: false, reason: err.message, streaming: [] };
+    App.liveHealth = {
+      ok: false,
+      streamingKnown: false,
+      reason: err.message,
+      streaming: [],
+      streamingChannels: [],
+    };
     changed =
-      App.liveMain !== null || (App.liveNow instanceof Set && App.liveNow.size > 0);
+      App.liveMain !== null ||
+      (App.liveNow instanceof Set && App.liveNow.size > 0) ||
+      (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0);
     App.liveNow = new Set();
+    App.liveChannelsNow = new Set();
     App.liveMain = null;
   }
   // 只有「谁在推流」真的变了才重绘视图，避免每次轮询都重建 DOM
@@ -465,7 +523,8 @@ export function installStageDelegation() {
       );
       Live.playSelected(App.state);
     } else if (act === 'live-refresh') {
-      refreshLiveHealth().then(() => Live.playSelected(App.state));
+      // 用户显式要求刷新：让服务端现场重新探测（可能要等媒体服务器超时，但这是主动操作）
+      refreshLiveHealth({ probe: true }).then(() => Live.playSelected(App.state));
     }
   });
 }

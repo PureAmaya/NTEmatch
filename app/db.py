@@ -215,6 +215,25 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL DEFAULT ''
 );
 
+-- 成员频道（日常直播）：**全局**，不挂在任何一届赛事上，跨届共享
+CREATE TABLE IF NOT EXISTS channels (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL DEFAULT '',
+  qq          TEXT NOT NULL DEFAULT '',
+  avatar      TEXT NOT NULL DEFAULT '',
+  stream_key  TEXT NOT NULL DEFAULT '',
+  title       TEXT NOT NULL DEFAULT '',
+  server      TEXT NOT NULL DEFAULT '',
+  role        TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  tags_json   TEXT NOT NULL DEFAULT '[]',
+  link        TEXT NOT NULL DEFAULT '',
+  color       TEXT NOT NULL DEFAULT '',
+  sort        INTEGER NOT NULL DEFAULT 0,
+  active      INTEGER NOT NULL DEFAULT 1,
+  featured    INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_players_event ON players(event_id, position);
 CREATE INDEX IF NOT EXISTS idx_rounds_event ON rounds(event_id, idx);
 CREATE INDEX IF NOT EXISTS idx_round_players_player ON round_players(event_id, player_id);
@@ -312,6 +331,10 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         "points": "INTEGER NOT NULL DEFAULT 0",
         "rank": "INTEGER NOT NULL DEFAULT 0",
         "forfeit": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "channels": {
+        "server": "TEXT NOT NULL DEFAULT ''",
+        "role": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -943,3 +966,72 @@ def _insert_many(
         return
     sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})"
     conn.executemany(sql, payload)
+
+
+# --------------------------------------------------------------------------- #
+# 成员频道（全局，跨届共享）
+#
+# 与赛事无关，因此不按 event_id 隔离：读写都是全库一份。
+# --------------------------------------------------------------------------- #
+def list_channels(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """全部成员频道，按「置顶优先 → sort → id」排序。"""
+    rows = conn.execute(
+        "SELECT * FROM channels ORDER BY featured DESC, sort, id"
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            tags = json.loads(row["tags_json"] or "[]")
+        except ValueError:
+            tags = []
+        out.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "qq": row["qq"],
+                "avatar": row["avatar"],
+                "streamKey": row["stream_key"],
+                "title": row["title"],
+                "server": row["server"],
+                "role": row["role"],
+                "description": row["description"],
+                "tags": [str(t) for t in tags] if isinstance(tags, list) else [],
+                "link": row["link"],
+                "color": row["color"],
+                "sort": row["sort"],
+                "active": bool(row["active"]),
+                "featured": bool(row["featured"]),
+            }
+        )
+    return out
+
+
+def upsert_channel(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    """新增 / 覆盖一个成员频道（按 id）。"""
+    _upsert(
+        conn,
+        "channels",
+        ("id",),
+        {
+            "id": row.get("id", ""),
+            "name": row.get("name", ""),
+            "qq": row.get("qq", ""),
+            "avatar": row.get("avatar", ""),
+            "stream_key": row.get("streamKey", ""),
+            "title": row.get("title", ""),
+            "server": row.get("server", ""),
+            "role": row.get("role", ""),
+            "description": row.get("description", ""),
+            "tags_json": json.dumps(row.get("tags", []) or [], ensure_ascii=False),
+            "link": row.get("link", ""),
+            "color": row.get("color", ""),
+            "sort": int(row.get("sort", 0) or 0),
+            "active": int(bool(row.get("active", True))),
+            "featured": int(bool(row.get("featured", False))),
+        },
+    )
+
+
+def delete_channel(conn: sqlite3.Connection, channel_id: str) -> bool:
+    cur = conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+    return cur.rowcount > 0

@@ -11,6 +11,7 @@ import json
 import os
 import random
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
@@ -31,7 +32,7 @@ from .auth import auth, is_factory_key, sha256_hex
 from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
-from .models import MAX_SIDES, Config, NTEModel, Player, Round, SetScore, Team
+from .models import MAX_SIDES, Channel, Config, NTEModel, Player, Round, SetScore, Team
 from .store import PROJECT_ROOT, store
 from .ws import hub
 
@@ -303,11 +304,18 @@ async def require_admin(request: Request, x_nte_token: str | None = Header(defau
 # 状态组装
 # --------------------------------------------------------------------------- #
 def build_public_state(cfg: Config) -> dict[str, Any]:
-    """公开状态 = 业务状态 + 当前届次标识（多届赛事用）。"""
+    """公开状态 = 业务状态 + 当前届次标识（多届赛事用）。
+
+    ``channels``（成员频道）是**全局**的：跟当前看哪一届无关，所以不走
+    ``build_state``，而是每次从这里挂上去。
+    """
     state = build_state(cfg)
     state["eventId"] = store.current_id
     state["eventName"] = cfg.event.name or cfg.event.title
     state["eventStatus"] = cfg.event.status
+    state["channels"] = logic.channel_views(cfg, store.channels())
+    # 频道板块的公告（全局，纯展示）：放异环相关的说明 / 活动文案
+    state["channelNotice"] = store.channel_notice()
     return state
 
 
@@ -326,6 +334,8 @@ async def lifespan(app: FastAPI):
     store.on_change(on_config_change)
     # 启动时先算一次，保证新连接的客户端立刻拿到数据
     await hub.broadcast_state(build_public_state(store.snapshot()))
+    # 直播探测放后台跑：接口只读缓存，媒体服务器不可达时也不会拖住任何请求
+    live.start_prober()
     cfg = store.snapshot()
     log.info("=" * 68)
     log.info("NTE 比赛平台已启动 | 当前届: %s (%s)", cfg.event.name, store.current_id)
@@ -347,6 +357,8 @@ async def lifespan(app: FastAPI):
     finally:
         await store.stop()
         await avatars.aclose()
+        # 先停后台探测，再关连接池：否则任务可能在关池的瞬间发起请求
+        await live.stop_prober()
         await live.aclose()
         log.info("服务已停止")
 
@@ -413,14 +425,20 @@ async def business_error_handler(request: Request, exc: ValueError) -> JSONRespo
 # --------------------------------------------------------------------------- #
 @app.get("/api/state")
 async def api_state() -> dict[str, Any]:
+    started = time.perf_counter()
     cfg = store.snapshot()
     state = build_public_state(cfg)
     state["live"] = live.stream_endpoints()
+    # 以下几项**只读后台缓存**（见 live.start_prober）：本接口是页面首屏的必经
+    # 之路，绝不能因为媒体服务器不可达而卡住。真实探测由后台任务负责。
+    #
     # 主直播间（默认流名）有没有人在推流；None = 查不到（API 未配置 / 不可达）
     state["live"]["streaming"] = await live.main_stream_ready()
     # 「正在推流」以**媒体服务器上报**为准（MediaMTX /v3/paths/list 的 ready）：
     # 只有真的有人在推的机位才会被标成直播中；查不到就是没有。
     state["livePlayers"] = await live.streaming_player_ids(cfg)
+    # 成员频道里正在推流的（全局）：前端据此给「直播中」标记
+    state["liveChannels"] = await live.streaming_channel_ids()
     state["liveStatus"] = await live.live_status_view()
     state["server"] = {
         "ws": hub.size,
@@ -428,6 +446,11 @@ async def api_state() -> dict[str, Any]:
         "ts": cfg.updated_at,
         "eventId": store.current_id,
     }
+    # 这个接口是页面首屏的必经之路，超过 1s 就留一条日志便于排查
+    # （直播探测已改为后台执行，这里慢基本只剩数据库 / 组装开销）。
+    elapsed = time.perf_counter() - started
+    if elapsed > 1.0:
+        log.warning("状态组装耗时较长 | %.2fs | revision=%d", elapsed, cfg.revision)
     return state
 
 
@@ -529,6 +552,10 @@ async def api_event_state(event_id: str) -> dict[str, Any]:
     state["eventName"] = cfg.event.name or cfg.event.title
     state["eventStatus"] = cfg.event.status
     state["readOnly"] = event_id != store.current_id
+    # 成员频道是全局的：回看往届时也照样展示（它们不属于任何一届）
+    state["channels"] = logic.channel_views(cfg, store.channels())
+    state["liveChannels"] = await live.streaming_channel_ids()
+    state["channelNotice"] = store.channel_notice()
     return state
 
 
@@ -678,8 +705,21 @@ async def api_private(_: str = Depends(require_admin)) -> dict[str, Any]:
             "cast": cast,
         }
 
+    # 成员频道（日常直播）：同样是隐私与推流凭据，只在管理端下发
+    channels: dict[str, Any] = {}
+    for channel in store.channels():
+        ckey = logic.clean_key(channel.stream_key)
+        channels[channel.id] = {
+            "id": channel.id,
+            "qq": channel.qq,
+            "streamKey": channel.stream_key,
+            "endpoints": logic.key_endpoints(stream, ckey) if ckey else {},
+            "push": logic.push_endpoints(stream, ckey) if ckey else {},
+        }
+
     return {
         "players": players,
+        "channels": channels,
         "rounds": rounds,
         # **完整**直播配置（含 WHIP/RTMP/RTSP/HLS 根地址与流名）：
         # 公开状态里这些字段被白名单剥掉了，管理端表单必须从这里取，
@@ -1022,6 +1062,78 @@ async def api_set_participants(
         "warnings": warnings,
         "state": build_public_state(cfg),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 成员频道（日常 / 非比赛直播；全局，跨届共享）
+#
+# 与赛事届次无关，因此**不受开赛锁定影响**，也不需要切换届次。
+# --------------------------------------------------------------------------- #
+@app.post("/api/channels")
+async def api_channel_save(payload: Channel, _: str = Depends(require_admin)) -> dict[str, Any]:
+    """新增 / 更新一个成员频道。
+
+    * 流名（``streamKey``）**全局唯一**：与选手以及其它频道都不能重复（否则串流）；
+    * 未给 id 时自动分配 ``c01`` 这类编号；
+    * 成员频道跨届共享，开赛锁定不会拦住它。
+    """
+    channel = payload.model_copy()
+    if not channel.name.strip():
+        raise HTTPException(status_code=400, detail="频道名不能为空")
+    key = logic.clean_key(channel.stream_key)
+    if key:
+        clash_player = next(
+            (p for p in store.snapshot().players if logic.clean_key(p.stream_key) == key), None
+        )
+        if clash_player is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"流名「{key}」已被选手 {clash_player.display_name} 使用，频道请换一个互不相同的流名",
+            )
+        clash_channel = next(
+            (
+                c
+                for c in store.channels()
+                if c.id != channel.id and logic.clean_key(c.stream_key) == key
+            ),
+            None,
+        )
+        if clash_channel is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"流名「{key}」已被频道 {clash_channel.display_name} 使用，请换成互不相同的流名",
+            )
+    saved = await store.save_channel(channel, actor="web:channel-save")
+    return {
+        "ok": True,
+        "id": saved.id,
+        "channel": logic.channel_view(store.snapshot(), saved),
+        "state": build_public_state(store.snapshot()),
+    }
+
+
+class ChannelNoticePayload(NTEModel):
+    """频道板块的公告文案（全局，纯展示，可留空清掉）。"""
+
+    text: str = ""
+
+
+@app.put("/api/channels/notice")
+async def api_channel_notice(
+    payload: ChannelNoticePayload, _: str = Depends(require_admin)
+) -> dict[str, Any]:
+    """设置「频道」板块的公告 / 异环相关内容（全局，与届次无关）。"""
+    text = await store.set_channel_notice(payload.text, actor="web:channel-notice")
+    return {"ok": True, "notice": text, "state": build_public_state(store.snapshot())}
+
+
+@app.delete("/api/channels/{channel_id}")
+async def api_channel_delete(channel_id: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+    """删除一个成员频道。"""
+    removed = await store.delete_channel(channel_id, actor="web:channel-delete")
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"频道 {channel_id} 不存在")
+    return {"ok": True, "state": build_public_state(store.snapshot())}
 
 
 # --------------------------------------------------------------------------- #
@@ -2148,6 +2260,33 @@ async def api_avatar_player(
         media_type=mime,
         headers={
             # 刷新请求不能被浏览器缓存，否则点完还是旧图
+            "Cache-Control": (
+                "no-store" if refresh else "public, max-age=3600, stale-while-revalidate=86400"
+            ),
+            "X-NTE-Avatar": source,
+        },
+    )
+
+
+@app.get("/api/avatar/c/{channel_id}")
+async def api_avatar_channel(
+    channel_id: str,
+    size: int = Query(default=100),
+    refresh: bool = Query(default=False),
+) -> Response:
+    """按**频道 ID** 取成员频道头像（与选手同一套代理，客户端看不到 QQ 号）。"""
+    channel = next((c for c in store.channels() if c.id == channel_id), None)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="频道不存在")
+    if not channel.qq:
+        raise HTTPException(status_code=404, detail="该频道未配置 QQ 头像")
+    if not avatars.is_valid_qq(channel.qq):
+        raise HTTPException(status_code=400, detail="频道的 QQ 号格式不正确")
+    body, mime, source = await avatars.get_avatar(channel.qq, size, channel.name, refresh=refresh)
+    return Response(
+        content=body,
+        media_type=mime,
+        headers={
             "Cache-Control": (
                 "no-store" if refresh else "public, max-age=3600, stale-while-revalidate=86400"
             ),

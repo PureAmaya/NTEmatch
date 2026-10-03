@@ -150,6 +150,11 @@ export const App = {
   // null = 还没探测过（此时以状态里的 /api/state → live.streaming 为准）
   liveMain: null,
   livePicked: null, // 最近一次解析出的机位对象（供局部刷新复用）
+  // 成员频道（日常直播）：正在推流的频道 ID 集合；null = 还没探测过
+  liveChannelsNow: null,
+  // 当前选中的成员频道 ID，以及最近一次解析出的频道对象（供局部刷新复用）
+  channelId: null,
+  channelPicked: null,
   events: [], // 届次列表缓存
   eventId: '', // 主赛事 ID（管理端设定的那一届；根路径就落在它身上）
   // 路由锁定的届（如 /e002 且它不是主赛事）：非空时整站看这一届，且不接受推送
@@ -207,12 +212,13 @@ export const canEdit = () => Boolean(App.token) && !App.state?.readOnly && !isFi
 
 /* --------------------------------- 路由 --------------------------------- */
 /** 页面段：地址栏里的页名，与 index.html 的 .tab[data-view] 一一对应。 */
-export const PAGES = ['overview', 'schedule', 'roster', 'live', 'events', 'admin'];
+export const PAGES = ['overview', 'schedule', 'roster', 'live', 'channels', 'events', 'admin'];
 export const PAGE_LABEL = {
   overview: '总览',
   schedule: '赛程',
   roster: '选手',
   live: '直播',
+  channels: '频道',
   events: '往届',
   admin: '管理',
 };

@@ -73,6 +73,10 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5.5" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M16 11.4l5.2-3.1v7.4L16 12.6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
     <span>直播</span>
   </button>
+  <button class="tab" role="tab" data-view="channels" aria-selected="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7.5 4.2v9.6L12 21l-7.5-4.2V7.2z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.7 9.2l4.9 2.8-4.9 2.8z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
+    <span>频道</span>
+  </button>
   <button class="tab" role="tab" data-view="events" aria-selected="false">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5zM5 10h14v3H5zM5 16h9v3H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>往届</span>
@@ -90,9 +94,9 @@
     <div class="panel panel--time" id="eventTimePanel" hidden></div>
     <div class="panel" id="championBox" hidden></div>
     <div class="panel" id="nowPlaying" hidden></div>
-    <div class="panel" id="bracketBoard"></div>
-    <div class="panel" id="standingsBoard"></div>
-    <div class="panel" id="formBoard"></div>
+    <div class="panel" id="bracketBoard" hidden></div>
+    <div class="panel" id="standingsBoard" hidden></div>
+    <div class="panel" id="formBoard" hidden></div>
     <div class="panel" id="rulesBoard" hidden></div>
   </section>
 
@@ -112,6 +116,13 @@
       <div class="panel" id="pushPanel"></div>
       <div class="panel" id="liveInfoPanel"></div>
     </div>
+  </section>
+
+  <section class="view" id="view-channels" data-view="channels" hidden>
+    <div class="panel" id="channelNotice" hidden></div>
+    <div class="panel panel--stage" id="channelStage"></div>
+    <div class="panel panel--toolbar" id="channelTools"></div>
+    <div class="roster-grid" id="channelGrid"></div>
   </section>
 
   <section class="view" id="view-events" data-view="events" hidden>

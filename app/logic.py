@@ -19,7 +19,7 @@ from typing import Any
 from . import league
 from . import tournament as T
 from .logging_conf import get_logger
-from .models import MAX_SIDES, Config, Player, Round, Side, StreamConfig, Team
+from .models import MAX_SIDES, Channel, Config, Player, Round, Side, StreamConfig, Team
 
 log = get_logger("logic")
 
@@ -977,6 +977,43 @@ def build_stream_map(cfg: Config) -> dict[str, dict[str, Any]]:
         room["roundLabel"] = (rnd.label or rnd.code) if rnd is not None else ""
         rooms[player.id] = room
     return rooms
+
+
+def channel_view(cfg: Config, channel: Channel) -> dict[str, Any]:
+    """把一个成员频道渲染成前端直接可用的结构（**脱敏**）。
+
+    与选手一致：公开状态里不含 QQ 与推流凭据，只给播放地址；
+    头像走 ``/api/avatar/c/<频道 ID>``，客户端请求里不会出现 QQ 号。
+    """
+    key = clean_key(channel.stream_key)
+    return {
+        "id": channel.id,
+        "name": channel.name or channel.id,
+        "title": channel.title,
+        "server": channel.server,
+        "role": channel.role,
+        "description": channel.description,
+        "tags": list(channel.tags),
+        "link": channel.link,
+        "color": channel.color,
+        "sort": channel.sort,
+        "featured": bool(channel.featured),
+        "active": bool(channel.active),
+        "avatar": channel.avatar,
+        "hasAvatar": channel.has_avatar_source,
+        "hasStream": bool(key),
+        # 播放地址（WHEP / HLS / 内嵌页）——源站直连，不含推流凭据
+        "play": play_endpoints(cfg.stream, key, compact=True) if key else {},
+    }
+
+
+def channel_views(cfg: Config, channels: list[Channel]) -> list[dict[str, Any]]:
+    """全部成员频道的公开视图（含已停用的）。
+
+    已停用的频道由**前端**对访客隐藏、对管理员保留（否则管理员把频道停用后
+    就再也看不到、无法重新启用）。顺序由 store 保证：置顶优先，再按 sort / id。
+    """
+    return [channel_view(cfg, ch) for ch in channels]
 
 
 def live_stream_player_ids(cfg: Config) -> list[str]:

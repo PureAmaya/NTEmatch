@@ -24,7 +24,9 @@ import {
   PUSH_TIP_LINE,
   avaHtml,
   boardHeadHtml,
+  channelAvaHtml,
   formChips,
+  isChannelLive,
   isLivePlayer,
   isMainLive,
   kpiCard,
@@ -41,7 +43,7 @@ import {
   whoHtml,
 } from './ui.js';
 import { renderEventsView } from './events.js';
-import { Live } from './live.js';
+import { ChannelLive, Live } from './live.js';
 
 const STAGE_LABEL = { group: '小组赛', wb: '胜者组', lb: '败者组', gf: '总决赛' };
 const PHASE_LABEL = {
@@ -1827,12 +1829,242 @@ export function liveInfoHtml(s, picked = null) {
   );
 }
 
+/* ---------------------------- 成员频道（日常直播） ----------------------------
+ *
+ * 与比赛直播是**两套独立的东西**：成员频道是常驻的「群友自播」位，跟赛事
+ * 届次无关——没有比赛时也能一直开着播，开赛锁定 / 往届回看都照看不误。
+ * 播放器复用同一套实现（live.js 的 ChannelLive），只是元素落在 #channelStage 里。
+ */
+/** 可见频道：停用的只对管理员可见（否则停用后就再也启不回来）。 */
+const visibleChannels = (s) => (s.channels || []).filter((c) => c.active || canEdit());
+
+/** 能播的频道：配了推流流名的才算（没流名的只在目录里展示）。 */
+const channelPool = (s) => visibleChannels(s).filter((c) => c.hasStream);
+
+/** 选中频道 / 线路变化才重建舞台，避免每次刷新都打断正在播的画面。 */
+function channelStageSig(picked) {
+  const st = App.state?.stream || {};
+  return [
+    st.enabled,
+    App.liveProto,
+    canEdit() ? 'admin' : 'guest',
+    picked ? picked.id : '',
+    picked ? (picked.play || {}).key || '' : '',
+  ].join('|');
+}
+
+function channelStageHtml(s, picked) {
+  return (
+    `<div class="panel__head"><h2>成员直播</h2>` +
+    `<span class="panel__hint">异环 · 日常播台 · 与比赛无关</span></div>` +
+    `<div class="live-pick" id="channelPick"></div>` +
+    `<div class="stage-frame" id="channelFrame">` +
+    `<video id="channelVideo" playsinline autoplay controls muted></video>` +
+    `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
+    `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>` +
+    `<span class="stage-state" id="channelState">待连接</span>` +
+    `<div class="stage-cover" id="channelCover" hidden></div></div>` +
+    `<div class="stage-meta" id="channelMeta"></div>` +
+    `<div class="stage-bar"><div class="stage-bar__left">` +
+    `<button class="btn btn--primary btn--sm" type="button" data-act="channel-play">播放</button>` +
+    `<button class="btn btn--sm" type="button" data-act="channel-stop">停止</button></div>` +
+    `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
+    `<span class="stage-bar__label">线路</span>` +
+    `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
+    `data-act="channel-proto" data-proto="webrtc" title="优先：WebRTC / WHEP，走 UDP，延迟最低">WebRTC<sup>优先</sup></button>` +
+    `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
+    `data-act="channel-proto" data-proto="hls" title="备选：HLS 走 TCP，抗抖动，延迟略高">HLS</button>` +
+    `</div>` +
+    `<div class="stage-bar__right">` +
+    `<button class="btn btn--sm" type="button" data-act="channel-open">打开源页</button>` +
+    `<button class="btn btn--sm" type="button" data-act="channel-copy">复制播放地址</button>` +
+    `<button class="btn btn--sm" type="button" data-act="channel-refresh">刷新信号</button>` +
+    `</div></div>`
+  );
+}
+
+function channelChipsHtml(pool, picked) {
+  if (!pool.length) return '';
+  return (
+    `<span class="live-pick__label">频道</span>` +
+    pool
+      .map((c) => {
+        const live = isChannelLive(c.id);
+        const active = picked && picked.id === c.id;
+        const cls =
+          `live-chip${active ? ' live-chip--active' : ''}${live ? ' live-chip--live' : ''}`;
+        return (
+          `<button type="button" class="${cls}" data-act="channel-watch" data-id="${esc(c.id)}" ` +
+          `title="${esc(c.title || c.name)}">${channelAvaHtml(c, 'xs')}` +
+          `<span class="live-chip__name">${esc(c.name)}</span>${live ? liveTag('LIVE') : ''}</button>`
+        );
+      })
+      .join('')
+  );
+}
+
+function channelMetaHtml(picked) {
+  if (!picked) return '';
+  const live = isChannelLive(picked.id);
+  return (
+    `<div class="vs-line${live ? '' : ' vs-line--idle'}">` +
+    `<span class="vs-line__tag">${live ? '直播中' : '未开播'}</span>` +
+    `<b>${esc(picked.name)}</b>` +
+    (picked.title ? `<span class="vs-line__side">${esc(picked.title)}</span>` : '') +
+    `</div>`
+  );
+}
+
+function renderChannelTools(channels) {
+  const host = qs('#channelTools');
+  if (!host) return;
+  const liveCount = channels.filter((c) => isChannelLive(c.id)).length;
+  host.innerHTML =
+    `<div class="tool-group"><span class="panel__hint">${channels.length} 个频道 · ${liveCount} 个在播</span></div>` +
+    (canEdit()
+      ? `<div class="tool-group" style="margin-left:auto">` +
+        `<button class="btn btn--sm" type="button" data-act="channel-notice-edit">编辑公告</button>` +
+        `<button class="btn btn--sm btn--primary" type="button" data-act="channel-add">新增频道</button></div>`
+      : '');
+}
+
+function channelCardHtml(c) {
+  const live = isChannelLive(c.id);
+  const tags = [];
+  if (live) tags.push(liveTag('直播中'));
+  if (c.featured) tags.push('<span class="badge badge--done">推荐</span>');
+  if (c.server) tags.push(`<span class="badge badge--pending" title="区服">${esc(c.server)}</span>`);
+  if (c.role) {
+    tags.push(`<span class="badge badge--done" title="常驻角色 / 称号">${esc(c.role)}</span>`);
+  }
+  if (!c.hasStream) tags.push('<span class="badge badge--pending">未配置流名</span>');
+  (c.tags || []).forEach((t) => tags.push(`<span class="badge badge--pending">${esc(t)}</span>`));
+  const ops =
+    `<div class="round__ops">` +
+    (c.hasStream
+      ? `<button class="btn btn--sm btn--primary" type="button" data-act="channel-watch" ` +
+        `data-id="${esc(c.id)}">${live ? '观看直播' : '打开频道'}</button>`
+      : '') +
+    (c.link
+      ? `<a class="btn btn--sm" href="${esc(c.link)}" target="_blank" rel="noopener noreferrer">外部链接</a>`
+      : '') +
+    (canEdit()
+      ? `<button class="btn btn--sm" type="button" data-act="channel-edit" data-id="${esc(c.id)}">编辑</button>` +
+        `<button class="btn btn--sm btn--danger" type="button" data-act="channel-del" data-id="${esc(c.id)}">删除</button>`
+      : '') +
+    `</div>`;
+  return (
+    `<article class="pcard${live ? ' pcard--live' : ''}${c.active ? '' : ' pcard--inactive'}">` +
+    `<div class="pcard__band"></div>` +
+    `<div class="pcard__top">${channelAvaHtml(c, 'md')}<div>` +
+    `<div class="pcard__name">${esc(c.name)}</div>` +
+    `<div class="pcard__sub" title="${esc(c.title || '')}">${esc(c.title || c.id)}</div>` +
+    `</div></div>` +
+    (c.description
+      ? `<div class="pcard__tags"><span class="panel__hint">${esc(c.description)}</span></div>`
+      : '') +
+    `<div class="pcard__tags">${tags.join('') || '<span class="panel__hint">—</span>'}</div>` +
+    ops +
+    `</article>`
+  );
+}
+
+/** 频道板块的公告（全局，管理员可编辑）：放异环相关的说明 / 活动文案。 */
+function renderChannelNotice(s) {
+  const host = qs('#channelNotice');
+  if (!host) return;
+  const text = String(s.channelNotice || '').trim();
+  if (!text) {
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  host.hidden = false;
+  host.innerHTML =
+    `<div class="panel__head"><h2>频道公告</h2>` +
+    `<span class="panel__hint">异环 · 日常播台</span></div>` +
+    `<div class="panel__body"><div class="notice">${esc(text).replace(/\n/g, '<br>')}</div></div>`;
+}
+
+function renderChannelGrid(channels) {
+  const host = qs('#channelGrid');
+  if (!host) return;
+  if (!channels.length) {
+    host.innerHTML =
+      `<div class="empty"><b>还没有成员频道</b>` +
+      (canEdit()
+        ? '点右上角「新增频道」把群友的直播间加进来（频道名 + 推流流名）'
+        : '等管理员添加成员频道后，就能在这里看大家直播了') +
+      `</div>`;
+    return;
+  }
+  host.innerHTML = channels.map((c) => channelCardHtml(c)).join('');
+}
+
+/**
+ * 渲染「频道」板块（成员日常直播）。
+ *
+ * 与比赛直播互不影响：本页只认成员频道，直播页只认比赛机位。
+ * ``App.channelId`` 记录观众选中的频道，切换时才重建舞台并换流。
+ */
+export function renderChannels(s) {
+  if (!qs('#channelStage')) return false;
+  const all = visibleChannels(s);
+  const pool = channelPool(s);
+  // 选中的频道不在了（被删 / 流名被清掉）→ 落到第一个在播的，其次第一个能播的
+  let picked = pool.find((c) => c.id === App.channelId) || null;
+  if (!picked) {
+    picked = pool.find((c) => isChannelLive(c.id)) || pool[0] || null;
+    App.channelId = picked ? picked.id : null;
+  }
+  App.channelPicked = picked;
+
+  const stage = qs('#channelStage');
+  const sig = channelStageSig(picked);
+  let rebuilt = false;
+  if (stage.dataset.sig !== sig) {
+    stage.dataset.sig = sig;
+    stage.innerHTML = channelStageHtml(s, picked);
+    rebuilt = true;
+  }
+  const pickEl = qs('#channelPick');
+  if (pickEl) pickEl.innerHTML = channelChipsHtml(pool, picked);
+  const metaEl = qs('#channelMeta');
+  if (metaEl) metaEl.innerHTML = channelMetaHtml(picked);
+
+  renderChannelNotice(s);
+  renderChannelTools(all);
+  renderChannelGrid(all);
+
+  // 只在舞台重建时换流，避免每次信号刷新都打断正在播的画面
+  if (rebuilt && App.view === 'channels') {
+    if (picked && isChannelLive(picked.id)) {
+      ChannelLive.playRoom(picked.play || null);
+    } else if (picked) {
+      ChannelLive.stop(false);
+      ChannelLive.setCover('当前未开播', `${picked.name} 现在没有推流；开播后这里会自动有画面。`);
+    } else {
+      ChannelLive.stop(false);
+      ChannelLive.setCover(
+        all.length ? '频道还没有流名' : '还没有成员频道',
+        all.length
+          ? '这些频道还没配置推流流名，配好后就能在这里播放。'
+          : canEdit()
+            ? '在右上角「新增频道」里添加成员直播间。'
+            : '等管理员添加成员频道后，这里就能看大家直播了。'
+      );
+    }
+  }
+  return rebuilt;
+}
+
 /* ------------------------------ 总调度 -------------------------------- */
 const VIEW_RENDERERS = {
   overview: renderOverview,
   schedule: renderSchedule,
   roster: renderRoster,
   live: renderLive,
+  channels: renderChannels,
   events: renderEventsView,
 };
 

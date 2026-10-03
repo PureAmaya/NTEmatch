@@ -23,10 +23,11 @@ import {
 } from './core.js';
 import { PUSH_TIP_LINE } from './ui.js';
 import { installDnD as installTeamDnD } from './teams.js';
-import { installStageDelegation, Live, refreshLiveHealth } from './live.js';
+import { ChannelLive, installStageDelegation, Live, refreshLiveHealth } from './live.js';
 import {
   focusLive,
   liveInfoHtml,
+  renderChannels,
   renderOverview,
   renderPublic,
   renderRosterGrid,
@@ -134,10 +135,16 @@ function setView(view, { silent = false } = {}) {
   localStorage.setItem(VIEW_KEY, view);
 
   if (view === 'live') {
+    ChannelLive.stop(false);
     if (App.state) focusLive(App.state);
+    refreshLiveHealth();
+  } else if (view === 'channels') {
+    Live.stop(false);
+    if (App.state) renderChannels(App.state);
     refreshLiveHealth();
   } else {
     Live.stop(false);
+    ChannelLive.stop(false);
     if (App.state) renderView(view, App.state);
   }
 
@@ -425,6 +432,9 @@ async function init() {
 
   await loadInitial();
   connectWS();
+  // 服务端把直播探测放在后台跑，首屏拿到的可能是「还没探到」；
+  // 这里补一次（只读服务端缓存，毫秒级）把「直播中」标记补齐，不阻塞任何渲染。
+  void refreshLiveHealth();
   renderAdmin();
 
   log.info('前端已就绪', 'api', API, 'view', App.view);

@@ -4,10 +4,12 @@
 
 import {
   App,
+  LIVE_PROTO_KEY,
   hooks,
   Modal,
   TOKEN_KEY,
   api,
+  copyText,
   esc,
   log,
   nowLocalInput,
@@ -27,6 +29,7 @@ import {
   fieldSelect,
   fieldSwitch,
   fieldText,
+  isChannelLive,
   privateOf,
   pushTipsHtml,
   roundHasResult,
@@ -35,7 +38,8 @@ import {
 import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
 import { invalidateEvents, loadEvents, renderEventsView } from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
-import { focusLive, renderPublic } from './views.js';
+import { ChannelLive, refreshLiveHealth } from './live.js';
+import { focusLive, renderChannels, renderPublic } from './views.js';
 
 /** 按对局编号（WB-1-2）或序号定位一场比赛。 */
 const roundOf = (ref) =>
@@ -1770,6 +1774,139 @@ function refreshDiagIfAdmin() {
   if (App.view === 'admin') refreshDiagnostics();
 }
 
+/* --------------------------- 成员频道（日常直播） --------------------------- */
+const channelOf = (id) => (App.state?.channels || []).find((c) => c.id === id) || null;
+
+/** 选中并播放某个成员频道（未开播时给一句说明，而不是去连一个空流）。 */
+function watchChannel(id) {
+  App.channelId = id || null;
+  const channel = channelOf(id);
+  if (App.state) renderChannels(App.state);
+  if (!channel) return;
+  if (isChannelLive(channel.id)) {
+    ChannelLive.playRoom(channel.play || null);
+  } else {
+    ChannelLive.stop(false);
+    ChannelLive.setCover('当前未开播', `${channel.name} 现在没有推流；开播后这里会自动有画面。`);
+  }
+}
+
+/** 新增 / 编辑成员频道（频道与赛事无关，任何届次下都能管理）。 */
+function openChannelModal(channel) {
+  const isNew = !channel;
+  // 推流流名 / QQ 属于私有数据，登录后从 /api/private 取
+  const priv = channel ? (App.private?.channels?.[channel.id] || {}) : {};
+  const url = channel?.avatar || '';
+  const preview = url
+    ? `<img src="${esc(url)}" alt=""><span class="ava__ring"></span>`
+    : esc(String(channel?.name || '?').slice(0, 1));
+  Modal.open({
+    title: isNew ? '新增成员频道' : `编辑频道 · ${channel.name}`,
+    body:
+      `<div class="form form--2">` +
+      fieldText('name', '频道名 / 主播名', channel?.name || '') +
+      fieldText('title', '直播间标题', channel?.title || '', { ph: '一句话，例如「每晚八点开播」' }) +
+      fieldText('server', '游戏区服', channel?.server || '', { ph: '如「国服 / 国际服」' }) +
+      fieldText('role', '常驻角色 / 称号', channel?.role || '', { ph: '展示用，可留空' }) +
+      fieldText('streamKey', '推流流名（必须唯一）', priv.streamKey || '', {
+        hint: priv.endpoints?.whipPush
+          ? `优先 WHIP：${priv.endpoints.whipPush}；备选 RTMP：${priv.endpoints.rtmpPush || '未配置'}。${PUSH_TIP_LINE}`
+          : `全局唯一（与任何选手流名也不能重复）；它就是这位群友的推流地址，如 tom → …/tom/whip（常驻，不用改）。${PUSH_TIP_LINE}`,
+      }) +
+      fieldText('qq', 'QQ（可选）', priv.qq || '', { hint: '仅服务端用于取头像' }) +
+      fieldText('link', '外部链接（可选）', channel?.link || '', { ph: '个人主页 / 其它平台' }) +
+      fieldNum('sort', '排序（小的在前）', channel?.sort ?? 0) +
+      fieldText('tags', '标签（逗号分隔）', (channel?.tags || []).join(', ')) +
+      `<div style="grid-column:1/-1">${fieldArea('description', '简介 / 内容说明', channel?.description || '')}</div>` +
+      `<div class="field" style="grid-column:1/-1"><label>头像</label>` +
+      `<div class="ava-edit" data-avatar-scope>` +
+      `<span class="ava ava--md${url ? '' : ' ava--placeholder'}" data-role="avatar-preview">${preview}</span>` +
+      `<div class="ava-edit__col">` +
+      `<input type="file" accept="image/*" data-role="avatar-file">` +
+      `<input name="avatar" type="text" value="${esc(url)}" placeholder="或直接填写图片 URL">` +
+      `</div></div></div>` +
+      fieldSwitch('active', '在用户端展示', channel ? channel.active !== false : true) +
+      fieldSwitch('featured', '置顶推荐', Boolean(channel?.featured)) +
+      `</div>` +
+      `<div class="notice" style="margin-top:10px">成员频道是<b>常驻</b>的日常直播位，` +
+      `与赛事届次无关：没有比赛时也能一直开着播，开赛锁定也不影响它。</div>`,
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-submit>保存</button>`,
+    onMount(bodyEl, footEl) {
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-submit]').onclick = async () => {
+        const data = collectForm(bodyEl);
+        if (!String(data.name || '').trim()) {
+          toast('请填写频道名', 'warn');
+          return;
+        }
+        data.tags = String(data.tags || '')
+          .split(/[,，]/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (channel?.id) data.id = channel.id;
+        try {
+          const res = await api('/channels', { method: 'POST', auth: true, body: data });
+          Modal.close();
+          toast(isNew ? '频道已创建' : '频道已保存', 'ok');
+          await refreshPrivate(); // 流名可能变了，推流地址需要重取
+          if (res.state) App.state = res.state;
+          renderPublic();
+        } catch (err) {
+          toast(err.message, 'err', 8000);
+        }
+      };
+    },
+  });
+}
+
+/** 编辑「频道」板块的公告（全局，放异环相关说明 / 活动文案）。 */
+function openChannelNoticeModal() {
+  const text = App.state?.channelNotice || '';
+  Modal.open({
+    title: '编辑频道公告',
+    body:
+      `<div class="field"><label for="f-channelNotice">公告内容（留空即清除）</label>` +
+      `<textarea id="f-channelNotice" rows="6" placeholder="例如：异环活动期间频道照常开播，每晚 8 点联机">${esc(text)}</textarea>` +
+      `<span class="field__hint">展示在「频道」页顶部，与赛事届次无关；换行会保留。</span></div>` +
+      `<div class="notice" style="margin-top:10px">公告只做展示。异环没有面向第三方的官方数据接口，` +
+      `游戏相关内容（区服 / 角色 / 活动）需管理员自行填写，本站不会自动抓取游戏数据。</div>`,
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-submit>保存公告</button>`,
+    onMount(bodyEl, footEl) {
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-submit]').onclick = async () => {
+        const value = qs('#f-channelNotice', bodyEl).value;
+        try {
+          const res = await api('/channels/notice', { method: 'PUT', auth: true, body: { text: value } });
+          Modal.close();
+          toast('频道公告已保存', 'ok');
+          if (res.state) App.state = res.state;
+          renderPublic();
+        } catch (err) {
+          toast(err.message, 'err', 6000);
+        }
+      };
+    },
+  });
+}
+
+async function deleteChannel(id) {
+  const channel = channelOf(id);
+  if (!window.confirm(`确认删除频道「${channel?.name || id}」？`)) return;
+  try {
+    const res = await api(`/channels/${encodeURIComponent(id)}`, { method: 'DELETE', auth: true });
+    toast('已删除频道', 'ok');
+    if (App.channelId === id) App.channelId = null;
+    if (res.state) App.state = res.state;
+    renderPublic();
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
 /* --------------------------- 动作分发 --------------------------- */
 export async function handleAction(act, el) {
   log.debug('动作', act, el?.dataset);
@@ -1797,6 +1934,55 @@ export async function handleAction(act, el) {
       if (hooks.gotoLive) hooks.gotoLive(null);
       return;
     }
+    // —— 成员频道（日常直播）——
+    case 'channel-watch':
+      return watchChannel(el.dataset.id);
+    case 'channel-play': {
+      const channel = channelOf(App.channelId);
+      if (channel) ChannelLive.playRoom(channel.play || null);
+      return;
+    }
+    case 'channel-stop':
+      ChannelLive.stop(true);
+      return;
+    case 'channel-open': {
+      const room = channelOf(App.channelId)?.play || {};
+      const url = (App.liveProto === 'hls' ? room.hlsPage : room.page) || room.page || '';
+      if (url) window.open(url, '_blank', 'noopener');
+      return;
+    }
+    case 'channel-copy': {
+      const room = channelOf(App.channelId)?.play || {};
+      // 复制哪条播放地址跟随当前线路：HLS 给播放页（…/<流名>/），WebRTC 给 WHEP
+      const url = (App.liveProto === 'hls' ? room.hlsPage : room.whep) || room.whep || '';
+      copyText(url).then((ok) =>
+        toast(ok ? `已复制播放地址：${url}` : '复制失败', ok ? 'ok' : 'err', ok ? 6000 : 3600)
+      );
+      return;
+    }
+    case 'channel-proto': {
+      const proto = el.dataset.proto || '';
+      App.liveProto = App.liveProto === proto ? '' : proto;
+      try {
+        localStorage.setItem(LIVE_PROTO_KEY, App.liveProto);
+      } catch (err) {
+        log.debug('线路偏好写入失败（忽略）', err);
+      }
+      if (App.state) renderChannels(App.state);
+      return;
+    }
+    case 'channel-refresh':
+      // 显式刷新：让服务端现场重新探测一次信号
+      refreshLiveHealth({ probe: true }).then(() => watchChannel(App.channelId));
+      return;
+    case 'channel-notice-edit':
+      return openChannelNoticeModal();
+    case 'channel-add':
+      return openChannelModal(null);
+    case 'channel-edit':
+      return openChannelModal(channelOf(el.dataset.id));
+    case 'channel-del':
+      return deleteChannel(el.dataset.id);
     case 'route-home':
       // 回到「当前届」路由的同一页（根路径只跟管理员选定的当前届走）
       return hooks.goto?.('', App.view);

@@ -159,6 +159,57 @@ export function roomFor(pid) {
   return (App.state?.streams || {})[pid] || null;
 }
 
+/* --------------------------- 成员频道（日常直播） --------------------------- */
+/**
+ * **真的在推流**的成员频道 ID 集合（与选手机位同一套判断）。
+ *
+ * 探测不到（媒体服务器 API 不可达）时是空集——宁可少显示「直播中」，
+ * 也不给观众一个假的直播标记。
+ */
+export const liveChannels = () =>
+  App.liveChannelsNow instanceof Set
+    ? App.liveChannelsNow
+    : new Set(App.state?.liveChannels || []);
+
+export const isChannelLive = (id) => Boolean(id) && liveChannels().has(id);
+
+/**
+ * 成员频道头像地址。
+ *
+ * 与选手一致：客户端不直接引用 QQ 头像域名，统一走 ``/api/avatar/c/<频道 ID>``，
+ * 请求里不会出现 QQ 号；``App.avatarBust[频道 ID]`` 用于绕过浏览器缓存。
+ */
+export function channelAvatarUrl(channel) {
+  if (!channel) return '';
+  if (channel.avatar) return channel.avatar;
+  const ui = App.state?.ui;
+  if (ui && ui.showAvatar === false) return '';
+  if (!channel.id || channel.hasAvatar === false) return '';
+  const bust = App.avatarBust?.[channel.id];
+  return (
+    `/api/avatar/c/${encodeURIComponent(channel.id)}?size=100` +
+    (bust ? `&t=${encodeURIComponent(bust)}` : '')
+  );
+}
+
+/** 频道头像（六边形 + 首字兜底），与选手机位同一套视觉。 */
+export function channelAvaHtml(channel, size = 'sm') {
+  const name = channel?.name || channel?.id || '?';
+  const url = channelAvatarUrl(channel);
+  const live = isChannelLive(channel?.id);
+  const cls = `ava ava--${size}${url ? '' : ' ava--placeholder'}${live ? ' ava--live' : ''}`;
+  const inner = url
+    ? `<span class="ava__fb">${esc(String(name).slice(0, 1))}</span>` +
+      `<img src="${esc(url)}" alt="${esc(name)}" loading="lazy" decoding="async" referrerpolicy="no-referrer">` +
+      `<span class="ava__ring"></span>`
+    : esc(String(name).slice(0, 1));
+  return (
+    `<span class="${cls}">${inner}` +
+    (live ? '<i class="ava__live" aria-hidden="true"></i><span class="sr-only">直播中</span>' : '') +
+    `</span>`
+  );
+}
+
 export function liveTag(text = '直播中') {
   return `<span class="live-tag"><i class="live-tag__dot"></i>${esc(text)}</span>`;
 }

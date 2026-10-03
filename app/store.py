@@ -30,7 +30,7 @@ from typing import Any
 from . import db, league, tournament
 from .defaults import default_config
 from .logging_conf import get_logger
-from .models import Config
+from .models import Channel, Config
 
 log = get_logger("store")
 
@@ -81,6 +81,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 
 _EVENT_ID_RE = re.compile(r"^e\d{3,}$")
 
+# 全局 meta 键：「频道」板块的公告 / 异环相关内容（不属于任何一届）
+CHANNEL_NOTICE_KEY = "channel_notice"
+
 Mutator = Callable[[dict[str, Any]], dict[str, Any]]
 ChangeHook = Callable[[Config, str], Awaitable[None]]
 # 收尾器：在所有变更与阵容重算都完成之后再过一遍（见 Mutate.final）
@@ -113,6 +116,10 @@ class ConfigStore:
         self._current: str = ""
         self._config: Config = Config.model_validate(default_config())
         self._hooks: list[ChangeHook] = []
+        # 成员频道（日常直播）：全局，跨届共享，与 _config 平级
+        self._channels: list[Channel] = []
+        # 频道板块的公告（全局，纯展示文案）
+        self._channel_notice: str = ""
         self._running = False
         # 出厂示例名单是否在本次载入中被清理（需要在启动时写回数据库）
         self._demo_purged = False
@@ -132,6 +139,8 @@ class ConfigStore:
             log.info("数据库为空，已初始化首届赛事 | id=%s", current)
         self._current = current
         self._config = await asyncio.to_thread(self._load_sync, current)
+        self._channels = await asyncio.to_thread(self._load_channels_sync)
+        self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
         if self._demo_purged:
             # 把出厂示例名单的清理结果落盘：数据库里也不该留这些假数据，
             # 顺便刷新 events 表缓存的选手数（往届列表会读它）
@@ -195,6 +204,88 @@ class ConfigStore:
 
     async def event_count(self) -> int:
         return len(await self.list_events())
+
+    # ------------------------------------------------------------------ #
+    # 成员频道（日常直播）——全局，跨届共享
+    # ------------------------------------------------------------------ #
+    def channels(self) -> list[Channel]:
+        """成员频道快照（全局，与当前届无关）。"""
+        return self._channels
+
+    @staticmethod
+    def _channel_sort(channel: Channel) -> tuple[Any, ...]:
+        return (not channel.featured, channel.sort, channel.id)
+
+    async def save_channel(self, channel: Channel, actor: str = "api") -> Channel:
+        """新增 / 更新一个成员频道（未给 id 时自动分配 ``c01`` 这类编号）。"""
+        async with self._lock:
+            if not channel.id:
+                channel = channel.model_copy(update={"id": self._next_channel_id()})
+            await asyncio.to_thread(self._save_channel_sync, channel.dump())
+            rest = [c for c in self._channels if c.id != channel.id]
+            self._channels = sorted([*rest, channel], key=self._channel_sort)
+        log.warning(
+            "成员频道已保存 | id=%s | 名称=%s | 流名=%s | 启用=%s",
+            channel.id,
+            channel.display_name,
+            channel.stream_key or "(未设置)",
+            channel.active,
+        )
+        await self._notify(self._config, f"channel:save:{actor}")
+        return channel
+
+    async def delete_channel(self, channel_id: str, actor: str = "api") -> bool:
+        """删除一个成员频道；返回是否真的删掉了。"""
+        async with self._lock:
+            removed = await asyncio.to_thread(self._delete_channel_sync, channel_id)
+            if removed:
+                self._channels = [c for c in self._channels if c.id != channel_id]
+        if removed:
+            log.warning("成员频道已删除 | id=%s", channel_id)
+            await self._notify(self._config, f"channel:delete:{actor}")
+        return removed
+
+    def channel_notice(self) -> str:
+        """「频道」板块的公告 / 异环相关内容（全局，纯展示文案）。"""
+        return self._channel_notice
+
+    async def set_channel_notice(self, text: str, actor: str = "api") -> str:
+        """设置频道公告（写入全局 meta，并广播一次）。"""
+        clean = (text or "").strip()
+        async with self._lock:
+            await asyncio.to_thread(self._set_channel_notice_sync, clean)
+            self._channel_notice = clean
+        log.info("频道公告已更新 | 长度=%d", len(clean))
+        await self._notify(self._config, f"channel:notice:{actor}")
+        return clean
+
+    def _load_channel_notice_sync(self) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, CHANNEL_NOTICE_KEY)
+
+    def _set_channel_notice_sync(self, text: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, CHANNEL_NOTICE_KEY, text)
+
+    def _next_channel_id(self) -> str:
+        used = {c.id for c in self._channels}
+        seq = 1
+        while f"c{seq:02d}" in used:
+            seq += 1
+        return f"c{seq:02d}"
+
+    def _load_channels_sync(self) -> list[Channel]:
+        with db.connect(self._db_path) as conn:
+            rows = db.list_channels(conn)
+        return sorted((Channel.model_validate(row) for row in rows), key=self._channel_sort)
+
+    def _save_channel_sync(self, row: dict[str, Any]) -> None:
+        with db.connect(self._db_path) as conn:
+            db.upsert_channel(conn, row)
+
+    def _delete_channel_sync(self, channel_id: str) -> bool:
+        with db.connect(self._db_path) as conn:
+            return db.delete_channel(conn, channel_id)
 
     # ------------------------------------------------------------------ #
     # 写

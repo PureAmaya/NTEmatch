@@ -1792,3 +1792,14 @@ body:has(.modal:not([hidden])) .fx__grid { animation-play-state: paused; }
   }
   .round, .pcard, .btn, .tab, .member { transition: none !important; }
 }
+
+/* ==========================================================================
+   34. 成员频道（日常直播板块）
+   ========================================================================== */
+
+/* 在播的频道卡：描边与色带都换成品红，和比赛的「直播中」保持一致 */
+.pcard--live { border-color: var(--magenta); filter: drop-shadow(5px 5px 0 rgba(255, 47, 142, .45)); }
+.pcard--live:hover { filter: drop-shadow(6px 6px 0 rgba(255, 47, 142, .5)); }
+.pcard--live .pcard__band {
+  background: repeating-linear-gradient(115deg, var(--magenta) 0 10px, #05080e 10px 20px);
+}

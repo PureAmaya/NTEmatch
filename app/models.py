@@ -109,6 +109,65 @@ class Team(NTEModel):
         return self.name or self.short or self.id
 
 
+class Channel(NTEModel):
+    """成员直播间（日常 / 非比赛）。
+
+    与 :class:`Player` 的区别：**跟赛事届次无关**，是常驻的「群友自播」位，
+    存在同一个库里但独立于任何一届赛事；没有比赛时也能一直开着播。
+
+    推流标识同样是他自己的唯一流名（``stream_key`` / ``streamKey``），
+    观众看到的是这个流名的播放地址；推流地址只在管理端出现。
+    """
+
+    id: str = ""
+    name: str = ""            # 主播名 / 频道名
+    qq: str = ""              # 可选，仅用于取头像
+    avatar: str = ""          # 非空则覆盖 QQ 头像（可为本地上传地址）
+    stream_key: str = ""      # 推流流名（全局唯一，与选手流名也不得重复）
+    title: str = ""           # 直播间标题（一句话）
+    server: str = ""          # 游戏区服（自由填写，如「国服 / 国际服」）
+    role: str = ""            # 常驻角色 / 称号（自由填写，展示用）
+    description: str = ""     # 简介 / 内容说明
+    tags: list[str] = Field(default_factory=list)
+    link: str = ""            # 外部跳转（个人主页 / 其它平台）
+    color: str = ""
+    sort: int = 0             # 排序（小的在前）
+    active: bool = True       # 停用后不出现在用户端
+    featured: bool = False    # 置顶推荐
+
+    @field_validator("qq")
+    @classmethod
+    def _clean_qq(cls, value: str) -> str:
+        return "".join(ch for ch in value if ch.isdigit())
+
+    @field_validator("stream_key")
+    @classmethod
+    def _clean_stream_key(cls, value: str) -> str:
+        """只保留 URL 路径安全字符，避免拼接出越界地址。"""
+        return "".join(ch for ch in value.strip().strip("/") if ch.isalnum() or ch in "-_")
+
+    @field_validator("tags")
+    @classmethod
+    def _clean_tags(cls, value: list[str]) -> list[str]:
+        out: list[str] = []
+        for item in value or []:
+            clean = str(item or "").strip()
+            if clean and clean not in out:
+                out.append(clean)
+        return out[:8]
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.id
+
+    @property
+    def has_avatar_source(self) -> bool:
+        """是否有可用的头像来源（自定义地址，或合法的 QQ 号）。"""
+        if self.avatar:
+            return True
+        return self.qq.isdigit() and 4 <= len(self.qq) <= 12
+
+
 # --------------------------------------------------------------------------- #
 # 对局
 # --------------------------------------------------------------------------- #
