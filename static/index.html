@@ -50,7 +50,13 @@
     <button class="btn btn--icon" id="btnRefresh" type="button" title="立即同步" aria-label="立即同步">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
-    <button class="btn btn--ghost" id="btnAdmin" type="button">管理</button>
+    <button class="btn btn--ghost" id="btnLogin" type="button" hidden>登录</button>
+    <button class="btn btn--ghost" id="btnAdmin" type="button" hidden>管理</button>
+    <button class="hud__me" id="btnMe" type="button" hidden aria-current="false"
+            title="我的资料（/user）">
+      <span class="hud__me-ava" id="meAvatar" aria-hidden="true"></span>
+      <span class="hud__me-name" id="meName"></span>
+    </button>
   </div>
 </header>
 <div class="hud__stripes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
@@ -81,9 +87,9 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5zM5 10h14v3H5zM5 16h9v3H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
     <span>往届</span>
   </button>
-  <button class="tab tab--admin" role="tab" data-view="admin" aria-selected="false">
+  <button class="tab tab--admin" role="tab" data-view="manage" aria-selected="false">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.1-2.9 7.6-7 9-4.1-1.4-7-4.9-7-9V6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.2 12.2l2 2 3.6-3.9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <span>管理</span>
+    <span>赛事管理</span>
   </button>
 </nav>
 
@@ -133,12 +139,22 @@
     </div>
   </section>
 
-  <section class="view" id="view-admin" data-view="admin" hidden>
+  <section class="view" id="view-manage" data-view="manage" hidden>
     <div id="adminGate"></div>
     <div id="adminPanel"></div>
   </section>
 
+  <section class="view" id="view-server" data-view="server" hidden>
+    <div id="serverBody"></div>
+  </section>
+
+  <section class="view" id="view-user" data-view="user" hidden>
+    <div id="userBody"></div>
+  </section>
+
 </main>
+
+<div id="customHtmlHost" hidden></div>
 
 <div class="modal" id="modal" hidden>
   <div class="modal__backdrop" data-close="1"></div>

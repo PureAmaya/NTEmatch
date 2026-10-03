@@ -19,18 +19,24 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import re
+import secrets
 import shutil
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import db, league, tournament
+from .auth import sha256_hex
 from .defaults import default_config
 from .logging_conf import get_logger
-from .models import Channel, Config
+from .login_guard import DEFAULT_SETTINGS as GUARD_DEFAULTS
+from .login_guard import GUARD_KEYS
+from .models import Channel, Config, LiveBan, Member, Player
 
 log = get_logger("store")
 
@@ -83,6 +89,26 @@ _EVENT_ID_RE = re.compile(r"^e\d{3,}$")
 
 # 全局 meta 键：「频道」板块的公告 / 异环相关内容（不属于任何一届）
 CHANNEL_NOTICE_KEY = "channel_notice"
+# 全局 meta 键：服务器管理员注入的自定义 HTML（用于接入统计 / 数据采集脚本）
+CUSTOM_HTML_KEY = "custom_html"
+# 全局 meta 键：「历届选手 → 成员」的一次性迁移是否已执行（幂等，避免每次启动都扫全库）
+MEMBERS_MIGRATED_KEY = "members_migrated_v1"
+# 全局 meta 键：登录失败限制（类 fail2ban）的配置（JSON 文本）
+LOGIN_GUARD_KEY = "login_guard"
+
+# 成员密钥与 WHIP Bearer 令牌的生成：都由服务端随机产出，明文只回给前端一次。
+MEMBER_KEY_BYTES = 24      # 密钥：token_urlsafe(24) ≈ 32 字符
+BEARER_TOKEN_BYTES = 32    # Bearer 令牌：token_urlsafe(32) ≈ 43 字符
+
+
+def new_member_secret() -> str:
+    """生成成员登录密钥（随机、URL 安全）。"""
+    return secrets.token_urlsafe(MEMBER_KEY_BYTES)
+
+
+def new_bearer_token() -> str:
+    """生成 WHIP 推流 Bearer 令牌（随机、URL 安全、全局唯一）。"""
+    return secrets.token_urlsafe(BEARER_TOKEN_BYTES)
 
 Mutator = Callable[[dict[str, Any]], dict[str, Any]]
 ChangeHook = Callable[[Config, str], Awaitable[None]]
@@ -118,8 +144,16 @@ class ConfigStore:
         self._hooks: list[ChangeHook] = []
         # 成员频道（日常直播）：全局，跨届共享，与 _config 平级
         self._channels: list[Channel] = []
+        # 成员（全局账号）：跨届共享；密钥 / 令牌以 sha256 存储
+        self._members: list[Member] = []
+        # 直播间封禁（全局）：scope=global / event
+        self._live_bans: list[LiveBan] = []
         # 频道板块的公告（全局，纯展示文案）
         self._channel_notice: str = ""
+        # 服务器管理员注入的自定义 HTML（全局，用于数据采集）
+        self._custom_html: str = ""
+        # 登录失败限制（类 fail2ban）配置（全局；运行时计数在 login_guard 模块）
+        self._guard: dict[str, Any] = dict(GUARD_DEFAULTS)
         self._running = False
         # 出厂示例名单是否在本次载入中被清理（需要在启动时写回数据库）
         self._demo_purged = False
@@ -140,7 +174,14 @@ class ConfigStore:
         self._current = current
         self._config = await asyncio.to_thread(self._load_sync, current)
         self._channels = await asyncio.to_thread(self._load_channels_sync)
+        self._members = await asyncio.to_thread(self._load_members_sync)
+        self._live_bans = await asyncio.to_thread(self._load_live_bans_sync)
         self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
+        self._custom_html = await asyncio.to_thread(self._load_custom_html_sync)
+        self._guard = await asyncio.to_thread(self._load_login_guard_sync)
+        await self.ensure_server_admin()
+        # 一次性迁移：历届所有选手都转成成员并建立关联（权限默认「成员」）
+        await self.migrate_players_to_members()
         if self._demo_purged:
             # 把出厂示例名单的清理结果落盘：数据库里也不该留这些假数据，
             # 顺便刷新 events 表缓存的选手数（往届列表会读它）
@@ -286,6 +327,435 @@ class ConfigStore:
     def _delete_channel_sync(self, channel_id: str) -> bool:
         with db.connect(self._db_path) as conn:
             return db.delete_channel(conn, channel_id)
+
+    # ------------------------------------------------------------------ #
+    # 成员（全局账号）
+    #
+    # 密钥与 Bearer 令牌只由服务端随机生成，明文只在生成 / 轮换的那一次回给
+    # 调用方；库里只存 sha256，之后任何接口都取不回明文（只能轮换）。
+    # ------------------------------------------------------------------ #
+    def members(self) -> list[Member]:
+        """成员列表快照（服务器管理员在前）。"""
+        return self._members
+
+    def member(self, uid: str) -> Member | None:
+        return next((m for m in self._members if m.uid == uid), None)
+
+    def member_by_stream_id(self, stream_id: str) -> Member | None:
+        key = (stream_id or "").strip()
+        if not key:
+            return None
+        return next((m for m in self._members if m.stream_id == key), None)
+
+    def member_by_key(self, key: str) -> Member | None:
+        """按登录密钥定位成员：sha256 后常量时间比较，避免时序侧信道。"""
+        raw = (key or "").strip()
+        if not raw:
+            return None
+        digest = sha256_hex(raw)
+        for m in self._members:
+            if m.key_sha256 and hmac.compare_digest(m.key_sha256, digest):
+                return m
+        return None
+
+    def server_admin(self) -> Member | None:
+        return next((m for m in self._members if m.permission == "server_admin"), None)
+
+    async def save_member(
+        self, member: Member, *, new_key: bool = False, new_bearer: bool = False
+    ) -> tuple[Member, str, str]:
+        """新增 / 更新成员。
+
+        返回 ``(成员, 新密钥明文, 新令牌明文)``；明文只在本次调用里生成，
+        未轮换时为空字符串（调用方据此决定要不要「仅显示一次」地回给前端）。
+        新建成员时密钥与令牌自动生成。
+        """
+        async with self._lock:
+            current = self.member(member.uid) if member.uid else None
+            data = member.model_copy()
+            if not data.uid:
+                data.uid = self._new_member_uid()
+            gen_key = new_key or current is None
+            gen_bearer = new_bearer or current is None
+            key_plain = new_member_secret() if gen_key else ""
+            bearer_plain = new_bearer_token() if gen_bearer else ""
+            if current is not None:
+                data.created_at = current.created_at or now_iso()
+                data.key_sha256 = current.key_sha256
+                data.bearer_sha256 = current.bearer_sha256
+            else:
+                data.created_at = data.created_at or now_iso()
+            if key_plain:
+                data.key_sha256 = sha256_hex(key_plain)
+            if bearer_plain:
+                data.bearer_sha256 = sha256_hex(bearer_plain)
+            data.updated_at = now_iso()
+            await asyncio.to_thread(self._save_member_sync, data)
+            rest = [m for m in self._members if m.uid != data.uid]
+            self._members = [*rest, data]
+        log.warning(
+            "成员已保存 | uid=%s | 名称=%s | 权限=%s | 流名=%s | 轮换密钥=%s | 轮换令牌=%s",
+            data.uid,
+            data.display_name,
+            data.permission,
+            data.stream_id or "(未设置)",
+            bool(key_plain),
+            bool(bearer_plain),
+        )
+        await self._notify(self._config, "member:save")
+        return data, key_plain, bearer_plain
+
+    async def delete_member(self, uid: str, actor: str = "api") -> bool:
+        """删除成员；返回是否真的删掉了。"""
+        async with self._lock:
+            removed = await asyncio.to_thread(self._delete_member_sync, uid)
+            if removed:
+                self._members = [m for m in self._members if m.uid != uid]
+        if removed:
+            log.warning("成员已删除 | uid=%s", uid)
+            await self._notify(self._config, f"member:delete:{actor}")
+        return removed
+
+    async def ensure_server_admin(self) -> Member:
+        """启动自检：全站**有且只有一个**服务器管理员。
+
+        没有就自动创建一个（随机密钥并打进启动日志）；多于一个时只保留最早
+        创建的那个，其余降级为赛事管理员。这样「谁是管理员」不会成为空缺，
+        也不会同时存在两个最高权限账号。
+        """
+        admins = [m for m in self._members if m.permission == "server_admin"]
+        if len(admins) == 1:
+            return admins[0]
+        if len(admins) > 1:
+            keep = min(admins, key=lambda m: (m.created_at, m.uid))
+            for m in admins:
+                if m.uid == keep.uid:
+                    continue
+                await self.save_member(m.model_copy(update={"permission": "event_admin"}))
+                log.warning("检测到多个服务器管理员，已将「%s」降级为赛事管理员", m.display_name)
+            return keep
+        member = Member(uid=self._new_member_uid(), name="服务器管理员", permission="server_admin")
+        saved, key_plain, _bearer_plain = await self.save_member(member)
+        log.warning("-" * 68)
+        log.warning("未检测到服务器管理员，已自动创建：%s", saved.display_name)
+        log.warning("登录密钥（仅此一次显示，请立即保存）：%s", key_plain)
+        log.warning("在 /admin（服务器管理）或 /user（个人）用该密钥登录；忘记可在成员管理里轮换。")
+        log.warning("-" * 68)
+        return saved
+
+    # ------------------------------------------------------------------ #
+    # 选手 ↔ 成员（「选手就是成员」）
+    #
+    # 成员是全局账号；历届的「选手」都对应一位成员：
+    #   * 启动时一次性把历届已有选手迁移成成员（继承姓名 / QQ / 头像 / 游戏 UUID / 推流 ID），
+    #     权限默认「成员」；
+    #   * 新增 / 编辑选手时自动建号并关联；
+    #   * 成员资料变更时反向同步到各届里关联的选手，保证两边一致。
+    # ------------------------------------------------------------------ #
+    async def migrate_players_to_members(self) -> int:
+        """一次性迁移：历届所有选手 → 成员并建立关联（幂等，跑过即打标记）。"""
+        async with self._lock:
+            if await asyncio.to_thread(self._get_meta_sync, MEMBERS_MIGRATED_KEY) == "1":
+                return 0
+            entries = await asyncio.to_thread(self._list_sync)
+            linked = 0
+            for entry in entries:
+                cfg = await asyncio.to_thread(self._load_sync, entry["id"])
+                players = [p.dump() for p in cfg.players]
+                changed = False
+                for p in players:
+                    member = await asyncio.to_thread(self._ensure_member_sync, p, create=True)
+                    if member is None:
+                        continue
+                    linked += 1
+                    if str(p.get("memberUid") or "") != member.uid:
+                        p["memberUid"] = member.uid
+                        changed = True
+                if not changed:
+                    continue
+                data = cfg.dump()
+                data["players"] = players
+                data["revision"] = int(data.get("revision", 0)) + 1
+                data["updatedAt"] = now_iso()
+                updated = Config.model_validate(data)
+                await asyncio.to_thread(self._save_sync, entry["id"], updated, False)
+                if entry["id"] == self._current:
+                    self._config = updated
+            await asyncio.to_thread(self._set_meta_sync, MEMBERS_MIGRATED_KEY, "1")
+        if linked:
+            log.warning(
+                "已将历届选手迁移为成员 | 关联选手=%d | 成员总数=%d", linked, len(self._members)
+            )
+            await self._notify(self._config, "members:migrate")
+        return linked
+
+    async def ensure_member_for_player(self, player: Player) -> Member | None:
+        """确保选手有对应成员（无则按选手信息建号，权限默认「成员」），返回该成员。"""
+        async with self._lock:
+            return await asyncio.to_thread(self._ensure_member_sync, player.dump(), create=True)
+
+    async def propagate_member(self, member: Member, actor: str = "api") -> int:
+        """把成员资料同步到各届里关联的选手（改名 / 换头像 / 换推流 ID 后调用）。"""
+        async with self._lock:
+            changed = await asyncio.to_thread(self._propagate_member_sync, member)
+        if changed:
+            log.warning("成员资料已同步到关联选手 | uid=%s | 覆盖届数=%d", member.uid, changed)
+            await self._notify(self._config, f"member:propagate:{actor}")
+        return changed
+
+    def _ensure_member_sync(self, player: dict[str, Any], *, create: bool = True) -> Member | None:
+        """按「关联 uid → 游戏 UUID → 姓名+QQ」定位成员；找不到就在 create 时新建。
+
+        已有成员只**补齐空缺字段**（不覆盖已填内容），避免反复覆盖全局资料。
+        """
+        from .logic import clean_key  # 局部导入，避免模块级循环依赖
+
+        uid = str(player.get("memberUid") or "").strip()
+        if uid:
+            existing = self.member(uid)
+            if existing is not None:
+                return existing
+        game_uuid = str(player.get("uuid") or "").strip()
+        name = str(player.get("name") or "").strip()
+        qq = str(player.get("qq") or "").strip()
+        stream_key = clean_key(str(player.get("streamKey") or ""))
+
+        found: Member | None = None
+        for m in self._members:
+            if game_uuid and m.game_uuid and m.game_uuid == game_uuid:
+                found = m
+                break
+            if name and qq and m.name == name and m.qq == qq:
+                found = m
+                break
+        if found is None and not create:
+            return None
+        if found is not None:
+            patch: dict[str, Any] = {}
+            if not found.qq and qq:
+                patch["qq"] = qq
+            if not found.avatar and player.get("avatar"):
+                patch["avatar"] = str(player["avatar"])
+            if not found.game_uuid and game_uuid:
+                patch["game_uuid"] = game_uuid
+            if (
+                not found.stream_id
+                and stream_key
+                and not any(m.stream_id == stream_key for m in self._members if m.uid != found.uid)
+            ):
+                patch["stream_id"] = stream_key
+            if patch:
+                found = found.model_copy(update={**patch, "updated_at": now_iso()})
+                self._save_member_sync(found)
+                self._members = [found if m.uid == found.uid else m for m in self._members]
+            return found
+
+        stream_id = ""
+        if stream_key and not any(m.stream_id == stream_key for m in self._members):
+            stream_id = stream_key
+        member = Member(
+            uid=self._new_member_uid(),
+            name=name or "成员",
+            qq=qq,
+            avatar=str(player.get("avatar") or ""),
+            game_uuid=game_uuid,
+            stream_id=stream_id,
+            permission="member",
+            active=bool(player.get("active", True)),
+            created_at=now_iso(),
+            updated_at=now_iso(),
+        )
+        self._save_member_sync(member)
+        self._members = [*self._members, member]
+        log.info(
+            "选手已转为成员 | 名称=%s | uid=%s | 推流ID=%s",
+            member.display_name,
+            member.uid,
+            member.stream_id or "(无)",
+        )
+        return member
+
+    def _propagate_member_sync(self, member: Member) -> int:
+        """把成员资料写回各届里与之关联的选手，返回被改动的届数。"""
+        changed_events = 0
+        for entry in self._list_sync():
+            cfg = self._load_sync(entry["id"])
+            players = [p.dump() for p in cfg.players]
+            changed = False
+            for p in players:
+                if str(p.get("memberUid") or "") != member.uid:
+                    continue
+                patch: dict[str, Any] = {}
+                if member.name and p.get("name") != member.name:
+                    patch["name"] = member.name
+                if p.get("qq") != member.qq:
+                    patch["qq"] = member.qq
+                if p.get("avatar") != member.avatar:
+                    patch["avatar"] = member.avatar
+                if p.get("uuid") != member.game_uuid:
+                    patch["uuid"] = member.game_uuid
+                # 推流流名跟随成员的推流 ID（选手的机位地址 = 成员的推流 ID）
+                if member.stream_id and p.get("streamKey") != member.stream_id:
+                    patch["streamKey"] = member.stream_id
+                if patch:
+                    p.update(patch)
+                    changed = True
+            if not changed:
+                continue
+            data = cfg.dump()
+            data["players"] = players
+            data["revision"] = int(data.get("revision", 0)) + 1
+            data["updatedAt"] = now_iso()
+            updated = Config.model_validate(data)
+            self._save_sync(entry["id"], updated, False)
+            if entry["id"] == self._current:
+                self._config = updated
+            changed_events += 1
+        return changed_events
+
+    def _get_meta_sync(self, key: str) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, key)
+
+    def _set_meta_sync(self, key: str, value: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, key, value)
+
+    # ------------------------------------------------------------------ #
+    # 直播间封禁（全局）
+    # ------------------------------------------------------------------ #
+    def live_bans(self) -> list[LiveBan]:
+        return self._live_bans
+
+    async def add_live_ban(self, ban: LiveBan, actor: str = "api") -> LiveBan:
+        """新增一条直播封禁记录（未给 id 时自动分配 ``b001`` 这类编号）。"""
+        async with self._lock:
+            if not ban.id:
+                ban = ban.model_copy(update={"id": self._new_ban_id()})
+            await asyncio.to_thread(self._save_live_ban_sync, ban)
+            rest = [b for b in self._live_bans if b.id != ban.id]
+            self._live_bans = [*rest, ban]
+        log.warning(
+            "直播已封禁 | id=%s | 范围=%s | 成员=%s | 流名=%s | 至=%s | 原因=%s",
+            ban.id,
+            ban.scope,
+            ban.member_uid or "(按流名)",
+            ban.stream_id or "(未指定)",
+            ban.until or "永久",
+            ban.reason or "(未填写)",
+        )
+        await self._notify(self._config, f"live:ban:{actor}")
+        return ban
+
+    async def remove_live_ban(self, ban_id: str, actor: str = "api") -> bool:
+        """解除一条直播封禁（仅服务器管理员可调用，见接口层）。"""
+        async with self._lock:
+            removed = await asyncio.to_thread(self._delete_live_ban_sync, ban_id)
+            if removed:
+                self._live_bans = [b for b in self._live_bans if b.id != ban_id]
+        if removed:
+            log.warning("已解除直播封禁 | id=%s", ban_id)
+            await self._notify(self._config, f"live:unban:{actor}")
+        return removed
+
+    # ------------------------------------------------------------------ #
+    # 服务器级配置：自定义 HTML（全局，用于接入统计 / 数据采集）
+    # ------------------------------------------------------------------ #
+    def custom_html(self) -> str:
+        return self._custom_html
+
+    async def set_custom_html(self, text: str, actor: str = "api") -> str:
+        clean = (text or "").strip()
+        async with self._lock:
+            await asyncio.to_thread(self._set_custom_html_sync, clean)
+            self._custom_html = clean
+        log.info("自定义 HTML 已更新 | 长度=%d", len(clean))
+        await self._notify(self._config, f"server:custom-html:{actor}")
+        return clean
+
+    # ------------------------------------------------------------------ #
+    # 服务器级配置：登录失败限制（类 fail2ban）
+    # ------------------------------------------------------------------ #
+    def guard_settings(self) -> dict[str, Any]:
+        """登录限制配置快照（含默认值）。"""
+        return dict(self._guard)
+
+    async def set_login_guard(self, patch: dict[str, Any], actor: str = "api") -> dict[str, Any]:
+        """更新登录限制配置（只接受已知键）。"""
+        clean = {k: v for k, v in (patch or {}).items() if k in GUARD_KEYS and v is not None}
+        if not clean:
+            raise ValueError("没有需要修改的配置项")
+        async with self._lock:
+            merged = {**self._guard, **clean}
+            self._guard = merged
+            await asyncio.to_thread(
+                self._set_meta_sync, LOGIN_GUARD_KEY, json.dumps(merged, ensure_ascii=False)
+            )
+        log.warning("登录限制配置已更新 | %s", merged)
+        await self._notify(self._config, f"server:login-guard:{actor}")
+        return dict(merged)
+
+    def _new_member_uid(self) -> str:
+        used = {m.uid for m in self._members}
+        while True:
+            uid = uuid.uuid4().hex
+            if uid not in used:
+                return uid
+
+    def _new_ban_id(self) -> str:
+        used = {b.id for b in self._live_bans}
+        seq = 1
+        while f"b{seq:03d}" in used:
+            seq += 1
+        return f"b{seq:03d}"
+
+    def _load_members_sync(self) -> list[Member]:
+        with db.connect(self._db_path) as conn:
+            rows = db.list_members(conn)
+        return [Member.model_validate(row) for row in rows]
+
+    def _save_member_sync(self, member: Member) -> None:
+        with db.connect(self._db_path) as conn:
+            db.upsert_member(conn, member.dump())
+
+    def _delete_member_sync(self, uid: str) -> bool:
+        with db.connect(self._db_path) as conn:
+            return db.delete_member(conn, uid)
+
+    def _load_live_bans_sync(self) -> list[LiveBan]:
+        with db.connect(self._db_path) as conn:
+            rows = db.list_live_bans(conn)
+        return [LiveBan.model_validate(row) for row in rows]
+
+    def _save_live_ban_sync(self, ban: LiveBan) -> None:
+        with db.connect(self._db_path) as conn:
+            db.upsert_live_ban(conn, ban.dump())
+
+    def _delete_live_ban_sync(self, ban_id: str) -> bool:
+        with db.connect(self._db_path) as conn:
+            return db.delete_live_ban(conn, ban_id)
+
+    def _load_custom_html_sync(self) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, CUSTOM_HTML_KEY)
+
+    def _set_custom_html_sync(self, text: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, CUSTOM_HTML_KEY, text)
+
+    def _load_login_guard_sync(self) -> dict[str, Any]:
+        """读登录限制配置（JSON），坏数据一律回落到默认值。"""
+        with db.connect(self._db_path) as conn:
+            raw = db.get_meta(conn, LOGIN_GUARD_KEY)
+        settings = dict(GUARD_DEFAULTS)
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    settings.update({k: v for k, v in data.items() if k in GUARD_KEYS})
+            except ValueError:
+                log.warning("登录限制配置无法解析，已回落到默认值")
+        return settings
 
     # ------------------------------------------------------------------ #
     # 写
@@ -600,9 +1070,17 @@ class ConfigStore:
     # 届次管理
     # ------------------------------------------------------------------ #
     async def create_event(
-        self, name: str, copy_roster: bool = False, fmt: str = "tournament"
+        self,
+        name: str,
+        copy_roster: bool = False,
+        fmt: str = "",
+        owner_uid: str = "",
     ) -> Config:
-        """新建一届并切换过去；可选沿用当前届的名单、队伍、规则与界面配置，并指定赛制。"""
+        """新建一届并切换过去；可选沿用当前届的名单、队伍、规则与界面配置，并指定赛制。
+
+        ``fmt`` 留空时按类型自动选：排名模式用锦标赛制，娱乐（不排名）用积分制
+        —— 娱乐赛事没有「晋级」可言，锦标赛制跑不起来。
+        """
         async with self._lock:
             template = default_config()
             if copy_roster:
@@ -615,12 +1093,20 @@ class ConfigStore:
                 for key in ("rules", "stream", "ui", "admin"):
                     if key in current:
                         template[key] = current[key]
-            # 赛制以新建时选择的为准（覆盖沿用的规则）
-            template["rules"] = {**template.get("rules", {}), "format": fmt}
+                # 比赛类型与排名开关也跟着沿用（同一类赛事通常连着办好几届）
+                for key in ("sport", "ranked"):
+                    if key in current.get("event", {}):
+                        template["event"][key] = current["event"][key]
+            # 赛制以新建时选择的为准（覆盖沿用的规则）；未指定时按排名模式挑一个合理的
+            ranked = bool(template["event"].get("ranked", True))
+            resolved_fmt = fmt if fmt in ("league", "tournament") else ("tournament" if ranked else "league")
+            template["rules"] = {**template.get("rules", {}), "format": resolved_fmt}
             events = await asyncio.to_thread(self._list_sync)
             clean_name = (name or "").strip() or f"第 {len(events) + 1} 届"
             template["event"]["name"] = clean_name
             template["event"]["status"] = "active"
+            # 记录归属：赛事管理员只能管理 / 删除自己创建的届
+            template["event"]["ownerUid"] = owner_uid
             if clean_name:
                 template["event"]["title"] = clean_name
             if template.get("participants"):
@@ -654,7 +1140,11 @@ class ConfigStore:
     async def update_event_meta(self, event_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         """修改某一届的名称 / 状态；当前届走常规更新以触发广播。"""
         self._check_id(event_id)
-        clean = {k: v for k, v in patch.items() if k in {"name", "status"} and v not in (None, "")}
+        clean = {
+            k: v
+            for k, v in patch.items()
+            if k in {"name", "status", "hidden", "sport", "ranked"} and v not in (None, "")
+        }
         if not clean:
             raise ValueError("没有需要修改的字段")
         if event_id == self._current:

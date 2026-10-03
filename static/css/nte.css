@@ -152,6 +152,21 @@ img { display: block; max-width: 100%; }
 }
 .hud__meta { display: flex; align-items: center; gap: 8px; flex: none; }
 
+/* 顶栏右侧的「当前用户」：头像 + 用户名（点进 /user） */
+.hud__me {
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+  max-width: 200px; padding: 3px 12px 3px 5px;
+  border: 1px solid var(--line-2); border-radius: 999px;
+  background: rgba(6, 10, 16, .72); color: var(--txt);
+  font: inherit; font-size: 12.5px; font-weight: 700; letter-spacing: .04em;
+  transition: border-color .16s, box-shadow .16s, background .16s;
+}
+.hud__me:hover { border-color: var(--accent); box-shadow: var(--glow); background: rgba(16, 26, 42, .9); }
+.hud__me[aria-current="true"] { border-color: var(--accent); }
+.hud__me-ava { display: inline-flex; flex: none; }
+.hud__me-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 560px) { .hud__me { max-width: 120px; padding-right: 8px; } }
+
 /* ---------- 5. 组件：chip / btn / badge ---------- */
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -237,6 +252,13 @@ img { display: block; max-width: 100%; }
 /* 靠 el.hidden 收起的页签（已完结的届没有直播页） */
 .tab[hidden] { display: none !important; }
 
+/* 「服务器 / 我的」各自是独立于比赛的模块：不随届次切换，各带一条竖线与前一组分开 */
+
+.tab--sep { border-left: 1px solid var(--line-2); }
+
+/* 成员推流 ID 重复：整卡高亮，提示管理员改成唯一值 */
+.pcard--warn { outline: 2px solid rgba(255, 92, 92, .75); outline-offset: -2px; }
+
 /* ---------- 7. 布局 / Panel ---------- */
 .stage {
   position: relative; z-index: 1;
@@ -250,7 +272,7 @@ img { display: block; max-width: 100%; }
    的元素都必须在这里显式声明一次，否则「隐藏」根本不生效——直播封面原先就是这么
    一直捂着播放器（连带原生控件都点不到）的。 */
 .chip[hidden], .panel[hidden], .modal__foot[hidden], .stage-cover[hidden],
-.live-pick[hidden] { display: none !important; }
+.live-pick[hidden], .btn[hidden], .hud__me[hidden] { display: none !important; }
 .grid { display: grid; gap: var(--gap); grid-template-columns: 1fr; }
 
 .panel {
@@ -699,6 +721,8 @@ img { display: block; max-width: 100%; }
     border-top: 0; border-bottom: 1px solid var(--line);
   }
   .tab { flex-direction: row; gap: 7px; padding: 11px 15px; font-size: 12.5px; }
+  /* 独立模块（服务器 / 我的）与比赛页签之间留一点距离 + 竖线 */
+  .tab--sep { margin-left: 10px; }
   .tab[aria-selected="true"]::after { top: auto; bottom: -1px; left: 8%; right: 8%; }
   .grid--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .round-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -272,10 +272,7 @@ function makePlayer(ids) {
         this.setState('检测失败');
         return;
       }
-      this.setCover(
-        '没有任何人在直播',
-        '现在没有人在推流，所以这里不摆机位。有人开播后会自动出现，点一下即可播放。'
-      );
+      this.setCover('当前没有直播', '有人开播后，机位会自动出现在这里，点击即可观看。');
       this.setState('无人直播');
       return;
     }
@@ -419,7 +416,8 @@ export async function probeLiveHealth() {
 const anyoneStreaming = () =>
   App.liveMain === true ||
   (App.liveNow instanceof Set && App.liveNow.size > 0) ||
-  (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0);
+  (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0) ||
+  (App.liveMembersNow instanceof Set && App.liveMembersNow.size > 0);
 
 async function healthTick(probe = false) {
   const ok = await refreshLiveHealth({ probe });
@@ -471,14 +469,20 @@ export async function refreshLiveHealth({ probe = false } = {}) {
     const nextChannels = new Set(
       Array.isArray(App.liveHealth.streamingChannels) ? App.liveHealth.streamingChannels : []
     );
+    // 成员直播间：回报哪些成员（按 uid）在推流
+    const nextMembers = new Set(
+      Array.isArray(App.liveHealth.streamingMembers) ? App.liveHealth.streamingMembers : []
+    );
     // 主直播间（默认流名）：探测不到就是 null（未知），此时一律不给这一路信号
     const main = App.liveHealth.streamingKnown ? Boolean(App.liveHealth.mainStreaming) : null;
     changed =
       main !== App.liveMain ||
       setDiff(App.liveNow, next) ||
-      setDiff(App.liveChannelsNow, nextChannels);
+      setDiff(App.liveChannelsNow, nextChannels) ||
+      setDiff(App.liveMembersNow, nextMembers);
     App.liveNow = next;
     App.liveChannelsNow = nextChannels;
+    App.liveMembersNow = nextMembers;
     App.liveMain = main;
     App.liveHealthFails = 0;
     App.liveHealthState = 'ok';

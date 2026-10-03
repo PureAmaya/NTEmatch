@@ -141,6 +141,11 @@ export const App = {
   state: null,
   liveInfo: null,
   liveHealth: null,
+  // 登录身份（服务器返回）：{ uid, name, permission, isServer, canManageEvents }
+  // null = 未登录或尚未校验；permission: member / event_admin / server_admin
+  me: null,
+  // 服务器管理页数据：成员列表 + 服务器配置（仅服务器管理员可写）
+  server: null,
   // 直播信号检测的状态机：idle（还没检测）/ loading（检测中）/ ok / error（连续失败到上限）
   // 只在直播 / 频道页推进，见 live.js 的 startLiveHealth / stopLiveHealth
   liveHealthState: 'idle',
@@ -156,6 +161,8 @@ export const App = {
   livePicked: null, // 最近一次解析出的机位对象（供局部刷新复用）
   // 成员频道（日常直播）：正在推流的频道 ID 集合；null = 还没探测过
   liveChannelsNow: null,
+  // 成员直播间：正在推流的成员 uid 集合；null = 还没探测过
+  liveMembersNow: null,
   // 当前选中的成员频道 ID，以及最近一次解析出的频道对象（供局部刷新复用）
   channelId: null,
   channelPicked: null,
@@ -175,6 +182,11 @@ export const App = {
   online: false,
   filter: 'all',
   search: '',
+  // 选手页的筛选（全部 / 已参与 / 未参与 / 替补 / 直播中 / 封禁中）
+  rosterFilter: 'all',
+  // 成员管理页的搜索 / 筛选
+  memberSearch: '',
+  memberFilter: 'all',
 };
 
 /** 上层注入的回调，避免核心层反向依赖视图层。 */
@@ -182,6 +194,18 @@ export const hooks = {};
 
 export const isAdmin = () => Boolean(App.token);
 export const reveal = () => !App.state || App.state.ui?.revealResults !== false || isAdmin();
+
+/**
+ * 当前登录者的权限：member / event_admin / server_admin；**没拿到身份就是空**。
+ *
+ * 刻意不做「有 token 就先当管理员」的保守兜底：令牌过期 / 会话失效（会话在内存里，
+ * 服务重启即失效）时会短暂冒出「没登录却顶着管理入口」的假象。启动流程本来就是
+ * 先 ``await`` 身份、再首次渲染，所以收紧不会让入口闪烁。
+ */
+export const myPermission = () => App.me?.permission || '';
+export const isServerAdmin = () => myPermission() === 'server_admin';
+export const canManageEvents = () =>
+  myPermission() === 'event_admin' || myPermission() === 'server_admin';
 
 /**
  * 这一届是否**已经完结**（只读 + 没有直播页）。
@@ -212,11 +236,24 @@ export const pageAvailable = (page, s) => page !== 'live' || liveAvailable(s);
  * 收起来——否则一次手滑就会写到主赛事上；已完结的届只留只读信息，要改先把
  * 它恢复成「进行中」。
  */
-export const canEdit = () => Boolean(App.token) && !App.state?.readOnly && !isFinished();
+export const canEdit = () =>
+  Boolean(App.token) && canManageEvents() && !App.state?.readOnly && !isFinished();
 
 /* --------------------------------- 路由 --------------------------------- */
 /** 页面段：地址栏里的页名，与 index.html 的 .tab[data-view] 一一对应。 */
-export const PAGES = ['overview', 'schedule', 'roster', 'live', 'channels', 'events', 'admin'];
+export const PAGES = [
+  'overview',
+  'schedule',
+  'roster',
+  'live',
+  'channels',
+  'events',
+  'manage',
+  'server',
+  'user',
+];
+/** 不属于任何一届的独立页（地址不带届 ID）。 */
+export const STANDALONE_PAGES = ['events', 'server', 'user'];
 export const PAGE_LABEL = {
   overview: '总览',
   schedule: '赛程',
@@ -224,7 +261,9 @@ export const PAGE_LABEL = {
   live: '直播',
   channels: '频道',
   events: '往届',
-  admin: '管理',
+  manage: '赛事管理',
+  server: '服务器',
+  user: '我的',
 };
 
 /**
@@ -245,6 +284,8 @@ export function parseRoute(path = location.pathname) {
     } catch {
       /* 非法转义就按原样处理 */
     }
+    // /admin 固定 = 服务器管理页（与届次无关）；赛事管理是 /<届>/manage
+    if (s === 'admin' && segs.length === 1) s = 'server';
     if (!page && PAGES.includes(s)) page = s;
     else if (!eventId && /^[A-Za-z0-9_-]{2,40}$/.test(s)) eventId = s;
   });
@@ -254,6 +295,9 @@ export function parseRoute(path = location.pathname) {
 /** 拼地址：届 ID 缺省时回落到「主赛事」的短链（根路径 / 或 /events 这类独立页）。 */
 export function routePath(eventId = '', page = 'overview') {
   const p = PAGES.includes(page) ? page : 'overview';
+  // 服务器管理页固定 /admin（独立于任何一届）；个人页固定 /user
+  if (p === 'server') return '/admin';
+  if (p === 'user') return '/user';
   if (!eventId) return p === 'overview' ? '/' : `/${p}`;
   return p === 'overview' ? `/${eventId}` : `/${eventId}/${p}`;
 }
@@ -324,6 +368,26 @@ export async function refreshPrivate() {
     App.private = null;
   }
   return App.private;
+}
+
+/**
+ * 拉取当前登录身份（权限 / uid / 昵称），用于恢复「我是谁、能做什么」。
+ *
+ * 未登录时清空，登录失效（401）也会清空并触发 ``hooks.onAuthLost``。
+ */
+export async function refreshMe() {
+  if (!App.token) {
+    App.me = null;
+    return null;
+  }
+  try {
+    App.me = await api('/auth/check', { auth: true });
+    log.debug('身份已加载', App.me?.permission);
+  } catch (err) {
+    log.warn('身份校验失败', err.message);
+    App.me = null;
+  }
+  return App.me;
 }
 
 /* -------------------------------- Toast -------------------------------- */

@@ -18,8 +18,20 @@ from typing import Any
 
 from . import league
 from . import tournament as T
+from .defaults import SPORT_PRESETS, sport_meta
 from .logging_conf import get_logger
-from .models import MAX_SIDES, Channel, Config, Player, Round, Side, StreamConfig, Team
+from .models import (
+    MAX_SIDES,
+    Channel,
+    Config,
+    LiveBan,
+    Member,
+    Player,
+    Round,
+    Side,
+    StreamConfig,
+    Team,
+)
 
 log = get_logger("logic")
 
@@ -486,6 +498,7 @@ def rulebook(cfg: Config) -> dict[str, Any]:
     teams = cfg.teams
     rounds = cfg.rounds
     players = joined_players(cfg)
+    meta = sport_meta(cfg.event.sport)
     per_match = max(2, min(MAX_SIDES, rules.teams_per_match or 2))
     shape = "组 vs 组" if per_match == 2 else f"{per_match} 队同场"
     loser = bool(rules.loser_bracket)
@@ -512,6 +525,19 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             f"参赛：{len(players)} 名选手 / {len(teams)} 支队伍。",
         ]
     sections.append({"title": "赛制概览", "items": overview})
+
+    if not cfg.event.ranked:
+        # 娱乐模式：规则面板直说「不排名」，避免用户找积分榜
+        sections.append(
+            {
+                "title": "娱乐模式（不排名）",
+                "items": [
+                    f"本场是娱乐性质的{meta['label']}：只记录{meta['round']}与{meta['score']}。",
+                    "不计算名次与积分、不判晋级、不产生冠军。",
+                    f"{meta['score']}相同时直接记为平局，不必指定胜方。",
+                ],
+            }
+        )
 
     groups = sorted({t.group or "A" for t in teams}) if teams else []
     size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
@@ -636,6 +662,10 @@ def build_state(cfg: Config, *, historical: bool = False) -> dict[str, Any]:
         "revision": cfg.revision,
         "updatedAt": cfg.updated_at,
         "event": cfg.event.dump(),
+        # 比赛类型（文案）与排名开关：前端据此换称呼、并决定是否展示排名 / 晋级相关内容
+        "sport": sport_meta(cfg.event.sport),
+        "sportPresets": [{"key": key, **meta} for key, meta in SPORT_PRESETS.items()],
+        "ranked": bool(cfg.event.ranked),
         # 整届的时间状态（是否结束 / 起止时间 / 用时）
         "eventTime": event_time_view(cfg, progress),
         "rules": cfg.rules.dump(),
@@ -802,6 +832,19 @@ def validate_config(cfg: Config) -> list[str]:
     per_team = max(1, cfg.rules.team_size or 2)
     need = per_team * 2
     joined = joined_players(cfg)
+    meta = sport_meta(cfg.event.sport)
+
+    if not cfg.event.ranked:
+        # 娱乐模式：只记录，不排名 / 不晋级
+        issues.append(
+            f"娱乐模式（{meta['label']} · 不排名）：只记录{meta['round']}与{meta['score']}，"
+            "不计算名次、不判晋级、不产生冠军；胜负可留空（分不出时记为平局）。"
+        )
+        if cfg.rules.format == "tournament":
+            issues.append(
+                "娱乐模式下锦标赛制没有意义（淘汰赛必须有胜者才能推进）；"
+                "建议改用积分制逐场记录，或直接把排名开关打开。"
+            )
 
     if joined and len(joined) < need:
         issues.append(f"参与选手 {len(joined)} 人，不足 {need} 人（{per_team} 人一队至少需要 2 队）。")
@@ -992,3 +1035,194 @@ def live_stream_player_ids(cfg: Config) -> list[str]:
             playing.update(rnd.side_a.player_ids)
             playing.update(rnd.side_b.player_ids)
     return [p.id for p in cfg.players if p.stream_key and p.id in playing]
+
+
+# --------------------------------------------------------------------------- #
+# 成员（全局账号）与直播封禁
+# --------------------------------------------------------------------------- #
+def ban_active(ban: LiveBan, now: datetime | None = None) -> bool:
+    """封禁当前是否生效：``until`` 为空 = 永久；否则到期自动失效。"""
+    until = (ban.until or "").strip()
+    if not until:
+        return True
+    parsed = parse_time(until)
+    if parsed is None:
+        return True
+    return parsed > (now or datetime.now())  # noqa: DTZ005
+
+
+def member_ban(bans: list[LiveBan], member: Member, event_id: str = "") -> LiveBan | None:
+    """成员当前生效的封禁（全局优先，其次永久优先、解禁越晚越优先）。"""
+    now = datetime.now()  # noqa: DTZ005
+    hits: list[LiveBan] = []
+    for ban in bans:
+        if not ban_active(ban, now):
+            continue
+        hit_uid = bool(ban.member_uid) and ban.member_uid == member.uid
+        hit_stream = bool(ban.stream_id) and bool(member.stream_id) and ban.stream_id == member.stream_id
+        if not (hit_uid or hit_stream):
+            continue
+        # 赛事级封禁只作用于它所属的那一届（其它届不受影响）
+        if ban.scope == "event" and event_id and ban.event_id != event_id:
+            continue
+        if ban.scope == "event" and not ban.event_id:
+            continue
+        hits.append(ban)
+    if not hits:
+        return None
+    hits.sort(key=lambda b: (b.scope != "global", bool(b.until), b.until))
+    return hits[0]
+
+
+def duplicate_streams(members: list[Member], channels: list[Channel]) -> dict[str, list[str]]:
+    """推流 ID / 流名重复检查（成员之间、以及成员与传统频道之间）。
+
+    重复会让两方推到同一个地址（串流），因此管理端要高亮提示管理员改掉。
+    返回 ``{流名: [占用者说明, …]}``（只含真正重复的）。
+    """
+    seen: dict[str, list[str]] = {}
+    for member in members:
+        key = clean_key(member.stream_id)
+        if key:
+            seen.setdefault(key, []).append(f"成员 {member.display_name}")
+    for channel in channels:
+        key = clean_key(channel.stream_key)
+        if key:
+            seen.setdefault(key, []).append(f"频道 {channel.display_name}")
+    return {key: who for key, who in seen.items() if len(who) > 1}
+
+
+def ban_view(ban: LiveBan) -> dict[str, Any]:
+    """封禁的对外结构（不含执行者等内部字段）。"""
+    return {
+        "id": ban.id,
+        "scope": ban.scope,
+        "memberUid": ban.member_uid,
+        "streamId": ban.stream_id,
+        "name": ban.name,
+        "reason": ban.reason,
+        "until": ban.until,
+        "eventId": ban.event_id,
+        "createdAt": ban.created_at,
+    }
+
+
+def player_round_map(cfg: Config) -> dict[str, Round]:
+    """一次遍历建立「选手 ID → 当前所在对局」，语义与 :func:`current_round_of` 一致。
+
+    对「整份成员列表」批量渲染时用它替代逐人扫描，避免 O(成员数 × 对局数)。
+    """
+    live: dict[str, Round] = {}
+    pending: dict[str, Round] = {}
+    latest: dict[str, Round] = {}
+    for rnd in sorted(cfg.rounds, key=lambda r: r.index):
+        for pid in round_player_ids(rnd):
+            latest[pid] = rnd
+            if rnd.status == "live" and pid not in live:
+                live[pid] = rnd
+            elif rnd.status == "pending" and pid not in pending:
+                pending[pid] = rnd
+    return {pid: (live.get(pid) or pending.get(pid) or rnd) for pid, rnd in latest.items()}
+
+
+def member_round(
+    cfg: Config,
+    member: Member,
+    *,
+    player: Player | None = None,
+    rounds: dict[str, Round] | None = None,
+) -> Round | None:
+    """成员当前所在的比赛：按 ``memberUid`` 关联选手，流名相同也可兜底关联。"""
+    if player is None:
+        if not cfg.players:
+            return None
+        player = next(
+            (
+                p
+                for p in cfg.players
+                if (member.uid and p.member_uid == member.uid)
+                or (member.stream_id and p.stream_key == member.stream_id)
+            ),
+            None,
+        )
+    if player is None:
+        return None
+    if rounds is not None:
+        return rounds.get(player.id)
+    return current_round_of(cfg, player.id)
+
+
+def member_view(
+    cfg: Config,
+    member: Member,
+    *,
+    bans: list[LiveBan] | None = None,
+    live_keys: set[str] | frozenset[str] | None = None,
+    event_id: str = "",
+    historical: bool = False,
+    player: Player | None = None,
+    rounds: dict[str, Round] | None = None,
+) -> dict[str, Any]:
+    """把一位成员渲染成前端直接可用的「直播间」结构（**脱敏**）。
+
+    含：展示信息、观看地址、是否在推流、封禁状态、以及他当前所在的比赛
+    （用于「直播间里显示比赛信息」）。密钥 / 令牌永不出现在这里。
+
+    ``player`` / ``rounds`` 是批量渲染时的预计算入参（见 :func:`player_round_map`），
+    单个人渲染时可省略。
+    """
+    data = member.public()
+    key = clean_key(member.stream_id)
+    live = bool(key) and not historical and key in (live_keys or set())
+    ban = None if historical else member_ban(list(bans or []), member, event_id)
+    rnd = None if historical else member_round(cfg, member, player=player, rounds=rounds)
+    data.update(
+        {
+            "live": live,
+            "play": play_endpoints(cfg.stream, key) if key else {},
+            "roundCode": rnd.code if rnd is not None else "",
+            "roundLabel": (rnd.label or rnd.code) if rnd is not None else "",
+            "banned": (
+                {
+                    "id": ban.id,
+                    "scope": ban.scope,
+                    "reason": ban.reason,
+                    "until": ban.until,
+                    "eventId": ban.event_id,
+                }
+                if ban is not None
+                else None
+            ),
+        }
+    )
+    return data
+
+
+def member_views(
+    cfg: Config,
+    members: list[Member],
+    *,
+    bans: list[LiveBan] | None = None,
+    live_keys: set[str] | frozenset[str] | None = None,
+    event_id: str = "",
+    historical: bool = False,
+) -> list[dict[str, Any]]:
+    """全部成员的公开直播间视图（批量渲染：选手索引与对局映射只算一次）。"""
+    if not members:
+        return []
+    by_member = {p.member_uid: p for p in cfg.players if p.member_uid}
+    by_stream = {p.stream_key: p for p in cfg.players if p.stream_key}
+    rounds = player_round_map(cfg) if not historical else None
+    return [
+        member_view(
+            cfg,
+            m,
+            bans=bans,
+            live_keys=live_keys,
+            event_id=event_id,
+            historical=historical,
+            player=by_member.get(m.uid) or by_stream.get(m.stream_id),
+            rounds=rounds,
+        )
+        for m in members
+    ]

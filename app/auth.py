@@ -40,6 +40,19 @@ class Session:
     created_at: float
     expires_at: float
     label: str = "admin"
+    # 会话身份：服务器管理员用 ``uid=""``（出厂 / 自定义管理 KEY 登录）；
+    # 成员用自己的 ``uid`` 登录，``permission`` 决定他能做什么。
+    uid: str = ""
+    name: str = ""
+    permission: str = "server_admin"
+
+    @property
+    def is_server(self) -> bool:
+        return self.permission == "server_admin"
+
+    @property
+    def can_manage_events(self) -> bool:
+        return self.permission in ("event_admin", "server_admin")
 
 
 class AuthManager:
@@ -64,30 +77,64 @@ class AuthManager:
         log.debug("管理 KEY 校验 | 结果=%s | 来源=%s", ok, "sha256" if admin.key_sha256 else "plain")
         return ok
 
-    def issue(self, label: str = "admin") -> Session:
+    def issue(
+        self,
+        label: str = "admin",
+        *,
+        uid: str = "",
+        name: str = "",
+        permission: str = "server_admin",
+    ) -> Session:
         now = time.time()
         session = Session(
             token=secrets.token_urlsafe(32),
             created_at=now,
             expires_at=now + self._ttl,
             label=label,
+            uid=uid,
+            name=name,
+            permission=permission,
         )
         self._sessions[session.token] = session
         self._gc()
-        log.info("签发管理会话 | label=%s | 有效期=%ds | 在线会话=%d", label, self._ttl, len(self._sessions))
+        log.info(
+            "签发会话 | label=%s | uid=%s | 权限=%s | 有效期=%ds | 在线会话=%d",
+            label,
+            uid or "(server-key)",
+            permission,
+            self._ttl,
+            len(self._sessions),
+        )
+        return session
+
+    def get(self, token: str | None) -> Session | None:
+        """取会话（含身份）；无效 / 过期时返回 ``None`` 并顺手清理。"""
+        if not token:
+            return None
+        session = self._sessions.get(token)
+        if session is None:
+            return None
+        if session.expires_at <= time.time():
+            self._sessions.pop(token, None)
+            log.debug("会话已过期")
+            return None
         return session
 
     def check(self, token: str | None) -> bool:
-        if not token:
-            return False
-        session = self._sessions.get(token)
-        if session is None:
-            return False
-        if session.expires_at <= time.time():
-            self._sessions.pop(token, None)
-            log.debug("管理会话已过期")
-            return False
-        return True
+        return self.get(token) is not None
+
+    def revoke_by_uid(self, uid: str, keep: str | None = None) -> int:
+        """注销某成员的全部会话（成员被删除 / 权限变更时调用）。"""
+        tokens = [
+            tok
+            for tok, s in self._sessions.items()
+            if s.uid == uid and tok != keep
+        ]
+        for tok in tokens:
+            self._sessions.pop(tok, None)
+        if tokens:
+            log.info("已注销成员会话 | uid=%s | 数量=%d", uid, len(tokens))
+        return len(tokens)
 
     def revoke(self, token: str | None) -> None:
         if token and self._sessions.pop(token, None):

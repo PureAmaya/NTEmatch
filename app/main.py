@@ -27,12 +27,21 @@ from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
-from . import avatars, league, live, logic, tournament
-from .auth import auth, is_factory_key, sha256_hex
+from . import avatars, league, live, logic, login_guard, tournament
+from . import members as members_api
+from .auth import Session, auth, is_factory_key, sha256_hex
 from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
 from .models import MAX_SIDES, Channel, Config, NTEModel, Player, Round, SetScore, Team
+from .security import (
+    optional_session,
+    require_admin,
+    require_current_event,
+    require_event,
+    require_event_owned,
+    require_server,
+)
 from .store import PROJECT_ROOT, store
 from .ws import hub
 
@@ -275,8 +284,11 @@ class EventCreatePayload(NTEModel):
 
 
 class EventMetaPayload(NTEModel):
+    """届次元信息：重命名 / 改状态 / 隐藏。``hidden=None`` 表示不改动可见性。"""
+
     name: str = ""
     status: str = ""
+    hidden: bool | None = None
 
 
 class AdminKeyPayload(NTEModel):
@@ -291,13 +303,13 @@ class ParticipantsPayload(NTEModel):
 
 
 # --------------------------------------------------------------------------- #
-# 鉴权依赖
+# 鉴权依赖（详见 app/security.py）
+#
+# ``require_admin``  任何已登录用户（成员 / 赛事管理员 / 服务器管理员）；
+# ``require_event``  赛事管理员或服务器管理员；
+# ``require_server`` 仅服务器管理员。
+# 会话自带身份（uid / permission），接口据此做归属与权限判定。
 # --------------------------------------------------------------------------- #
-async def require_admin(request: Request, x_nte_token: str | None = Header(default=None)) -> str:
-    token = x_nte_token or request.query_params.get("token")
-    if not auth.check(token):
-        raise HTTPException(status_code=401, detail="管理会话无效或已过期，请重新输入 KEY")
-    return token or ""
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +328,22 @@ def build_public_state(cfg: Config) -> dict[str, Any]:
     state["channels"] = logic.channel_views(cfg, store.channels())
     # 频道板块的公告（全局，纯展示）：放异环相关的说明 / 活动文案
     state["channelNotice"] = store.channel_notice()
+    # 成员直播间（全局）：只要成员配了推流 ID 就出现在频道里，
+    # 是否「直播中」以媒体服务器上报为准（前端据此点亮标记）。
+    ready = live.ready_paths_snapshot() or set()
+    # 只下发**启用中**的成员直播间（停用成员的会话与推流都已失效，不该出现在频道里）；
+    # 停用成员仍可在 /admin 的成员管理里看到并重新启用（走 /api/members）。
+    state["members"] = logic.member_views(
+        cfg,
+        [m for m in store.members() if m.active],
+        bans=store.live_bans(),
+        live_keys=ready,
+        event_id=store.current_id,
+    )
+    # 生效中的直播封禁（公开）：直播间 / 成员卡据此显示封禁时间与理由
+    state["liveBans"] = [logic.ban_view(b) for b in store.live_bans() if logic.ban_active(b)]
+    # 服务器管理员注入的自定义 HTML（用于接入统计 / 数据采集）
+    state["customHtml"] = store.custom_html()
     return state
 
 
@@ -372,28 +400,38 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-_origins = os.getenv("NTE_CORS_ORIGINS", "*")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in _origins.split(",") if o.strip()] or ["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Location"],
-)
+# 跨域默认**关闭**：前端由本站同源提供，正常不需要任何 CORS。
+# 确有跨域需求（前端单独部署在别的域名）时，用 NTE_CORS_ORIGINS 显式列出允许的来源；
+# 不要用 ``*``——那等于允许任意站点携带凭据调用本 API。
+_origins = [o.strip() for o in os.getenv("NTE_CORS_ORIGINS", "").split(",") if o.strip()]
+if _origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Location"],
+    )
+    log.info("已启用跨域访问 | 允许来源=%s", ", ".join(_origins))
+else:
+    log.info("未配置 NTE_CORS_ORIGINS：仅允许同源访问（前端与 API 同域时无需配置）")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(EdgeCacheMiddleware)
 
 app.include_router(live.router)
+app.include_router(members_api.router)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     if exc.status_code >= 400:
         log.debug("HTTP %s | %s %s | %s", exc.status_code, request.method, request.url.path, exc.detail)
+    # 保留 HTTPException 自带的响应头（如限流的 Retry-After），否则前端拿不到
     return JSONResponse(
         status_code=exc.status_code,
         content={"ok": False, "error": exc.detail, "status": exc.status_code},
+        headers=getattr(exc, "headers", None),
     )
 
 
@@ -471,7 +509,7 @@ async def api_health() -> dict[str, Any]:
 
 
 @app.get("/api/diagnostics")
-async def api_diagnostics(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_diagnostics(_: Session = Depends(require_event)) -> dict[str, Any]:
     cfg = store.snapshot()
     return {
         "databasePath": str(store.path),
@@ -492,14 +530,108 @@ async def api_diagnostics(_: str = Depends(require_admin)) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 鉴权
 # --------------------------------------------------------------------------- #
+def _server_session(label: str) -> Session:
+    """签发服务器管理员会话，并**绑定到那位唯一的服务器管理员成员**。
+
+    服务器管理员只是「权限最高的成员」，本身也是一条成员记录（启动自检
+    ``store.ensure_server_admin`` 保证它存在），所以会话直接带上他的 ``uid``：
+    这样他也能用自己的 ``/user`` 页改资料 / 轮换密钥，``/api/me`` 也会回他自己的
+    成员视图。万一记录缺失（正常不会）才退回无 uid 的 key 级会话。
+    """
+    admin = store.server_admin()
+    if admin is None:
+        return auth.issue(label=label, uid="", name="服务器管理员", permission="server_admin")
+    return auth.issue(
+        label=label, uid=admin.uid, name=admin.display_name, permission="server_admin"
+    )
+
+
 @app.post("/api/auth")
-async def api_auth(payload: AuthPayload) -> dict[str, Any]:
+async def api_auth(payload: AuthPayload, request: Request) -> dict[str, Any]:
+    """登录：成员密钥（随机生成、哈希存储）或服务器管理员管理 KEY。
+
+    ``/api/auth`` 是**唯一**的暴力破解入口，因此这里挂了登录失败限制
+    （类 fail2ban，见 ``login_guard`` 模块）：同一 IP 在时间窗内失败过多会被
+    临时封禁；真实 IP 由反向代理配置决定（未配置可信代理时不信任转发头）。
+    """
+    settings = store.guard_settings()
+    ip = login_guard.client_ip(request, settings)
+    # 本机直连不设防：既不限流、也不计入失败（否则在本机手滑几次就把自己封了）
+    local = login_guard.is_local(request, settings)
+    if not local:
+        wait = login_guard.blocked_seconds(ip, settings)
+        if wait:
+            log.warning("登录被限流拒绝 | ip=%s | 剩余=%ds", ip, wait)
+            raise HTTPException(
+                status_code=429,
+                detail=f"登录失败次数过多，请 {wait} 秒后再试",
+                headers={"Retry-After": str(wait)},
+            )
+
+    key = (payload.key or "").strip()
+    # 1) 成员密钥：成员 / 赛事管理员 / 服务器管理员都用它登录
+    member = store.member_by_key(key)
+    if member is not None:
+        if not member.active:
+            if not local:
+                login_guard.record_failure(ip, settings)
+            raise HTTPException(status_code=403, detail="该成员已被停用，无法登录")
+        login_guard.record_success(ip)
+        session = auth.issue(
+            label=f"member:{member.uid}",
+            uid=member.uid,
+            name=member.display_name,
+            permission=member.permission,
+        )
+        log.warning("成员登录 | uid=%s | 权限=%s", member.uid, member.permission)
+        return {
+            "ok": True,
+            "token": session.token,
+            "expiresAt": int(session.expires_at),
+            "uid": member.uid,
+            "name": member.display_name,
+            "permission": member.permission,
+        }
+    # 2) 出厂 / 自定义管理 KEY（服务器管理员主密钥，向后兼容）
     cfg = store.snapshot()
-    if not auth.verify_key(payload.key, cfg.admin):
-        log.warning("管理 KEY 校验失败，拒绝登录")
-        raise HTTPException(status_code=401, detail="KEY 不正确")
-    session = auth.issue()
-    return {"ok": True, "token": session.token, "expiresAt": int(session.expires_at)}
+    if auth.verify_key(key, cfg.admin):
+        login_guard.record_success(ip)
+        session = _server_session("server-key")
+        log.warning("服务器管理员以管理 KEY 登录 | ip=%s | 成员=%s", ip, session.uid or "(缺)")
+        return {
+            "ok": True,
+            "token": session.token,
+            "expiresAt": int(session.expires_at),
+            "uid": session.uid,
+            "name": session.name,
+            "permission": session.permission,
+        }
+    banned = 0 if local else login_guard.record_failure(ip, settings)
+    log.warning("登录失败：密钥不正确 | ip=%s%s", ip, f"（已封禁 {banned}s）" if banned else "")
+    raise HTTPException(status_code=401, detail="密钥不正确")
+
+
+@app.post("/api/auth/local")
+async def api_auth_local(request: Request) -> dict[str, Any]:
+    """本机直连免登录：回环地址访问时直接签发服务器管理员会话。
+
+    判定见 ``login_guard.is_local``（回环地址 + 无转发头 + Host 为本机名），
+    且可在 `/admin → 登录限制` 里用「本机不设防」开关整体关闭。
+    """
+    settings = store.guard_settings()
+    if not login_guard.is_local(request, settings):
+        raise HTTPException(status_code=403, detail="仅本机（localhost）直连可用")
+    session = _server_session("local")
+    log.warning("本机直连免登录 | 已签发服务器管理员会话 | 成员=%s", session.uid or "(缺)")
+    return {
+        "ok": True,
+        "local": True,
+        "token": session.token,
+        "expiresAt": int(session.expires_at),
+        "uid": session.uid,
+        "name": session.name,
+        "permission": session.permission,
+    }
 
 
 @app.post("/api/auth/logout")
@@ -509,13 +641,27 @@ async def api_logout(x_nte_token: str | None = Header(default=None)) -> dict[str
 
 
 @app.get("/api/auth/check")
-async def api_auth_check(_: str = Depends(require_admin)) -> dict[str, Any]:
-    return {"ok": True}
+async def api_auth_check(session: Session = Depends(require_admin)) -> dict[str, Any]:
+    """校验会话并回传身份（前端刷新后据此恢复权限显示）。"""
+    member = store.member(session.uid) if session.uid else None
+    return {
+        "ok": True,
+        "uid": session.uid,
+        "name": session.name or (member.display_name if member else "服务器管理员"),
+        "permission": session.permission,
+        "isServer": session.is_server,
+        "canManageEvents": session.can_manage_events,
+    }
 
 
 @app.post("/api/admin/key")
-async def api_admin_key(payload: AdminKeyPayload, _: str = Depends(require_admin)) -> dict[str, Any]:
-    """更新管理 KEY。默认只写 sha256，不留明文；更新后注销全部会话。"""
+async def api_admin_key(
+    payload: AdminKeyPayload, session: Session = Depends(require_server)
+) -> dict[str, Any]:
+    """更新服务器管理员的主管理 KEY（仅服务器管理员）。
+
+    默认只写 sha256，不留明文；更新后注销全部会话（需用新 KEY 重新登录）。
+    """
     raw = (payload.key or "").strip()
     if len(raw) < 6:
         raise HTTPException(status_code=400, detail="管理 KEY 至少 6 位")
@@ -534,18 +680,45 @@ async def api_admin_key(payload: AdminKeyPayload, _: str = Depends(require_admin
 # 赛事届次（多届赛事：记录 / 查看 / 管理）
 # --------------------------------------------------------------------------- #
 @app.get("/api/events")
-async def api_events() -> dict[str, Any]:
-    """届次列表（公开）：名称、状态、时间、规模与冠军。"""
-    return {"current": store.current_id, "events": await store.list_events()}
+async def api_events(session: Session | None = Depends(optional_session)) -> dict[str, Any]:
+    """届次列表：名称、状态、时间、规模与冠军。
+
+    被「隐藏」的届次对访客不出现；服务器管理员登录后仍能看全（用于管理）。
+    """
+    events = await store.list_events()
+    is_server = bool(session and session.is_server)
+    if not is_server:
+        events = [e for e in events if not e.get("hidden")]
+    return {"current": store.current_id, "events": events}
+
+
+async def _event_owner(event_id: str) -> str:
+    """目标届的归属 uid（不存在则 404）。"""
+    entry = next((e for e in await store.list_events() if e["id"] == event_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"第 {event_id} 届不存在")
+    return str(entry.get("ownerUid") or "")
+
+
+async def _require_event_ownership(session: Session, event_id: str) -> None:
+    """赛事管理员只能操作自己创建的届；服务器管理员放行。"""
+    if session.is_server:
+        return
+    require_event_owned(session, await _event_owner(event_id))
 
 
 @app.get("/api/events/{event_id}/state")
-async def api_event_state(event_id: str) -> dict[str, Any]:
+async def api_event_state(
+    event_id: str, session: Session | None = Depends(optional_session)
+) -> dict[str, Any]:
     """只读查看某一届的完整战绩（不影响当前届）。"""
     try:
         cfg = await store.read_event(event_id)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # 被隐藏的届：对访客当作不存在（服务器管理员仍可经链接查看）
+    if cfg.event.hidden and not (session and session.is_server):
+        raise HTTPException(status_code=404, detail=f"第 {event_id} 届不存在")
     # 往届回看：比赛一律按「没有直播」渲染（结束的比赛不可能在直播）
     state = build_state(cfg, historical=True)
     state["eventId"] = event_id
@@ -556,31 +729,55 @@ async def api_event_state(event_id: str) -> dict[str, Any]:
     state["channels"] = logic.channel_views(cfg, store.channels())
     state["liveChannels"] = await live.streaming_channel_ids()
     state["channelNotice"] = store.channel_notice()
+    # 成员直播间同样是全局的；往届回看一律按「没有直播」渲染
+    state["members"] = logic.member_views(
+        cfg,
+        [m for m in store.members() if m.active],
+        bans=store.live_bans(),
+        live_keys=set(),
+        event_id=event_id,
+        historical=True,
+    )
+    state["liveBans"] = [logic.ban_view(b) for b in store.live_bans() if logic.ban_active(b)]
+    state["customHtml"] = store.custom_html()
     return state
 
 
 @app.post("/api/events")
 async def api_event_create(
-    payload: EventCreatePayload, _: str = Depends(require_admin)
+    payload: EventCreatePayload, session: Session = Depends(require_event)
 ) -> dict[str, Any]:
-    """新建一届并切换过去；可选沿用当前届的名单与规则，并选择赛制。"""
+    """新建一届并切换过去；可选沿用当前届的名单与规则，并选择赛制。
+
+    新建的届归属创建者：赛事管理员之后只能管理 / 删除自己创建的届
+    （服务器管理员用管理 KEY 登录，``uid`` 为空，创建的届归服务器管理）。
+    """
     fmt = (payload.format or "").strip()
     if fmt not in ("", "league", "tournament"):
         raise HTTPException(status_code=400, detail="赛制只能是 league（积分制）或 tournament（锦标赛制）")
     cfg = await store.create_event(
-        payload.name, copy_roster=payload.copy_roster, fmt=fmt or "tournament"
+        payload.name,
+        copy_roster=payload.copy_roster,
+        fmt=fmt,  # 留空 = 由 store 按排名模式自动选（娱乐赛事用积分制）
+        owner_uid=session.uid,
     )
-    log.warning("已新建届次 | id=%s | 赛制=%s", store.current_id, cfg.rules.format)
+    log.warning(
+        "已新建届次 | id=%s | 赛制=%s | 归属=%s",
+        store.current_id,
+        cfg.rules.format,
+        session.uid or "(服务器)",
+    )
     return {
         "ok": True,
         "eventId": store.current_id,
         "name": cfg.event.name,
         "format": cfg.rules.format,
+        "ownerUid": session.uid,
     }
 
 
 @app.post("/api/format")
-async def api_set_format(payload: FormatPayload, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_set_format(payload: FormatPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """切换本届赛制。两套规则的赛程互不通用，因此切换会清空现有对局（比分一并清除）。"""
     fmt = (payload.format or "").strip()
     if fmt != store.snapshot().rules.format:
@@ -606,8 +803,11 @@ async def api_set_format(payload: FormatPayload, _: str = Depends(require_admin)
 
 
 @app.post("/api/events/{event_id}/switch")
-async def api_event_switch(event_id: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_event_switch(
+    event_id: str, session: Session = Depends(require_event)
+) -> dict[str, Any]:
     """把某一届设为当前进行中的赛事。"""
+    await _require_event_ownership(session, event_id)
     try:
         cfg = await store.switch_event(event_id)
     except (FileNotFoundError, ValueError) as exc:
@@ -617,11 +817,15 @@ async def api_event_switch(event_id: str, _: str = Depends(require_admin)) -> di
 
 @app.patch("/api/events/{event_id}")
 async def api_event_meta(
-    event_id: str, payload: EventMetaPayload, _: str = Depends(require_admin)
+    event_id: str, payload: EventMetaPayload, session: Session = Depends(require_event)
 ) -> dict[str, Any]:
-    """重命名某一届，或标记 draft / active / closed。"""
+    """重命名某一届、标记 draft / active / closed，或设置隐藏。"""
+    await _require_event_ownership(session, event_id)
+    patch: dict[str, Any] = {"name": payload.name, "status": payload.status}
+    if payload.hidden is not None:
+        patch["hidden"] = payload.hidden
     try:
-        entry = await store.update_event_meta(event_id, {"name": payload.name, "status": payload.status})
+        entry = await store.update_event_meta(event_id, patch)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -630,8 +834,11 @@ async def api_event_meta(
 
 
 @app.delete("/api/events/{event_id}")
-async def api_event_delete(event_id: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_event_delete(
+    event_id: str, session: Session = Depends(require_event)
+) -> dict[str, Any]:
     """删除一届（至少保留一届）。"""
+    await _require_event_ownership(session, event_id)
     try:
         await store.delete_event(event_id)
     except FileNotFoundError as exc:
@@ -648,7 +855,7 @@ async def api_event_delete(event_id: str, _: str = Depends(require_admin)) -> di
 # 管理端登录后从这里单独取，避免把推流凭据广播给所有在线客户端。
 # --------------------------------------------------------------------------- #
 @app.get("/api/private")
-async def api_private(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_private(_: Session = Depends(require_current_event)) -> dict[str, Any]:
     """选手隐私字段 + 推流 / 播放地址（仅管理端）。
 
     推流标识规则：**只有选手自己的唯一流名**（``tom``），地址整届固定不变
@@ -671,6 +878,8 @@ async def api_private(_: str = Depends(require_admin)) -> dict[str, Any]:
             "qq": player.qq,
             "streamKey": player.stream_key,
             "note": player.note,
+            # 关联的全局成员（选手就是成员）：管理端据此做「关联成员」下拉
+            "memberUid": player.member_uid,
             # 该选手自己的固定地址（两套协议都有）：换比赛不用重新推
             "endpoints": logic.key_endpoints(stream, key) if key else {},
             "push": logic.push_endpoints(stream, key) if key else {},
@@ -739,7 +948,9 @@ async def api_private(_: str = Depends(require_admin)) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
-_PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version"}
+# 这些字段不能经 /api/config 改动：版本号 / 时间戳由服务端维护，
+# 管理 KEY（admin）只能走 /api/admin/key（且仅服务器管理员）。
+_PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version", "admin"}
 
 
 def event_locked() -> bool:
@@ -770,7 +981,7 @@ _LOCK_PATCH_KEYS = ("locked", "lockedAt")
 async def api_update_config(
     request: Request,
     patch: dict[str, Any] = Body(...),  # noqa: B008  (FastAPI 依赖注入惯例)
-    _: str = Depends(require_admin),
+    _: Session = Depends(require_current_event),
 ) -> dict[str, Any]:
     clean = {k: v for k, v in patch.items() if k not in _PROTECTED_PATCH_KEYS}
     if not clean:
@@ -796,6 +1007,13 @@ async def api_update_config(
             if k not in _LOCK_PATCH_KEYS and k not in ("locked_at",)
         }
         clean["event"] = {**kept, "startTime": start, "endTime": end}
+    # 娱乐模式（排名开关关闭）不判胜负：强制允许平局，录分时不必指定胜方
+    if clean.get("event", {}).get("ranked") is False:
+        rules_patch = clean.get("rules")
+        if not isinstance(rules_patch, dict):
+            rules_patch = {}
+            clean["rules"] = rules_patch
+        rules_patch["allowDraw"] = True
     # 批量保存选手时同样要保证推流流名唯一，否则两位选手会推到同一个地址
     players_patch = clean.get("players")
     if isinstance(players_patch, list):
@@ -849,7 +1067,7 @@ def _event_lock_patch(data: dict[str, Any], locked: bool, at: str = "") -> dict[
 
 @app.post("/api/event/start")
 async def api_event_start(
-    payload: EventStartPayload, _: str = Depends(require_admin)
+    payload: EventStartPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """开始比赛：**锁定赛制与参赛名单**（需二次确认）。
 
@@ -910,7 +1128,7 @@ async def api_event_start(
 
 @app.post("/api/event/unlock")
 async def api_event_unlock(
-    payload: EventUnlockPayload, _: str = Depends(require_admin)
+    payload: EventUnlockPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """解除锁定：恢复对赛制 / 名单 / 组队 / 赛程的修改权限（需二次确认）。
 
@@ -946,13 +1164,13 @@ async def api_event_unlock(
 
 
 @app.post("/api/reload")
-async def api_reload(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_reload(_: Session = Depends(require_current_event)) -> dict[str, Any]:
     cfg = await store.reload(reason="web")
     return {"ok": True, "revision": cfg.revision}
 
 
 @app.get("/api/export")
-async def api_export(_: str = Depends(require_admin)) -> Response:
+async def api_export(_: Session = Depends(require_current_event)) -> Response:
     """导出当前届为 JSON（备份 / 迁移用；也可作为导入他处的快照）。"""
     cfg = store.snapshot()
     payload = json.dumps(cfg.dump(), ensure_ascii=False, indent=2)
@@ -968,7 +1186,7 @@ async def api_export(_: str = Depends(require_admin)) -> Response:
 # 选手
 # --------------------------------------------------------------------------- #
 @app.post("/api/players")
-async def api_upsert_player(payload: Player, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_upsert_player(payload: Player, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     player = payload.model_copy()
     if not player.id:
         existing = {p.id for p in store.snapshot().players}
@@ -1004,12 +1222,26 @@ async def api_upsert_player(payload: Player, _: str = Depends(require_admin)) ->
         players.append(dumped)
         return data
 
+    # 编辑已有选手时若前端没回传关联成员，沿用原有 memberUid（避免改个名字就又建一位成员）
+    existing_player = next((p for p in store.snapshot().players if p.id == player.id), None)
+    if existing_player is not None and not player.member_uid and existing_player.member_uid:
+        player = player.model_copy(update={"member_uid": existing_player.member_uid})
+    # 「选手就是成员」：确保这位选手有对应的全局成员（无则自动建号，权限默认「成员」）
+    member = await store.ensure_member_for_player(player)
+    if member is not None:
+        player = player.model_copy(update={"member_uid": member.uid})
+
     cfg = await store.mutate(_mutate, actor="web:player-upsert")
-    return {"ok": True, "revision": cfg.revision, "player": player.dump()}
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "player": player.dump(),
+        "memberUid": player.member_uid,
+    }
 
 
 @app.delete("/api/players/{player_id}")
-async def api_delete_player(player_id: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_delete_player(player_id: str, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """删除选手（比赛开始后禁止，改由替补换人调整）。
 
     新增 / 编辑选手**不受锁定限制**——替补可能是一位全新的人，
@@ -1036,7 +1268,7 @@ async def api_delete_player(player_id: str, _: str = Depends(require_admin)) -> 
 # --------------------------------------------------------------------------- #
 @app.post("/api/participants")
 async def api_set_participants(
-    payload: ParticipantsPayload, _: str = Depends(require_admin)
+    payload: ParticipantsPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """保存本届参与选手，并按新名单自动重排未开赛对局。
 
@@ -1070,7 +1302,7 @@ async def api_set_participants(
 # 与赛事届次无关，因此**不受开赛锁定影响**，也不需要切换届次。
 # --------------------------------------------------------------------------- #
 @app.post("/api/channels")
-async def api_channel_save(payload: Channel, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_channel_save(payload: Channel, _: Session = Depends(require_event)) -> dict[str, Any]:
     """新增 / 更新一个成员频道。
 
     * 流名（``streamKey``）**全局唯一**：与选手以及其它频道都不能重复（否则串流）；
@@ -1082,6 +1314,14 @@ async def api_channel_save(payload: Channel, _: str = Depends(require_admin)) ->
         raise HTTPException(status_code=400, detail="频道名不能为空")
     key = logic.clean_key(channel.stream_key)
     if key:
+        clash_member = next(
+            (m for m in store.members() if logic.clean_key(m.stream_id) == key), None
+        )
+        if clash_member is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"流名「{key}」已被成员 {clash_member.display_name} 使用，频道请换一个互不相同的流名",
+            )
         clash_player = next(
             (p for p in store.snapshot().players if logic.clean_key(p.stream_key) == key), None
         )
@@ -1120,7 +1360,7 @@ class ChannelNoticePayload(NTEModel):
 
 @app.put("/api/channels/notice")
 async def api_channel_notice(
-    payload: ChannelNoticePayload, _: str = Depends(require_admin)
+    payload: ChannelNoticePayload, _: Session = Depends(require_event)
 ) -> dict[str, Any]:
     """设置「频道」板块的公告 / 异环相关内容（全局，与届次无关）。"""
     text = await store.set_channel_notice(payload.text, actor="web:channel-notice")
@@ -1128,7 +1368,7 @@ async def api_channel_notice(
 
 
 @app.delete("/api/channels/{channel_id}")
-async def api_channel_delete(channel_id: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_channel_delete(channel_id: str, _: Session = Depends(require_event)) -> dict[str, Any]:
     """删除一个成员频道。"""
     removed = await store.delete_channel(channel_id, actor="web:channel-delete")
     if not removed:
@@ -1140,7 +1380,7 @@ async def api_channel_delete(channel_id: str, _: str = Depends(require_admin)) -
 # 赛程
 # --------------------------------------------------------------------------- #
 @app.post("/api/teams/auto")
-async def api_teams_auto(payload: TeamsFormPayload, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_teams_auto(payload: TeamsFormPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """按本届参与名单随机分配队友，生成固定队伍（会清空现有赛程）。
 
     锦标赛制必须组队；积分制的「固定队伍」模式也使用这里的队伍。
@@ -1169,7 +1409,7 @@ async def api_teams_auto(payload: TeamsFormPayload, _: str = Depends(require_adm
 
 
 @app.put("/api/teams")
-async def api_teams_update(payload: TeamsPayload, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """手动调整固定队伍成员；队伍结构变化时清空赛程以免对阵失效。
 
     比赛开始后禁止整体重排队伍（单个替补请用 ``/api/teams/{id}/substitute``）。
@@ -1220,7 +1460,7 @@ class TeamSubstitutePayload(NTEModel):
 
 @app.post("/api/teams/{team_id}/substitute")
 async def api_team_substitute(
-    team_id: str, payload: TeamSubstitutePayload, _: str = Depends(require_admin)
+    team_id: str, payload: TeamSubstitutePayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """替补换人（锦标赛制）：**不重建赛程**，只换掉队伍里的一个人。
 
@@ -1308,7 +1548,7 @@ async def api_team_substitute(
 
 @app.post("/api/tournament/generate")
 async def api_tournament_generate(
-    payload: TournamentPayload, _: str = Depends(require_admin)
+    payload: TournamentPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """生成完整赛程：小组赛轮转 + 淘汰赛（覆盖现有对局与比分）。
 
@@ -1430,7 +1670,7 @@ def _validate_group_rounds(rounds: list[dict[str, Any]]) -> None:
 
 @app.post("/api/tournament/group-pairings")
 async def api_group_pairings(
-    payload: GroupPairingsPayload, _: str = Depends(require_admin)
+    payload: GroupPairingsPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """**开赛前**手动调整小组赛对阵（换对手 / 恢复默认）。
 
@@ -1507,7 +1747,7 @@ async def api_group_pairings(
 
 @app.post("/api/tournament/preview")
 async def api_tournament_preview(
-    payload: TournamentPayload, _: str = Depends(require_admin)
+    payload: TournamentPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """**只读**预估赛程结构（不写库）：参赛人数 → 队伍数 → 小组 / 淘汰赛规模 → 场次。
 
@@ -1525,7 +1765,7 @@ async def api_tournament_preview(
 
 
 @app.post("/api/tournament/clear")
-async def api_tournament_clear(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_tournament_clear(_: Session = Depends(require_current_event)) -> dict[str, Any]:
     """清空赛程（保留固定队伍），用于重新编排。
 
     比赛开始后禁止——清空会把比分一起丢掉。
@@ -1545,7 +1785,7 @@ def _require_league() -> None:
 
 @app.post("/api/schedule/generate")
 async def api_schedule_generate(
-    payload: SchedulePayload, _: str = Depends(require_admin)
+    payload: SchedulePayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """积分制：生成动态轮换（或固定队伍）赛程，覆盖现有对局与比分。"""
     _require_league()
@@ -1575,7 +1815,7 @@ async def api_schedule_generate(
 
 @app.post("/api/schedule/append")
 async def api_schedule_append(
-    payload: ScheduleAppendPayload, _: str = Depends(require_admin)
+    payload: ScheduleAppendPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """积分制：追加补赛，优先安排出场次数最少的选手（不影响已有比分）。"""
     _require_league()
@@ -1595,7 +1835,7 @@ async def api_schedule_append(
 
 
 @app.post("/api/rounds")
-async def api_round_append(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_round_append(_: Session = Depends(require_current_event)) -> dict[str, Any]:
     """积分制：在赛程末尾追加一局空对局，供管理员手动编排。"""
     _require_league()
 
@@ -1624,7 +1864,7 @@ async def api_round_append(_: str = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.delete("/api/rounds")
-async def api_rounds_clear(_: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_rounds_clear(_: Session = Depends(require_current_event)) -> dict[str, Any]:
     """清空**全部比赛**（两套赛制通用；比分一并丢弃，队伍与名单保留）。
 
     允许删到一场不剩——赛程为空是合法状态，之后可以重新生成。
@@ -1644,7 +1884,7 @@ async def api_rounds_clear(_: str = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.delete("/api/rounds/{ref}")
-async def api_round_delete(ref: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_round_delete(ref: str, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """积分制：删除一局并重新编号，保持序号连续。"""
     _require_league()
 
@@ -1671,7 +1911,7 @@ async def api_round_delete(ref: str, _: str = Depends(require_admin)) -> dict[st
 
 @app.post("/api/rounds/{ref}/swap")
 async def api_round_swap(
-    ref: str, payload: RoundSwapPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundSwapPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """积分制换人：把在场的 fromId 换成 toId。
 
@@ -1727,7 +1967,7 @@ async def api_round_swap(
 
 @app.post("/api/rounds/{ref}/lineup")
 async def api_round_lineup(
-    ref: str, payload: RoundLineupPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundLineupPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """积分制：直接设置某一侧的出场名单（用于空位补人 / 移出阵容）。
 
@@ -1832,7 +2072,7 @@ def _round_mutator(ref: str, fn):
 
 @app.post("/api/rounds/{ref}/status")
 async def api_round_status(
-    ref: str, payload: RoundStatusPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundStatusPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """切换比赛状态（pending / live / done）。"""
     status = payload.status
@@ -1872,7 +2112,7 @@ _ROUND_TIME_FIELDS = (
 
 @app.post("/api/rounds/{ref}/walkover")
 async def api_round_walkover(
-    ref: str, payload: RoundWalkoverPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundWalkoverPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """判某一方弃权（长期没人 / 人数不足）：该方垫底，其余各方自动晋级。
 
@@ -1944,7 +2184,7 @@ async def api_round_walkover(
 
 @app.post("/api/rounds/{ref}/times")
 async def api_round_times(
-    ref: str, payload: RoundTimesPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundTimesPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """登记一场比赛的计划 / 开始 / 结束时间。
 
@@ -2008,7 +2248,7 @@ async def api_round_times(
 
 @app.post("/api/rounds/{ref}/result")
 async def api_round_result(
-    ref: str, payload: RoundResultPayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundResultPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """录入比赛结果并结算。
 
@@ -2029,8 +2269,13 @@ async def api_round_result(
         ready = all(site.team_id for site in target.sides)
     if not ready:
         raise HTTPException(status_code=400, detail="本场对阵尚未确定（需等待上游比赛结果）")
-    # 淘汰赛必须分出胜负（双败赛制不接受平局）；小组赛与积分制常规局可按规则允许平局
-    allow_draw = cfg_now.rules.allow_draw and target.stage in ("group", "league")
+    # 淘汰赛必须分出胜负（双败赛制不接受平局）；小组赛与积分制常规局可按规则允许平局。
+    # 娱乐模式（不排名）例外：任何场次都允许平局，只为「记下来」。
+    ranked = bool(cfg_now.event.ranked)
+    # 娱乐模式（不排名）下任何场次都允许平局；否则只有小组赛 / 积分制常规局按规则允许
+    allow_draw = (not ranked) or (
+        cfg_now.rules.allow_draw and target.stage in ("group", "league")
+    )
 
     side_count = len(target.sides)
     valid_keys = [chr(ord("A") + i) for i in range(side_count)]
@@ -2103,9 +2348,13 @@ async def api_round_result(
                     model.sides[index].rank = offset
             model.winner = winner
         if not winner:
-            who = "并列第一" if side_count > 2 else "比分相同"
-            hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
-            raise HTTPException(status_code=400, detail=f"{who}，无法判定晋级：{hint}")
+            if ranked:
+                who = "并列第一" if side_count > 2 else "比分相同"
+                hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
+                raise HTTPException(status_code=400, detail=f"{who}，无法判定晋级：{hint}")
+            # 娱乐模式：分不出胜负就直接记平局，绝不因为「没点胜方」而卡住记录
+            winner = "DRAW"
+            model.winner = "DRAW"
         if winner == "DRAW" and not allow_draw:
             raise HTTPException(status_code=400, detail="当前规则不允许平局")
 
@@ -2160,7 +2409,7 @@ async def api_round_result(
 
 @app.post("/api/rounds/{ref}/live")
 async def api_round_live(
-    ref: str, payload: RoundLivePayload, _: str = Depends(require_admin)
+    ref: str, payload: RoundLivePayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """本场直播开关：是否为本场比赛推流，以及直播选手提示。"""
 
@@ -2174,7 +2423,7 @@ async def api_round_live(
 
 
 @app.post("/api/rounds/{ref}/reset")
-async def api_round_reset(ref: str, _: str = Depends(require_admin)) -> dict[str, Any]:
+async def api_round_reset(ref: str, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     """重置一场比赛；依赖它的后续对局会自动作废（上游变了，下游重来）。"""
 
     def apply(rnd: dict[str, Any]) -> None:
@@ -2203,7 +2452,7 @@ async def api_round_reset(ref: str, _: str = Depends(require_admin)) -> dict[str
 # --------------------------------------------------------------------------- #
 @app.post("/api/avatar/upload")
 async def api_avatar_upload(
-    payload: AvatarUploadPayload, _: str = Depends(require_admin)
+    payload: AvatarUploadPayload, _: Session = Depends(require_event)
 ) -> dict[str, Any]:
     """接收 data:URL 头像并落盘，返回同源可访问地址。"""
     try:

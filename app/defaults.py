@@ -16,6 +16,59 @@ from typing import Any
 # 只要它没被改过，启动时就会在控制台提示；改过之后不再显示。
 DEFAULT_ADMIN_KEY = "NTE-ADMIN"
 
+# 比赛类型预设：只影响**界面文案**（参赛者 / 成绩 / 场次的称呼），
+# 数据模型仍是「若干方同场 + 记录分数 / 名次」，因此赛车、摄影、桌游等都能直接用。
+# ``key`` 可自由填写（未收录的类型按 generic 处理，并把 key 原样作为名称展示）。
+SPORT_PRESETS: dict[str, dict[str, str]] = {
+    "volleyball": {
+        "label": "排球 / 对抗赛",
+        "participant": "选手",
+        "participants": "选手",
+        "score": "比分",
+        "round": "对局",
+        "venue": "场地",
+    },
+    "racing": {
+        "label": "赛车",
+        "participant": "车手",
+        "participants": "车手",
+        "score": "成绩",
+        "round": "赛段",
+        "venue": "赛道",
+    },
+    "photography": {
+        "label": "摄影",
+        "participant": "作者",
+        "participants": "作者",
+        "score": "得分",
+        "round": "作品",
+        "venue": "赛区",
+    },
+    "generic": {
+        "label": "通用 / 其它",
+        "participant": "参赛者",
+        "participants": "参赛者",
+        "score": "得分",
+        "round": "场次",
+        "venue": "场地",
+    },
+}
+
+DEFAULT_SPORT = "volleyball"
+
+
+def sport_meta(key: str = "") -> dict[str, str]:
+    """把比赛类型 key 解析成文案字典（未知类型回落到通用称呼）。"""
+    clean = (key or "").strip() or DEFAULT_SPORT
+    preset = SPORT_PRESETS.get(clean)
+    if preset is None:
+        base = dict(SPORT_PRESETS["generic"])
+        base["label"] = clean
+        base["key"] = clean
+        return base
+    return {"key": clean, **preset}
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "revision": 0,
@@ -24,6 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "name": "首届赛事",
         # 新届没有任何选手与比赛，状态从「筹备中」开始；点「开始比赛」后自动转为进行中
         "status": "draft",
+        # 比赛类型（预设 key 或自定义）与排名开关（关 = 娱乐记录模式，不排名 / 不晋级）
+        "sport": DEFAULT_SPORT,
+        "ranked": True,
         "title": "NTE 比赛",
         "subtitle": "NEVERNESS TO EVERNESS · MATCH",
         "venue": "",

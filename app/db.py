@@ -228,7 +228,41 @@ CREATE TABLE IF NOT EXISTS channels (
   featured    INTEGER NOT NULL DEFAULT 0
 );
 
+-- 成员（全局账号）：**不挂在任何一届**，跨届共享。
+-- key_sha256 / bearer_sha256 是密钥与 WHIP Bearer 令牌的哈希，明文永不落库。
+CREATE TABLE IF NOT EXISTS members (
+  uid           TEXT PRIMARY KEY,
+  name          TEXT NOT NULL DEFAULT '',
+  qq            TEXT NOT NULL DEFAULT '',
+  avatar        TEXT NOT NULL DEFAULT '',
+  game_uuid     TEXT NOT NULL DEFAULT '',
+  stream_id     TEXT NOT NULL DEFAULT '',
+  room_title    TEXT NOT NULL DEFAULT '',
+  note          TEXT NOT NULL DEFAULT '',
+  permission    TEXT NOT NULL DEFAULT 'member',
+  active        INTEGER NOT NULL DEFAULT 1,
+  created_at    TEXT NOT NULL DEFAULT '',
+  updated_at    TEXT NOT NULL DEFAULT '',
+  key_sha256    TEXT NOT NULL DEFAULT '',
+  bearer_sha256 TEXT NOT NULL DEFAULT ''
+);
+
+-- 直播间封禁（全局）：scope=global 由服务器管理员签发；scope=event 由赛事管理员签发。
+CREATE TABLE IF NOT EXISTS live_bans (
+  id          TEXT PRIMARY KEY,
+  scope       TEXT NOT NULL DEFAULT 'global',
+  member_uid  TEXT NOT NULL DEFAULT '',
+  stream_id   TEXT NOT NULL DEFAULT '',
+  name        TEXT NOT NULL DEFAULT '',
+  reason      TEXT NOT NULL DEFAULT '',
+  until       TEXT NOT NULL DEFAULT '',
+  event_id    TEXT NOT NULL DEFAULT '',
+  created_at  TEXT NOT NULL DEFAULT '',
+  created_by  TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_players_event ON players(event_id, position);
+CREATE INDEX IF NOT EXISTS idx_members_stream ON members(stream_id);
 CREATE INDEX IF NOT EXISTS idx_rounds_event ON rounds(event_id, idx);
 CREATE INDEX IF NOT EXISTS idx_round_players_player ON round_players(event_id, player_id);
 """
@@ -287,6 +321,12 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         "end_time": "TEXT NOT NULL DEFAULT ''",
         "locked": "INTEGER NOT NULL DEFAULT 0",
         "locked_at": "TEXT NOT NULL DEFAULT ''",
+        # 届次归属与可见性（见 models.EventInfo.owner_uid / hidden）
+        "owner_uid": "TEXT NOT NULL DEFAULT ''",
+        "hidden": "INTEGER NOT NULL DEFAULT 0",
+        # 比赛类型与排名开关（见 models.EventInfo.sport / ranked）
+        "sport": "TEXT NOT NULL DEFAULT 'volleyball'",
+        "ranked": "INTEGER NOT NULL DEFAULT 1",
     },
     "event_rules": {
         "format": "TEXT NOT NULL DEFAULT 'tournament'",
@@ -327,6 +367,10 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
     "channels": {
         "server": "TEXT NOT NULL DEFAULT ''",
         "role": "TEXT NOT NULL DEFAULT ''",
+    },
+    "players": {
+        # 关联的全局成员（选手就是成员）：空 = 独立选手
+        "member_uid": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -440,15 +484,17 @@ def save_event(
         """
         INSERT INTO events (
             id, name, status, title, subtitle, venue, organizer, start_time, end_time,
-            locked, locked_at, rules_text, logo_text,
+            locked, locked_at, rules_text, logo_text, owner_uid, hidden, sport, ranked,
             created_at, updated_at, revision, players_count, rounds_count, played_count, champion
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, status = excluded.status, title = excluded.title,
             subtitle = excluded.subtitle, venue = excluded.venue, organizer = excluded.organizer,
             start_time = excluded.start_time, end_time = excluded.end_time,
             locked = excluded.locked, locked_at = excluded.locked_at,
             rules_text = excluded.rules_text, logo_text = excluded.logo_text,
+            owner_uid = excluded.owner_uid, hidden = excluded.hidden,
+            sport = excluded.sport, ranked = excluded.ranked,
             updated_at = excluded.updated_at, revision = excluded.revision,
             players_count = excluded.players_count, rounds_count = excluded.rounds_count,
             played_count = excluded.played_count, champion = excluded.champion
@@ -467,6 +513,10 @@ def save_event(
             event.get("lockedAt", ""),
             event.get("rulesText", ""),
             event.get("logoText", ""),
+            event.get("ownerUid", ""),
+            int(bool(event.get("hidden", False))),
+            event.get("sport", "volleyball") or "volleyball",
+            int(bool(event.get("ranked", True))),
             created,
             data.get("updatedAt", ""),
             int(data.get("revision", 0)),
@@ -572,7 +622,7 @@ def save_event(
         "players",
         (
             "event_id", "id", "name", "uuid", "qq", "avatar", "tag", "stream_key", "note",
-            "substitute", "active", "position",
+            "substitute", "active", "member_uid", "position",
         ),
         (
             (
@@ -587,6 +637,7 @@ def save_event(
                 p.get("note", ""),
                 int(bool(p.get("substitute", False))),
                 int(bool(p.get("active", True))),
+                p.get("memberUid", ""),
                 idx,
             )
             for idx, p in enumerate(players)
@@ -705,7 +756,22 @@ def delete_event(conn: sqlite3.Connection, event_id: str) -> bool:
 
 
 def update_event_meta(conn: sqlite3.Connection, event_id: str, patch: dict[str, Any]) -> bool:
-    fields = {k: v for k, v in patch.items() if k in {"name", "status", "updated_at", "revision", "champion"}}
+    fields = {
+        k: v
+        for k, v in patch.items()
+        if k
+        in {
+            "name",
+            "status",
+            "updated_at",
+            "revision",
+            "champion",
+            "owner_uid",
+            "hidden",
+            "sport",
+            "ranked",
+        }
+    }
     if not fields:
         return False
     assignments = ", ".join(f"{k} = ?" for k in fields)
@@ -722,7 +788,7 @@ def list_events(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT id, name, status, title, subtitle, start_time, end_time,
-               locked, locked_at,
+               locked, locked_at, owner_uid, hidden, sport, ranked,
                created_at, updated_at, revision,
                players_count, rounds_count, played_count, champion
         FROM events ORDER BY created_at DESC, id DESC
@@ -739,6 +805,10 @@ def list_events(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "endTime": row["end_time"],
             "locked": bool(row["locked"]),
             "lockedAt": row["locked_at"],
+            "ownerUid": row["owner_uid"],
+            "hidden": bool(row["hidden"]),
+            "sport": row["sport"],
+            "ranked": bool(row["ranked"]),
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "revision": row["revision"],
@@ -773,6 +843,7 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             "note": row["note"],
             "substitute": bool(row["substitute"]),
             "active": bool(row["active"]),
+            "memberUid": row["member_uid"],
         }
         for row in conn.execute(
             "SELECT * FROM players WHERE event_id = ? ORDER BY position, id", (event_id,)
@@ -894,6 +965,10 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             # 比赛是否已开始（赛制与参赛名单锁定）
             "locked": bool(ev["locked"]),
             "lockedAt": ev["locked_at"],
+            "ownerUid": ev["owner_uid"],
+            "hidden": bool(ev["hidden"]),
+            "sport": ev["sport"],
+            "ranked": bool(ev["ranked"]),
             "rulesText": ev["rules_text"],
             "logoText": ev["logo_text"],
         },
@@ -1043,4 +1118,109 @@ def upsert_channel(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
 
 def delete_channel(conn: sqlite3.Connection, channel_id: str) -> bool:
     cur = conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+    return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# 成员（全局账号）
+# --------------------------------------------------------------------------- #
+def _member_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "uid": row["uid"],
+        "name": row["name"],
+        "qq": row["qq"],
+        "avatar": row["avatar"],
+        "gameUuid": row["game_uuid"],
+        "streamId": row["stream_id"],
+        "roomTitle": row["room_title"],
+        "note": row["note"],
+        "permission": row["permission"],
+        "active": bool(row["active"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "keySha256": row["key_sha256"],
+        "bearerSha256": row["bearer_sha256"],
+    }
+
+
+def list_members(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM members ORDER BY (permission = 'server_admin') DESC, created_at, uid"
+    ).fetchall()
+    return [_member_row(row) for row in rows]
+
+
+def upsert_member(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    _upsert(
+        conn,
+        "members",
+        ("uid",),
+        {
+            "uid": row.get("uid", ""),
+            "name": row.get("name", ""),
+            "qq": row.get("qq", ""),
+            "avatar": row.get("avatar", ""),
+            "game_uuid": row.get("gameUuid", ""),
+            "stream_id": row.get("streamId", ""),
+            "room_title": row.get("roomTitle", ""),
+            "note": row.get("note", ""),
+            "permission": row.get("permission", "member"),
+            "active": int(bool(row.get("active", True))),
+            "created_at": row.get("createdAt", ""),
+            "updated_at": row.get("updatedAt", ""),
+            "key_sha256": row.get("keySha256", ""),
+            "bearer_sha256": row.get("bearerSha256", ""),
+        },
+    )
+
+
+def delete_member(conn: sqlite3.Connection, uid: str) -> bool:
+    cur = conn.execute("DELETE FROM members WHERE uid = ?", (uid,))
+    return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# 直播间封禁（全局）
+# --------------------------------------------------------------------------- #
+def list_live_bans(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT * FROM live_bans ORDER BY created_at DESC, id DESC").fetchall()
+    return [
+        {
+            "id": row["id"],
+            "scope": row["scope"],
+            "memberUid": row["member_uid"],
+            "streamId": row["stream_id"],
+            "name": row["name"],
+            "reason": row["reason"],
+            "until": row["until"],
+            "eventId": row["event_id"],
+            "createdAt": row["created_at"],
+            "createdBy": row["created_by"],
+        }
+        for row in rows
+    ]
+
+
+def upsert_live_ban(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    _upsert(
+        conn,
+        "live_bans",
+        ("id",),
+        {
+            "id": row.get("id", ""),
+            "scope": row.get("scope", "global"),
+            "member_uid": row.get("memberUid", ""),
+            "stream_id": row.get("streamId", ""),
+            "name": row.get("name", ""),
+            "reason": row.get("reason", ""),
+            "until": row.get("until", ""),
+            "event_id": row.get("eventId", ""),
+            "created_at": row.get("createdAt", ""),
+            "created_by": row.get("createdBy", ""),
+        },
+    )
+
+
+def delete_live_ban(conn: sqlite3.Connection, ban_id: str) -> bool:
+    cur = conn.execute("DELETE FROM live_bans WHERE id = ?", (ban_id,))
     return cur.rowcount > 0

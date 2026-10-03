@@ -20,16 +20,19 @@ MediaMTX 的 HLS 与 WebRTC 是**两个独立端口**（``8888`` / ``8889``）�
 from __future__ import annotations
 
 import asyncio
+import hmac
 import time
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import model_validator
 
 from . import logic
+from .auth import sha256_hex
 from .logging_conf import get_logger
-from .models import Config, NTEModel, StreamConfig
+from .models import Config, LiveBan, NTEModel, StreamConfig
 from .store import store
 
 log = get_logger("live")
@@ -242,6 +245,18 @@ async def streaming_channel_ids() -> list[str]:
     return [c.id for c in store.channels() if logic.clean_key(c.stream_key) in ready]
 
 
+async def streaming_member_uids() -> list[str]:
+    """**真的在推流**的成员：他的推流 ID 出现在媒体服务器上报的列表里。
+
+    成员只要开播就自动出现在频道里（无需管理员批准），所以「直播中」标记
+    也一律以媒体服务器上报为准；查不到就是空列表。
+    """
+    ready = ready_paths_snapshot()
+    if not ready:
+        return []
+    return [m.uid for m in store.members() if logic.clean_key(m.stream_id) in ready]
+
+
 # --------------------------------------------------------------------------- #
 # 端口探测与后台刷新
 # --------------------------------------------------------------------------- #
@@ -378,7 +393,11 @@ class LiveAuthPayload(NTEModel):
 
 
 def registered_push_keys() -> set[str]:
-    """本站登记过的流名（允许推流的白名单）：选手 + 成员频道 + 主直播间默认流名。"""
+    """本站登记过的流名（**遗留**白名单）：选手 + 成员频道 + 主直播间默认流名。
+
+    成员的推流走「推流 ID + Bearer 令牌」强校验（见 :func:`authorize_publish`），
+    不在这里；这个集合只兜住主直播间与服务器管理员手工建的频道 / 选手。
+    """
     cfg = store.snapshot()
     keys: set[str] = set()
     for player in cfg.players:
@@ -395,12 +414,79 @@ def registered_push_keys() -> set[str]:
     return keys
 
 
+def _publish_token(payload: LiveAuthPayload) -> str:
+    """从鉴权回调里取推流令牌。
+
+    WHIP 客户端（OBS）把凭据放在地址里（``…/whip?token=xxx``）或 Basic 认证
+    里，MediaMTX 会分别透传到 ``token`` / ``password`` / ``query`` 字段；
+    为兼容各种写法，这里依次尝试。
+    """
+    for value in (payload.token, payload.password):
+        raw = (value or "").strip()
+        if raw:
+            return raw
+    query = (payload.query or "").strip()
+    if query:
+        try:
+            params = parse_qs(query)
+            for name in ("token", "bearer", "access_token", "key"):
+                if params.get(name):
+                    return str(params[name][0]).strip()
+        except (ValueError, TypeError):
+            log.debug("推流令牌 query 解析失败（忽略）| query=%s", query)
+    return ""
+
+
+def active_ban_for(key: str) -> LiveBan | None:
+    """某条推流当前生效的封禁（按流名或成员命中；全局 + 赛事级都算）。"""
+    if not key:
+        return None
+    member = store.member_by_stream_id(key)
+    for ban in store.live_bans():
+        if not logic.ban_active(ban):
+            continue
+        hit_stream = bool(ban.stream_id) and ban.stream_id == key
+        hit_uid = bool(ban.member_uid) and member is not None and ban.member_uid == member.uid
+        if not (hit_stream or hit_uid):
+            continue
+        log.debug("命中封禁 | ban=%s | key=%s | 至=%s", ban.id, key, ban.until or "永久")
+        return ban
+    return None
+
+
+def authorize_publish(key: str, token: str) -> tuple[bool, str]:
+    """推流授权：**推流 ID + Bearer 令牌**同时正确才放行。
+
+    成员（含其关联的选手）必须令牌匹配；主直播间与服务器管理员手工建的
+    遗留频道走登记白名单（无令牌）。封禁期间一律拒绝。
+    """
+    key = logic.clean_key(key)
+    if not key:
+        return False, "空的推流路径"
+    ban = active_ban_for(key)
+    if ban is not None:
+        return False, f"该直播间已被封禁（{ban.reason or '未填写原因'}）"
+    member = store.member_by_stream_id(key)
+    if member is not None:
+        if not member.active:
+            return False, "该成员已被停用"
+        if not member.bearer_sha256:
+            return False, "该成员未配置推流令牌"
+        if not token or not hmac.compare_digest(sha256_hex(token), member.bearer_sha256):
+            return False, "Bearer 令牌不正确"
+        return True, ""
+    if key in registered_push_keys():
+        return True, ""
+    return False, "该推流流名未在本站登记"
+
+
 @router.post("/auth")
 async def live_auth(payload: LiveAuthPayload) -> dict[str, Any]:
-    """媒体服务器鉴权回调：**只放行本站登记过的推流，播放一律放行**。
+    """媒体服务器鉴权回调：**推流必须带正确的推流 ID 与 Bearer 令牌**，播放一律放行。
 
-    * ``publish``：推流路径必须在本站登记过（选手流名 / 成员频道流名 /
-      主直播间默认流名），否则回 401 拒绝——这就是「不接受匿名推流」；
+    * ``publish``：成员推流要求「推流 ID = 他的 streamId」且 Bearer 令牌匹配
+      （令牌在地址 ``?token=`` 或 Basic 认证里带），并且未处于封禁期；
+      主直播间与遗留频道按登记白名单放行。任一不满足即回 401；
     * ``api`` ：控制 API 的 Basic 认证按「直播配置」里的用户名 / 密码校验
       （没填就放行，与以前一致）；
     * ``read`` / ``playback``：播放放行（建议在媒体服务器侧用
@@ -410,19 +496,26 @@ async def live_auth(payload: LiveAuthPayload) -> dict[str, Any]:
     action = (payload.action or "").strip().lower()
     path = logic.clean_key(payload.path)
     if action == "publish":
-        if path and path in registered_push_keys():
+        token = _publish_token(payload)
+        ok, reason = authorize_publish(path, token)
+        if ok:
             log.info(
-                "推流鉴权通过 | path=%s | protocol=%s | ip=%s", path, payload.protocol, payload.ip
+                "推流鉴权通过 | path=%s | protocol=%s | ip=%s | 带令牌=%s",
+                path,
+                payload.protocol,
+                payload.ip,
+                bool(token),
             )
             return {"ok": True, "action": action, "path": path}
         log.warning(
-            "推流鉴权拒绝（流名未在本站登记） | path=%s | protocol=%s | ip=%s | user=%s",
+            "推流鉴权拒绝 | path=%s | 原因=%s | protocol=%s | ip=%s | user=%s",
             payload.path,
+            reason,
             payload.protocol,
             payload.ip,
             payload.user,
         )
-        raise HTTPException(status_code=401, detail="该推流流名未在本站登记，已拒绝推流")
+        raise HTTPException(status_code=401, detail=reason)
     if action == "api":
         stream = store.snapshot().stream
         expected = (stream.api_user or "").strip()
@@ -434,6 +527,65 @@ async def live_auth(payload: LiveAuthPayload) -> dict[str, Any]:
         log.warning("控制 API 鉴权拒绝 | user=%s | ip=%s", payload.user, payload.ip)
         raise HTTPException(status_code=401, detail="控制 API 用户名 / 密码不正确")
     return {"ok": True, "action": action, "path": path}
+
+
+async def kick_stream(stream_key: str) -> dict[str, Any]:
+    """强制掐断一条正在推流的 WHIP 会话（服务器管理员 / 赛事管理员的「掐断直播」）。
+
+    实现：查 MediaMTX 的 WebRTC 会话列表，找到该路径**推流端**（``state=publish``）
+    的会话并调 ``kick``。查不到（未配置 API / 不可达 / 已停播）时返回 ``ok=False``，
+    但封禁记录仍会生效——下次该令牌再来推流一样会被鉴权拒绝。
+    """
+    key = logic.clean_key(stream_key)
+    if not key:
+        return {"ok": False, "kicked": 0, "reason": "未指定推流 ID"}
+    cfg = store.snapshot().stream
+    api = (cfg.api_base or "").strip().rstrip("/")
+    if not api:
+        return {"ok": False, "kicked": 0, "reason": "未配置 MediaMTX API 地址，无法远程掐断"}
+    client = _client_get(bool(cfg.verify_tls))
+    try:
+        resp = await client.get(
+            f"{api}/v3/webrtcsessions/list", timeout=_READY_TIMEOUT, auth=api_auth(cfg)
+        )
+        resp.raise_for_status()
+        items = (resp.json() or {}).get("items") or []
+    except httpx.HTTPStatusError as exc:
+        reason = f"MediaMTX API 返回 HTTP {exc.response.status_code}"
+        log.warning("掐断直播失败 | key=%s | %s", key, reason)
+        return {"ok": False, "kicked": 0, "reason": reason}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        reason = _friendly_error(exc)
+        log.warning("掐断直播失败 | key=%s | %s", key, reason)
+        return {"ok": False, "kicked": 0, "reason": reason}
+
+    sessions = [item for item in items if logic.clean_key(str(item.get("path") or "")) == key]
+    # 只踢**推流端**（state=publish）：踢掉观看会话会把观众断掉，反而帮了违规者
+    publishers = [item for item in sessions if str(item.get("state") or "") == "publish"]
+    kicked = 0
+    for item in publishers:
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            continue
+        try:
+            await client.post(
+                f"{api}/v3/webrtcsessions/{sid}/kick", timeout=_READY_TIMEOUT, auth=api_auth(cfg)
+            )
+            kicked += 1
+        except httpx.HTTPError as exc:
+            log.warning("掐断会话失败 | key=%s | sid=%s | %s", key, sid, _friendly_error(exc))
+    if kicked:
+        # 掐断后让「谁在推流」的缓存立即失效，前端下次刷新就看不到直播中
+        _ready_cache["at"] = float("-inf")
+        kick_refresh()
+        log.warning("已强制掐断直播 | key=%s | 会话=%d", key, kicked)
+    if kicked:
+        reason = ""
+    elif sessions:
+        reason = "未能定位推流会话（媒体服务器版本不支持或状态未知）"
+    else:
+        reason = "当前没有该路径的推流会话（可能已经停播）"
+    return {"ok": kicked > 0, "kicked": kicked, "reason": reason}
 
 
 def main_stream_key() -> str:
@@ -614,6 +766,8 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         "streaming": await streaming_player_ids(cfg) if known else [],
         # 成员频道（日常直播）里正在推流的频道 ID：与选手机位同一套判断
         "streamingChannels": await streaming_channel_ids() if known else [],
+        # 成员直播间（推流 ID 对应成员）里正在推流的成员 uid
+        "streamingMembers": await streaming_member_uids() if known else [],
         # 主直播间（默认流名）是否有人在推：只有真的在推，前端才给出这一路信号
         "mainStreaming": bool(ready) and main_stream_key() in (ready or set()),
         "api": {"configured": bool(api), "ok": known, "url": api, "reason": api_reason},

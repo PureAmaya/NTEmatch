@@ -12,7 +12,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.alias_generators import to_camel
 
 # 选手对外可见的字段：只有名字与头像等展示信息（UUID / QQ / 推流流名不下发）
-PUBLIC_PLAYER_FIELDS = ("id", "name", "avatar", "tag", "substitute", "active")
+PUBLIC_PLAYER_FIELDS = ("id", "name", "avatar", "tag", "substitute", "active", "member_uid")
+
+# 成员权限：成员 < 赛事管理员 < 服务器管理员。
+# 服务器管理员全局有且只有一个（程序启动时自检，见 store.ensure_server_admin）。
+MemberPermission = Literal["member", "event_admin", "server_admin"]
+# 直播封禁范围：global = 服务器管理员签发的全局封禁；event = 赛事管理员签发、仅作用于自己那届
+LiveBanScope = Literal["global", "event"]
+
+# 成员对外可见（含访客）字段：展示信息与推流 ID（用于频道展示），不含任何凭据
+PUBLIC_MEMBER_FIELDS = (
+    "uid",
+    "name",
+    "avatar",
+    "game_uuid",
+    "stream_id",
+    "room_title",
+    "permission",
+    "active",
+)
 
 # 一场比赛最多 4 支队伍同场（组 vs 组 vs 组 vs 组）
 SideKey = Literal["A", "B", "C", "D"]
@@ -59,6 +77,7 @@ class Player(NTEModel):
     note: str = ""
     substitute: bool = False
     active: bool = True
+    member_uid: str = ""      # 关联的全局成员（选手就是成员）；空 = 独立选手
 
     @field_validator("qq")
     @classmethod
@@ -89,7 +108,7 @@ class Player(NTEModel):
         管理端需要时通过 ``GET /api/private``（需登录）单独获取。
         头像改用 ``/api/avatar/p/<选手 ID>`` 取，客户端因此看不到 QQ 号。
         """
-        data: dict[str, Any] = {key: getattr(self, key) for key in PUBLIC_PLAYER_FIELDS}
+        data: dict[str, Any] = self.model_dump(by_alias=True, include=list(PUBLIC_PLAYER_FIELDS))
         data["hasStream"] = bool(self.stream_key)
         data["hasAvatar"] = self.has_avatar_source
         return data
@@ -167,6 +186,101 @@ class Channel(NTEModel):
         if self.avatar:
             return True
         return self.qq.isdigit() and 4 <= len(self.qq) <= 12
+
+
+# --------------------------------------------------------------------------- #
+# 成员（全局）与直播封禁（全局）
+# --------------------------------------------------------------------------- #
+class Member(NTEModel):
+    """服务器成员（全局，跨届共享）。
+
+    成员是本站的「账号」：``uid`` 是网站用户 UUID（全局唯一，创建时自动生成），
+    ``key_sha256`` 是登录密钥的哈希（密钥是成员的登录凭证），
+    ``bearer_sha256`` 是 WHIP 推流 Bearer 令牌的哈希。
+
+    密钥与令牌**只由服务端随机生成**，生成后明文只回给前端一次；此后一概以
+    sha256 存储、不再下发，只能「轮换」（轮换后旧值立即失效）。
+
+    ``stream_id`` 是这位成员的推流 ID（也是他在媒体服务器上的推流路径），
+    与令牌一起构成推流凭据；只有两者同时正确才允许推流（见 ``live`` 模块）。
+    """
+
+    uid: str = ""             # 网站用户 UUID（全局唯一，自动生成；不可修改）
+    name: str = ""
+    qq: str = ""
+    avatar: str = ""
+    game_uuid: str = ""       # 游戏内 UUID
+    stream_id: str = ""       # 推流 ID（全局唯一）
+    room_title: str = ""      # 直播间名字（成员可自行修改）
+    note: str = ""
+    permission: MemberPermission = "member"
+    active: bool = True
+    created_at: str = ""
+    updated_at: str = ""
+    key_sha256: str = ""
+    bearer_sha256: str = ""
+
+    @field_validator("qq")
+    @classmethod
+    def _clean_qq(cls, value: str) -> str:
+        return "".join(ch for ch in value if ch.isdigit())
+
+    @field_validator("stream_id")
+    @classmethod
+    def _clean_stream_id(cls, value: str) -> str:
+        """只保留 URL 路径安全字符，避免拼出越界路径。"""
+        return "".join(ch for ch in value.strip().strip("/") if ch.isalnum() or ch in "-_")
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.uid
+
+    @property
+    def has_avatar_source(self) -> bool:
+        if self.avatar:
+            return True
+        return self.qq.isdigit() and 4 <= len(self.qq) <= 12
+
+    def public(self) -> dict[str, Any]:
+        """对外**脱敏**结构：展示信息 + 推流 ID；密钥 / 令牌绝不下发。
+
+        字段名统一走 camelCase 别名（与全站 JSON 约定一致）。
+        """
+        data: dict[str, Any] = self.model_dump(by_alias=True, include=list(PUBLIC_MEMBER_FIELDS))
+        data["hasKey"] = bool(self.key_sha256)
+        data["hasBearer"] = bool(self.bearer_sha256)
+        data["hasAvatar"] = self.has_avatar_source
+        return data
+
+    def private(self) -> dict[str, Any]:
+        """管理端结构：在公开字段基础上补上隐私字段（仍**不含**密钥 / 令牌明文）。"""
+        data = self.public()
+        data["qq"] = self.qq
+        data["note"] = self.note
+        data["createdAt"] = self.created_at
+        data["updatedAt"] = self.updated_at
+        return data
+
+
+class LiveBan(NTEModel):
+    """直播间封禁记录。
+
+    * ``scope="global"``：服务器管理员签发，任何届次均生效，且只有服务器管理员能解除；
+    * ``scope="event"``：赛事管理员对自己那届的直播间签发，仅在该届生效。
+
+    ``until`` 为空 = 永久封禁；否则到期自动失效（判定见 ``logic.ban_active``）。
+    """
+
+    id: str = ""
+    scope: LiveBanScope = "global"
+    member_uid: str = ""      # 被禁成员（可空：仅按流名封禁）
+    stream_id: str = ""       # 被禁的推流 ID（= 成员 stream_id / 频道流名）
+    name: str = ""            # 展示名缓存（成员改名后仍能显示当时的名字）
+    reason: str = ""
+    until: str = ""           # 解禁时间 ISO；空 = 永久
+    event_id: str = ""        # scope=event 时所属届
+    created_at: str = ""
+    created_by: str = ""      # 执行者展示名 / 权限
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +435,14 @@ class Round(NTEModel):
 class EventInfo(NTEModel):
     name: str = ""            # 届名（多届赛事标识，如「2026 国庆赛」）
     status: Literal["draft", "active", "closed"] = "active"
+    # 归属：由哪位成员创建（赛事管理员只能管理 / 删除自己创建的届；空 = 仅服务器管理员可管）
+    owner_uid: str = ""
+    hidden: bool = False      # 隐藏：不出现在公开的届次列表里（服务器管理员仍可见）
+    # 比赛类型：预设 key（volleyball / racing / photography / generic）或自定义字符串。
+    # 只影响界面文案（参赛者 / 成绩 / 场次的称呼），数据模型不变。
+    sport: str = "volleyball"
+    # 排名开关：关 = 娱乐记录模式（只记录场次与分数，不排名、不晋级、不判冠军）
+    ranked: bool = True
     title: str = "NTE 比赛"
     subtitle: str = "NEVERNESS TO EVERNESS · MATCH"
     venue: str = ""
@@ -333,6 +455,13 @@ class EventInfo(NTEModel):
     locked_at: str = ""       # 开赛（锁定）时刻
     rules_text: str = ""
     logo_text: str = "NTE"
+
+    @field_validator("sport")
+    @classmethod
+    def _clean_sport(cls, value: str) -> str:
+        """类型 key 只保留安全字符，避免拼进 HTML / 路径。"""
+        clean = "".join(ch for ch in str(value or "").strip() if ch.isalnum() or ch in "-_")
+        return clean[:32] or "volleyball"
 
 
 class Rules(NTEModel):

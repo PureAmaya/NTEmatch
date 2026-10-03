@@ -5,7 +5,22 @@
  * 届列表是公开数据（访客也能看历史）；建届 / 改名 / 删除 / 设为主赛事需登录。
  */
 
-import { App, api, esc, fmtFull, fmtSpan, log, qs, routePath, toast } from './core.js';
+import {
+  App,
+  api,
+  canManageEvents,
+  esc,
+  fmtFull,
+  fmtSpan,
+  isServerAdmin,
+  log,
+  qs,
+  routePath,
+  toast,
+} from './core.js';
+
+/** 这一届是否归当前用户管（服务器管理员放行）。 */
+const ownedByMe = (e) => isServerAdmin() || Boolean(e?.ownerUid && e.ownerUid === App.me?.uid);
 
 const STATUS_LABEL = { draft: '筹备中', active: '进行中', closed: '已结束' };
 const STATUS_CLASS = { draft: 'badge--pending', active: 'badge--live', closed: 'badge--done' };
@@ -49,7 +64,7 @@ const POP_ICON =
  */
 function eventCardHtml(e) {
   const path = routePath(e.id, 'overview');
-  const ops = App.token
+  const ops = ownedByMe(e)
     ? `<div class="evt-card__ops">` +
       (e.current
         ? `<span class="panel__hint">当前主赛事</span>`
@@ -91,18 +106,19 @@ export async function renderEventsView() {
   const host = qs('#eventsList');
   if (!host) return;
   const events = await loadEvents(false);
-  const bar = App.token
-    ? `<div class="tool-group" style="margin-bottom:10px">` +
-      `<button class="btn btn--sm btn--primary" type="button" data-act="event-new">新建一届</button>` +
-      `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新</button>` +
-      `<span class="panel__hint">新建后自动设为主赛事；同期只会有一个主赛事</span>` +
-      `</div>`
-    : '';
+  const bar =
+    `<div class="tool-group" style="margin-bottom:10px">` +
+    (canManageEvents()
+      ? `<button class="btn btn--sm btn--primary" type="button" data-act="event-new">新建一届</button>`
+      : '') +
+    `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新</button>` +
+    `<span class="panel__hint">${canManageEvents() ? '新建后自动设为主赛事；同期只会有一个主赛事' : '每一届一张卡片 · 点卡片进入只读回看'}</span>` +
+    `</div>`;
   host.innerHTML =
     bar +
     (events.length
       ? `<div class="evt-grid">${events.map(eventCardHtml).join('')}</div>`
       : `<div class="empty"><b>暂无赛事记录</b>${
-          App.token ? '点上面的「新建一届」开始' : '请等待管理员新建一届赛事'
+          canManageEvents() ? '点上面的「新建一届」开始' : '请等待管理员新建一届赛事'
         }</div>`);
 }

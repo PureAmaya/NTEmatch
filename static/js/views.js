@@ -5,12 +5,14 @@
 import {
   App,
   canEdit,
+  canManageEvents,
   esc,
   fmtDuration,
   fmtFull,
   fmtRange,
   fmtTime,
   hooks,
+  isServerAdmin,
   liveAvailable,
   log,
   qs,
@@ -29,6 +31,7 @@ import {
   isChannelLive,
   isLivePlayer,
   isMainLive,
+  isMemberLive,
   kpiCard,
   livePlayers,
   liveTag,
@@ -44,6 +47,7 @@ import {
 } from './ui.js';
 import { renderEventsView } from './events.js';
 import { ChannelLive, Live } from './live.js';
+import { renderServerPage, renderUserPage } from './members.js';
 
 const STAGE_LABEL = { group: '小组赛', wb: '胜者组', lb: '败者组', gf: '总决赛' };
 const PHASE_LABEL = {
@@ -219,11 +223,56 @@ function eventTimePanelHtml(s) {
 
 /* ------------------------------ 总览 ---------------------------------- */
 export function renderOverview(s) {
+  if (s.ranked === false) {
+    renderCasualOverview(s);
+    return;
+  }
   if (isLeague(s)) {
     renderLeagueOverview(s);
     return;
   }
   renderTournamentOverview(s);
+}
+
+/**
+ * 娱乐模式（排名开关关闭）的总览：**只讲记录**。
+ *
+ * 这类赛事不排名次、不判晋级、不产生冠军，所以这里不摆积分榜 / 对阵图 / 冠军横幅，
+ * 只给「参与人数 + 场次进度 + 进行中」与用户端规则面板。
+ */
+function renderCasualOverview(s) {
+  const meta = s.sport || {};
+  const rounds = s.rounds || [];
+  const done = rounds.filter((r) => r.status === 'done').length;
+  const live = rounds.filter((r) => r.status === 'live').length;
+  const noun = meta.round || '场次';
+  qs('#kpiRow').innerHTML = [
+    kpiCard(meta.participants || '参赛者', `${(s.players || []).length} 人`, '本届参与'),
+    kpiCard(noun, `${done} / ${rounds.length}`, `已记录 / 全部`),
+    kpiCard('进行中', `${live}`, live ? `正在记录的${noun}` : '暂无'),
+    kpiCard('模式', '娱乐', '只记录 · 不排名'),
+  ].join('');
+  renderNowPlaying(s);
+  setPanel('eventTimePanel', eventTimePanelHtml(s));
+  setPanel('championBox', '');
+  setPanel('bracketBoard', '');
+  setPanel('standingsBoard', '');
+  setPanel('formBoard', '');
+  setPanel('rulesBoard', rulesPanelHtml(s));
+}
+
+/**
+ * 按「比赛类型」换界面称呼（选手 → 车手 / 作者 / 参赛者…）。
+ *
+ * 只改最容易看见的页签名，避免把整套文案都参数化；类型未收录时用通用称呼。
+ */
+function applySportMeta(s) {
+  const meta = s.sport || {};
+  const rosterTab = qsa('.tab').find((t) => t.dataset.view === 'roster');
+  if (rosterTab) {
+    const label = rosterTab.querySelector('span');
+    if (label) label.textContent = meta.participants || '选手';
+  }
 }
 
 /* —— 锦标赛制总览：小组赛 + 双败对阵图 —— */
@@ -1354,20 +1403,51 @@ export function renderRoster(s) {
   renderRosterGrid(s);
 }
 
+/** 选手当前生效的直播封禁（按关联成员的 uid 命中）。 */
+function playerBan(s, p) {
+  if (!p?.memberUid) return null;
+  return (s.liveBans || []).find((b) => b.memberUid && b.memberUid === p.memberUid) || null;
+}
+
 function filteredPlayers(s) {
   const kw = App.search.trim().toLowerCase();
-  if (!kw) return s.players || [];
-  // 只搜索用户端可见的字段（UUID / QQ 不下发，也不该作为检索维度）
-  return (s.players || []).filter((p) =>
-    [p.name, p.tag, p.id].filter(Boolean).some((v) => String(v).toLowerCase().includes(kw))
-  );
+  let list = s.players || [];
+  if (kw) {
+    // 只搜索用户端可见的字段（UUID / QQ 不下发，也不该作为检索维度）
+    list = list.filter((p) =>
+      [p.name, p.tag, p.id, p.memberUid].filter(Boolean).some((v) =>
+        String(v).toLowerCase().includes(kw)
+      )
+    );
+  }
+  const f = App.rosterFilter || 'all';
+  if (f === 'joined') list = list.filter((p) => !isOut(p.id));
+  else if (f === 'out') list = list.filter((p) => isOut(p.id));
+  else if (f === 'sub') list = list.filter((p) => p.substitute);
+  else if (f === 'live') list = list.filter((p) => isLivePlayer(p.id));
+  else if (f === 'banned') list = list.filter((p) => Boolean(playerBan(s, p)));
+  return list;
 }
+
+const ROSTER_FILTERS = [
+  ['all', '全部'],
+  ['joined', '已参与本届'],
+  ['out', '未参与本届'],
+  ['sub', '替补'],
+  ['live', '直播中'],
+  ['banned', '封禁中'],
+];
 
 function renderRosterTools(s) {
   const focused = document.activeElement && document.activeElement.id === 'rosterSearch';
   qs('#rosterTools').innerHTML =
     `<div class="field" style="min-width:200px"><input id="rosterSearch" type="search" ` +
     `placeholder="搜索姓名 / 编号" value="${esc(App.search)}" autocomplete="off"></div>` +
+    `<div class="field"><select id="rosterFilter" aria-label="筛选选手">` +
+    ROSTER_FILTERS.map(
+      ([v, t]) => `<option value="${v}"${App.rosterFilter === v ? ' selected' : ''}>${t}</option>`
+    ).join('') +
+    `</select></div>` +
     `<div class="tool-group" style="margin-left:auto">` +
     `<span class="panel__hint">${filteredPlayers(s).length} / ${(s.players || []).length} 人</span>` +
     (canEdit() ? `<button class="btn btn--sm btn--primary" type="button" data-act="player-add">新增选手</button>` : '') +
@@ -1406,6 +1486,13 @@ function playerCardHtml(p) {
   const tags = [];
   if (out) tags.push(`<span class="badge badge--out">未参与本届</span>`);
   if (isLivePlayer(p.id)) tags.push(liveTag('直播中'));
+  const ban = playerBan(App.state, p);
+  if (ban) {
+    tags.push(
+      `<span class="badge badge--lose" title="${esc(ban.reason || '')}">` +
+        `${ban.until ? `封禁至 ${esc(fmtFull(ban.until))}` : '永久封禁'}</span>`
+    );
+  }
   if (league && st.bestStreak >= 2) tags.push(`<span class="badge badge--win">连胜×${st.bestStreak}</span>`);
   if (!league && pr?.teamName) tags.push(`<span class="badge badge--done">${esc(pr.teamName)}</span>`);
   if (p.tag) tags.push(`<span class="badge badge--pending">${esc(p.tag)}</span>`);
@@ -1471,7 +1558,7 @@ export function renderRosterGrid(s) {
 /* ------------------------------ 直播 ----------------------------------
  *
  * 一条硬规则：**只有「配了推流流名 + 媒体服务器确认在推流」才出现在界面上**。
- * 没人推流时，直播页不摆任何机位，只留一句「没有任何人在直播」；
+ * 没人推流时，直播页只留一句「当前没有直播」；
  * 主直播间（直播配置里的「默认流名」）也只有它真的在推流时，
  * 才作为一路独立机位出现——一个人都没播时，它就是唯一可选的那一路。
  */
@@ -1562,19 +1649,23 @@ function roundOfPlayer(s, pid) {
   );
 }
 
-/** 没有任何在播机位时的提示（区分「确实没人播」与「探测不到」）。 */
+/** 当前没有在播机位时的提示（区分「确实无人开播」与「探测不到」）。 */
 function liveEmptyHtml(s) {
   const known = App.liveHealth ? App.liveHealth.streamingKnown : s.liveStatus?.known;
-  const hint =
-    known === false
-      ? '暂时无法判断有没有人在直播：媒体服务器 API 不可达，请管理员到「直播配置」里检查 API 地址与账号。'
-      : canEdit()
-        ? '让主播在 OBS 里推他自己的流名（选手名单里填的那个）；推上来后这里会自动出现，平时不摆空机位。'
-        : '等主播开播后再来看。';
-  return `<div class="live-pick__empty live-pick__empty--none"><b>没有任何人在直播</b>${esc(hint)}</div>`;
+  let hint;
+  if (known === false) {
+    hint = canEdit()
+      ? '暂时无法判断有没有人在直播：媒体服务器 API 不可达，请到「直播配置」检查 API 地址与账号。'
+      : '暂时无法获取直播状态，请稍后再试。';
+  } else {
+    hint = canEdit()
+      ? '主播在 OBS 里按自己的推流地址开播后，机位会自动出现在这里。'
+      : '等主播开播后再来看。';
+  }
+  return `<div class="live-pick__empty live-pick__empty--none"><b>当前没有直播</b>${esc(hint)}</div>`;
 }
 
-/** 正在检测推流状态：给一段加载动画，别让用户对着「没有任何人在直播」干等。 */
+/** 正在检测推流状态：给一段加载动画，避免把「检测中」误显示成「当前没有直播」。 */
 function liveLoadingHtml() {
   return (
     `<div class="ldg">` +
@@ -1583,13 +1674,13 @@ function liveLoadingHtml() {
   );
 }
 
-/** 连续检测失败：说清现状并给一个手动重试入口（不再自动重试，等服务器恢复）。 */
+/** 连续检测失败：说明现状并给一个手动重试入口（不再自动重试）。 */
 function liveFailHtml(message) {
   const detail = message || '已连续 3 次未取到推流状态';
   return (
     `<div class="ldg ldg--err">` +
     `<span class="ldg__bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>` +
-    `<span class="ldg__msg"><b>获取失败，等待服务器修复</b>${esc(detail)}</span>` +
+    `<span class="ldg__msg"><b>暂时无法获取直播状态</b>${esc(detail)}</span>` +
     `<button class="btn btn--sm" type="button" data-act="live-health-retry">重试</button></div>`
   );
 }
@@ -1597,7 +1688,7 @@ function liveFailHtml(message) {
 /**
  * 检测进行中的占位：按状态给「加载动画 / 获取失败 / 确实没人播」。
  *
- * 关键是不把「还没检测出结果」说成「没有任何人在直播」——那会误导观众。
+ * 关键是不把「还没检测出结果」说成「当前没有直播」——那会误导观众。
  */
 function livePendingHtml(s) {
   if (App.liveHealthState === 'error') return liveFailHtml(App.liveHealth?.reason);
@@ -1784,10 +1875,8 @@ function pushPanelHtml(s, picked) {
               `</div>`
         )
         .join('')
-    : `<div class="empty"><b>没有任何人在直播</b>${
-        admin
-          ? '目前没有信号在推，所以这里不摆地址；有人开播后会自动出现。'
-          : '等主播开播后再来看。'
+    : `<div class="empty"><b>当前没有直播</b>${
+        admin ? '有人开播后，推流与观看地址会自动出现在这里。' : '等主播开播后再来看。'
       }</div>`;
   const note = [
     st.note ? `<div class="notice" style="margin-top:10px">${esc(st.note)}</div>` : '',
@@ -1863,8 +1952,51 @@ export function liveInfoHtml(s, picked = null) {
 /** 可见频道：停用的只对管理员可见（否则停用后就再也启不回来）。 */
 const visibleChannels = (s) => (s.channels || []).filter((c) => c.active || canEdit());
 
+/**
+ * 成员直播间 → 与「频道」同构的合成对象（带 ``member:true``）。
+ *
+ * 成员只要配了推流 ID 就自动出现在频道里（无需管理员审批），开播与否以
+ * 媒体服务器上报为准；关联比赛时带上比赛信息，被禁时带上封禁状态。
+ */
+function memberRoom(m) {
+  return {
+    id: `m:${m.uid}`,
+    uid: m.uid,
+    member: true,
+    name: m.name || m.uid,
+    title: m.roomTitle || '',
+    description: '',
+    tags: [],
+    link: '',
+    active: true,
+    featured: false,
+    avatar: m.avatar || '',
+    hasAvatar: m.hasAvatar,
+    hasStream: Boolean(m.streamId),
+    play: m.play || {},
+    live: isMemberLive(m.uid),
+    banned: m.banned || null,
+    roundCode: m.roundCode || '',
+    roundLabel: m.roundLabel || '',
+    permission: m.permission,
+  };
+}
+
+/** 成员直播间列表（只保留配了推流 ID 的）。 */
+const memberRooms = (s) => (s.members || []).filter((m) => m.streamId).map(memberRoom);
+
+/** 频道页的完整房间列表：成员直播间 + 管理员手工建的传统频道。 */
+export function channelRooms(s) {
+  const members = memberRooms(s);
+  const memberIds = new Set(members.map((c) => c.id));
+  return [...members, ...visibleChannels(s).filter((c) => !memberIds.has(c.id))];
+}
+
+/** 一个房间是否在推流（成员直播间 / 传统频道两套判定）。 */
+const roomLive = (room) => (room?.member ? isMemberLive(room.uid) : isChannelLive(room?.id));
+
 /** 能播的频道：配了推流流名的才算（没流名的只在目录里展示）。 */
-const channelPool = (s) => visibleChannels(s).filter((c) => c.hasStream);
+const channelPool = (s) => channelRooms(s).filter((c) => c.hasStream);
 
 /** 选中频道 / 线路变化才重建舞台，避免每次刷新都打断正在播的画面。 */
 function channelStageSig(picked) {
@@ -1914,7 +2046,7 @@ function channelChipsHtml(pool, picked) {
     `<span class="live-pick__label">频道</span>` +
     pool
       .map((c) => {
-        const live = isChannelLive(c.id);
+        const live = roomLive(c);
         const active = picked && picked.id === c.id;
         const cls =
           `live-chip${active ? ' live-chip--active' : ''}${live ? ' live-chip--live' : ''}`;
@@ -1930,7 +2062,7 @@ function channelChipsHtml(pool, picked) {
 
 function channelMetaHtml(picked) {
   if (!picked) return '';
-  const live = isChannelLive(picked.id);
+  const live = roomLive(picked);
   return (
     `<div class="vs-line${live ? '' : ' vs-line--idle'}">` +
     `<span class="vs-line__tag">${live ? '直播中' : '未开播'}</span>` +
@@ -1943,7 +2075,7 @@ function channelMetaHtml(picked) {
 function renderChannelTools(channels) {
   const host = qs('#channelTools');
   if (!host) return;
-  const liveCount = channels.filter((c) => isChannelLive(c.id)).length;
+  const liveCount = channels.filter((c) => roomLive(c)).length;
   host.innerHTML =
     `<div class="tool-group"><span class="panel__hint">${channels.length} 个频道 · ${liveCount} 个在播</span></div>` +
     (canEdit()
@@ -1954,26 +2086,40 @@ function renderChannelTools(channels) {
 }
 
 function channelCardHtml(c) {
-  const live = isChannelLive(c.id);
+  const live = roomLive(c);
   const tags = [];
   if (live) tags.push(liveTag('直播中'));
+  if (c.member) tags.push('<span class="badge badge--done">成员直播间</span>');
   if (c.featured) tags.push('<span class="badge badge--done">推荐</span>');
   if (c.server) tags.push(`<span class="badge badge--pending" title="区服">${esc(c.server)}</span>`);
   if (c.role) {
     tags.push(`<span class="badge badge--done" title="常驻角色 / 称号">${esc(c.role)}</span>`);
   }
-  if (!c.hasStream) tags.push('<span class="badge badge--pending">未配置流名</span>');
+  if (c.roundLabel) {
+    tags.push(`<span class="badge badge--live">比赛中 · ${esc(c.roundLabel)}</span>`);
+  }
+  if (c.banned) {
+    tags.push(
+      `<span class="badge badge--lose" title="${esc(c.banned.reason || '')}">` +
+        `${c.banned.until ? `封禁至 ${esc(fmtFull(c.banned.until))}` : '永久封禁'}</span>`
+    );
+  }
+  if (!c.hasStream) tags.push('<span class="badge badge--pending">未配置推流 ID</span>');
   (c.tags || []).forEach((t) => tags.push(`<span class="badge badge--pending">${esc(t)}</span>`));
   const ops =
     `<div class="round__ops">` +
     (c.hasStream
       ? `<button class="btn btn--sm btn--primary" type="button" data-act="channel-watch" ` +
-        `data-id="${esc(c.id)}">${live ? '观看直播' : '打开频道'}</button>`
+        `data-id="${esc(c.id)}">${live ? '观看直播' : '打开直播间'}</button>`
       : '') +
     (c.link
       ? `<a class="btn btn--sm" href="${esc(c.link)}" target="_blank" rel="noopener noreferrer">外部链接</a>`
       : '') +
-    (canEdit()
+    (c.member && canEdit()
+      ? `<button class="btn btn--sm btn--danger" type="button" data-act="member-ban" ` +
+        `data-uid="${esc(c.uid)}">掐断 / 封禁</button>`
+      : '') +
+    (!c.member && canEdit()
       ? `<button class="btn btn--sm" type="button" data-act="channel-edit" data-id="${esc(c.id)}">编辑</button>` +
         `<button class="btn btn--sm btn--danger" type="button" data-act="channel-del" data-id="${esc(c.id)}">删除</button>`
       : '') +
@@ -2016,10 +2162,10 @@ function renderChannelGrid(channels) {
   if (!host) return;
   if (!channels.length) {
     host.innerHTML =
-      `<div class="empty"><b>还没有成员频道</b>` +
+      `<div class="empty"><b>还没有直播间</b>` +
       (canEdit()
-        ? '点右上角「新增频道」把群友的直播间加进来（频道名 + 推流流名）'
-        : '等管理员添加成员频道后，就能在这里看大家直播了') +
+        ? '点右上角「新增频道」，或让成员在「我的」里设置推流 ID。'
+        : '等成员开播后再来看。') +
       `</div>`;
     return;
   }
@@ -2034,12 +2180,12 @@ function renderChannelGrid(channels) {
  */
 export function renderChannels(s) {
   if (!qs('#channelStage')) return false;
-  const all = visibleChannels(s);
+  const all = channelRooms(s);
   const pool = channelPool(s);
   // 选中的频道不在了（被删 / 流名被清掉）→ 落到第一个在播的，其次第一个能播的
   let picked = pool.find((c) => c.id === App.channelId) || null;
   if (!picked) {
-    picked = pool.find((c) => isChannelLive(c.id)) || pool[0] || null;
+    picked = pool.find((c) => roomLive(c)) || pool[0] || null;
     App.channelId = picked ? picked.id : null;
   }
   App.channelPicked = picked;
@@ -2072,7 +2218,7 @@ export function renderChannels(s) {
 
   // 只在舞台重建时换流，避免每次信号刷新都打断正在播的画面
   if (rebuilt && App.view === 'channels') {
-    if (picked && isChannelLive(picked.id)) {
+    if (picked && roomLive(picked)) {
       ChannelLive.playRoom(picked.play || null);
     } else if (picked) {
       ChannelLive.stop(false);
@@ -2080,12 +2226,12 @@ export function renderChannels(s) {
     } else {
       ChannelLive.stop(false);
       ChannelLive.setCover(
-        all.length ? '频道还没有流名' : '还没有成员频道',
+        all.length ? '当前没有直播' : '还没有直播间',
         all.length
-          ? '这些频道还没配置推流流名，配好后就能在这里播放。'
+          ? '还没有配置推流地址，配置后即可播放。'
           : canEdit()
-            ? '在右上角「新增频道」里添加成员直播间。'
-            : '等管理员添加成员频道后，这里就能看大家直播了。'
+            ? '点右上角「新增频道」，或让成员在「我的」里设置推流 ID。'
+            : '等成员开播后再来看。'
       );
     }
   }
@@ -2100,6 +2246,8 @@ const VIEW_RENDERERS = {
   live: renderLive,
   channels: renderChannels,
   events: renderEventsView,
+  server: renderServerPage,
+  user: renderUserPage,
 };
 
 /** 只渲染指定视图；切页时按需渲染，避免隐藏视图做无谓的 DOM 重建。 */
@@ -2115,14 +2263,87 @@ export function renderView(view, s = App.state) {
  * 每次状态刷新都对一遍（包括 WebSocket 推来的变更：管理员刚把这一届标记结束，
  * 观众这边的直播页签也要立刻收掉）。
  */
-function syncTabs(s) {
-  const liveTab = qsa('.tab').find((t) => t.dataset.view === 'live');
-  if (!liveTab) return;
-  const allow = liveAvailable(s);
-  if (liveTab.hidden === !allow) return; // 已经是目标状态
-  liveTab.hidden = !allow;
-  // 正停在直播页却被收走（届被标记结束了）：回总览，别留一个够不着的页面
-  if (!allow && App.view === 'live') hooks.goto?.(App.routeEvent, 'overview', { replace: true });
+export function syncTabs(s) {
+  // 单个页签的可见性：需要收起且当前正停在该页时，回落到总览
+  const setTab = (view, allow) => {
+    const tab = qsa('.tab').find((t) => t.dataset.view === view);
+    if (!tab || tab.hidden === !allow) return;
+    tab.hidden = !allow;
+    if (!allow && App.view === view) hooks.goto?.(App.routeEvent, 'overview', { replace: true });
+  };
+  // 直播页：已完结的届 / 往届回看时收起
+  setTab('live', liveAvailable(s));
+  // 赛事管理页：**登录了且有权限**才出现；未登录 / 身份未到手一律收起
+  setTab('manage', Boolean(App.me) && canManageEvents());
+}
+
+const PERMISSION_TEXT = {
+  member: '成员',
+  event_admin: '赛事管理员',
+  server_admin: '服务器管理员',
+};
+
+/**
+ * 顶栏右侧：`管理`（= 服务器管理，只有服务器管理员看得见）+ 当前用户（头像 + 名字，点进 /user）。
+ *
+ * 「服务器 / 我的」原本各占一个页签，现在并进顶栏，页签只留比赛相关的内容；
+ * 路由 `/admin` 与 `/user` 照旧可用（刷新 / 收藏 / 分享都落得住）。
+ */
+export function syncHeader() {
+  // `管理`：只有**服务器管理员**本人看得见（未登录 / 身份未到手一律收起）
+  const adminBtn = qs('#btnAdmin');
+  if (adminBtn) adminBtn.hidden = !isServerAdmin();
+  // 未登录时给一个明确的登录入口，免得密钥没处可输
+  const loginBtn = qs('#btnLogin');
+  if (loginBtn) loginBtn.hidden = Boolean(App.token);
+  const chip = qs('#btnMe');
+  if (!chip) return;
+  // 认不出「你是谁」就不显示用户块（宁可空着，也不要挂一个「未登录」的牌子）
+  const me = App.me || null;
+  chip.hidden = !me;
+  if (chip.hidden) return;
+  const m = me.member || null;
+  const name = me.name || m?.name || '已登录';
+  const ava = qs('#meAvatar');
+  if (ava) {
+    ava.innerHTML = m
+      ? avaHtml(m, 'xs')
+      : `<span class="ava ava--xs ava--placeholder">${esc(String(name).slice(0, 1))}</span>`;
+  }
+  const nameEl = qs('#meName');
+  if (nameEl) nameEl.textContent = name;
+  chip.title = `${name}（${PERMISSION_TEXT[me.permission] || '成员'}）· 点击编辑我的资料`;
+  chip.setAttribute('aria-current', String(App.view === 'user'));
+}
+
+/**
+ * 注入服务器管理员配置的自定义 HTML（用于统计 / 数据采集）。
+ *
+ * 用 ``<template>`` 解析后重新创建 ``<script>`` 节点——直接 innerHTML 不会执行
+ * 内联脚本，重建节点才会。内容变了才重建（避免每次状态推送都重复执行脚本）。
+ */
+let customHtmlSig = null;
+
+function applyCustomHtml(html) {
+  const host = qs('#customHtmlHost');
+  if (!host) return;
+  const text = String(html || '');
+  if (text === customHtmlSig) return;
+  customHtmlSig = text;
+  host.hidden = !text;
+  host.innerHTML = '';
+  if (!text) return;
+  const tpl = document.createElement('template');
+  tpl.innerHTML = text;
+  const frag = tpl.content;
+  frag.querySelectorAll('script').forEach((old) => {
+    const fresh = document.createElement('script');
+    [...old.attributes].forEach((a) => fresh.setAttribute(a.name, a.value));
+    fresh.textContent = old.textContent;
+    old.replaceWith(fresh);
+  });
+  host.appendChild(frag);
+  log.debug('自定义 HTML 已注入', text.length, '字符');
 }
 
 /** 状态推送入口：HUD/公告始终刷新，正文只刷新当前可见视图。 */
@@ -2135,5 +2356,8 @@ export function renderPublic() {
   applyTheme(s);
   renderHeader(s);
   syncTabs(s);
+  syncHeader();
+  applySportMeta(s);
+  applyCustomHtml(s.customHtml);
   renderView(App.view, s);
 }

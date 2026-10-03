@@ -164,6 +164,52 @@ export const liveChannels = () =>
 
 export const isChannelLive = (id) => Boolean(id) && liveChannels().has(id);
 
+/* --------------------------- 成员直播间（全局） --------------------------- */
+/**
+ * **真的在推流**的成员 uid 集合（按推流 ID 判定，与选手机位同一套）。
+ *
+ * 探测不到（媒体服务器 API 不可达）时是空集——宁可少显示「直播中」，
+ * 也不给观众一个假的直播标记。
+ */
+export const liveMembers = () =>
+  App.liveMembersNow instanceof Set
+    ? App.liveMembersNow
+    : new Set((App.state?.members || []).filter((m) => m.live).map((m) => m.uid));
+
+export const isMemberLive = (uid) => Boolean(uid) && liveMembers().has(uid);
+
+/** 成员直播间头像：统一走 ``/api/avatar/m/<uid>``，请求里不出现 QQ 号。 */
+export function memberAvatarUrl(member) {
+  if (!member) return '';
+  if (member.avatar) return member.avatar;
+  const ui = App.state?.ui;
+  if (ui && ui.showAvatar === false) return '';
+  if (!member.uid || member.hasAvatar === false) return '';
+  const bust = App.avatarBust?.[`m:${member.uid}`];
+  return (
+    `/api/avatar/m/${encodeURIComponent(member.uid)}?size=100` +
+    (bust ? `&t=${encodeURIComponent(bust)}` : '')
+  );
+}
+
+/** 成员直播间头像（六边形 + 首字兜底 + 直播中光环）。 */
+export function memberAvaHtml(member, size = 'sm') {
+  const name = member?.name || member?.uid || '?';
+  const url = memberAvatarUrl(member);
+  const live = isMemberLive(member?.uid);
+  const cls = `ava ava--${size}${url ? '' : ' ava--placeholder'}${live ? ' ava--live' : ''}`;
+  const inner = url
+    ? `<span class="ava__fb">${esc(String(name).slice(0, 1))}</span>` +
+      `<img src="${esc(url)}" alt="${esc(name)}" loading="lazy" decoding="async" referrerpolicy="no-referrer">` +
+      `<span class="ava__ring"></span>`
+    : esc(String(name).slice(0, 1));
+  return (
+    `<span class="${cls}">${inner}` +
+    (live ? '<i class="ava__live" aria-hidden="true"></i><span class="sr-only">直播中</span>' : '') +
+    `</span>`
+  );
+}
+
 /**
  * 成员频道头像地址。
  *
@@ -183,11 +229,14 @@ export function channelAvatarUrl(channel) {
   );
 }
 
-/** 频道头像（六边形 + 首字兜底），与选手机位同一套视觉。 */
+/** 频道头像（六边形 + 首字兜底），与选手机位同一套视觉。
+ *
+ * 也兼容「成员直播间」的合成对象（带 ``member:true`` / ``uid``）：走成员头像接口。
+ */
 export function channelAvaHtml(channel, size = 'sm') {
   const name = channel?.name || channel?.id || '?';
-  const url = channelAvatarUrl(channel);
-  const live = isChannelLive(channel?.id);
+  const url = channel?.member ? memberAvatarUrl(channel) : channelAvatarUrl(channel);
+  const live = channel?.member ? isMemberLive(channel.uid) : isChannelLive(channel?.id);
   const cls = `ava ava--${size}${url ? '' : ' ava--placeholder'}${live ? ' ava--live' : ''}`;
   const inner = url
     ? `<span class="ava__fb">${esc(String(name).slice(0, 1))}</span>` +

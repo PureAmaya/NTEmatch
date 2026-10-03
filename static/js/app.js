@@ -6,10 +6,14 @@ import {
   App,
   API,
   PAGES,
+  STANDALONE_PAGES,
+  TOKEN_KEY,
   VIEW_KEY,
   api,
+  canManageEvents,
   copyText,
   hooks,
+  isServerAdmin,
   log,
   Modal,
   pageAvailable,
@@ -38,9 +42,11 @@ import {
   renderPublic,
   renderRosterGrid,
   renderView,
+  syncTabs,
 } from './views.js';
 import { renderAdmin } from './admin.js';
 import { handleAction, handleForm, login, uploadAvatarFile } from './actions.js';
+import { refreshMeData, refreshServerData, renderMemberGrid } from './members.js';
 
 /* --------------------------- 路由（届 + 页面） ---------------------------
  *
@@ -62,9 +68,9 @@ let route = { eventId: '', page: 'overview' };
 
 async function goto(eventId = '', page = 'overview', { replace = false } = {}) {
   const want = PAGES.includes(page) ? page : 'overview';
-  // 「往届」是独立页：不属于任何一届，地址固定 /events（内容就是全部届的卡片）
-  const listPage = want === 'events';
-  let id = listPage ? '' : String(eventId || App.eventId || '');
+  // 独立页（往届 / 服务器 / 我的）不属于任何一届：地址不带届 ID
+  const standalone = STANDALONE_PAGES.includes(want);
+  let id = standalone ? '' : String(eventId || App.eventId || '');
   if (id && !App.events.some((e) => e.id === id)) {
     if (id !== route.eventId) toast(`没有这一届：${id}`, 'warn', 6000);
     id = '';
@@ -107,15 +113,27 @@ async function goto(eventId = '', page = 'overview', { replace = false } = {}) {
     } catch (err) {
       log.warn('直播信息加载失败', err);
     }
-    await refreshPrivate();
+    // 隐私字段 / 推流地址只对有赛事管理权限的人拉（普通成员会被 403）
+    if (canManageEvents()) await refreshPrivate();
+    // 独立页各自的额外数据：服务器管理（成员 + 配置）/ 个人（我的资料）
+    if (want === 'server') {
+      // 每次进入本页重新拉一次，并复位「只试一次」标记
+      App.serverTried = false;
+      App.eventsTried = false;
+      await refreshServerData({ silent: true });
+    } else if (want === 'user') {
+      await refreshMeData();
+    }
   }
 
   // 页面可用性要等状态到手才能定（已完结的届没有直播页）→ 不可用就回落到总览
   const pg = pageAvailable(want, App.state) ? want : 'overview';
-  route = { eventId: listPage ? '' : id, page: pg };
+  route = { eventId: standalone ? '' : id, page: pg };
   const path = routePath(route.eventId, pg);
   if (location.pathname !== path) history[replace ? 'replaceState' : 'pushState']({ ...route }, '', path);
 
+  // 先把页签可见性同步好，否则 setView 会因为「页签被收起来」而回落到总览
+  if (App.state) syncTabs(App.state);
   setView(pg, { silent: true });
   renderPublic();
   renderAdmin();
@@ -130,8 +148,10 @@ window.addEventListener('popstate', (ev) => {
 
 /* --------------------------- 视图切换 --------------------------- */
 function setView(view, { silent = false } = {}) {
-  // 页签被收起来的页面不能进（如已完结的届没有直播页）
-  if (!qsa('.tab').some((t) => t.dataset.view === view && !t.hidden)) view = 'overview';
+  // 页签被收起来的页面不能进（如已完结的届没有直播页）。
+  // 注意：`server` / `user` 已经**没有页签**了（并进顶栏），只认「存在但被收起」。
+  const tab = qsa('.tab').find((t) => t.dataset.view === view);
+  if (tab && tab.hidden) view = 'overview';
   App.view = view;
   document.documentElement.dataset.view = view;
   qsa('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.view === view)));
@@ -157,7 +177,7 @@ function setView(view, { silent = false } = {}) {
   if ((view === 'live' || view === 'channels') && App.state) startLiveHealth();
   else if (view !== 'live' && view !== 'channels') stopLiveHealth();
 
-  if (view === 'admin') renderAdmin();
+  if (view === 'manage') renderAdmin();
   // 记下已渲染的视图与指纹（切页本身就重建过 DOM，避免随后一次推送再重建一遍）
   App.renderedView = view;
   App.renderedKey = stateKey(App.state);
@@ -304,7 +324,17 @@ function bindStatic() {
     toast('已同步最新状态', 'ok', 2000);
   });
 
-  qs('#btnAdmin').addEventListener('click', () => goto(route.eventId, 'admin'));
+  // 顶栏「管理」= 服务器管理（只有服务器管理员看得见，见 views.syncHeader）
+  qs('#btnAdmin')?.addEventListener('click', () => {
+    if (!isServerAdmin()) return;
+    goto('', 'server');
+  });
+
+  // 顶栏「登录」= 去 /user 的登录门（未登录时才出现）
+  qs('#btnLogin')?.addEventListener('click', () => goto('', 'user'));
+
+  // 顶栏右上角的「头像 + 用户名」：进自己的 /user 页
+  qs('#btnMe')?.addEventListener('click', () => goto('', 'user'));
 
   // 头像加载失败（没配 QQ / 接口 4xx / 断网）：移除坏图，露出底下的首字兜底。
   // error 事件不冒泡，所以必须用捕获阶段监听。
@@ -351,12 +381,44 @@ function bindStatic() {
       if (App.state) renderRosterGrid(App.state);
     }, 120);
   });
+  // 选手筛选：切换下拉立即重绘网格
+  qs('#rosterTools').addEventListener('change', (e) => {
+    if (e.target.id !== 'rosterFilter') return;
+    App.rosterFilter = e.target.value;
+    if (App.state) renderRosterGrid(App.state);
+  });
 
   // 管理端表单提交
   qs('#adminPanel').addEventListener('submit', (e) => {
     if (!e.target.dataset.form) return;
     e.preventDefault();
     handleForm(e.target);
+  });
+
+  // 服务器 / 个人页的表单提交（成员、自定义 HTML、我的资料…）
+  qs('#serverBody').addEventListener('submit', (e) => {
+    if (!e.target.dataset.form) return;
+    e.preventDefault();
+    handleForm(e.target);
+  });
+  qs('#userBody').addEventListener('submit', (e) => {
+    if (!e.target.dataset.form) return;
+    e.preventDefault();
+    handleForm(e.target);
+  });
+
+  // 成员管理：搜索（防抖、只重绘网格）/ 筛选
+  let memberTimer = null;
+  qs('#serverBody').addEventListener('input', (e) => {
+    if (e.target.id !== 'memberSearch') return;
+    App.memberSearch = e.target.value;
+    clearTimeout(memberTimer);
+    memberTimer = setTimeout(renderMemberGrid, 120);
+  });
+  qs('#serverBody').addEventListener('change', (e) => {
+    if (e.target.id !== 'memberFilter') return;
+    App.memberFilter = e.target.value;
+    renderMemberGrid();
   });
 
   // 头像文件选择（选手编辑弹窗与批量名单共用）
@@ -371,6 +433,12 @@ function bindStatic() {
   // 门禁：回车登录
   qs('#adminGate').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') login(qs('#adminKey')?.value || '');
+  });
+  // 服务器 / 个人页门禁：回车登录
+  ['#serverBody', '#userBody'].forEach((sel) => {
+    qs(sel).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.id === 'adminKey') login(e.target.value || '');
+    });
   });
 
   // 桌面端跨断点时重绘排行榜列结构
@@ -393,6 +461,9 @@ async function init() {
   installStageDelegation();
   installTeamDnD();
   hooks.onAuthLost = () => {
+    App.me = null;
+    App.server = null;
+    App.serverTried = false;
     renderAdmin({ force: true });
     renderPublic();
   };
@@ -426,14 +497,17 @@ async function init() {
   setView(App.view, { silent: true });
 
   if (App.token) {
-    try {
-      await api('/auth/check', { auth: true });
-      log.info('管理会话校验通过');
+    const me = await refreshMeData();
+    if (me) {
+      log.info('会话校验通过', me.permission);
       await refreshPrivate();
-    } catch (err) {
-      log.warn('管理会话校验失败', err.message);
+    } else {
+      log.warn('会话校验失败，已清除登录态');
       App.private = null;
     }
+  } else {
+    // 本机（localhost）直连免登录：能签发就直接以服务器管理员身份进入
+    await tryLocalLogin();
   }
 
   await loadInitial();
@@ -441,6 +515,29 @@ async function init() {
   renderAdmin();
 
   log.info('前端已就绪', 'api', API, 'view', App.view);
+}
+
+/**
+ * 本机（localhost）直连免登录：向后端要一个服务器管理员会话。
+ *
+ * 服务端只在「回环地址 + 无转发头 + Host 为本机名」时才签发（见 `login_guard.is_local`），
+ * 且可在「服务器 → 登录限制」里用「本机不设防」开关关闭；失败就静默忽略、照常显示登录页。
+ */
+async function tryLocalLogin() {
+  try {
+    const res = await api('/auth/local', { method: 'POST' });
+    if (!res || !res.token) return false;
+    App.token = res.token;
+    localStorage.setItem(TOKEN_KEY, res.token);
+    // 身份与成员视图都走 /api/me：会话就绑在那位唯一的服务器管理员成员上，
+    // 所以这里能直接拿到他自己的资料（/user 页因此可用）
+    await Promise.all([refreshMeData(), refreshPrivate()]);
+    log.info('本机直连免登录：已获得服务器管理员会话');
+    return true;
+  } catch (err) {
+    log.debug('本机免登录不可用（忽略）', err.message);
+    return false;
+  }
 }
 
 if (document.readyState === 'loading') {

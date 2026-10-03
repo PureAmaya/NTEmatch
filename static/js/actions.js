@@ -39,7 +39,8 @@ import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
 import { invalidateEvents, loadEvents, renderEventsView } from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
 import { ChannelLive, probeLiveHealth } from './live.js';
-import { focusLive, renderChannels, renderPublic } from './views.js';
+import { channelRooms, focusLive, renderChannels, renderPublic } from './views.js';
+import { handleMemberAction, handleMemberForm, refreshMeData } from './members.js';
 
 /** 按对局编号（WB-1-2）或序号定位一场比赛。 */
 const roundOf = (ref) =>
@@ -1515,7 +1516,7 @@ async function refreshEventsUI(force = false) {
   invalidateEvents();
   await loadEvents(force);
   if (App.view === 'events') await renderEventsView();
-  else if (App.view === 'admin') renderAdmin({ force: true });
+  else if (App.view === 'manage') renderAdmin({ force: true });
 }
 
 function openEventNewModal() {
@@ -1677,6 +1678,10 @@ function openPlayerEditModal(player, defaults = {}) {
       }) +
       fieldText('qq', 'QQ（可选）', priv.qq || '', { hint: '仅服务端用于取头像' }) +
       fieldText('tag', '编号（可选）', player?.tag || '') +
+      // 关联全局成员（「选手就是成员」）：选上后推流 / 封禁状态与成员同步
+      `<div class="field"><label for="f-memberUid">关联成员</label>` +
+      `<select id="f-memberUid" name="memberUid"><option value="">（自动匹配 / 新建）</option></select>` +
+      `<span class="field__hint">留空即按游戏 UUID 或「姓名 + QQ」自动匹配，匹配不到会新建成员</span></div>` +
       `<div class="field" style="grid-column:1/-1"><label>头像</label>` +
       `<div class="ava-edit" data-avatar-scope>` +
       `<span class="ava ava--md${url ? '' : ' ava--placeholder'}" data-role="avatar-preview">${preview}</span>` +
@@ -1695,6 +1700,22 @@ function openPlayerEditModal(player, defaults = {}) {
       `<button class="btn btn--sm btn--primary" type="button" data-submit>保存</button>`,
     onMount(bodyEl, footEl) {
       footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      // 异步填充「关联成员」下拉（成员列表需登录，独立选手留空）
+      const sel = bodyEl.querySelector('#f-memberUid');
+      const currentUid = priv.memberUid || '';
+      api('/members', { auth: true })
+        .then((res) => {
+          (res.members || []).forEach((m) => {
+            const opt = document.createElement('option');
+            opt.value = m.uid;
+            const role =
+              m.permission === 'server_admin' ? '（服务器管理员）' : m.permission === 'event_admin' ? '（赛事管理员）' : '';
+            opt.textContent = `${m.name || m.uid}${m.streamId ? ` · ${m.streamId}` : ''}${role}`;
+            if (m.uid === currentUid) opt.selected = true;
+            sel.appendChild(opt);
+          });
+        })
+        .catch((err) => log.debug('成员列表加载失败（忽略）', err));
       footEl.querySelector('[data-submit]').onclick = async () => {
         const data = collectForm(bodyEl);
         if (!String(data.name || '').trim()) {
@@ -1766,15 +1787,16 @@ export async function uploadAvatarFile(input) {
 function hooksRenderAdmin() {
   // 数据刚变过：强制刷新面板（普通重绘会被「指纹没变就不重建」挡掉，
   // 而这里要的正是把服务端的新值显示出来；用户没保存的输入仍会被保住）
-  if (App.view === 'admin') renderAdmin({ force: true });
+  if (App.view === 'manage') renderAdmin({ force: true });
 }
 
 function refreshDiagIfAdmin() {
-  if (App.view === 'admin') refreshDiagnostics();
+  if (App.view === 'manage') refreshDiagnostics();
 }
 
 /* --------------------------- 成员频道（日常直播） --------------------------- */
-const channelOf = (id) => (App.state?.channels || []).find((c) => c.id === id) || null;
+// 频道页的房间既可能是成员直播间（合成对象），也可能是传统频道
+const channelOf = (id) => channelRooms(App.state).find((c) => c.id === id) || null;
 
 /** 选中并播放某个成员频道（未开播时给一句说明，而不是去连一个空流）。 */
 function watchChannel(id) {
@@ -1909,6 +1931,8 @@ async function deleteChannel(id) {
 /* --------------------------- 动作分发 --------------------------- */
 export async function handleAction(act, el) {
   log.debug('动作', act, el?.dataset);
+  // 成员 / 服务器相关动作先交给 members.js 处理；未命中再走赛事动作
+  if (await handleMemberAction(act, el)) return;
   switch (act) {
     case 'filter':
       App.filter = el.dataset.filter || 'all';
@@ -1992,6 +2016,10 @@ export async function handleAction(act, el) {
     case 'route-home':
       // 回到「当前届」路由的同一页（根路径只跟管理员选定的当前届走）
       return hooks.goto?.('', App.view);
+    case 'route-user':
+      return hooks.goto?.('', 'user');
+    case 'route-server':
+      return hooks.goto?.('', 'server');
     case 'event-new':
       return openEventNewModal();
     case 'event-refresh':
@@ -2044,6 +2072,8 @@ export async function handleAction(act, el) {
       App.token = '';
       localStorage.removeItem(TOKEN_KEY);
       App.private = null; // 清掉隐私数据（UUID / QQ / 推流地址）
+      App.me = null;
+      App.server = null;
       toast('已退出登录', 'info');
       renderAdmin({ force: true });
       renderPublic();
@@ -2143,17 +2173,24 @@ export async function handleAction(act, el) {
 
 export async function login(key) {
   if (!key.trim()) {
-    toast('请输入管理 KEY', 'warn');
+    toast('请输入密钥', 'warn');
     return;
   }
   try {
     const res = await api('/auth', { method: 'POST', body: { key } });
     App.token = res.token;
-    localStorage.setItem('nte:token', res.token);
-    // 登录后才能取到选手隐私字段与推流地址
-    await refreshPrivate();
+    localStorage.setItem(TOKEN_KEY, res.token);
+    App.me = {
+      uid: res.uid || '',
+      name: res.name || '',
+      permission: res.permission || 'member',
+      isServer: res.permission === 'server_admin',
+      canManageEvents: res.permission === 'event_admin' || res.permission === 'server_admin',
+    };
+    // 登录后才能取到选手隐私字段与推流地址；/api/me 补上成员视图
+    await Promise.all([refreshPrivate(), refreshMeData()]);
     toast('登录成功', 'ok');
-    log.info('管理登录成功');
+    log.info('登录成功', App.me.permission);
     renderAdmin({ force: true });
     renderPublic();
   } catch (err) {
@@ -2363,6 +2400,9 @@ const PATCH_BUILDERS = {
 
 export async function handleForm(formEl) {
   const name = formEl.dataset.form;
+
+  // 成员 / 服务器相关表单先交给 members.js
+  if (await handleMemberForm(formEl)) return;
 
   if (name === 'admin-key') {
     const values = collectForm(formEl);

@@ -2,7 +2,20 @@
  * 只负责渲染与拉取诊断；表单提交/按钮动作由 actions.js 处理。
  */
 
-import { App, api, esc, fmtFull, hooks, isFinished, log, qs, qsa, stateKey } from './core.js';
+import {
+  App,
+  api,
+  canManageEvents,
+  esc,
+  fmtFull,
+  hooks,
+  isFinished,
+  isServerAdmin,
+  log,
+  qs,
+  qsa,
+  stateKey,
+} from './core.js';
 import {
   avaHtml,
   fieldArea,
@@ -103,6 +116,17 @@ export function renderAdmin({ force = false } = {}) {
   if (!App.token) {
     panel.innerHTML = '';
     gate.innerHTML = gateHtml();
+  } else if (!canManageEvents()) {
+    gate.innerHTML = '';
+    panel.innerHTML =
+      `<div class="panel"><div class="panel__head"><h2>赛事管理</h2>` +
+      `<span class="panel__hint">当前权限：成员</span></div><div class="panel__body">` +
+      `<div class="notice notice--warn">你是以<b>成员</b>身份登录的，不能管理赛事。` +
+      `可在「我的」页修改个人资料、直播间名字与凭据；` +
+      `如需创建 / 管理赛事，请联系服务器管理员把你的权限提升为「赛事管理员」。</div>` +
+      `<div class="tool-group" style="margin-top:10px">` +
+      `<button class="btn btn--sm btn--primary" type="button" data-act="route-user">前往「我的」</button>` +
+      `</div></div></div>`;
   } else if (App.state) {
     gate.innerHTML = '';
     panel.innerHTML = adminPanelHtml(App.state);
@@ -123,13 +147,15 @@ const isLeague = (s = App.state) => (s?.rules?.format || 'tournament') === 'leag
 
 const gateHtml = () =>
   `<div class="panel"><div class="gate">` +
-  `<div class="gate__title">管理端登录</div>` +
-  `<p class="gate__desc">输入赛事管理 KEY 以解锁比分录入、赛程生成与配置编辑。</p>` +
-  `<div class="field"><label for="adminKey">管理 KEY</label>` +
-  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入 KEY"></div>` +
+  `<div class="gate__title">赛事管理登录</div>` +
+  `<p class="gate__desc">用<b>成员密钥</b>或<b>服务器管理 KEY</b> 登录，以解锁比分录入、赛程生成与配置编辑。` +
+  `（普通成员只能修改自己的资料，见「我的」页。）</p>` +
+  `<div class="field"><label for="adminKey">密钥</label>` +
+  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥或管理 KEY"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
-  `<p class="gate__hint">初次使用：KEY 见服务启动日志（默认 <b>NTE-ADMIN</b>，请登录后尽快修改）。` +
-  `<br>忘记 KEY：在服务器上执行 <code>uv run python -m app --reset-key</code> 重置。</p>` +
+  `<p class="gate__hint">成员密钥由服务器管理员在「服务器 → 成员管理」里生成。` +
+  `<br>服务器主 KEY 见服务启动日志（默认 <b>NTE-ADMIN</b>，请登录后尽快修改）。` +
+  `<br>在本机（localhost / 127.0.0.1）直接访问时无需登录。</p>` +
   `</div></div>`;
 
 const EVENT_STATE_TEXT = {
@@ -376,6 +402,14 @@ export function adminPanelHtml(s) {
       ['active', '进行中'],
       ['closed', '已结束'],
     ]) +
+    fieldSelect(
+      'sport',
+      '比赛类型',
+      evt.sport || 'volleyball',
+      (s.sportPresets || []).map((p) => [p.key, p.label]),
+      { hint: '只影响界面称呼（参赛者 / 成绩 / 场次），不影响数据与赛制' }
+    ) +
+    fieldSwitch('ranked', '排名模式（关闭 = 娱乐记录，不排名 / 不晋级）', evt.ranked !== false) +
     fieldText('venue', '场地', evt.venue) +
     fieldText('organizer', '主办方', evt.organizer) +
     fieldText('logoText', 'Logo 文字', evt.logoText) +
@@ -490,7 +524,8 @@ export function adminPanelHtml(s) {
 
   return (
     panelHtml('系统状态', '实时诊断', `<div id="diagBox" class="kv"><div class="kv__row"><dt>加载中</dt><dd>…</dd></div></div>`) +
-    panelHtml('管理 KEY', '登录凭证', keyForm) +
+    // 服务器主 KEY 属于服务器级：只有服务器管理员能改
+    (isServerAdmin() ? panelHtml('管理 KEY', '服务器主密钥', keyForm) : '') +
     panelHtml(
       '主赛事',
       `${esc(s.eventName || s.eventId || '')} · 同期只有一个`,
