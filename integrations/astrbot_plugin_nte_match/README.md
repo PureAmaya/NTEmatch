@@ -16,10 +16,20 @@
 
 1. 把本目录（`astrbot_plugin_nte_match`）整个复制到 AstrBot 的 `data/plugins/` 下：
 
-   ```bash
-   # 假设 AstrBot 的数据目录是 /opt/astrbot/data
-   cp -r astrbot_plugin_nte_match /opt/astrbot/data/plugins/
-   ```
+  ```bash
+  # 假设 AstrBot 的数据目录是 /opt/astrbot/data
+  cp -r astrbot_plugin_nte_match /opt/astrbot/data/plugins/
+  # Docker 部署：拷进容器（拷完在面板「插件管理」里重载，或重启 AstrBot）
+  docker cp astrbot_plugin_nte_match <容器名>:/AstrBot/data/plugins/
+  ```
+
+> **别在 AstrBot 面板里用「从 URL 安装」填本站的插件地址**——它会 404，且与网络无关：
+> 面板认的是 GitHub 的 `…/tree/<分支>/<子目录>`，而下载时走的是 codeload 的
+> `…/zip/refs/heads/<分支>`，**codeload 只给整仓 zip、不接受子目录**，于是
+> `…/NTEmatch/zip/refs/heads/master`（整仓）是 200，
+> `…/master/integrations/astrbot_plugin_nte_match` 是 404。这条路要求
+> **仓库根目录就是插件**，而本插件在整站的子目录里，所以只能「拷目录」这一种装法。
+
 
 2. 到 **NTE 比赛站点 →「服务器 → QQ 机器人 → 查询接口令牌」**点「生成令牌」，
    复制那串 `nte_…`（**只显示一次**）；

@@ -1,4 +1,4 @@
-/* 公开视图渲染：总览 / 赛程 / 选手 / 直播 / HUD。
+﻿/* 公开视图渲染：总览 / 赛程 / 选手 / 直播 / HUD。
  * 仅生成 DOM，不绑定事件（按钮统一以 data-act 标记，由 actions/app 委托）。
  */
 
@@ -2304,6 +2304,14 @@ export function renderChannels(s) {
   if (!qs('#channelStage')) return false;
   const all = channelRooms(s);
   const pool = channelPool(s);
+  // 状态快照不完整（`channels` / `streams` 两个字段都缺失：还没加载完，或中途被一次
+  // 局部状态覆盖过）→ **别动舞台**。否则会闪一下「还没有直播间」，还会把选中的频道
+  // 清成 null，看起来就像「来回切两次线路，直播就没了」。
+  const known = Array.isArray(s?.channels) || Array.isArray(s?.streams);
+  if (!known && App.channelId) {
+    log.debug('频道列表暂时未知，保留当前舞台');
+    return false;
+  }
   // 选中的频道不在了（被删 / 流名被清掉）→ 落到第一个在播的，其次第一个能播的
   let picked = pool.find((c) => c.id === App.channelId) || null;
   if (!picked) {
@@ -2424,12 +2432,19 @@ export function renderView(view, s = App.state) {
  * 也要立刻收掉）。
  */
 export function syncTabs(s, page = App.view) {
-  // 单个页签的可见性：需要收起且当前正停在该页时，回落到总览
+  // 单个页签的可见性：这一条页签被收起、而人恰好要去的正是它时，才把人挪到总览
+  // （例如某一届刚完结 → 直播页签收起，而此刻正站在直播页）。
+  //
+  // 为什么比的是**目标页 page** 而不是 App.view（旧值）：goto 里这一步发生在 setView 之前，
+  // 从赛事页点页脚去独立页（/developer、/channels、/events…）时 App.view 还是旧页，
+  // 用旧值会误触发一次「回落到总览」——而此刻 App.routeEvent 已经被清成 ''，
+  // 于是 goto('', 'overview') 又被「赛事页必须带届 ID」的规则弹回主页：
+  // 表现就是「第一次点开发者跳到主页，第二次才进去」。
   const setTab = (view, allow) => {
     const tab = qsa('.tab').find((t) => t.dataset.view === view);
     if (!tab || tab.hidden === !allow) return;
     tab.hidden = !allow;
-    if (!allow && App.view === view) {
+    if (!allow && page === view) {
       hooks.goto?.(App.routeEvent, 'overview', { replace: true });
     }
   };

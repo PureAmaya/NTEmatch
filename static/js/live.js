@@ -40,6 +40,33 @@ function loadHlsLib() {
   return hlsLoading;
 }
 
+/**
+ * 把信令失败的 HTTP 状态翻成人话。
+ *
+ * 404 是最常见的那种，但它有**两种完全不同的含义**，实测 MediaMTX 的应答就能分开：
+ *
+ * * ``{"status":"error","error":"no stream is available on path…"}`` —— 路径对、**这一路没人推**；
+ * * ``404 page not found``（Go 路由的默认 404）—— **这个地址压根不存在**，多半是站点里
+ *   直播线路的端口 / 地址填错了。
+ *
+ * 两者混成一句「没有推流」会把人带去查推流端，其实该去改地址——所以按应答体分开说。
+ */
+function signalError(status, bodies = []) {
+  if (status === 404) {
+    if (bodies.some((b) => /no stream is available/i.test(b))) {
+      return '这个机位现在没有推流（媒体服务器上没有这个流名）';
+    }
+    if (bodies.some((b) => /page not found/i.test(b))) {
+      return '连不上这个观看地址（媒体服务器上没这个路径）：检查站点里直播线路的端口与地址';
+    }
+    return '这个机位现在没有推流（媒体服务器上没有这个流名）';
+  }
+  if (status === 401 || status === 403) {
+    return `媒体服务器拒绝了信令（HTTP ${status}）：检查推流鉴权是否放行观看`;
+  }
+  return `信令失败 HTTP ${status}`;
+}
+
 function waitIceComplete(pc, timeout = 3000) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
@@ -228,12 +255,29 @@ function makePlayer(ids) {
     await waitIceComplete(pc);
     if (myToken !== this.token) throw new Error('已取消');
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/sdp' },
-      body: pc.localDescription.sdp,
-    });
-    if (!res.ok) throw new Error(`信令失败 HTTP ${res.status}`);
+    // 信令端点：MediaMTX 的**读流端点是 `<路径>/whep`**（它自带的播放页发的也是这个），
+    // 而裸路径 `<路径>` 是那张**播放页**（只认 GET）——对它 POST 只会拿到 Go 路由的
+    // 「404 page not found」，跟随便编个路径完全一样（实测过，见 README）。
+    // 所以先发 /whep；只有 404/405（这个端点不存在）才退回裸路径，兼容只认裸路径的老版本。
+    const endpoints = url.endsWith('/whep') ? [url] : [`${url}/whep`, url];
+    let res = null;
+    const bodies = []; // 各端点的应答体：两种 404 意思不同，报错时要认出来（见 signalError）
+    for (const endpoint of endpoints) {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: pc.localDescription.sdp,
+      });
+      if (res.ok) {
+        url = endpoint;
+        break;
+      }
+      // 只有「这个端点不存在」才换下一个；其它状态码按它本身报错
+      if (res.status !== 404 && res.status !== 405) break;
+      bodies.push(await res.text().catch(() => ''));
+      log.warn('信令端点在媒体服务器上不存在，换下一个', endpoint, res.status);
+    }
+    if (!res.ok) throw new Error(signalError(res.status, bodies));
     await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
     this.setState('WebRTC 播放中');
     log.info('直播使用 WebRTC', url);

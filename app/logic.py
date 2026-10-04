@@ -310,7 +310,7 @@ def current_round_of(cfg: Config, player_id: str) -> Round | None:
 # 对外可见地址的字段白名单。全是**媒体服务器的源地址**（不做反代），前端直连：
 #   ``webrtc`` = ``<baseUrl>/<流名>``（8889）观看；
 #   ``hls``    = ``<hlsBase>/<流名>``（8888）观看。
-# 观看地址就是「端口 + 流名」，没有 ``/whep`` 之类的子路由。
+# 观看地址就是「端口 + 流名」；播放器发信令时另接 ``/whep``（见 live.js 与 README）。
 PLAY_ENDPOINT_KEYS = ("key", "webrtc", "hls")
 
 
@@ -1098,11 +1098,15 @@ def validate_config(cfg: Config) -> list[str]:
 def key_endpoints(stream: StreamConfig, key: str) -> dict[str, str]:
     """按流名派生**推流与观看**的源站地址（媒体服务器直连，不做反代）。
 
-    一共三个地址，都只在端口上按流名区分，没有 ``/whep`` 这类子路由：
+    一共三个地址，都只在端口上按流名区分：
 
     * 推流（WHIP，8889）：``{baseUrl}/{流名}/whip``；
     * 观看（WebRTC，8889）：``{baseUrl}/{流名}``；
     * 观看（HLS，8888）：``{hlsBase}/{流名}``。
+
+    这三个地址**下发的都是裸路径**：MediaMTX 自带的播放页就是它，「打开源页」要的也是它。
+    播放器（``live.js``）跑 WebRTC 时另外往 ``{baseUrl}/{流名}/whep`` 发信令（MediaMTX 的
+    读流端点），404/405 才退回裸路径——两种版本都不用改配置。
 
     ``whipPush`` 属于凭据，只走 :func:`push_endpoints` 下发管理端；
     两个观看地址走 :func:`play_endpoints`，可对用户端公开。

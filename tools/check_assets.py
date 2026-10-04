@@ -7,7 +7,8 @@
 2. ``import ... from './x.js'`` 指向的文件真的存在（改名/挪文件后的漏网之鱼）；
 3. **导入的符号真的被导出**（``import { foo }`` 而 ``x.js`` 里根本没有 ``foo``）——
    这类错没有任何静态检查兜着，只有在浏览器里点开那个页面才会炸；
-4. ``index.html`` 里引用的 ``/static/...`` 文件真的存在。
+4. ``index.html`` 里引用的 ``/static/...`` 文件真的存在；
+5. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）。
 
 用法：``uv run python tools/check_assets.py``
 """
@@ -171,6 +172,27 @@ def check_icons() -> list[str]:
     return problems
 
 
+def check_sync_tabs_fallback() -> list[str]:
+    """``syncTabs`` 的「页签收起 → 回落」必须按**目标页**判断，不能按 ``App.view``（旧值）。
+
+    踩过的坑：从赛事页点页脚「开发者」去 ``/developer`` 时，`App.view` 还是 ``overview``，
+    于是误触发一次「回落到总览」；而那一刻 ``App.routeEvent`` 已被清空，``goto('', 'overview')``
+    又被「赛事页必须带届 ID」的规则弹回**主页**——表现就是「第一次点跳到主页，第二次才进去」。
+    这类 bug 前端没有编译期保护，所以在这里钉一句源码约定。
+    """
+    source = (JS_DIR / "views.js").read_text(encoding="utf-8")
+    bad = "!allow && App.view === view"
+    if bad in source:
+        return [
+            (
+                "views.js 的 syncTabs 又按 App.view（旧值）判断回落了："
+                "会从赛事页去独立页时把路由踩回主页，请改成 page === view"
+            )
+        ]
+    print("  OK  syncTabs 的页签回落按目标页判断（不会踩掉独立页路由）")
+    return []
+
+
 def main() -> int:
     print("前端静态资源自检：")
     problems = (
@@ -179,6 +201,7 @@ def main() -> int:
         + check_exported_symbols()
         + check_icons()
         + check_index_assets()
+        + check_sync_tabs_fallback()
     )
     for line in problems:
         print(f"  !! {line}")
