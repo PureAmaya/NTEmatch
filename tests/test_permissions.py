@@ -9,7 +9,12 @@
 
 from __future__ import annotations
 
-from app.main import app
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+
+from app.main import _apply_stream_patch, _apply_ui_patch, app
 
 # 允许的闸门（值 = 依赖函数名）
 GUARDS = {
@@ -185,6 +190,33 @@ def test_public_reads_stay_public():
     """有意公开的读取接口（首页数据、健康检查）不该被顺手收紧。"""
     public = {path for (method, path), names in ROUTES if method == "GET" and not (names & GUARDS)}
     assert PUBLIC_READS <= public, f"这些本应公开：{sorted(PUBLIC_READS - public)}"
+
+
+def test_media_server_settings_are_server_only():
+    """``/api/config`` 里的**直播媒体服务器设置**只有服务器管理员能改。
+
+    这条闸门是**按补丁内容**判的（同一个接口还要给赛事管理员改赛制与文案），静态列表
+    看不出来，所以在这里单钉一条：赛事管理员碰地址 / 凭据一律 403，只能开关「启用直播」。
+    """
+    event_admin = SimpleNamespace(is_server=False)
+    for key in ("baseUrl", "apiBase", "apiUser", "apiPass", "apiPassClear", "whipPush", "pushToken"):
+        with pytest.raises(HTTPException) as err:
+            _apply_stream_patch({key: "x"}, event_admin)
+        assert err.value.status_code == 403, f"{key} 没被拦住"
+    _apply_stream_patch({"enabled": False}, event_admin)  # 开关放行：整站直播的开关
+
+
+def test_ui_config_is_server_only():
+    """界面配置（主题色 / 分享图 / 展示开关）是**站点级外观**：赛事管理员碰它一律 403。
+
+    和直播配置同一条思路：表单从赛事管理页搬走了，但真正把关的是这里——
+    前端藏起来不算数。
+    """
+    event_admin = SimpleNamespace(is_server=False)
+    with pytest.raises(HTTPException) as err:
+        _apply_ui_patch({"accent": "lime"}, event_admin)
+    assert err.value.status_code == 403
+    _apply_ui_patch({"accent": "lime"}, SimpleNamespace(is_server=True))  # 服务器管理员放行
 
 
 def test_markdown_media_writes_need_login_only():

@@ -1087,7 +1087,10 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
                 "baseUrl": stream["base_url"],
                 "apiBase": stream["api_base"],
                 "apiUser": stream["api_user"],
-                "apiPass": stream["api_pass"],
+                # API 密码是**凭据**：明文只留服务端，这里只回一个布尔。
+                # 前端据此显示「已配置（留空 = 不修改）」，提交时留空即保持原值
+                # （见 logic.management_stream_config 与 main._apply_stream_patch）。
+                "hasApiPass": bool(stream["api_pass"]),
                 "hlsBase": stream["hls_base"],
                 "streamKey": stream["stream_key"],
             "pushToken": stream["push_token"],

@@ -58,7 +58,7 @@ import {
   renderHomeGroups,
 } from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
-import { ChannelLive, probeLiveHealth } from './live.js';
+import { ChannelLive, Live, probeLiveHealth } from './live.js';
 import { channelRooms, focusLive, renderChannels, renderPublic } from './views.js';
 import { handleMemberAction, handleMemberForm, refreshMeData } from './members.js';
 
@@ -2068,6 +2068,7 @@ export async function handleAction(act, el) {
       return;
     case 'live-select':
       App.livePlayerId = el.dataset.pid || null;
+      Live.stoppedByUser = false; // 主动选台 = 想看，解除「别再自动播」的标记
       log.info('切换直播机位', App.livePlayerId);
       if (App.state) focusLive(App.state);
       return;
@@ -2086,6 +2087,7 @@ export async function handleAction(act, el) {
       return watchChannel(el.dataset.id);
     case 'channel-play': {
       const channel = channelOf(App.channelId);
+      ChannelLive.stoppedByUser = false; // 主动点「播放」：恢复自动开播的资格
       if (channel) ChannelLive.playRoom(channel.play || null);
       return;
     }
@@ -2109,6 +2111,7 @@ export async function handleAction(act, el) {
     }
     case 'channel-proto': {
       const proto = el.dataset.proto || '';
+      ChannelLive.stoppedByUser = false; // 换线路也是「我想看」
       App.liveProto = App.liveProto === proto ? '' : proto;
       try {
         localStorage.setItem(LIVE_PROTO_KEY, App.liveProto);

@@ -705,6 +705,129 @@ function serverStatusPanelHtml() {
   return panelHtml('服务器状态', '实时', body);
 }
 
+/**
+ * 直播配置（**站点级**，只有服务器管理员看得到）。
+ *
+ * 这一块原来摆在赛事管理页里：于是**赛事管理员**（不是服务器管理员）也能看到并改
+ * 媒体服务器的根地址、API 地址 / 账号 / 密码与推流令牌——一处媒体服务器给整站所有届
+ * 共用，本来就该由服务器管理员维护。现在赛事页只留「启用直播」一个开关（见 admin.js）。
+ *
+ * **API 密码从不回填**：服务端只回 `hasApiPass` 布尔，明文只留服务端
+ * （见 logic.management_stream_config）。
+ * 所以这里值恒为空、把「有没有配」写在 placeholder 上；留空 = 不修改，要清空得勾那个开关
+ * ——与 AstrBot 的 API Key 同一套规矩。
+ */
+function streamPanelHtml() {
+  const stream = App.server?.config?.stream;
+  if (!stream) {
+    // 拿不到配置就**别渲染表单**：空输入框一保存会把已填的地址清空（管理端最贵的事故）
+    return panelHtml(
+      '直播配置',
+      'MediaMTX',
+      `<div class="notice notice--warn">没取到直播配置（服务器数据可能没加载完整）。` +
+        `点下面的「刷新」重试——<b>不要</b>在空表单上保存，那会把已有的地址清掉。</div>`
+    );
+  }
+  const form =
+    `<form class="form form--2" data-form="stream">` +
+    fieldSwitch('enabled', '启用直播', stream.enabled !== false) +
+    fieldSelect(
+      'mode',
+      '默认播放线路',
+      stream.mode,
+      [
+        ['auto', '自动（WebRTC，不通再退 HLS）'],
+        ['webrtc', 'WebRTC（8889，UDP，低延迟）'],
+        ['hls', 'HLS（8888，TCP，抗抖动）'],
+      ],
+      { hint: '观众还能在直播页自行切换线路，不必改这里' }
+    ) +
+    fieldText('provider', '服务类型', stream.provider) +
+    fieldText('streamKey', '默认流名（兜底）', stream.streamKey, {
+      hint:
+        '仅在选手没有流名时使用；选手各自的地址由他的推流流名决定（整届固定不变）。' +
+        '流名只能用字母、数字、连字符(-)与下划线(_)',
+    }) +
+    fieldText('pushToken', '推流令牌（主直播间 / 遗留频道）', stream.pushToken, {
+      hint:
+        '留空 = 这些流名只要登记过就能推（旧行为）；填了则推它们也必须带这个令牌。' +
+        '成员机位不受它影响——那边一律要求「推流 ID + 该成员自己的 Bearer 令牌」。' +
+        '令牌只收 ASCII 字符（字母 / 数字 / 符号）且不能有空格',
+    }) +
+    fieldSwitch('verifyTls', '校验源站 HTTPS 证书', stream.verifyTls !== false, {
+      hint: '只影响「信号探测」；自签名证书时关掉。观众侧仍需浏览器信任的证书',
+    }) +
+    `<div class="notice" style="grid-column:1/-1"><b>推流只有 WHIP；观众看直播只有两个地址：</b>` +
+    `<code>&lt;WebRTC 根地址&gt;/&lt;流名&gt;/</code>（8889）与 <code>&lt;HLS 根地址&gt;/&lt;流名&gt;/</code>（8888），` +
+    `打开就能看，播放器用的也是这两个（信令另外接 <code>/whep</code>）。地址都是<b>源站地址</b>` +
+    `（本站不做反代），因此站点是 HTTPS 时源站也要 HTTPS。</div>` +
+    `<div style="grid-column:1/-1">${fieldText('baseUrl', 'WebRTC 根地址', stream.baseUrl, {
+      hint: '8889 端口：WHIP 推流 + 观众观看地址，例如 https://live.example.com:8889',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldText('apiBase', 'MediaMTX API 地址', stream.apiBase, {
+      hint: '默认 http://live.example.com:9997（mediamtx.yml 里 api: yes）。' +
+        '只有媒体服务器上报「正在推流」的机位才会显示「直播中」；留空则不显示任何直播标记',
+    })}</div>` +
+    // 控制 API 开了鉴权（mediamtx.yml 的 authInternalUsers）时必须填下面两项，
+    // 否则查询回 401，界面上就是那句「媒体服务器 API 不可达」
+    `<div style="grid-column:1/-1">${fieldText('apiUser', 'MediaMTX API 用户名', stream.apiUser, {
+      hint: '媒体服务器配了 API 鉴权时必填（等价于 curl -u 用户名:密码）；留空 = 请求不带认证',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldText('apiPass', 'MediaMTX API 密码', '', {
+      type: 'password',
+      ph: stream.hasApiPass ? '已配置（留空 = 不修改）' : '未配置（留空 = 请求不带认证）',
+      hint: '属于凭据：明文只存服务端、不下发到浏览器。留空表示保持已保存的密码不变',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldSwitch('apiPassClear', '清除已保存的 API 密码', false, {
+      hint: '勾上再保存 = 清空（媒体服务器关掉 API 鉴权时才需要）',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldText('hlsBase', 'HLS 根地址', stream.hlsBase, {
+      hint: '8888 端口：观众观看地址，例如 https://live.example.com:8888',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldText('whipPush', '默认流名的 WHIP 地址', stream.whipPush, {
+      hint: '主直播间（默认流名）的推流地址；选手 / 频道各自的地址由他们自己的流名派生',
+    })}</div>` +
+    `<div style="grid-column:1/-1">${fieldText('poster', '封面图 URL', stream.poster)}</div>` +
+    `<div style="grid-column:1/-1">${fieldArea('note', '备注', stream.note)}</div>` +
+    `<div class="form-actions" style="grid-column:1/-1">` +
+    `<button class="btn btn--primary" type="submit">保存直播配置</button></div></form>`;
+  return panelHtml('直播配置', 'MediaMTX · 站点级', form);
+}
+
+/**
+ * 界面配置（**只有服务器管理员**看得到）。
+ *
+ * 主题色 / 分享图 / 展示开关和直播配置一样只出现在这里：赛事管理页不再提供这块表单，
+ * 写接口那边同样把关（见 main._apply_ui_patch）。
+ *
+ * 注意这一份**是按届保存的**（数据库里就是 `event_ui(event_id, …)`）：表单改的是
+ * **当前届**那一套，所以标题里把届名写出来——否则「改完没生效」多半只是在改别的届。
+ */
+function uiPanelHtml() {
+  const ui = App.state?.ui || {};
+  const eventName = App.state?.eventName || App.state?.event?.name || App.state?.eventId || '';
+  const form =
+    `<form class="form form--2" data-form="ui">` +
+    fieldSelect('accent', '主题色', ui.accent, [
+      ['cyan', '青'], ['violet', '紫'], ['magenta', '品红'], ['amber', '琥珀'], ['lime', '青柠'],
+    ]) +
+    fieldText('accentCustom', '自定义主题色', ui.accentCustom, {
+      hint: '十六进制，如 #ff6a00；填了就覆盖上面的预设（副色按色相自动推出来）',
+    }) +
+    fieldText('ogImage', '分享图（og:image）', ui.ogImage, {
+      hint: '留空 = 内置那张 /og.png；可填 /static/xxx.png 或完整网址，1200×630 最佳',
+    }) +
+    // 注：UUID / QQ 属于隐私字段，任何情况下都不下发用户端，因此不再提供开关
+    fieldSwitch('showAvatar', '显示选手头像', ui.showAvatar) +
+    fieldSwitch('revealResults', '公开展示结果', ui.revealResults) +
+    `<div class="notice" style="grid-column:1/-1">这一份作用于<b>当前届` +
+    `${eventName ? `：${esc(eventName)}` : ''}</b>（主题与分享图按届保存）。` +
+    `要给别的届改：先在主页点开那一届（或到「届次管理」里切），回来再保存。</div>` +
+    `<div class="form-actions" style="grid-column:1/-1">` +
+    `<button class="btn btn--primary" type="submit">保存界面配置</button></div></form>`;
+  return panelHtml('界面配置', '主题与展示 · 按届保存', form);
+}
+
 export function renderServerPage() {
   const host = qs('#serverBody');
   if (!host) return;
@@ -758,10 +881,12 @@ export function renderServerPage() {
   host.innerHTML =
     serverStatusPanelHtml() +
     sitePanelHtml() +
+    uiPanelHtml() +
     membersPanelHtml() +
     eventsPanelHtml() +
     backupPanelHtml() +
     qqbotPanelHtml() +
+    streamPanelHtml() +
     loginGuardPanelHtml() +
     serverConfigPanelHtml() +
     // 服务器信息（一篇说明）与服务器通知（一条条要人马上看到的）放一起：
@@ -1430,6 +1555,24 @@ export async function handleMemberAction(act, el) {
 /** 处理成员 / 服务器相关表单；返回是否已处理。 */
 export async function handleMemberForm(formEl) {
   const name = formEl.dataset.form;
+  // 只接**服务器页**上那两张站点级表单（直播配置 / 界面配置）。赛事管理页那个
+  // 「启用直播」开关仍走通用的 PATCH_BUILDERS 分支：那边不需要重绘本页，权限也更低。
+  // 放在这里是为了两件事：保存后刷新面板（`hasApiPass` 会从「未配置」变「已配置」），
+  // 以及**清掉刚输入的密码**——明文不该在 DOM 里多留一秒。
+  if ((name === 'stream' || name === 'ui') && formEl.closest('#serverBody')) {
+    const v = collectForm(formEl);
+    try {
+      await api('/config', { method: 'PUT', auth: true, body: { [name]: v } });
+      toast(name === 'ui' ? '界面配置已保存' : '直播配置已保存', 'ok');
+      await refreshServerData({ silent: true });
+      renderServerPage();
+      // 换主题 / 换分享图要立刻生效：让全局状态重新过一遍 applyState
+      if (name === 'ui' && hooks.refreshState) await hooks.refreshState();
+    } catch (err) {
+      toast(err.message, 'err', 7000);
+    }
+    return true;
+  }
   if (name === 'server-html') {
     const v = collectForm(formEl);
     try {

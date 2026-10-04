@@ -113,6 +113,9 @@ function makePlayer(ids) {
     room: null, // 当前机位的地址集合（key_endpoints 结果）
     // 正在播的「机位 + 线路」：只有两者都没变、且画面确实还活着时才跳过重连
     playing: { key: '', mode: '' },
+    // 用户**主动**按过「停止」：此后不再自动开播（否则刚停掉、一次信号刷新又给放上了）。
+    // 任何「用户自己想看」的动作（选台 / 点播放 / 换线路）都会把它清掉。
+    stoppedByUser: false,
     hlsInst: null, // hls.js 实例（非原生 HLS 的浏览器才有）
 
   el: () => q(ids.video),
@@ -390,6 +393,7 @@ function makePlayer(ids) {
       }
     }
     if (manual) {
+      this.stoppedByUser = true; // 别再自动开播把他烦回来（见 stoppedByUser 注释）
       this.setState('已停止');
       this.setCover('已停止播放', '点击「播放」重新连接直播信号');
       log.info('直播已手动停止');
@@ -577,6 +581,7 @@ export function installStageDelegation() {
     // 所以机位 / 比赛切换必须在这里处理，否则点了没反应。
     if (act === 'live-select') {
       const pid = btn.dataset.pid || null;
+      Live.stoppedByUser = false; // 主动点某一路 = 想看，解除「别再自动播」的标记
       if (App.livePlayerId !== pid) {
         App.livePlayerId = pid;
         log.info('切换直播机位', pid);
@@ -593,8 +598,10 @@ export function installStageDelegation() {
       }
       return;
     }
-    if (act === 'live-play') Live.playSelected(App.state);
-    else if (act === 'live-stop') Live.stop(true);
+    if (act === 'live-play') {
+      Live.stoppedByUser = false; // 用户点了「播放」：恢复自动开播的资格
+      Live.playSelected(App.state);
+    } else if (act === 'live-stop') Live.stop(true);
     else if (act === 'live-open') {
       const url = watchUrlOf(Live.room);
       if (url) window.open(url, '_blank', 'noopener');

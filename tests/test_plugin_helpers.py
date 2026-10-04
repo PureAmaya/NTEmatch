@@ -191,6 +191,102 @@ def test_sender_id_falls_back_to_message_obj(plugin_module):
     assert plugin_module._sender_id(_FakeEvent()) == ""
 
 
+class _At:
+    """消息链里的 At 片段（`_at_targets` 只读它的 ``qq``）。"""
+
+    def __init__(self, qq):
+        self.qq = qq
+
+
+class _Msg:
+    def __init__(self, *segs):
+        self.message = list(segs)
+
+
+async def test_credential_commands_send_you_to_private_chat(plugin_module):
+    """三条自助命令都只调站点的 ``/credential``，群里只说「去私聊查收」。
+
+    **新值不在插件手里**：站点把密钥 / 令牌直接私聊给本人，响应里本来就没有明文
+    （见 ``app/bot_api.py``），所以插件这一侧连「不小心打进群」的机会都没有。
+    """
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    calls: list[tuple] = []
+
+    async def fake_post(path, payload=None):
+        calls.append((path, payload))
+        return {"ok": True, "kind": "key", "sent": True, "note": "登录密钥已重置"}
+
+    plugin._post = fake_post
+    out = [item async for item in plugin.cmd_rotate_key(_FakeEvent(sender="10001", group="g1"))]
+    assert calls == [
+        ("credential", {"qq": "10001", "targetQq": "", "what": "key", "value": ""})
+    ]
+    assert out[0]["type"] == "plain" and "私聊" in out[0]["text"]
+
+    await _collect(plugin.cmd_rotate_token(_FakeEvent(sender="10001")))
+    assert calls[-1][1]["what"] == "token"
+
+    await _collect(plugin.cmd_set_stream_key(_FakeEvent(sender="10001"), "tom"))
+    assert calls[-1][1] == {"qq": "10001", "targetQq": "", "what": "streamId", "value": "tom"}
+
+
+async def _collect(gen):
+    """把异步生成器跑完，返回它 yield 出来的结果。"""
+    return [item async for item in gen]
+
+
+async def test_stream_key_command_explains_usage_without_value(plugin_module):
+    """没给流名时直接说用法（不白跑一趟站点）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_post(path, payload=None):
+        raise AssertionError("没给流名时不该调站点")
+
+    plugin._post = fake_post
+    out = await _collect(plugin.cmd_set_stream_key(_FakeEvent(sender="10001")))
+    assert "用法" in out[0]["text"] and "改推流码" in out[0]["text"]
+
+
+async def test_credential_failure_keeps_the_change_honest(plugin_module):
+    """私聊没发出去时要讲清「已经换好了、只是你没收到」——否则他会反复重试，每试一次作废一把。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_post(path, payload=None):
+        return {"ok": True, "sent": False, "detail": "Bot not found", "note": "直播令牌已重置"}
+
+    plugin._post = fake_post
+    out = await _collect(plugin.cmd_rotate_token(_FakeEvent(sender="10001")))
+    text = out[0]["text"]
+    assert "已重置" in text and "私聊" in text and "再发一次" in text
+
+
+async def test_grant_points_to_self_service_when_key_cannot_be_sent(plugin_module):
+    """站点没能把新成员密钥私聊出去时，群里给出「他自己重置换新」的办法。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_post(path, payload=None):
+        return {"ok": True, "created": True, "name": "张三", "keySent": False, "detail": "Bot not found"}
+
+    plugin._post = fake_post
+    event = _FakeEvent(sender="10001", group="g1", message_obj=_Msg(_At("10002")))
+    out = await plugin._grant(event, "member")  # _grant 返回单条结果（不是生成器）
+    assert "比赛重置密钥" in out["text"]
+    assert "张三" in out["text"]
+
+
+async def test_grant_confirms_private_delivery(plugin_module):
+    """站点把密钥私聊出去之后，群里只说「已私聊发给 TA」——不带任何明文。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_post(path, payload=None):
+        return {"ok": True, "created": True, "name": "张三", "keySent": True}
+
+    plugin._post = fake_post
+    event = _FakeEvent(sender="10001", group="g1", message_obj=_Msg(_At("10002")))
+    out = await plugin._grant(event, "event_admin")
+    assert "赛事管理员" in out["text"] and "私聊" in out["text"]
+
+
 def test_call_cooldown_blocks_repeat(plugin_module):
     """召集：同一会话立刻再发要被挡；换个会话不受影响。"""
     plugin = plugin_module.NTEMatchPlugin(context=None)
@@ -256,7 +352,7 @@ def test_help_doc_lists_every_command(plugin_module):
     """
     source = PLUGIN.read_text(encoding="utf-8")
     commands = re.findall(r'@filter\.command\(\s*"([^"]+)"', source)
-    assert len(commands) == 16, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
+    assert len(commands) == 19, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
     doc = (PLUGIN.parent / "HELP.md").read_text(encoding="utf-8")
     for name in commands:
         assert name in plugin_module.HELP_TEXT, f"HELP_TEXT 里缺命令：{name}"

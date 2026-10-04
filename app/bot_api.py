@@ -14,12 +14,17 @@
 | `GET /api/bot/managers` | **有资格召集**的人的 QQ（服务器管理员 + 举办者） |
 | `GET /api/bot/query` | 直接拿到**可以原样发到群里**的纯文本（分段已切好） |
 | `GET /api/bot/whoami` | 按 QQ 认人：这个人在站内是什么身份、有没有权限 |
-| `POST /api/bot/members` | 群里授权 / 添加成员（**仅服务器管理员**，按请求者 QQ 判定） |
+| `POST /api/bot/members` | 群里授权 / 添加成员（**仅服务器管理员**；新建成员时**站点直接把密钥私聊给本人**） |
 | `GET /api/bot/my-links` | 本人的推流地址 + **站内**直播间地址 |
-| `POST /api/bot/notify` | 把一条消息**私聊**发给某人（帮助说明 / 新密钥 / 推流地址） |
+| `POST /api/bot/credential` | 凭据重置：重置登录密钥 / 重置直播令牌 / 改推流码（默认改自己；服务器管理员可代改，**新值只私聊给被改的那个人**） |
+| `POST /api/bot/notify` | 把一条消息**私聊**发给某人（帮助说明 / 推流地址） |
 
-前六个是只读查询，后四个会**写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，
-不是用户手输），权限判定在站点这一侧；密钥只走私聊、不授予 ``server_admin``。
+前面几个 ``GET`` 是只读查询；``POST /members``、``POST /credential`` 与 ``POST /notify`` 会
+**写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，不是用户手输），权限判定在站点这一侧；
+密钥只走私聊、不授予 ``server_admin``。
+
+**凭据永远不由接口回话**：轮换出来的密钥 / 令牌只在**站点发出的那条私聊**里出现，
+响应体里只有「发了没发出去」——插件拿不到明文，也就打不进群里。
 
 ``/api/bot/query`` 的 ``kind`` 清单见 ``/api/bot/manifest``。其中 ``live``（当前直播）
 是**全局**信息（不挑届次），并且会**真的探测一次**媒体服务器（最多等 3 秒）——
@@ -43,6 +48,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from . import live, logic, qqbot
 from .auth import verify_secret
 from .logging_conf import get_logger
+from .members import ensure_stream_unique
 from .models import Member, NTEModel
 from .store import store
 
@@ -68,10 +74,49 @@ class BotGrantPayload(NTEModel):
 
 
 class BotNotifyPayload(NTEModel):
-    """私聊投递：给某个 QQ 发一条文本（帮助文档 / 新密钥 / 推流地址）。"""
+    """私聊投递：给某个 QQ 发一条文本（帮助文档 / 推流地址）。"""
 
     qq: str = ""
     text: str = ""
+
+
+class BotCredentialPayload(NTEModel):
+    """凭据重置：默认改**自己**，服务器管理员可以替别人改。
+
+    ``what`` 三选一：
+
+    * ``key``    —— 重置登录密钥（旧密钥立刻失效）；
+    * ``token``  —— 重置直播令牌（Bearer；要求已有推流码）；
+    * ``streamId`` —— 改推流码，新值放在 ``value`` 里。
+
+    ``target_qq`` 留空 = 改自己（谁都能改自己的）；填了别人 = 只有服务器管理员能这么做。
+    **无论改谁，新值都只私聊给被改的那个人**——服务器管理员也看不到。
+    """
+
+    qq: str = ""
+    target_qq: str = ""
+    what: str = ""
+    value: str = ""
+
+
+#: ``what`` 的写法容错：插件与脚本都可能写成别的形式
+_CREDENTIAL_ALIAS = {
+    "key": "key",
+    "password": "key",
+    "secret": "key",
+    "登录密钥": "key",
+    "密钥": "key",
+    "token": "token",
+    "bearer": "token",
+    "streamtoken": "token",
+    "直播令牌": "token",
+    "令牌": "token",
+    "streamid": "streamId",
+    "stream_id": "streamId",
+    "streamkey": "streamId",
+    "推流码": "streamId",
+    "推流id": "streamId",
+}
 
 
 def _clean_qq(raw: Any) -> str:
@@ -104,6 +149,66 @@ def _actor_member(qq: str) -> Member:
     if not member.active:
         raise HTTPException(status_code=403, detail="你的成员账号已被停用，无法操作")
     return member
+
+
+async def _send_private(settings: dict[str, Any], qq: str, text: str) -> dict[str, Any]:
+    """让站点把一条消息**私聊**发给某个 QQ（群里推送走的是同一条通道）。
+
+    凭据就靠这一层做到「只走私聊」：接口只回「发了没有」，明文连调用方都拿不到。
+    """
+    clean = _clean_qq(qq)
+    if not clean:
+        return {"ok": False, "detail": "没有目标 QQ"}
+    umo = qqbot.private_umo(settings, clean)
+    result = await qqbot.send_text(text, settings=settings, umo=umo)
+    if not result.get("ok"):
+        log.warning("私聊投递失败 | qq=%s | %s", clean, result.get("detail"))
+    return result
+
+
+def _secret_notice(kind: str, site: str) -> str:
+    """拿到新凭据后必须跟着的那段提醒。
+
+    密钥与令牌都是「谁拿到谁就能用」：密钥能登录、令牌能推流。所以除了让他保存好，
+    还要说清两件事——这条消息本身也别外传；**觉得可能泄露就立刻再重置一次**
+    （旧值随即作废，这正是自助重置存在的意义）。
+    """
+    if kind == "key":
+        return (
+            "注意：任何拿到这把密钥的人都能用它登录你的账号（改资料，有权限的话还能管赛事）。\n"
+            "别把这条消息转给别人；如果它可能被别人看到，马上再发一次「比赛重置密钥」"
+            f"（旧密钥立即失效），或到 {site}/user 再轮换一次。"
+        )
+    return (
+        "注意：任何拿到这串令牌的人都能用你的推流码往你直播间推流（把你的画面顶掉）。\n"
+        "别把这条消息转给别人；如果它可能被别人看到，马上再发一次「比赛重置令牌」"
+        "（旧令牌立即失效）。"
+    )
+
+
+def _credential_target(actor: Member, raw_qq: str) -> tuple[Member, bool]:
+    """这次改**谁**的凭据；返回 ``(成员, 是不是在替别人改)``。
+
+    不填 / 填自己 = 自助。填了别人的 QQ 必须是**服务器管理员**：代改是管理动作，
+    不是「谁都能顺手把别人的登录口令作废」。
+
+    新值始终只发给**被改的那个人**（见 ``api_bot_credential`` 末尾），
+    所以服务器管理员代改也拿不到密钥 / 令牌——他要的只是「帮不上线的人重置」。
+    """
+    target_qq = _clean_qq(raw_qq)
+    if not target_qq or target_qq == _clean_qq(actor.qq):
+        return actor, False
+    if actor.permission != "server_admin":
+        raise HTTPException(status_code=403, detail="只有服务器管理员能替别人重置凭据")
+    target = store.member_by_qq(target_qq)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="这个 QQ 还不是成员：先用「比赛添加 @某人」把 TA 加进来，再重置凭据。",
+        )
+    if not target.active:
+        raise HTTPException(status_code=403, detail="TA 的成员账号已被停用，先启用再重置凭据")
+    return target, True
 
 
 def _bearer(header: str | None) -> str:
@@ -440,14 +545,15 @@ async def api_bot_whoami(
 
 @router.post("/members")
 async def api_bot_member_grant(
+    request: Request,
     payload: BotGrantPayload,
-    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+    settings: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
 ) -> dict[str, Any]:
     """群里「授权赛事管理员 / 添加成员」：**只有服务器管理员能调**。
 
     * 目标已经是成员 → 只改权限（不碰他的密钥与令牌，不覆盖他的资料）；
-    * 目标还不是 → 自动建号：名字取群昵称，QQ 就是 QQ 号，权限按请求给；
-      此时返回 ``secretKey``（**明文只出现这一次**），由插件私聊转交本人；
+    * 目标还不是 → 自动建号：名字取群昵称，QQ 就是 QQ 号，权限按请求给，
+      然后**由站点把登录密钥私聊给本人**（`keySent` 说明发了没有）；
     * 不允许授予 ``server_admin``（见 :data:`BOT_GRANTABLE`）。
     """
     actor = _actor_member(payload.actor_qq)
@@ -514,6 +620,17 @@ async def api_bot_member_grant(
     log.warning(
         "QQ 机器人新建成员 | qq=%s | 权限=%s | 操作者=%s", target_qq, permission, actor.uid
     )
+    # 密钥由**站点**直接私聊给本人：它一个字节都不经过插件（插件只拿「发了没有」），
+    # 所以群命令这条路径上根本不存在把它打进群里的可能。
+    site = _site_base(request)
+    sent = await _send_private(
+        settings,
+        target_qq,
+        f"【NTE 比赛】你好 {saved.display_name}，服务器管理员把你设为了{label}。\n"
+        f"登录密钥（只显示这一次，请立即保存）：{key_plain}\n\n"
+        f"用法：打开 {site} 用这把密钥登录（{site}/user 改自己的资料）。\n"
+        + _secret_notice("key", site),
+    )
     return {
         "ok": True,
         "created": True,
@@ -521,8 +638,9 @@ async def api_bot_member_grant(
         "uid": saved.uid,
         "name": saved.display_name,
         "permission": saved.permission,
-        "secretKey": key_plain,
-        "note": "已新建成员；登录密钥只出现这一次，请私聊转交本人",
+        "keySent": bool(sent.get("ok")),
+        "detail": sent.get("detail") or "",
+        "note": "已新建成员；登录密钥只私聊给了 TA 本人",
     }
 
 
@@ -595,12 +713,117 @@ async def api_bot_notify(
         raise HTTPException(status_code=400, detail="没有目标 QQ")
     if not text:
         raise HTTPException(status_code=400, detail="消息内容为空")
-    umo = qqbot.private_umo(settings, qq)
-    result = await qqbot.send_text(text, settings=settings, umo=umo)
-    if not result.get("ok"):
-        log.warning("私聊投递失败 | qq=%s | %s", qq, result.get("detail"))
+    result = await _send_private(settings, qq, text)
     return {
         "ok": bool(result.get("ok")),
-        "umo": umo,
+        "umo": qqbot.private_umo(settings, qq),
         "detail": result.get("detail") or "",
+    }
+
+
+@router.post("/credential")
+async def api_bot_credential(
+    request: Request,
+    payload: BotCredentialPayload,
+    settings: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """凭据重置：**默认改自己**，服务器管理员可以替别人改。
+
+    四条规矩（都是「凭据」这件事逼出来的）：
+
+    * **谁改谁**：不填 ``targetQq`` = 改自己（身份取自插件上报的 QQ，不是用户手输）；
+      填了别人 = 只有**服务器管理员**能这么做（见 :func:`_credential_target`）；
+    * **新值只发给被改的那个人**：无论自助还是代改，私聊都发到 ``targetQq``；
+      响应体里**不含任何明文**——插件拿不到，也就不可能被它打进群里，
+      连服务器管理员自己也看不到别人（或自己）的新密钥 / 令牌；
+    * **令牌要有推流码才发**：没有推流码（推流 ID）的成员，令牌没地方填，
+      先让他设/改推流码——不然发出去也只是一串无处可用的字符；
+    * **私聊发不出去时**只回「没发出去」，让人再发一次命令（凭据已经换了）。
+
+    **先换后发**：凭据换成功但私聊失败时，旧值已经作废，本人再发一次命令就能拿到新的
+    （换之前先探一次私聊做不到「原子」——私聊通道本身也可能中途挂掉）。
+    """
+    actor = _actor_member(payload.qq)
+    member, for_other = _credential_target(actor, payload.target_qq)
+    kind = _CREDENTIAL_ALIAS.get(str(payload.what or "").strip().lower())
+    if kind is None:
+        raise HTTPException(status_code=400, detail="要重置什么？只能是 密钥 / 令牌 / 推流码")
+    site = _site_base(request)
+    cfg = store.snapshot()
+    push_hint = "（站点还没填媒体服务器地址，请找服务器管理员）"
+    # 代改时在私聊里说清「谁帮你重置的」：本人对不上号时能立刻再改一次
+    by_line = f"（这次由服务器管理员「{actor.display_name}」帮你重置）\n" if for_other else ""
+
+    if kind == "key":
+        _saved, key_plain, _bearer = await store.save_member(member, new_key=True)
+        text = (
+            f"【NTE 比赛】你的登录密钥已重置\n{by_line}"
+            f"登录密钥（只显示这一次）：{key_plain}\n\n"
+            f"用法：打开 {site}，用这把密钥登录（{site}/user 改自己的资料）。\n"
+            + _secret_notice("key", site)
+        )
+        note = "登录密钥已重置"
+    elif kind == "token":
+        stream_id = (member.stream_id or "").strip()
+        if not stream_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "你还没有推流码（推流 ID），令牌没地方填。"
+                    "先发「比赛改推流码 你的流名」（英文 / 数字），再来重置令牌。"
+                ),
+            )
+        _saved, _key, bearer_plain = await store.save_member(member, new_bearer=True)
+        push = logic.push_endpoints(cfg.stream, stream_id).get("whipPush", "")
+        text = (
+            f"【NTE 比赛】你的直播令牌已重置\n{by_line}"
+            f"推流码（推流 ID）：{stream_id}\n"
+            f"推流服务器（WHIP）：{push or push_hint}\n"
+            f"Bearer 令牌（只显示这一次）：{bearer_plain}\n\n"
+            "用法：OBS → 设置 → 直播 → 服务选 WHIP，服务器填上面的地址，"
+            "「Bearer 令牌」填这一串。\n"
+            f"你的直播间：{site}/channels/{quote(stream_id)}\n"
+            + _secret_notice("token", site)
+        )
+        note = "直播令牌已重置"
+    else:  # streamId：改推流码
+        try:
+            key = logic.check_stream_key(payload.value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not key:
+            raise HTTPException(
+                status_code=400, detail="推流码不能为空；用法：比赛改推流码 你的流名（英文 / 数字）"
+            )
+        ensure_stream_unique(key, member.uid)  # 与成员管理共用同一条唯一性规则
+        await store.save_member(member.model_copy(update={"stream_id": key}))
+        push = logic.push_endpoints(cfg.stream, key).get("whipPush", "")
+        text = (
+            f"【NTE 比赛】你的推流码已改为 {key}\n{by_line}"
+            f"推流服务器（WHIP）：{push or push_hint}\n"
+            "Bearer 令牌：没变（还是原来那一串；忘了就发「比赛重置令牌」换一把）\n\n"
+            f"你的直播间：{site}/channels/{quote(key)}\n"
+            "OBS 里的服务器地址要跟着一起改，令牌不用动；"
+            "如果此刻正在推流，改完要在 OBS 里重新「开始推流」才会到新地址。\n"
+            "注意：推流码本身是公开的（观看地址里就有它），别拿它当密码——"
+            "真正拦住别人的是 Bearer 令牌。"
+        )
+        note = f"推流码已改为 {key}"
+
+    # 新值发给**被改的那个人**：自助时就是本人；代改时是对方（管理员自己也看不到）
+    sent = await _send_private(settings, member.qq, text)
+    tail = (
+        "，新值只私聊发给你本人"
+        if not for_other
+        else f"，新值只私聊发给 {member.display_name} 本人（你这边看不到）"
+    )
+    return {
+        "ok": True,
+        "kind": kind,
+        "name": member.display_name,
+        "forOther": for_other,
+        "toQq": _clean_qq(member.qq),
+        "sent": bool(sent.get("ok")),
+        "detail": sent.get("detail") or "",
+        "note": f"{note}{tail}",
     }

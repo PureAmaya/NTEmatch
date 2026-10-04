@@ -1,6 +1,6 @@
 name: astrbot_plugin_nte_match
 display_name: NTE 比赛
-desc: 把 NTE 比赛平台的赛事列表 / 信息 / 进度 / 结果接进群聊：16 条群命令，不依赖任何大模型（不注册 LLM 工具）。
+desc: 把 NTE 比赛平台的赛事列表 / 信息 / 进度 / 结果接进群聊：19 条群命令，不依赖任何大模型（不注册 LLM 工具）。
 help: 发送「比赛帮助」查看可用命令（配了「帮助图」时直接回一张图）。
 version: 1.0.0
 author: 早八时睡觉的你

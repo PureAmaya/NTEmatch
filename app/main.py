@@ -1227,10 +1227,12 @@ async def api_private(_: Session = Depends(require_current_event)) -> dict[str, 
         "players": players,
         "channels": channels,
         "rounds": rounds,
-        # **完整**直播配置（含 WHIP 推流地址、HLS 根地址与控制 API 凭据）：
+        # **管理端**直播配置（含 WHIP 推流地址、HLS 根地址与控制 API 账号）：
         # 公开状态里这些字段被白名单剥掉了，管理端表单必须从这里取，
         # 否则表单是空的、一保存就把根地址清成空字符串。
-        "stream": stream.dump(),
+        # 但**API 密码明文不在这里**：本接口赛事管理员就能读，只回 hasApiPass 布尔
+        # （见 logic.management_stream_config）。
+        "stream": logic.management_stream_config(stream),
         # 推流 / 观看的协议列定义（WebRTC / HLS），前端据此渲染复制表格
         "protocols": logic.protocol_sets(stream),
         "baseUrl": stream.base_url,
@@ -1249,6 +1251,74 @@ async def api_private(_: Session = Depends(require_current_event)) -> dict[str, 
 # 凭据**没有任何**可经这里改动的字段——成员密钥走成员管理的轮换接口，
 # 主管理 KEY 那套已整体退休（见 README「登录与权限」）。
 _PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version"}
+
+#: 直播配置里**只有服务器管理员能改**的键。
+#:
+#: 除「启用直播」这个开关外，其余全是**站点级**的媒体服务器设置（根地址 / API 地址与账号 /
+#: 凭据 / 默认流名 / 推流令牌 / 封面 / 备注）。这些只在「服务器 → 直播配置」里出现：
+#: 赛事管理员能决定「这一届要不要直播」，但看不到也改不了媒体服务器本身
+#: （一处媒体服务器给整站所有届共用，本来就该由服务器管理员维护）。
+_STREAM_SERVER_KEYS = frozenset(
+    {
+        "provider",
+        "baseUrl",
+        "apiBase",
+        "apiUser",
+        "apiPass",
+        "apiPassClear",
+        "hlsBase",
+        "streamKey",
+        "pushToken",
+        "mode",
+        "verifyTls",
+        "whipPush",
+        "poster",
+        "title",
+        "note",
+    }
+)
+
+
+def _apply_ui_patch(patch: dict[str, Any], session: Session) -> None:
+    """界面配置只有服务器管理员能改。
+
+    主题色 / 分享图 / 展示开关全是**站点级**的（整站共用一套外观），所以赛事管理页不再
+    提供这块表单（见 ``static/js/admin.js``），写接口这边同样把关——别只靠前端藏。
+    """
+    if session.is_server:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="界面配置（主题色 / 分享图 / 展示开关）是站点级设置，只有服务器管理员能改。",
+    )
+
+
+def _apply_stream_patch(patch: dict[str, Any], session: Session) -> None:
+    """直播配置补丁的两条规矩（**就地**改 ``patch``）。
+
+    * **权限**：媒体服务器设置只有服务器管理员能碰，赛事管理员至多开关「启用直播」；
+    * **凭据**：API 密码的明文只留服务端——接口回给浏览器的是 ``hasApiPass`` 布尔
+      （见 :func:`db.private_config`），所以这里「**留空 = 保持原值**」，
+      要清空必须显式传 ``apiPassClear``。否则管理端一次无关的保存就把密码抹掉了，
+      与 qqbot 的 API Key 是同一套规矩（那边叫 ``SECRET_KEYS``）；
+    * **局部补丁**：表单只发自己那几个字段（赛事页只发 ``enabled``），没提到的键由
+      ``store.update`` 的深合并保留——所以「只改一个开关」不会顺手把地址清空。
+    """
+    if not session.is_server:
+        touched = sorted(set(patch) & _STREAM_SERVER_KEYS)
+        if touched:
+            raise HTTPException(
+                status_code=403,
+                detail="直播的媒体服务器设置（根地址 / API 账号 / 推流令牌…）只有服务器管理员能改；"
+                "这里只能开关「启用直播」。",
+            )
+    # 凭据：明文只留服务端（浏览器拿到的是 hasApiPass），所以「留空 = 保持原值」——
+    # 把键去掉就行：store.update 是**深合并**，没提到的键（含已存的密码）原样保留。
+    # 要清空必须显式传 ``apiPassClear``。
+    if patch.pop("apiPassClear", False):
+        patch["apiPass"] = ""
+    elif not str(patch.get("apiPass") or "").strip():
+        patch.pop("apiPass", None)
 
 
 def event_locked() -> bool:
@@ -1279,11 +1349,18 @@ _LOCK_PATCH_KEYS = ("locked", "lockedAt")
 async def api_update_config(
     request: Request,
     patch: dict[str, Any] = Body(...),  # noqa: B008  (FastAPI 依赖注入惯例)
-    _: Session = Depends(require_current_event),
+    session: Session = Depends(require_current_event),
 ) -> dict[str, Any]:
     clean = {k: v for k, v in patch.items() if k not in _PROTECTED_PATCH_KEYS}
     if not clean:
         raise HTTPException(status_code=400, detail="没有需要更新的内容")
+    # 直播配置：媒体服务器设置只有服务器管理员能改；API 密码「留空 = 不改」
+    stream_patch = clean.get("stream")
+    if isinstance(stream_patch, dict):
+        _apply_stream_patch(stream_patch, session)
+    # 界面配置同理（站点级外观）
+    if isinstance(clean.get("ui"), dict):
+        _apply_ui_patch(clean["ui"], session)
     # 赛制与参赛名单在开赛后冻结；其它配置（直播、界面、赛事信息文案）随时可改
     for key, label in (("rules", "赛制"), ("participants", "参赛名单")):
         if key in clean:

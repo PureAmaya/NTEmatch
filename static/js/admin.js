@@ -416,7 +416,7 @@ function lockPanelHtml(s) {
       `<div class="notice" style="margin-top:10px"><b>已冻结</b>：赛制、每队人数、每场同场队伍数、败者组开关、` +
       `参赛名单、重新组队、赛程重建 / 清空、删除选手。<br>` +
       `<b>仍然可用</b>：<b>直播开关</b>、<b>替补换人</b>（替补不在名单里会自动加入）、录分与重置、` +
-      `时间登记、赛事信息与界面配置、新增选手档案。</div>` +
+      `时间登记、赛事信息、新增选手档案。</div>` +
       `<div class="tool-group" style="margin-top:10px">` +
       `<button class="btn btn--sm btn--primary" type="button" data-act="team-sub">替补换人</button>` +
       `<button class="btn btn--sm btn--danger" type="button" data-act="event-unlock">解除锁定</button></div>`
@@ -486,10 +486,12 @@ export function adminPanelHtml(s) {
   }
   const evt = s.event || {};
   const rules = s.rules || {};
-  // 公开状态里的 stream 是脱敏白名单（根地址 / 流名 / 推流地址都被剥掉），
-  // 用它渲染表单会出现空输入框、一保存就把地址清空——所以管理端必须取私有配置。
-  const stream = App.private?.stream || s.stream || {};
-  const ui = s.ui || {};
+  // 这里只用**公开**的 stream（脱敏白名单：enabled / mode / 文案）。
+  // 媒体服务器地址与凭据不在这页的渲染范围里，所以不必去拿私有配置——
+  // 拿不到值时渲染出空输入框、一保存就把地址清空，正是要避免的那种事故。
+  // 界面配置（主题色 / 分享图 / 展示开关）同理：它按届保存，但**只有服务器管理员**能改，
+  // 所以表单也搬去了「服务器」页（见 members.js 的 uiPanelHtml）。
+  const stream = s.stream || {};
 
   const eventTime = s.eventTime || {};
   // 已结束的届：赛事信息转为只读（服务端同样会拒），但通知照旧可发
@@ -544,78 +546,16 @@ export function adminPanelHtml(s) {
 
   const rulesForm = isLeague(s) ? leagueRulesForm(rules) : tournamentRulesForm(rules, s);
 
-  const uiForm = `<form class="form form--2" data-form="ui">` +
-    fieldSelect('accent', '主题色', ui.accent, [
-      ['cyan', '青'], ['violet', '紫'], ['magenta', '品红'], ['amber', '琥珀'], ['lime', '青柠'],
-    ]) +
-    fieldText('accentCustom', '自定义主题色', ui.accentCustom, {
-      hint: '十六进制，如 #ff6a00；填了就覆盖上面的预设（副色按色相自动推出来）',
+  // 这一页**只留一个直播开关**：赛事管理员能决定「本届要不要直播」，但碰不到媒体服务器
+  // 本身——根地址 / API 地址与账号 / 凭据 / 默认流名 / 推流令牌 / 封面 / 备注都是
+  // **站点级**设置（一处媒体服务器给整站所有届共用），只出现在「服务器 → 直播配置」里，
+  // 由服务器管理员维护；写接口那边同样把关（见 main._STREAM_SERVER_KEYS）。
+  const streamForm = `<form class="form" data-form="stream">` +
+    fieldSwitch('enabled', '启用直播', stream.enabled !== false, {
+      hint: '站点级开关：关掉后直播页与所有推流地址一起隐藏。' +
+        '媒体服务器地址、API 账号与凭据在「服务器 → 直播配置」里填',
     }) +
-    fieldText('ogImage', '分享图（og:image）', ui.ogImage, {
-      hint: '留空 = 内置那张 /og.png；可填 /static/xxx.png 或完整网址，1200×630 最佳',
-    }) +
-    // 注：UUID / QQ 属于隐私字段，任何情况下都不下发用户端，因此不再提供开关
-    fieldSwitch('showAvatar', '显示选手头像', ui.showAvatar) +
-    fieldSwitch('revealResults', '公开展示结果', ui.revealResults) +
-    `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存界面配置</button></div></form>`;
-
-  const streamForm = `<form class="form form--2" data-form="stream">` +
-    fieldSwitch('enabled', '启用直播', stream.enabled) +
-    fieldSelect(
-      'mode',
-      '默认播放线路',
-      stream.mode,
-      [
-        ['auto', '自动（WebRTC，不通再退 HLS）'],
-        ['webrtc', 'WebRTC（8889，UDP，低延迟）'],
-        ['hls', 'HLS（8888，TCP，抗抖动）'],
-      ],
-      { hint: '观众还能在直播页自行切换线路，不必改这里' }
-    ) +
-    fieldText('provider', '服务类型', stream.provider) +
-    fieldText('streamKey', '默认流名（兜底）', stream.streamKey, {
-      hint:
-        '仅在选手没有流名时使用；选手各自的地址由他的推流流名决定（整届固定不变）。' +
-        '流名只能用字母、数字、连字符(-)与下划线(_)',
-    }) +
-    fieldText('pushToken', '推流令牌（主直播间 / 遗留频道）', stream.pushToken, {
-      hint:
-        '留空 = 这些流名只要登记过就能推（旧行为）；填了则推它们也必须带这个令牌。' +
-        '成员机位不受它影响——那边一律要求「推流 ID + 该成员自己的 Bearer 令牌」。' +
-        '令牌只收 ASCII 字符（字母 / 数字 / 符号）且不能有空格',
-    }) +
-    fieldSwitch('verifyTls', '校验源站 HTTPS 证书', stream.verifyTls !== false, {
-      hint: '只影响「信号探测」；自签名证书时关掉。观众侧仍需浏览器信任的证书',
-    }) +
-    `<div class="notice" style="grid-column:1/-1"><b>推流只有 WHIP；观众看直播只有两个地址：</b>` +
-    `<code>&lt;WebRTC 根地址&gt;/&lt;流名&gt;/</code>（8889）与 <code>&lt;HLS 根地址&gt;/&lt;流名&gt;/</code>（8888），` +
-    `打开就能看，播放器用的也是这两个。地址都是<b>源站地址</b>（本站不做反代），` +
-    `因此站点是 HTTPS 时源站也要 HTTPS。</div>` +
-    `<div style="grid-column:1/-1">${fieldText('baseUrl', 'WebRTC 根地址', stream.baseUrl, {
-      hint: '8889 端口：WHIP 推流 + 观众观看地址，例如 https://live.example.com:8889',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('apiBase', 'MediaMTX API 地址', stream.apiBase, {
-      hint: '默认 http://live.example.com:9997（mediamtx.yml 里 api: yes）。' +
-        '只有媒体服务器上报「正在推流」的机位才会显示「直播中」；留空则不显示任何直播标记',
-    })}</div>` +
-    // 控制 API 开了鉴权（mediamtx.yml 的 authInternalUsers）时必须填下面两项，
-    // 否则查询回 401，界面上就是那句「媒体服务器 API 不可达」
-    `<div style="grid-column:1/-1">${fieldText('apiUser', 'MediaMTX API 用户名', stream.apiUser, {
-      hint: '媒体服务器配了 API 鉴权时必填（等价于 curl -u 用户名:密码）；留空 = 请求不带认证',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('apiPass', 'MediaMTX API 密码', stream.apiPass, {
-      type: 'password',
-      hint: '属于凭据：只存服务端、只在管理端下发，观众端拿不到',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('hlsBase', 'HLS 根地址', stream.hlsBase, {
-      hint: '8888 端口：观众观看地址，例如 https://live.example.com:8888',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('whipPush', '默认流名的 WHIP 地址', stream.whipPush, {
-      hint: '主直播间（默认流名）的推流地址；选手 / 频道各自的地址由他们自己的流名派生',
-    })}</div>` +
-    `<div style="grid-column:1/-1">${fieldText('poster', '封面图 URL', stream.poster)}</div>` +
-    `<div style="grid-column:1/-1">${fieldArea('note', '备注', stream.note)}</div>` +
-    `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存直播配置</button></div></form>`;
+    `<div class="form-actions"><button class="btn btn--primary" type="submit">保存</button></div></form>`;
 
   // 已完结的届只留只读信息：编辑面板整体上锁，只放行「恢复进行」
   const finished = isFinished(s);
@@ -633,8 +573,7 @@ export function adminPanelHtml(s) {
       isLeague(s) ? '积分制' : '双败淘汰制',
       lockedWrap(rulesForm, s.event?.locked, '比赛已开始，赛制与人数已锁定')
     ) +
-    panelHtml('界面配置', '主题与展示', uiForm) +
-    panelHtml('直播配置', 'MediaMTX', streamForm) +
+    panelHtml('赛事直播', '总开关', streamForm) +
     participantsPanelHtml(s) +
     panelHtml(
       '组队台',

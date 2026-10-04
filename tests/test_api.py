@@ -208,3 +208,51 @@ async def test_bot_token_is_accepted_from_headers_only():
             assert query.status_code == 401
     finally:
         await store.set_qqbot({"botApiTokenHash": ""}, actor="test", internal=True)
+
+
+async def test_api_password_never_reaches_the_browser(admin_client):
+    """直播的 API 密码像别的凭据一样：**明文只留服务端**，接口只回布尔。
+
+    以前 ``/api/private`` 直接下发 ``stream.dump()``——而**赛事管理员**就能读这个接口，
+    等于把媒体服务器的控制密码交给了每一位赛事管理员（表单还会把它显示在密码框里）。
+    """
+    saved = store.snapshot().stream.dump()
+    try:
+        await store.update({"stream": {**saved, "apiPass": "s3cret-live"}})
+        for path in ("/api/private", "/api/server/config"):
+            body = (await admin_client.get(path)).text
+            assert "s3cret-live" not in body, f"{path} 把 API 密码明文发出去了"
+            assert '"apiPass"' not in body, f"{path} 还在下发 apiPass 这个键"
+        private = (await admin_client.get("/api/private")).json()
+        assert private["stream"]["hasApiPass"] is True  # 表单据此显示「已配置（留空 = 不改）」
+    finally:
+        await store.update({"stream": saved})
+
+
+async def test_saving_the_live_switch_keeps_the_media_server_config(admin_client):
+    """赛事页只发 ``enabled``：其余键必须保持原值（``store.update`` 深合并）。
+
+    直播配置存在**同一行**里，一次整份写就会把地址与凭据一起冲成默认值——所以
+    「补丁是局部的」这件事值得钉一条。
+    """
+    saved = store.snapshot().stream.dump()
+    try:
+        await store.update(
+            {
+                "stream": {
+                    **saved,
+                    "baseUrl": "https://live.test:8889",
+                    "hlsBase": "https://live.test:8888",
+                    "pushToken": "tk-live",
+                }
+            }
+        )
+        res = await admin_client.put("/api/config", json={"stream": {"enabled": False}})
+        assert res.status_code == 200
+        stream = (await admin_client.get("/api/server/config")).json()["stream"]
+        assert stream["enabled"] is False
+        assert stream["baseUrl"] == "https://live.test:8889"
+        assert stream["hlsBase"] == "https://live.test:8888"
+        assert stream["pushToken"] == "tk-live"
+    finally:
+        await store.update({"stream": saved})

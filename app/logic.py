@@ -339,6 +339,22 @@ def public_stream_config(stream: StreamConfig) -> dict[str, Any]:
     return {key: data[key] for key in PUBLIC_STREAM_FIELDS if key in data}
 
 
+def management_stream_config(stream: StreamConfig) -> dict[str, Any]:
+    """**管理端**可见的直播配置：除 API 密码的明文外全都在。
+
+    密码是凭据：明文只留服务端（``mediamtx.yml`` 里那份），这里只回一个 ``hasApiPass``
+    布尔。管理端表单据此显示「已配置（留空 = 不修改）」，提交时留空即保持原值
+    （见 ``main._apply_stream_patch``）——与 qqbot 的 API Key 是同一套规矩。
+
+    它同时是 ``/api/private``（赛事管理员可读）与 ``/api/server/config``（仅服务器管理员）
+    的**唯一**出处：以前那两处各自 ``stream.dump()``，等于把密码明文交给了每一位赛事管理员。
+    """
+    data = stream.dump()
+    data.pop("apiPass", None)
+    data["hasApiPass"] = bool(stream.api_pass)
+    return data
+
+
 # 推流凭据：只有 WHIP（WebRTC / UDP）——仅管理端可见
 PUSH_ENDPOINT_KEYS = ("key", "whipPush")
 

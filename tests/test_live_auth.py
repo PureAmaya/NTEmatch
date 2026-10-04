@@ -10,7 +10,7 @@ import pytest
 
 from app import live
 from app.logic import clean_key
-from app.models import Member
+from app.models import LiveBan, Member
 from app.store import store
 
 
@@ -95,3 +95,33 @@ async def test_main_stream_token_is_optional_but_enforced_when_set():
         assert live.authorize_publish(main_key, "main-secret")[0] is True
     finally:
         await st.update({"stream": {"pushToken": original}}, actor="test")
+
+
+async def test_ban_follows_the_member_not_the_stream_name():
+    """封禁按**成员**记：换令牌、改推流码都绕不过（``authorize_publish`` 先查封禁）。
+
+    这是「禁止某人直播」真正成立的前提——封的是**人**，不是那串名字：
+    否则他改一个推流码就又能开播了。
+    """
+    st = await _ready_store()
+    _saved, _key, bearer = await st.save_member(
+        Member(name="捣乱的", stream_id="ban-a", permission="member"), new_bearer=True
+    )
+    member = next(m for m in st.members() if m.stream_id == "ban-a")
+    ban = LiveBan(member_uid=member.uid, stream_id="ban-a", name="捣乱的", reason="测试")
+    saved_ban = await st.add_live_ban(ban, actor="test")
+    try:
+        ok, reason = live.authorize_publish("ban-a", bearer)
+        assert ok is False and "封禁" in reason
+
+        # 换令牌：照样拒（封禁在令牌校验之前）
+        _m, _k, fresh = await st.save_member(st.member(member.uid), new_bearer=True)
+        assert live.authorize_publish("ban-a", fresh)[0] is False
+
+        # 改推流码：新名字照样拒——封的是这个人
+        await st.save_member(st.member(member.uid).model_copy(update={"stream_id": "ban-b"}))
+        ok, reason = live.authorize_publish("ban-b", fresh)
+        assert ok is False and "封禁" in reason
+    finally:
+        await st.remove_live_ban(saved_ban.id, actor="test")
+        await st.delete_member(member.uid)

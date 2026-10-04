@@ -1860,8 +1860,12 @@ export function renderLive(s) {
     stage.dataset.sig = sig;
     stage.innerHTML = stageHtml(s);
     rebuilt = true;
-    if (App.view === 'live') Live.playSelected(s);
   }
+  // 有人在推流就直接开播——**每次重绘都试一次**，不只是舞台重建时：对方刚好在你打开
+  // 这一页之后才开播，是最常见的场景，不该还要求观众手点一下。playRoom 是幂等的
+  // （同一路正在播就只恢复画面，不会重连），所以多试一次没有代价；
+  // 只有用户自己按过「停止」的才不再自动播。
+  if (App.view === 'live' && !Live.stoppedByUser) Live.playSelected(s);
 
   // 比赛条只在「有比赛有人在播」时才出现（没人播就整条收起来）
   const roundBar = qs('#liveRounds');
@@ -2126,6 +2130,9 @@ function channelStageSig(picked) {
     canEdit() ? 'admin' : 'guest',
     picked ? picked.id : '',
     picked ? (picked.play || {}).key || '' : '',
+    // 这一路「在不在播」也要进签名：否则对方开播 / 下播时舞台不重建，
+    // 封面会一直停在「当前未开播」——而且画面也不会自己出来。
+    picked ? (roomLive(picked) ? 'live' : 'off') : '',
   ].join('|');
 }
 
@@ -2346,15 +2353,13 @@ export function renderChannels(s) {
   renderChannelTools(all);
   renderChannelGrid(all);
 
-  // 只在舞台重建时换流，避免每次信号刷新都打断正在播的画面
-  if (rebuilt && App.view === 'channels') {
-    if (picked && roomLive(picked)) {
-      ChannelLive.playRoom(picked.play || null);
-    } else if (picked) {
-      ChannelLive.stop(false);
+  // 舞台重建时先把「没得播」的几种情况收拾干净（停连接 + 给封面）；
+  // 「有的播」走下面那条自动开播，只留一个播放入口。
+  if (rebuilt && App.view === 'channels' && !(picked && roomLive(picked))) {
+    ChannelLive.stop(false);
+    if (picked) {
       ChannelLive.setCover('当前未开播', `${picked.name} 现在没有推流；开播后这里会自动有画面。`);
     } else {
-      ChannelLive.stop(false);
       ChannelLive.setCover(
         all.length ? '当前没有直播' : '还没有直播间',
         all.length
@@ -2364,6 +2369,11 @@ export function renderChannels(s) {
             : '等成员开播后再来看。'
       );
     }
+  }
+  // 有人在推流就直接开播——每次重绘都试一次（对方在你打开这一页之后才开播也能自动上），
+  // playRoom 幂等，只有用户自己按过「停止」的才不自动播。
+  if (App.view === 'channels' && !ChannelLive.stoppedByUser && picked && roomLive(picked)) {
+    ChannelLive.playRoom(picked.play || null);
   }
   return rebuilt;
 }

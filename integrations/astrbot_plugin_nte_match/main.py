@@ -153,8 +153,11 @@ HELP_TEXT = (
     "· 比赛届次 —— 全部届次的编号与名称（填参数用）\n"
     "· 比赛召集 [届次] —— @ 参赛者到场（仅本届举办者 / 服务器管理员，带冷却）\n"
     "· 比赛我的 —— 你自己的推流地址 + 直播间地址（私聊发你）\n"
+    "· 比赛重置密钥 [@某人] —— 换登录密钥（旧密钥立即失效；私聊发本人）\n"
+    "· 比赛重置令牌 [@某人] —— 换直播令牌（要先有推流码；私聊发本人）\n"
+    "· 比赛改推流码 <流名> [@某人] —— 改推流码（英文 / 数字；令牌不变）\n"
     "· 比赛授权 @某人 —— 把群友设为赛事管理员（仅服务器管理员；不是成员会自动建号）\n"
-    "· 比赛添加 @某人 —— 把群友添加为普通成员（仅服务器管理员）\n"
+    "· 比赛添加 @某人 —— 把群友添加为普通成员（仅服务器管理员；密钥私聊发给本人）\n"
     "· 比赛帮助 —— 就是本条（私聊发你）\n"
     "上面带 [届次] 的命令**必须写明哪一届**：写 e001 / 1 / 第2届 / 名称里的几个字都行\n"
     "（不知道有哪些届就发「比赛届次」）；不带 [届次] 的命令不用填。\n"
@@ -162,6 +165,8 @@ HELP_TEXT = (
     "—— 怎么参加 ——\n"
     "参赛不用自己注册：本届举办者在站点里把你排进名单就行，群里 @ 你就是要开打了。\n"
     "想用「比赛我的」查自己的推流地址，得先成为成员（服务器管理员发：比赛添加 @你）。\n"
+    "「比赛我的 / 比赛重置密钥 / 比赛重置令牌 / 比赛改推流码」不 @ 人就是**只动自己那份**\n"
+    "（按你发命令的 QQ 认人）；带上 @某人 才是替 TA 改，那要服务器管理员，新值也只发 TA 本人。\n"
     "—— 怎么触发 ——\n"
     "要先 @ 机器人 再说命令，或按 AstrBot 里设的唤醒前缀发（例如「/比赛进度」）。\n"
     "光打「比赛进度」不会触发：这是 AstrBot 的命令过滤规则（必须被 @ 或命中唤醒前缀），\n"
@@ -466,22 +471,14 @@ class NTEMatchPlugin(star.Star):
         label = "赛事管理员" if permission == "event_admin" else "普通成员"
         who = str(data.get("name") or target)
         if data.get("created"):
-            secret = str(data.get("secretKey") or "")
-            if not secret:  # 理论上不会发生；真发生了也别把「有密钥」说成没有
-                return event.plain_result(f"已把 {who} 添加为{label}。")
-            sent = await self._notify(
-                target,
-                f"【NTE 比赛】你好 {who}，服务器管理员把你设为了{label}。\n"
-                f"登录密钥（只显示这一次，请立即保存）：{secret}\n"
-                "用法：打开站点 → 用这把密钥登录（/user 改自己的资料；有权限的话 /admin 是服务器管理）。\n"
-                "密钥别转给别人；丢了可以让服务器管理员在成员管理里重置一次。",
-            )
-            if sent.get("ok"):
+            # 密钥由**站点**直接私聊给本人（这里的响应里没有明文，插件也无从泄露）。
+            if data.get("keySent"):
                 return event.plain_result(f"已把 {who} 添加为{label}，登录密钥已私聊发给 TA。")
             return event.plain_result(
-                f"已把 {who} 添加为{label}，但登录密钥**没能私聊发出去**"
-                f"（{sent.get('error') or '未知原因'}）。\n"
-                "密钥只显示这一次、站里也取不回，请让 TA 找服务器管理员重置一次密钥。"
+                f"已把 {who} 添加为{label}，但登录密钥没能私聊发给 TA"
+                f"（{data.get('detail') or '未知原因'}）。\n"
+                "密钥只显示这一次、站里也取不回：让 TA 加机器人好友后自己发一次"
+                "「比赛重置密钥」，就能拿到一把新的（旧的那把同时作废）。"
             )
         if data.get("changed"):
             return event.plain_result(f"{who} 已改为{label}（密钥与令牌不变）。")
@@ -518,6 +515,89 @@ class NTEMatchPlugin(star.Star):
         yield event.plain_result(
             f"（私聊没发出去：{sent.get('error') or '未知原因'}，直接回在这里）\n{text}"
         )
+
+    # ------------------------------------------------------------------ #
+    # 自助凭据：本人换自己的密钥 / 令牌 / 推流码
+    # ------------------------------------------------------------------ #
+    async def _credential(self, event, what: str, value: str = ""):
+        """把「改凭据」这件事交给站点，群里只报结果。
+
+        不 @ 人 = 改自己；@ 了人 = 替 TA 改（**只有服务器管理员能这么做**，站点那侧判定）。
+        新值**谁都不经过**：站点直接私聊发给**被改的那个人**，响应里没有明文——
+        所以插件连「不小心打进群」的机会都没有，管理员也不会看到别人的新密钥 /
+        令牌。这是**结构上**的保证，不靠这里的自觉。
+
+        还要说清一件事：私聊发不出去时，凭据**已经换好了**（旧值已作废），
+        否则本人会以为「没生效」而反复重试——每重试一次就白作废一把。
+        """
+        who = _sender_id(event)
+        if not who:
+            yield event.plain_result("没识别到你的 QQ，请稍后再试。")
+            return
+        targets = _at_targets(event)
+        target = targets[0] if targets else ""
+        data = await self._post(
+            "credential", {"qq": who, "targetQq": target, "what": what, "value": value}
+        )
+        if not data.get("ok"):
+            yield event.plain_result(str(data.get("error") or "操作失败"))
+            return
+        note = str(data.get("note") or "已处理")
+        other = bool(data.get("forOther"))
+        if data.get("sent"):
+            if other:
+                yield event.plain_result(
+                    f"{note}；新值已私聊发给 TA 本人（不经过你，你也看不到）——"
+                    "让 TA 自己去查收。"
+                )
+                return
+            yield event.plain_result(f"{note}；已私聊发给你，去查收（里面的注意事项一起看下）。")
+            return
+        if other:
+            yield event.plain_result(
+                f"{note}，但私聊没能发给 TA（{data.get('detail') or '未知原因'}）。\n"
+                "让 TA 加机器人好友后自己发一次同样的命令，或你再加一次"
+                "——旧的那份已经作废，务必让 TA 拿到新的。"
+            )
+            return
+        yield event.plain_result(
+            f"{note}，但私聊没能发出去（{data.get('detail') or '未知原因'}）。\n"
+            "凭据不能在群里发，所以：先加机器人好友，再发一次同样的命令就能拿到新的。"
+        )
+
+    @filter.command("比赛重置密钥", alias={"重置登录密钥", "我的密钥", "换密钥", "比赛密钥"})
+    async def cmd_rotate_key(self, event: AstrMessageEvent):
+        """换一把**自己**的登录密钥（新密钥只私聊发给你，旧密钥立即失效）。
+
+        也可以 ``@某人`` 替 TA 换——**只有服务器管理员**能这么做，而且新密钥仍然只发给 TA 本人。
+        """
+        async for item in self._credential(event, "key"):
+            yield item
+
+    @filter.command("比赛重置令牌", alias={"重置直播令牌", "我的令牌", "换令牌", "比赛令牌"})
+    async def cmd_rotate_token(self, event: AstrMessageEvent):
+        """换一把**自己**的直播令牌（Bearer；新令牌只私聊发给你，要先有推流码）。
+
+        ``@某人`` 可替 TA 换（仅服务器管理员），新令牌同样只发给 TA 本人。
+        """
+        async for item in self._credential(event, "token"):
+            yield item
+
+    @filter.command("比赛改推流码", alias={"修改推流码", "设置推流码", "我的推流码", "比赛推流码"})
+    async def cmd_set_stream_key(self, event: AstrMessageEvent, stream_key: str = ""):
+        """改**自己**的推流码（推流 ID）；用法：@机器人 比赛改推流码 新流名
+
+        ``@某人`` 可替 TA 改（仅服务器管理员）；改完的结果仍然只私聊发给 TA 本人。
+        """
+        key = (stream_key or "").strip()
+        if not key:
+            yield event.plain_result(
+                "用法：@机器人 比赛改推流码 你的流名\n"
+                "（流名只能用英文、数字、连字符(-)与下划线(_)；改完 OBS 里的服务器地址要一起换）"
+            )
+            return
+        async for item in self._credential(event, "streamId", key):
+            yield item
 
     @filter.command("比赛", alias={"当前比赛", "赛事", "ntematch"})
     async def cmd_current(self, event: AstrMessageEvent):

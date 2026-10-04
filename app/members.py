@@ -123,8 +123,17 @@ def _member_or_404(uid: str) -> Member:
     return member
 
 
-def _ensure_stream_unique(stream_id: str, uid: str) -> None:
-    """推流 ID 全局唯一：与其它成员、以及遗留频道冲突都拒绝。"""
+def ensure_stream_unique(stream_id: str, uid: str) -> None:
+    """推流 ID 全局唯一：与别的成员、以及**站点里已登记的流名**冲突都拒绝。
+
+    公开的（不带下划线）：QQ 机器人的「改推流码」端点也用同一条规则——
+    两处各判一次迟早会漂，索性只有这一份。
+
+    第二条容易漏：主直播间默认流名 / 遗留频道 / 选手固定流名在 ``authorize_publish``
+    里本来走**白名单**那条分支，而 ``member_by_stream_id`` 是按流名反查成员的——
+    某个成员一旦把自己的推流码改成这些名字，同一条流名就会改走「成员 + Bearer 令牌」
+    分支去找**他**，等于拿别人的门牌号把别人的直播间顶掉。所以这里一并拒掉。
+    """
     key = logic.clean_key(stream_id)
     if not key:
         return
@@ -133,12 +142,10 @@ def _ensure_stream_unique(stream_id: str, uid: str) -> None:
         raise HTTPException(
             status_code=400, detail=f"推流 ID「{key}」已被成员 {clash.display_name} 使用"
         )
-    clash_channel = next(
-        (c for c in store.channels() if logic.clean_key(c.stream_key) == key), None
-    )
-    if clash_channel is not None:
+    if key in live.registered_push_keys():
         raise HTTPException(
-            status_code=400, detail=f"推流 ID「{key}」已被频道 {clash_channel.display_name} 使用"
+            status_code=400,
+            detail=f"推流 ID「{key}」是站点里已登记的流名（主直播间 / 频道 / 选手），换一个",
         )
 
 
@@ -226,7 +233,7 @@ async def api_member_save(
     # 这里**直接报错**而不是静默丢掉字符——静默清洗会存成另一个值，
     # 用户照着填的地址推不动，反而更难查（ValueError 会被统一转成 400）。
     stream_id = logic.check_stream_key(payload.stream_id)
-    _ensure_stream_unique(stream_id, payload.uid)
+    ensure_stream_unique(stream_id, payload.uid)
 
     member = Member(
         uid=payload.uid,
@@ -331,7 +338,7 @@ async def api_me_update(payload: MePayload, session: Session = Depends(require_a
         raise HTTPException(status_code=400, detail="成员名称不能为空")
     # 同上：推流 ID 只收 ASCII，含非法字符直接报错（不静默丢字符）
     stream_id = logic.check_stream_key(payload.stream_id)
-    _ensure_stream_unique(stream_id, member.uid)
+    ensure_stream_unique(stream_id, member.uid)
     updated = member.model_copy(
         update={
             "name": payload.name,
@@ -391,6 +398,12 @@ async def api_server_config(session: Session = Depends(require_server)) -> dict[
         "eventName": cfg.event.name or cfg.event.title,
         # 还有几位成员的凭据是历史无盐格式（建议在成员管理里轮换一次）
         "legacyCredentials": len(store.legacy_credential_members()),
+        # 站点级直播配置（媒体服务器根地址 / API 地址与账号 / 默认流名 / 推流令牌…）：
+        # 它只出现在「服务器 → 直播配置」里——赛事管理页不该有这些
+        # （读接口与写接口的门槛分别是 require_server 与 main._STREAM_SERVER_KEYS）。
+        # **API 密码的明文不下发**：只回 hasApiPass，前端留空 = 不改
+        # （与 /api/private 共用 logic.management_stream_config）。
+        "stream": logic.management_stream_config(cfg.stream),
     }
 
 
