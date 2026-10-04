@@ -84,7 +84,7 @@ async def test_retired_admin_key_is_rejected(legacy):
     async with _client() as c:
         res = await c.post("/api/auth", json={"key": legacy})
     assert res.status_code == 401
-    assert "成员密钥" in _detail(res.json())
+    assert _detail(res.json()) == "密钥不正确"
 
 
 @pytest.mark.parametrize("blank", ["", "   "])
@@ -94,6 +94,29 @@ async def test_blank_key_never_logs_in(blank):
     async with _client() as c:
         res = await c.post("/api/auth", json={"key": blank})
     assert res.status_code == 401
+
+
+async def test_login_failure_leaks_nothing():
+    """登录失败只回一句「密钥不正确」：不说凭据类型，也不带任何运维手段。
+
+    以前这里写着「密钥由服务器管理员在成员管理里生成」「忘了可执行 --reset-key 重置」——
+    那等于把两样东西摊给任何来试密码的人：该猜哪种凭据，以及服务端有哪些后手。
+    找回方式属于登录页的文案（那里本来就有），接口只负责说「不对」。
+    """
+    from app import login_guard
+
+    await _ready()
+    login_guard.clear()  # 别把这几次失败算进同 IP 的计数（阈值 5 次，会误伤后面的用例）
+    try:
+        async with _client() as c:
+            res = await c.post("/api/auth", json={"key": "definitely-not-the-key"})
+        assert res.status_code == 401
+        message = _detail(res.json())
+        assert message == "密钥不正确"
+        for leak in ("--reset-key", "uv run", "python -m", "成员管理", "服务器 →", "生成"):
+            assert leak not in message, f"登录失败的文案里不该出现：{leak}"
+    finally:
+        login_guard.clear()
 
 
 async def test_admin_key_endpoint_answers_clearly_after_retirement():

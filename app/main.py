@@ -912,12 +912,11 @@ async def api_auth(payload: AuthPayload, request: Request) -> dict[str, Any]:
     # 2) 没命中任何成员 → 登录失败。
     #    这里刻意**不再有**「主管理 KEY」这条路径：那套凭据已退休（见 README「登录与权限」）。
     banned = 0 if local else login_guard.record_failure(ip, settings)
-    log.warning("登录失败：成员密钥不正确 | ip=%s%s", ip, f"（已封禁 {banned}s）" if banned else "")
-    raise HTTPException(
-        status_code=401,
-        detail="成员密钥不正确。密钥由服务器管理员在「服务器 → 成员管理」里生成；"
-        "服务器管理员本人若忘记密钥，可在服务器上执行 `uv run python -m app --reset-key` 重置。",
-    )
+    log.warning("登录失败：密钥不正确 | ip=%s%s", ip, f"（已封禁 {banned}s）" if banned else "")
+    # 只回一句「密钥不正确」。**不在这里帮忙**：写明凭据类型等于告诉扫描器该猜什么，
+    # 把 `--reset-key` 这类运维命令写进响应更是把服务端的手段摊给陌生人。
+    # 找回方式属于登录页的文案（那里本来就有），不属于接口返回。
+    raise HTTPException(status_code=401, detail="密钥不正确")
 
 
 @app.post("/api/auth/local")
@@ -970,11 +969,7 @@ async def api_admin_key_disabled() -> dict[str, Any]:
     保留这条路由只为**给出明确答复**：老前端 / 老脚本调它时，得到的是一句
     「已移除，用成员密钥」，而不是 404 那种让人以为「是不是我地址写错了」的沉默。
     """
-    raise HTTPException(
-        status_code=410,
-        detail="主管理 KEY 已移除。登录与管理都走成员密钥："
-        "服务器管理员的密钥可在「服务器 → 成员管理 → 轮换密钥」重新生成。",
-    )
+    raise HTTPException(status_code=410, detail="主管理 KEY 已移除：登录与管理都走成员密钥。")
 
 
 # --------------------------------------------------------------------------- #
