@@ -1,13 +1,18 @@
 """命令行入口：启动服务与维护工具。
 
-不传参数即启动服务；``--reset-key`` 用于**忘记服务器管理员密钥**时在本机重置
-（凭据就是「能访问服务器上的数据库文件」，这是自托管应用的常规做法）。
+不传参数即启动服务；``--reset-key`` / ``--transfer-admin`` 是两条**只能在本机做**的
+维护路径（凭据就是「能访问服务器上的数据库文件」，这是自托管应用的常规做法）：
+
+* ``--reset-key``：服务器管理员**忘了密钥**时重置；
+* ``--transfer-admin``：**换人**——把服务器管理员交给另一位成员，旧管理员删除或降级，
+  并给接任者派发新密钥（界面上做不到：既不能提升别人，也不能降级唯一的管理员）。
 
 ::
 
     uv run python -m app                     启动服务
     uv run python -m app --reset-key         重置服务器管理员密钥（随机生成）
     uv run python -m app --reset-key 新密钥   重置服务器管理员密钥（指定值）
+    uv run python -m app --transfer-admin    交接服务器管理员（交互式；也可带目标与开关）
 """
 
 from __future__ import annotations
@@ -37,10 +42,16 @@ USAGE = """NTE 比赛 · 命令行
   python -m app --port 8123                换个端口启动
   python -m app --host 127.0.0.1 -p 8123   同时指定监听地址
   python -m app --reset-key [新密钥]        重置服务器管理员的登录密钥（省略则随机生成）
+  python -m app --transfer-admin [目标]     交接服务器管理员：把「目标」设为管理员，
+                                           旧管理员删除或降级，并给新管理员派发新密钥
+                                           目标可写 uid / QQ / 名字片段；不给就交互式选择
+                                            --delete-old 删掉旧账号 / --keep-old 降级（默认）
+                                            --key 新密钥 指定新密钥
   python -m app --help                     显示本帮助
 
 端口与监听地址也可以走环境变量 NTE_PORT / NTE_HOST，命令行参数优先。
 忘记服务器管理员密钥时：先停止服务 → 执行 --reset-key → 用打印出的新密钥登录。
+要换人时：先停止服务 → 执行 --transfer-admin → 用新管理员的密钥登录。
 """
 
 
@@ -111,7 +122,7 @@ def reset_admin_key(new_key: str | None = None) -> int:
         print("请先执行 `uv run python -m app` 启动一次服务，让它初始化数据。")
         return 1
 
-    key = (new_key or "").strip()
+    key = _clean(new_key)
     generated = not key
     if generated:
         key = generate_key()
@@ -152,6 +163,180 @@ def reset_admin_key(new_key: str | None = None) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# 交接服务器管理员
+# --------------------------------------------------------------------------- #
+_PERMISSION_LABEL = {"server_admin": "服务器管理员", "event_admin": "赛事管理员", "member": "成员"}
+
+
+def _clean(text: str) -> str:
+    """去掉首尾空白与 BOM。
+
+    为什么要管 BOM：把答案**管道喂给** ``python -m app``（脚本 / ``echo`` / PowerShell
+    的 ``|``）时，Windows 会在开头塞一个 ``\\ufeff``，``"2"`` 会变成 ``"﻿2"``——
+    不清理的话「选第 2 位」会被判成「没找到成员」。
+    """
+    return (text or "").replace("\ufeff", "").strip()
+
+
+def _match_members(members: list[dict], token: str) -> list[dict]:
+    """按 uid / QQ / 名字片段 / 列表序号找成员，返回全部命中（唯一性交给调用方判断）。"""
+    raw = _clean(token)
+    if not raw:
+        return []
+    if raw.isdigit():  # 交互列表里打印的序号
+        index = int(raw)
+        if 1 <= index <= len(members):
+            return [members[index - 1]]
+    low = raw.lower()
+    for key in ("uid", "qq"):
+        hits = [m for m in members if str(m.get(key) or "").strip().lower() == low]
+        if hits:
+            return hits
+    return [m for m in members if low in str(m.get("name") or "").lower()]
+
+
+def _print_member_list(members: list[dict]) -> None:
+    """编号 + 名字 + 权限 + QQ + uid（编号可直接用于下一步选择）。"""
+    for index, member in enumerate(members, 1):
+        label = _PERMISSION_LABEL.get(str(member.get("permission")), str(member.get("permission")))
+        marks = []
+        if member.get("permission") == "server_admin":
+            marks.append("当前管理员")
+        if not member.get("active", True):
+            marks.append("已停用")
+        tail = f"  ← {' · '.join(marks)}" if marks else ""
+        print(
+            f"  {index:>2}. {member.get('name') or '(未命名)'}  [{label}]  "
+            f"QQ={member.get('qq') or '—'}  uid={member['uid']}{tail}"
+        )
+
+
+def transfer_admin(target: str = "", *, mode: str = "", new_key: str | None = None, ask=input) -> int:
+    """把「服务器管理员」交给另一位成员：旧管理员**删除或降级**，并给接任者派发新密钥。
+
+    为什么只能在本机做：全站有且只有一个服务器管理员，界面上既不能把别人提升上来、
+    也不能把唯一的管理员降级 / 删除（见 ``app/members.py`` 里那三处 400）。所以「换人」
+    这条路留在命令行：**凭据 = 能碰到数据库文件**，和 ``--reset-key`` 同一档权限。
+
+    * ``target``：接任者（uid / QQ / 名字片段 / 列表序号）；留空则交互选择；
+    * ``mode``：``demote``（旧管理员降级为赛事管理员）/ ``delete``（删掉旧账号）；留空则交互询问；
+    * ``new_key``：指定新密钥（默认随机生成）；
+    * ``ask``：问答用的函数（测试里注入脚本化输入）。
+    """
+    if mode and mode not in {"demote", "delete"}:
+        print(f"未知的处置方式: {mode}（只能是 demote / delete）")
+        return 2
+    if not DB_PATH.exists():
+        print(f"未找到数据库: {DB_PATH}")
+        print("请先执行 `uv run python -m app` 启动一次服务，让它初始化数据。")
+        return 1
+
+    interactive = not (target and mode)
+    db.init_db(DB_PATH)
+    with db.connect(DB_PATH) as conn:
+        members = db.list_members(conn)
+    if not members:
+        print("数据库里还没有成员。请先启动一次服务（会自动创建服务器管理员）。")
+        return 1
+
+    old = next((m for m in members if m.get("permission") == "server_admin"), None)
+
+    if not target:
+        print()
+        print("现有成员：")
+        _print_member_list(members)
+        print()
+        target = _clean(ask("把哪一位设为新的服务器管理员？（填序号 / uid / QQ / 名字）："))
+
+    hits = _match_members(members, target)
+    if not hits:
+        print(f"没找到成员「{target}」：可以填序号、uid、QQ 或名字的一部分。")
+        return 1
+    if len(hits) > 1:
+        print(f"「{target}」匹配到 {len(hits)} 位，请写得更具体：")
+        _print_member_list(hits)
+        return 1
+    new_admin = hits[0]
+    old_name = (old or {}).get("name") or "（当前没有管理员）"
+    if old is not None and new_admin["uid"] == old["uid"]:
+        print(f"「{new_admin.get('name') or new_admin['uid']}」已经是服务器管理员了，无需交接。")
+        return 1
+
+    if not mode:
+        print()
+        print(f"当前服务器管理员：{old_name}")
+        print("他之后怎么处理？")
+        print("  [1] 降级为赛事管理员（保留账号，默认）")
+        print("  [2] 删除账号")
+        answer = _clean(ask("请选择 [1/2]：")).lower()
+        mode = "delete" if answer in {"2", "delete", "删除"} else "demote"
+
+    if interactive:
+        action = "删除账号" if mode == "delete" else "降级为赛事管理员"
+        confirm = _clean(
+            ask(
+                f"确认：把「{new_admin.get('name') or new_admin['uid']}」设为服务器管理员，"
+                f"并把「{old_name}」{action}？[y/N]："
+            )
+        ).lower()
+        if confirm not in {"y", "yes", "是", "确认"}:
+            print("已取消。")
+            return 1
+
+    key = _clean(new_key)
+    generated = not key
+    if generated:
+        key = generate_key()
+    if len(key) < MIN_KEY_LEN:
+        print(f"密钥至少 {MIN_KEY_LEN} 位，请重新执行。")
+        return 1
+
+    stamp = now_iso()
+    with db.connect(DB_PATH) as conn:
+        if old is not None:
+            if mode == "delete":
+                conn.execute("DELETE FROM members WHERE uid = ?", (old["uid"],))
+            else:
+                conn.execute(
+                    "UPDATE members SET permission = 'event_admin', updated_at = ? WHERE uid = ?",
+                    (stamp, old["uid"]),
+                )
+        # 接任者：升为管理员、一并启用（停用的账号不启用就登不进去）、换掉密钥
+        conn.execute(
+            "UPDATE members SET permission = 'server_admin', active = 1,"
+            " key_hash = ?, key_sha256 = '', updated_at = ? WHERE uid = ?",
+            (hash_secret(key), stamp, new_admin["uid"]),
+        )
+    log.warning(
+        "服务器管理员已交接 | 新=%s | 旧=%s(%s)",
+        new_admin["uid"],
+        (old or {}).get("uid") or "无",
+        mode,
+    )
+
+    line = "=" * 62
+    print()
+    print(line)
+    print(f"  服务器管理员已交给「{new_admin.get('name') or new_admin['uid']}」")
+    print(f"  新登录密钥（{'随机生成' if generated else '指定'}）：{key}")
+    print("  存储方式：加盐哈希 —— 数据库里不再保留明文")
+    if old is not None:
+        if mode == "delete":
+            print(f"  旧管理员「{old_name}」的账号已删除")
+            print("  （他创办的届会变成「无主」，由服务器管理员接管；比赛内容不受影响）")
+        else:
+            print(f"  旧管理员「{old_name}」已降级为赛事管理员（他创办的届仍归他管）")
+    print(line)
+    if _port_in_use(int(os.getenv("NTE_PORT", "8000"))):
+        print("  ⚠ 检测到服务仍在运行：请先停止它再重新启动，")
+        print("    否则内存里的旧成员数据可能在下一次改动时覆盖本次交接。")
+    print("  下一步：重启服务 → 用上面的新密钥登录（/admin 或 /user）")
+    print("  重启后所有在线会话失效——旧管理员 / 被删成员的登录状态一并作废。")
+    print(line)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # 参数分发
 # --------------------------------------------------------------------------- #
 def _take_option(args: list[str], *names: str) -> tuple[str | None, list[str]]:
@@ -176,6 +361,18 @@ def _take_option(args: list[str], *names: str) -> tuple[str | None, list[str]]:
             found = args[index + 1] if index + 1 < len(args) else ""
             index += 2
     return found, rest
+
+
+def _drop_flag(args: list[str], *names: str) -> tuple[bool, list[str]]:
+    """去掉布尔开关（``--xxx`` 这种不带值的），返回（是否出现过, 剩余参数）。"""
+    seen = False
+    rest: list[str] = []
+    for arg in args:
+        if arg in names:
+            seen = True
+            continue
+        rest.append(arg)
+    return seen, rest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -211,6 +408,24 @@ def main(argv: list[str] | None = None) -> int:
             print(USAGE)
             return 2
         return reset_admin_key(rest[0] if rest else None)
+
+    if args and args[0] == "--transfer-admin":
+        rest = args[1:]
+        key_raw, rest = _take_option(rest, "--key")
+        delete_old, rest = _drop_flag(rest, "--delete-old")
+        keep_old, rest = _drop_flag(rest, "--keep-old")
+        if delete_old and keep_old:
+            print("--delete-old 与 --keep-old 只能给一个。")
+            return 2
+        target = ""
+        if rest and not rest[0].startswith("-"):
+            target = rest.pop(0)
+        if rest:
+            print(f"无法识别的参数: {' '.join(rest)}")
+            print(USAGE)
+            return 2
+        mode = "delete" if delete_old else ("demote" if keep_old else "")
+        return transfer_admin(target, mode=mode, new_key=key_raw)
 
     if args:
         print(f"无法识别的参数: {' '.join(args)}")

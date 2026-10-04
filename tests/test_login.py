@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 
@@ -198,3 +200,102 @@ async def test_legacy_database_drops_the_admin_key_table(tmp_path):
             row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
     assert "event_admin" not in tables
+
+
+# --------------------------------------------------------------------------- #
+# 交接服务器管理员（--transfer-admin）
+# --------------------------------------------------------------------------- #
+def _seed_members(path) -> None:
+    """造三位成员：老管理员、接任者、以及一位名字与接任者相近的成员（验歧义）。"""
+    db.init_db(path)
+    stamp = "2026-01-01T00:00:00"
+    with db.connect(path) as conn:
+        for uid, name, qq, permission in (
+            ("u-old", "老管理员", "10001", "server_admin"),
+            ("u-new", "接任者", "10002", "event_admin"),
+            ("u-third", "小接任者", "10003", "member"),
+        ):
+            conn.execute(
+                "INSERT INTO members (uid, name, qq, permission, active, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (uid, name, qq, permission, stamp, stamp),
+            )
+        conn.commit()
+
+
+def _members(path) -> dict[str, dict]:
+    with db.connect(path) as conn:
+        return {m["uid"]: m for m in db.list_members(conn)}
+
+
+def test_cli_transfer_admin_demotes_old_and_issues_new_key(tmp_path, monkeypatch, capsys):
+    """交接（降级旧账号）：接任者成为唯一管理员、旧管理员降级、打印出的新密钥当时就能登录。"""
+    path = tmp_path / "transfer.sqlite"
+    monkeypatch.setattr(cli, "DB_PATH", path)
+    _seed_members(path)
+
+    assert cli.main(["--transfer-admin", "u-new", "--keep-old"]) == 0
+
+    rows = _members(path)
+    assert rows["u-new"]["permission"] == "server_admin"
+    assert rows["u-old"]["permission"] == "event_admin"
+    assert sum(1 for m in rows.values() if m["permission"] == "server_admin") == 1
+
+    out = capsys.readouterr().out
+    key = re.search(r"新登录密钥（随机生成）：(\S+)", out)
+    assert key is not None, "必须把新密钥打印出来（只此一次）"
+    assert verify_secret(key.group(1), rows["u-new"]["keyHash"]) is True
+    assert rows["u-new"]["keySha256"] == "", "历史无盐列要一并清掉"
+    assert "已降级为赛事管理员" in out
+
+
+def test_cli_transfer_admin_can_delete_the_old_account(tmp_path, monkeypatch, capsys):
+    """交接（删除旧账号）：旧成员从库里消失，接任者拿到指定的新密钥。"""
+    path = tmp_path / "transfer.sqlite"
+    monkeypatch.setattr(cli, "DB_PATH", path)
+    _seed_members(path)
+
+    # 用 QQ 定位接任者，顺带验一下「按 QQ 找」这条匹配路径
+    code = cli.main(["--transfer-admin", "10002", "--delete-old", "--key", "MY-NEW-KEY"])
+    assert code == 0
+
+    rows = _members(path)
+    assert "u-old" not in rows, "旧管理员账号应当已删除"
+    assert rows["u-new"]["permission"] == "server_admin"
+    assert verify_secret("MY-NEW-KEY", rows["u-new"]["keyHash"]) is True
+    assert "账号已删除" in capsys.readouterr().out
+
+
+def test_cli_transfer_admin_is_interactive(tmp_path, monkeypatch, capsys):
+    """不带目标与开关时走**交互**：列成员 → 选第几位 → 选「删除」→ 确认。"""
+    path = tmp_path / "transfer.sqlite"
+    monkeypatch.setattr(cli, "DB_PATH", path)
+    _seed_members(path)
+
+    # 列表顺序 = 服务器管理员优先 + created_at + uid，所以第 2 位是 u-new（接任者）
+    # 故意带上 BOM 与空格：管道喂输入时 Windows 会塞 \ufeff（真踩过，选「2」被当成没找到）
+    answers = iter(["\ufeff2", " 2 ", " y\n"])
+    assert cli.transfer_admin(ask=lambda _prompt="": next(answers)) == 0
+
+    rows = _members(path)
+    assert "u-old" not in rows
+    assert rows["u-new"]["permission"] == "server_admin"
+    out = capsys.readouterr().out
+    assert "现有成员：" in out and "服务器管理员已交给" in out
+
+
+def test_cli_transfer_admin_refuses_bad_input(tmp_path, monkeypatch, capsys):
+    """交给自己 / 找不到人 / 名字有歧义 —— 一律拒绝，且**一个字都不许改**。"""
+    path = tmp_path / "transfer.sqlite"
+    monkeypatch.setattr(cli, "DB_PATH", path)
+    _seed_members(path)
+
+    assert cli.transfer_admin("u-old", mode="demote") == 1  # 自己交给自己
+    assert cli.transfer_admin("查无此人", mode="demote") == 1
+    assert cli.transfer_admin("接任", mode="demote") == 1  # 「接任者」与「小接任者」都命中
+    assert cli.transfer_admin("u-new", mode="乱写") == 2
+
+    rows = _members(path)
+    assert rows["u-old"]["permission"] == "server_admin"
+    assert rows["u-new"]["permission"] == "event_admin"
+    assert len(rows) == 3, "失败的交接不该顺手删掉谁"

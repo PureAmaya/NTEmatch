@@ -81,9 +81,30 @@ docker compose logs -f nte      # 首次启动的服务器管理员登录密钥�
 ====================================================================
 ```
 
-之后每次启动只打印一行登录方式提示。全站**有且只有一个**服务器管理员：他不能被停用 /
-降级 / 删除；需要换人时，先在「服务器 → 成员管理」里把另一位提升为服务器管理员
-（原来那位会自动降级为赛事管理员），再用新管理员的密钥登录。
+之后每次启动只打印一行登录方式提示。全站**有且只有一个**服务器管理员，现在的守卫是**三重锁**：
+不能把别的成员设为服务器管理员、不能把唯一的管理员降级 / 停用、也不能删除他
+（对应 `app/members.py` 里三处 400）。
+
+> 因此**界面上没有"交接"路径**：换人用命令行（先停服）——
+>
+> ```bash
+> # 交互式：列出成员 → 选接任者 → 选「删除旧账号 / 降级」→ 确认
+> uv run python -m app --transfer-admin
+>
+> # 也可以直接指定（目标写 uid / QQ / 名字片段）
+> uv run python -m app --transfer-admin 10002 --delete-old   # --keep-old 则降级（默认）
+> uv run python -m app --transfer-admin 10002 --key 我的新密钥
+> ```
+>
+> 它会一次做完三件事：把接任者升为服务器管理员、**给 TA 派发新密钥**（只打印一次）、
+> 旧管理员**删除或降级**。删除时他创办的届会变成「无主」（由服务器管理员接管），
+> **比赛内容不受影响**；重启后所有在线会话作废。
+>
+> 实在要用数据库改（CLI 也跑不起来时）：停服后
+> `UPDATE members SET permission='event_admin' WHERE permission='server_admin';`
+> 再 `UPDATE members SET permission='server_admin' WHERE uid='目标 uid';`，然后重启。
+> 注意：编辑表单里那个「服务器管理员（有且只有一个）」选项，对**别人**是死路——
+> 选了会被接口拒掉（它只用于"自己保持是自己"）。
 
 ### 忘记密钥怎么办
 
@@ -1639,7 +1660,7 @@ MPL-2.0 / PSF-2.0），**没有任何 GPL-only 组件**——只有那类会与 
 ```
 app/               后端（FastAPI）
   main.py          路由与生命周期
-  cli.py           命令行入口（启动服务 / --reset-key 重置服务器管理员密钥）
+  cli.py           命令行入口（启动服务 / --reset-key 重置密钥 / --transfer-admin 交接管理员）
   db.py            SQLite 持久层（表结构 + 多届读写 + 旧库自动补列）
   store.py         赛事存储门面（事务、届次管理、旧数据迁移）
   tournament.py    锦标赛制引擎（随机组队 / 小组赛单循环 / 双败淘汰，纯函数）
@@ -1733,7 +1754,7 @@ HLS :8888 / 控制 API :9997）。注意两点：WebRTC 走 UDP，用 host 网�
 ```bash
 uv sync --extra dev      # ruff / pytest 在 dev 可选依赖里，要先装
 uv run ruff check app tests tools
-uv run pytest            # 238 条：结算 / 比法 / 校验 / 存储 / 接口 / 权限 / 凭据 / 推流鉴权 / 通知 / 版权 / 插件
+uv run pytest            # 243 条：结算 / 比法 / 校验 / 存储 / 接口 / 权限 / 凭据 / 推流鉴权 / 通知 / 版权 / 插件
 uv run python tools/check_assets.py   # 前端静态资源自检（见下）
 ```
 
