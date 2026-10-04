@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from . import league
+from . import league, markdown, metrics
 from . import tournament as T
 from .defaults import SPORT_PRESETS, sport_meta
 from .logging_conf import get_logger
@@ -249,8 +249,31 @@ def public_player(player: Player, *, has_stream: bool | None = None) -> dict[str
 # 观看地址（8889 / 8888）可对用户端公开；**推流地址（WHIP）只在管理端出现**。
 # --------------------------------------------------------------------------- #
 def clean_key(text: str) -> str:
-    """推流路径片段：只保留字母数字与 - _，避免拼出越界路径。"""
-    return "".join(ch for ch in (text or "").strip() if ch.isalnum() or ch in "-_")
+    """推流路径片段：只保留 **ASCII** 字母数字与 - _，避免拼出越界路径。
+
+    为什么显式判 ``isascii()``：``str.isalnum()`` 对中文 / 全角字符**也返回 True**，
+    旧实现会把「中文id」原样当成流名——于是推流地址里出现非 ASCII，
+    OBS、媒体服务器、以及各种字符串比较（``hmac.compare_digest`` 会直接抛
+    TypeError）都得跟着擦屁股。流名就该是主机名 / 路径里那一小撮安全字符。
+    """
+    return "".join(ch for ch in (text or "").strip() if ch.isascii() and (ch.isalnum() or ch in "-_"))
+
+
+def check_stream_key(raw: str, label: str = "推流 ID") -> str:
+    """校验并规整推流标识：**含非法字符就直接报错**，不静默丢弃。
+
+    静默清洗看着「宽容」，其实更坑：用户填「中文id」，存进去变成「id」，
+    推流地址对不上，要排查半天。宁可当场把话说清楚（调用方把 ``ValueError``
+    转成 400）。
+    """
+    text = (raw or "").strip()
+    clean = clean_key(text)
+    if text and clean != text:
+        raise ValueError(
+            f"{label}只能使用 ASCII 字母、数字、连字符(-)与下划线(_)；"
+            f"不能包含中文、空格或其它符号：{text}"
+        )
+    return clean
 
 
 def player_stream_key(player: Player) -> str:
@@ -491,6 +514,18 @@ def knockout_round_names(size: int, loser_bracket: bool) -> list[str]:
     return names
 
 
+# 系列赛的中文说法（BO1 不是「系列赛」）
+_SERIES_NAME = {3: "三局两胜", 5: "五局三胜", 7: "七局四胜"}
+
+
+def series_label(best_of: int) -> str:
+    """把 ``best_of`` 说成人话；1（一局定胜负）返回空串。"""
+    n = int(best_of or 1)
+    if n <= 1:
+        return ""
+    return _SERIES_NAME.get(n, f"{n} 局 {n // 2 + 1} 胜")
+
+
 def rulebook(cfg: Config) -> dict[str, Any]:
     """把当前赛制与参数翻译成用户端可读的规则条目。"""
     rules = cfg.rules
@@ -503,6 +538,17 @@ def rulebook(cfg: Config) -> dict[str, Any]:
     shape = "组 vs 组" if per_match == 2 else f"{per_match} 队同场"
     loser = bool(rules.loser_bracket)
     sections: list[dict[str, Any]] = []
+
+    # ---- 比法（app/metrics.py）：方向只有一处定义，这里翻译成人话 ----
+    time_based = metrics.lower_is_better(rules.metric)
+    # 「同分再比什么」在两种比法下不是同一个东西
+    tie_break = "完成场次、总用时" if time_based else "净胜分、总得分"
+    if time_based:
+        verdict = "每局用时短者胜；用时相同视为并列，需人工指定胜方或记平局。"
+    elif rules.target_score:
+        verdict = f"单局目标分 {rules.target_score} 分，先到者胜。"
+    else:
+        verdict = "单局不设目标分，按录入比分判定胜负。"
 
     # ---- 赛制概览 ----
     if league:
@@ -551,12 +597,11 @@ def rulebook(cfg: Config) -> dict[str, Any]:
                 "title": "积分与排名",
                 "items": [
                     "每局积分：" + "、".join(points) + "。",
-                    f"排名依据：总得分 ÷ 出场次数（均分）降序；出场不足 {rules.min_rank_played} 局不参与名次。",
                     (
-                        f"单局目标分 {rules.target_score} 分，先到者胜。"
-                        if rules.target_score
-                        else "单局不设目标分，按录入比分判定胜负。"
+                        f"排名依据：总得分 ÷ 出场次数（均分）降序，同分再比{tie_break}；"
+                        f"出场不足 {rules.min_rank_played} 局不参与名次。"
                     ),
+                    verdict,
                 ],
             }
         )
@@ -569,15 +614,17 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             ),
             (
                 f"排名依据：名次分 —— 同场 {per_match} 队时第 1 名得 {per_match} 分，"
-                f"依次递减，最低 1 分；同分再比净胜分、总得分。"
+                f"依次递减，最低 1 分；同分再比{tie_break}。"
                 if per_match > 2
-                else "排名依据：名次分 —— 胜 2 分、负 1 分；同分再比净胜分、总得分。"
+                else f"排名依据：名次分 —— 胜 2 分、负 1 分；同分再比{tie_break}。"
             ),
             (
                 "小组赛允许平局。"
                 if rules.allow_draw
                 else "小组赛必须分出胜负（不设平局）。"
             ),
+            # 「怎么算赢」：比法决定方向，必须写在最显眼的地方
+            verdict,
         ]
         if size:
             left = len(teams) - size
@@ -613,14 +660,28 @@ def rulebook(cfg: Config) -> dict[str, Any]:
         sections.append({"title": "淘汰赛", "items": knockout_items})
 
     # ---- 其他 ----
-    others = [
-        "比赛结果按录入的比分自动判定胜负与名次，录入各局小分还能自动汇总局分与总得分。"
-        if not league
-        else "比赛结果按录入的比分自动结算积分；每局独立结算，不影响其它局。"
-    ]
+    if league:
+        result_note = "比赛结果按录入的成绩自动结算积分；每局独立结算，不影响其它局。"
+    elif time_based:
+        result_note = "比赛结果按录入的用时自动判定胜负与名次，录入各局用时还能自动汇总局分与总用时。"
+    else:
+        result_note = "比赛结果按录入的比分自动判定胜负与名次，录入各局小分还能自动汇总局分与总得分。"
+    others = [result_note]
+    if time_based:
+        others.append(
+            "用时制：成绩按毫秒存储与比较（界面写 1:23.456 这样的时间）；"
+            "没填或填 0 视为「未完赛」，名次垫底。"
+        )
+    series = series_label(rules.best_of)
+    if series:
+        others.append(
+            f"系列赛：每场 {rules.best_of} 局小局（{series}），"
+            f"先赢 {(rules.best_of + 1) // 2} 局小局者赢下整场；"
+            "局数与胜负由「各局小分」自动汇总，不需要另外填大比分。"
+        )
     if cfg.stream.enabled:
         others.append("直播：每场比赛可单独开启推流，并标注直播选手提示。")
-    if cfg.rules.target_score and not league:
+    if cfg.rules.target_score and not league and not time_based:
         others.append(f"单局目标分：{cfg.rules.target_score} 分。")
     sections.append({"title": "其他", "items": others})
 
@@ -639,12 +700,20 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             "groups": len(groups),
             "size": size,
             "targetScore": rules.target_score,
+            "metric": metrics.norm(rules.metric),
+            "metricLabel": metrics.LABELS[metrics.norm(rules.metric)],
+            "metricNote": metrics.DESCRIPTIONS[metrics.norm(rules.metric)],
+            "timeBased": time_based,
+            "bestOf": rules.best_of,
+            "series": series_label(rules.best_of),
             "groupMatches": sum(1 for r in rounds if r.stage == "group"),
             "knockoutMatches": sum(1 for r in rounds if r.stage != "group"),
             "totalRounds": rules.total_rounds,
             "minRankPlayed": rules.min_rank_played,
         },
         "note": cfg.event.rules_text,
+        # 赛事信息按 Markdown 渲染（服务端一次渲染，前端直接展示；见 app/markdown.py）
+        "noteHtml": markdown.render(cfg.event.rules_text),
     }
 
 
@@ -652,7 +721,7 @@ def rulebook(cfg: Config) -> dict[str, Any]:
 # 汇总状态
 # --------------------------------------------------------------------------- #
 def build_state(cfg: Config, *, historical: bool = False) -> dict[str, Any]:
-    """组装下发给前端的完整公开状态（不含管理 KEY）。
+    """组装下发给前端的完整公开状态（不含任何凭据）。
 
     按 ``rules.format`` 走两套人马：积分制下发 standings，锦标赛制下发 bracket/groups。
     ``historical=True`` 表示这是往届回看，此时比赛一律按「没有直播」渲染。
@@ -722,8 +791,8 @@ def _tournament_state(cfg: Config) -> dict[str, Any]:
     teams = cfg.teams
     rounds = cfg.rounds
     by_id = {t.id: t for t in teams}
-    tables = T.group_tables(teams, rounds)
-    ranking = T.overall_ranking(tables)
+    tables = T.group_tables(teams, rounds, cfg.rules.metric)
+    ranking = T.overall_ranking(tables, cfg.rules.metric)
     size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
     champion = T.champion_of(teams, rounds)
     return {
@@ -846,7 +915,14 @@ def validate_config(cfg: Config) -> list[str]:
                 "建议改用积分制逐场记录，或直接把排名开关打开。"
             )
 
-    if joined and len(joined) < need:
+    if not cfg.players:
+        # 全新的一届最容易卡在这里：页面各处都空着，却没人说「先去加选手」
+        issues.append(
+            f"还没有录入任何{meta['participant']}：先到「{meta['participant']}」页添加，"
+            "再勾选本届参与名单。"
+        )
+    elif len(joined) < need:
+        # 注意：参与名单留空 = 全员参与（见 joined_players），所以这里只可能是真的不够人
         issues.append(f"参与选手 {len(joined)} 人，不足 {need} 人（{per_team} 人一队至少需要 2 队）。")
 
     chosen = selection_ids(cfg)
@@ -863,6 +939,17 @@ def validate_config(cfg: Config) -> list[str]:
     ids = [p.id for p in cfg.players]
     if len(set(ids)) != len(ids):
         issues.append("存在重复的选手 ID，请检查名单。")
+
+    # 历史数据里可能存着非 ASCII 流名（旧版 clean_key 把中文也留下了）。
+    # 载入不能因此报错，但必须**说出来**：这类流名的推流地址根本用不了。
+    bad_keys = [
+        p.display_name for p in cfg.players if p.stream_key and clean_key(p.stream_key) != p.stream_key
+    ]
+    if bad_keys:
+        issues.append(
+            f"{'、'.join(bad_keys[:5])} 的推流流名含非 ASCII 字符（中文 / 空格 / 符号），"
+            "推流地址不可用，请改成字母、数字、连字符(-)或下划线(_)。"
+        )
 
     # 推流流名必须唯一：重复会让两个选手推/播同一个地址，直接串流
     seen_keys: dict[str, list[str]] = {}
@@ -937,6 +1024,71 @@ def validate_config(cfg: Config) -> list[str]:
     size = T.size_from_rounds(cfg.rounds)
     if size and len(cfg.teams) < size:
         issues.append(f"淘汰赛规模为 {size} 强，但只有 {len(cfg.teams)} 支队伍，请重新生成赛程。")
+
+    # ---- 系列赛（BO）与录入是否对得上 ----
+    # 判定本身不需要额外规则（填了各局小分就是「谁赢的局多谁赢」，见 judge_round），
+    # 这里只负责把「对不上」的情况说出来：局数超了、或者赛制没设 BO 却记了多局。
+    best_of = int(cfg.rules.best_of or 1)
+    if best_of > 1:
+        over = [
+            r for r in cfg.rounds if len(r.sets) > best_of and len(r.sides) == 2
+        ]
+        if over:
+            names = "、".join((r.label or r.code) for r in over[:4])
+            issues.append(
+                f"{names} 记录的小局数超过 BO{best_of}（一场最多 {best_of} 局），"
+                "多出来的局不会被计入胜负，建议核对后删掉。"
+            )
+        # 「已经分出胜负、后面还接着记」的场次：小局的顺序是有意义的，
+        # 所以从前往后数，谁先到 ⌈n/2⌉ 局就是终结点，之后的记录都不该存在。
+        half = (best_of + 1) // 2
+        trailing: list[Round] = []
+        for rnd in cfg.rounds:
+            if len(rnd.sides) != 2:
+                continue
+            wins = [0, 0]
+            for i, item in enumerate(rnd.sets):
+                # 每局谁赢由比法决定（计分制比大、用时制比小，见 app/metrics.py）
+                left = metrics.value_key(item.a, cfg.rules.metric)
+                right = metrics.value_key(item.b, cfg.rules.metric)
+                if left < right:
+                    wins[0] += 1
+                elif right < left:
+                    wins[1] += 1
+                if max(wins) >= half and i < len(rnd.sets) - 1:
+                    trailing.append(rnd)
+                    break
+        if trailing:
+            names = "、".join((r.label or r.code) for r in trailing[:4])
+            issues.append(
+                f"{names} 已经先到 {half} 局（胜负已定），后面还记了小局，请核对。"
+            )
+    elif any(len(r.sets) > 1 for r in cfg.rounds):
+        issues.append(
+            "有场次记了多局小分，但赛制是「一局定胜负（BO1）」："
+            "按现有规则会以「赢的局数」作为局分。若本来就想打三局两胜，"
+            "请到「赛制」里把系列赛改成 BO3。"
+        )
+
+    if metrics.lower_is_better(cfg.rules.metric):
+        # 用时制下 0 = 未完赛 / 退赛：已分出胜负却有一方没成绩，多半是漏填。
+        # 弃权方本来就记 0，要排除掉，否则每次弃权都会冒一条无意义的提示。
+        blank = [
+            r
+            for r in cfg.rounds
+            if r.status == "done"
+            and r.winner not in ("", "DRAW")
+            and any(
+                not side.forfeit
+                and metrics.round_total(side.score, side.points, bool(r.sets)) <= 0
+                for side in r.sides
+            )
+        ]
+        if blank:
+            names = "、".join((r.label or r.code) for r in blank[:4])
+            issues.append(
+                f"{names} 有一方没有用时（0 = 未完赛）：确认是退赛，还是漏填了。"
+            )
     return issues
 
 

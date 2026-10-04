@@ -4,12 +4,21 @@ version = "0.1.0"
 description = "NTE 比赛（异环）通用赛事平台：自动分组 / 积分结算 / 实时排行 / 直播推流"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
     "pydantic>=2.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/PureAmaya/NTEmatch"
+Repository = "https://github.com/PureAmaya/NTEmatch"
+Issues = "https://github.com/PureAmaya/NTEmatch/issues"
+Source = "https://github.com/PureAmaya/NTEmatch"
+"开源组件清单" = "https://github.com/PureAmaya/NTEmatch/blob/main/app/credits.py"
 
 [project.optional-dependencies]
 dev = [
@@ -31,3 +40,9 @@ packages = ["app"]
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 异步测试直接写 async def 就行，不必逐个加 @pytest.mark.asyncio
+asyncio_mode = "auto"
+addopts = "-q"

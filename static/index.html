@@ -7,7 +7,10 @@
 <meta name="color-scheme" content="dark">
 <meta name="description" content="NTE 比赛（异环）通用赛事平台：自动分组、积分结算、选手档案与直播推流。">
 <title>NTE 比赛 · 赛事平台</title>
-<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<!-- 老浏览器不认 SVG 图标时退回 .ico；现代浏览器用上面那个矢量图（任何尺寸都清晰） -->
+<link rel="alternate icon" href="/favicon.ico" type="image/x-icon">
+<link rel="manifest" href="/static/manifest.webmanifest">
 <link rel="stylesheet" href="/static/css/nte.css">
 </head>
 <body>
@@ -23,12 +26,13 @@
 <header class="hud">
   <div class="hud__brand">
     <span class="logo-plate" aria-hidden="true">
+      <!-- 品牌标记：渐变用主题变量而不是写死的颜色，换主题色 / 自定义色都会跟着变 -->
       <svg class="mark" viewBox="0 0 48 48">
         <defs>
           <linearGradient id="markGrad" x1="0" y1="1" x2="1" y2="0">
-            <stop offset="0%" stop-color="#0ea5c6"/>
-            <stop offset="50%" stop-color="#22e0e8"/>
-            <stop offset="100%" stop-color="#ff2f8e"/>
+            <stop offset="0%" style="stop-color:var(--accent)"/>
+            <stop offset="50%" style="stop-color:var(--accent-2, var(--accent))"/>
+            <stop offset="100%" style="stop-color:var(--accent)"/>
           </linearGradient>
         </defs>
         <polygon points="24,3 41.5,13 41.5,35 24,45 6.5,35 6.5,13" fill="none" stroke="url(#markGrad)" stroke-width="3.4" stroke-linejoin="round"/>
@@ -46,7 +50,7 @@
     <span class="chip chip--event" id="chipEvent" title="正在看哪一届" hidden>—</span>
     <span class="chip chip--time" id="chipEventTime" hidden title="赛事起止时间">—</span>
     <button class="btn btn--icon" id="btnRefresh" type="button" title="立即同步" aria-label="立即同步">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="ic" data-icon="refresh"></span>
     </button>
     <button class="btn btn--ghost" id="btnLogin" type="button" hidden>登录</button>
     <button class="btn btn--ghost" id="btnAdmin" type="button" hidden>管理</button>
@@ -59,30 +63,33 @@
 </header>
 <div class="hud__stripes" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
 
-<nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
+<!-- 导航进度条：切换页面时立刻出现（不确定进度，滚动光带），到手就淡出 -->
+<div class="nav-progress" id="navProgress" aria-hidden="true"><i></i></div>
+
+<nav class="tabs" id="tabs" aria-label="主导航">
   <span class="tabs__deco" aria-hidden="true"></span>
-  <button class="tab tab--home" role="tab" data-view="home" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.4 12 4.4l8 7V20H4z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.6 20v-5.4h4.8V20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
+  <button class="tab tab--home" type="button" data-view="home" aria-current="false">
+    <span class="ic" data-icon="home"></span>
     <span>主页</span>
   </button>
-  <button class="tab" role="tab" data-view="overview" aria-selected="true">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m5 10V5m5 14v-7m5 7V8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+  <button class="tab" type="button" data-view="overview" aria-current="true">
+    <span class="ic" data-icon="chart"></span>
     <span>总览</span>
   </button>
-  <button class="tab" role="tab" data-view="schedule" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+  <button class="tab" type="button" data-view="schedule" aria-current="false">
+    <span class="ic" data-icon="list"></span>
     <span>赛程</span>
   </button>
-  <button class="tab" role="tab" data-view="roster" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M3.2 19c.8-3.2 3.2-4.9 5.8-4.9S14 15.8 14.8 19M16.4 6.1a3 3 0 0 1 0 5.8M18 19c-.2-1.5-.8-2.8-1.6-3.8" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></svg>
+  <button class="tab" type="button" data-view="roster" aria-current="false">
+    <span class="ic" data-icon="users"></span>
     <span>选手</span>
   </button>
-  <button class="tab" role="tab" data-view="live" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5.5" width="13" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M16 11.4l5.2-3.1v7.4L16 12.6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/></svg>
+  <button class="tab" type="button" data-view="live" aria-current="false">
+    <span class="ic" data-icon="video"></span>
     <span>直播</span>
   </button>
-  <button class="tab tab--admin" role="tab" data-view="manage" aria-selected="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.1-2.9 7.6-7 9-4.1-1.4-7-4.9-7-9V6z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><path d="M9.2 12.2l2 2 3.6-3.9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <button class="tab tab--admin" type="button" data-view="manage" aria-current="false">
+    <span class="ic" data-icon="shield"></span>
     <span>赛事管理</span>
   </button>
 </nav>
@@ -102,6 +109,7 @@
     <div class="panel" id="bracketBoard" hidden></div>
     <div class="panel" id="standingsBoard" hidden></div>
     <div class="panel" id="formBoard" hidden></div>
+    <div class="panel" id="noticeBoard" hidden></div>
     <div class="panel" id="rulesBoard" hidden></div>
   </section>
 
@@ -147,11 +155,46 @@
     <div id="userBody"></div>
   </section>
 
+  <!-- 开发者页（/developer）：关于作者、联系方式、开源许可与开源组件清单 -->
+  <section class="view" id="view-developer" data-view="developer" hidden>
+    <div id="developerBody"></div>
+  </section>
+
   <section class="view" id="view-denied" data-view="denied" hidden>
     <div id="deniedBody"></div>
   </section>
 
 </main>
+
+<!-- 页脚：入口、署名与许可。刻意做成静态 HTML（不依赖 JS 与接口）——
+     署名不该因为一次请求失败就消失；只有「开源组件」清单由 JS 现取。
+     头像是可选的网络资源，所以放在「开发者」页里，页脚只留文字。 -->
+<footer class="foot" id="siteFoot">
+  <nav class="foot__links" aria-label="站点链接与许可">
+    <a class="foot__link" href="/developer" data-route
+       title="开发者信息、联系方式与开源许可"><span class="ic" data-icon="user"></span>开发者</a>
+    <a class="foot__link" href="https://space.bilibili.com/11393965" target="_blank" rel="noopener noreferrer"
+       title="开发者的 B 站个人空间"><span class="ic" data-icon="video"></span>B 站</a>
+    <a class="foot__link" href="https://github.com/PureAmaya/NTEmatch" target="_blank" rel="noopener noreferrer"
+       title="本站源码（AGPL-3.0）"><span class="ic" data-icon="code"></span>源码</a>
+    <a class="foot__link" href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer"
+       title="GNU Affero 通用公共许可证 v3.0 全文"><span class="ic" data-icon="shield"></span>AGPL-3.0</a>
+    <button class="foot__link foot__link--btn" type="button" data-act="credits"
+            title="本站用到的开源组件与各自许可">
+      <span class="ic" data-icon="book"></span>开源组件
+    </button>
+  </nav>
+  <div class="foot__meta">
+    <p class="foot__note">
+      本站以 <b>AGPL-3.0</b> 许可开源 · © 早八时睡觉的你 · 源码
+      <a class="foot__repo" href="https://github.com/PureAmaya/NTEmatch"
+         target="_blank" rel="noopener noreferrer">github.com/PureAmaya/NTEmatch</a>
+    </p>
+    <p class="foot__fine">
+      第三方组件与 MediaMTX 的许可详见「开源组件」 · 修改后对外提供服务，请同样公开源码
+    </p>
+  </div>
+</footer>
 
 <div id="customHtmlHost" hidden></div>
 
@@ -161,7 +204,7 @@
     <header class="modal__head">
       <h2 class="ol-w" id="modalTitle">标题</h2>
       <button class="btn btn--icon btn--ghost" type="button" data-close="1" aria-label="关闭">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+        <span class="ic" data-icon="close"></span>
       </button>
     </header>
     <div class="modal__body" id="modalBody"></div>

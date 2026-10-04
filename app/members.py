@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from . import avatars, live, logic, login_guard
-from .auth import Session, admin_key_mode, auth
+from .auth import Session, auth
 from .logging_conf import get_logger
 from .models import LiveBan, Member, NTEModel
 from .security import (
@@ -156,6 +156,11 @@ def _member_public(member: Member, session: Session, *, self_view: bool = False)
         view.update(member.private())
         # 仅管理端 / 本人可见：凭据是否还是历史无盐格式（提示轮换用）
         view["legacyCredential"] = bool(member.legacy_credentials)
+        # 推流地址（完整）：本人当然要看到自己要往哪推。以前前端只能自己拼，于是
+        # 界面上留了 `<WebRTC 根地址>` 这种占位符——地址明明就在配置里，没有理由不填全。
+        # 注意这不是凭据：真正的密钥是 Bearer 令牌，它只显示一次、不在这个地址里。
+        if member.stream_id:
+            view["push"] = logic.push_endpoints(cfg.stream, member.stream_id)
     return view
 
 
@@ -217,7 +222,11 @@ async def api_member_save(
         # 同理：唯一的服务器管理员被停用后，全站就没有人能管理了
         raise HTTPException(status_code=400, detail="服务器管理员不能被停用（有且只有一个）")
 
-    _ensure_stream_unique(payload.stream_id, payload.uid)
+    # 推流 ID 只收 ASCII：非 ASCII 拼出的推流地址用不了，比较时还会抛异常。
+    # 这里**直接报错**而不是静默丢掉字符——静默清洗会存成另一个值，
+    # 用户照着填的地址推不动，反而更难查（ValueError 会被统一转成 400）。
+    stream_id = logic.check_stream_key(payload.stream_id)
+    _ensure_stream_unique(stream_id, payload.uid)
 
     member = Member(
         uid=payload.uid,
@@ -225,7 +234,7 @@ async def api_member_save(
         qq=payload.qq,
         avatar=payload.avatar,
         game_uuid=payload.game_uuid,
-        stream_id=logic.clean_key(payload.stream_id),
+        stream_id=stream_id,
         room_title=payload.room_title,
         note=payload.note,
         permission=permission,  # type: ignore[arg-type]
@@ -295,8 +304,9 @@ async def api_member_rotate(
 async def api_me(session: Session = Depends(require_admin)) -> dict[str, Any]:
     """当前登录者的身份与个人资料。
 
-    服务器管理员用管理 KEY 登录时 ``member`` 为空（key 级会话），
-    成员用密钥登录时回自己的成员视图（含封禁状态）。
+    ``member`` 是本人视角的成员视图（含自己的 QQ / 备注，便于在「我的」页编辑）。
+    只有极端情况（会话没绑定成员，例如本机免登录且服务器管理员成员记录缺失）
+    才会回 ``None``。
     """
     member = store.member(session.uid) if session.uid else None
     return {
@@ -315,18 +325,20 @@ async def api_me(session: Session = Depends(require_admin)) -> dict[str, Any]:
 async def api_me_update(payload: MePayload, session: Session = Depends(require_admin)) -> dict[str, Any]:
     """成员修改自己的资料（uid / 权限 / 凭据不可改，只能轮换）。"""
     if not session.uid:
-        raise HTTPException(status_code=400, detail="当前为管理 KEY 登录，没有可编辑的成员资料")
+        raise HTTPException(status_code=400, detail="当前会话未绑定成员，没有可编辑的成员资料")
     member = _member_or_404(session.uid)
     if not (payload.name or "").strip():
         raise HTTPException(status_code=400, detail="成员名称不能为空")
-    _ensure_stream_unique(payload.stream_id, member.uid)
+    # 同上：推流 ID 只收 ASCII，含非法字符直接报错（不静默丢字符）
+    stream_id = logic.check_stream_key(payload.stream_id)
+    _ensure_stream_unique(stream_id, member.uid)
     updated = member.model_copy(
         update={
             "name": payload.name,
             "qq": "".join(ch for ch in (payload.qq or "") if ch.isdigit()),
             "avatar": payload.avatar,
             "game_uuid": payload.game_uuid,
-            "stream_id": logic.clean_key(payload.stream_id),
+            "stream_id": stream_id,
             "room_title": payload.room_title,
             "note": payload.note,
         }
@@ -341,7 +353,7 @@ async def api_me_update(payload: MePayload, session: Session = Depends(require_a
 async def api_me_rotate(payload: RotatePayload, session: Session = Depends(require_admin)) -> dict[str, Any]:
     """成员轮换自己的密钥 / 令牌（明文仅此一次；轮换密钥会注销本人会话）。"""
     if not session.uid:
-        raise HTTPException(status_code=400, detail="当前为管理 KEY 登录，无法轮换成员凭据")
+        raise HTTPException(status_code=400, detail="当前会话未绑定成员，无法轮换成员凭据")
     member = _member_or_404(session.uid)
     if not payload.key and not payload.bearer:
         raise HTTPException(status_code=400, detail="请指定要轮换的项目（key / bearer）")
@@ -377,8 +389,7 @@ async def api_server_config(session: Session = Depends(require_server)) -> dict[
         "customHtmlKey": "custom_html",
         "eventId": store.current_id,
         "eventName": cfg.event.name or cfg.event.title,
-        # 主管理 KEY 的存储形态（pbkdf2_sha256 / 历史 sha256 / plain）
-        "adminKeyMode": admin_key_mode(cfg.admin),
+        # 还有几位成员的凭据是历史无盐格式（建议在成员管理里轮换一次）
         "legacyCredentials": len(store.legacy_credential_members()),
     }
 

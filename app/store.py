@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import secrets
 import shutil
@@ -77,13 +78,20 @@ def _strip_demo_roster(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     return {**data, "players": []}, True
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = PROJECT_ROOT / "config"
+# 数据根目录：默认就在仓库里（config / data / backups 三处）。
+# ``NTE_DATA_DIR`` 可以把它整个挪走——容器里挂一个卷最省事；代码与静态资源
+# 始终跟着仓库走，不受影响。
+_DATA_ENV = os.getenv("NTE_DATA_DIR", "").strip()
+DATA_ROOT = Path(_DATA_ENV).expanduser().resolve() if _DATA_ENV else PROJECT_ROOT
+CONFIG_DIR = DATA_ROOT / "config"
 DB_PATH = CONFIG_DIR / "nte.sqlite3"
 LEGACY_EVENTS_DIR = CONFIG_DIR / "events"
 LEGACY_INDEX_PATH = CONFIG_DIR / "index.json"
 LEGACY_CONFIG_PATH = CONFIG_DIR / "match.json"
 MIGRATED_DIR = CONFIG_DIR / "migrated-json"
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = DATA_ROOT / "data"
+# 备份也属于「数据」：跟着 DATA_ROOT 走，别把它们留在镜像层里
+BACKUP_ROOT = DATA_ROOT / "backups"
 
 _EVENT_ID_RE = re.compile(r"^e\d{3,}$")
 
@@ -95,6 +103,8 @@ DEFAULT_SITE_NAME = "NTE 比赛"
 SITE_NAME_MAX = 24
 # 全局 meta 键：服务器管理员注入的自定义 HTML（用于接入统计 / 数据采集脚本）
 CUSTOM_HTML_KEY = "custom_html"
+#: 服务器信息（Markdown 原文）：站点级的「关于本站 / 说明」
+SERVER_INFO_KEY = "server_info"
 # 全局 meta 键：「历届选手 → 成员」的一次性迁移是否已执行（幂等，避免每次启动都扫全库）
 MEMBERS_MIGRATED_KEY = "members_migrated_v1"
 # 全局 meta 键：登录失败限制（类 fail2ban）的配置（JSON 文本）
@@ -158,6 +168,11 @@ class ConfigStore:
         self._site_name: str = ""
         # 服务器管理员注入的自定义 HTML（全局，用于数据采集）
         self._custom_html: str = ""
+        # 服务器信息（全局，Markdown）：服务器管理员在管理页维护的「关于本站」
+        self._server_info: str = ""
+        # 各作用域**最新一条**通知的轻量信息（内存缓存）：状态广播要用到它，
+        # 不能每次都查库。key = "scope:event_id"（服务器级是 "server:"）。
+        self._notice_heads: dict[str, dict[str, Any]] = {}
         # 登录失败限制（类 fail2ban）配置（全局；运行时计数在 login_guard 模块）
         self._guard: dict[str, Any] = dict(GUARD_DEFAULTS)
         # QQ 机器人（AstrBot）推送配置（全局；含 API Key，只进不出）
@@ -187,6 +202,8 @@ class ConfigStore:
         self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
         self._site_name = await asyncio.to_thread(self._load_site_name_sync)
         self._custom_html = await asyncio.to_thread(self._load_custom_html_sync)
+        self._server_info = await asyncio.to_thread(self._load_server_info_sync)
+        self._notice_heads = await asyncio.to_thread(self._load_notice_heads_sync)
         self._guard = await asyncio.to_thread(self._load_login_guard_sync)
         self._qqbot = await asyncio.to_thread(self._load_qqbot_sync)
         await self.ensure_server_admin()
@@ -211,6 +228,7 @@ class ConfigStore:
             len(cfg.players),
             len(cfg.rounds),
         )
+        self._warn_non_ascii_stream_keys()
 
     async def stop(self) -> None:
         self._running = False
@@ -243,10 +261,21 @@ class ConfigStore:
         return self._config.dump()
 
     async def list_events(self) -> list[dict[str, Any]]:
-        """届次列表（含当前标记），按创建时间倒序。"""
+        """届次列表（含当前标记与**举办者名字**），按创建时间倒序。
+
+        存储层只存 ``ownerUid``（一串随机字符串），对用户毫无意义——所以在这里
+        配上成员显示名。查不到（成员被删了 / 历史无主数据）就留空，前端据此
+        显示「服务器管理员」。
+        """
         events = await asyncio.to_thread(self._list_sync)
+        by_uid = {m.uid: m for m in self._members}
         for item in events:
             item["current"] = item["id"] == self._current
+            uid = str(item.get("ownerUid") or "")
+            owner = by_uid.get(uid) if uid else None
+            item["ownerName"] = owner.display_name if owner else ""
+            # 头像也一起给：列表上只有名字时，一屏十几届根本认不出是谁办的
+            item["ownerAvatar"] = (owner.avatar or "") if owner else ""
         return events
 
     async def read_event(self, event_id: str) -> Config:
@@ -379,6 +408,26 @@ class ConfigStore:
         if not key:
             return None
         return next((m for m in self._members if m.stream_id == key), None)
+
+    def member_by_qq(self, qq: str) -> Member | None:
+        """按 QQ 找成员（群里认人用：插件上报的 QQ → 站内身份）。
+
+        **只在唯一命中时返回**：两位成员填了同一个 QQ 时返回 ``None``——那种情况下
+        「这是谁」本身就有歧义，宁可当作查不到让对方先去改资料，也不能随便挑一个
+        （挑错就等于把权限给了错的人）。歧义会记一条 warning 方便排查。
+        """
+        want = (qq or "").strip()
+        if not want:
+            return None
+        hits = [m for m in self._members if (m.qq or "").strip() == want]
+        if len(hits) > 1:
+            log.warning(
+                "QQ 对应多个成员，按「查不到」处理 | qq=%s | uid=%s",
+                want,
+                ", ".join(m.uid for m in hits),
+            )
+            return None
+        return hits[0] if hits else None
 
     def member_by_key(self, key: str) -> Member | None:
         """按登录密钥定位成员。
@@ -783,6 +832,123 @@ class ConfigStore:
         return clean
 
     # ------------------------------------------------------------------ #
+    # 全局键值（meta 表）：给「提醒去重」这类小状态用
+    # ------------------------------------------------------------------ #
+    async def meta(self, key: str, default: str = "") -> str:
+        """读一条全局键值。"""
+        return await asyncio.to_thread(self._meta_sync, key, default)
+
+    def _meta_sync(self, key: str, default: str) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, key, default)
+
+    async def set_meta(self, key: str, value: str) -> None:
+        """写一条全局键值（立即落库：进程重启后仍要记得「这条提醒已经发过」）。"""
+        await asyncio.to_thread(self._set_meta_sync, key, value)
+
+    def _set_meta_sync(self, key: str, value: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, key, value)
+            conn.commit()
+
+    # ------------------------------------------------------------------ #
+    # 服务器信息（站点级 Markdown）+ 公告（通知）
+    # ------------------------------------------------------------------ #
+    def server_info(self) -> str:
+        """站点级说明（Markdown 原文，渲染在服务端做）。"""
+        return self._server_info
+
+    async def set_server_info(self, text: str, actor: str = "api") -> str:
+        clean = str(text or "").strip()
+        async with self._lock:
+            await asyncio.to_thread(self._set_server_info_sync, clean)
+            self._server_info = clean
+        log.info("服务器信息已更新 | 长度=%d", len(clean))
+        await self._notify(self._config, f"server:info:{actor}")
+        return clean
+
+    def notice_heads(self) -> dict[str, dict[str, Any] | None]:
+        """「当前届」与「服务器级」各自最新一条公告的轻量信息（给状态广播用）。
+
+        只带 id / 标题 / 时间，不带正文：状态每次变更都会广播给所有在线客户端，
+        把正文塞进去等于让每次改比分都重发一遍公告。
+        """
+        return {
+            "event": self._notice_head("event", self._current),
+            "server": self._notice_head("server", ""),
+        }
+
+    def _notice_head(self, scope: str, event_id: str) -> dict[str, Any] | None:
+        head = self._notice_heads.get(f"{scope}:{event_id}")
+        return dict(head) if head else None
+
+    async def list_notices(
+        self, scope: str, event_id: str = "", page: int = 1, size: int = 4
+    ) -> dict[str, Any]:
+        """分页取公告（最新在前）。"""
+        size = max(1, min(int(size or 4), 50))
+        page = max(1, int(page or 1))
+        items, total = await asyncio.to_thread(
+            self._list_notices_sync, scope, event_id, size, (page - 1) * size
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "size": size,
+            "pages": max(1, (total + size - 1) // size),
+        }
+
+    async def get_notice(self, notice_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_notice_sync, notice_id)
+
+    async def save_notice(
+        self,
+        *,
+        scope: str,
+        event_id: str = "",
+        notice_id: str = "",
+        title: str,
+        body: str,
+        author: str = "",
+    ) -> dict[str, Any]:
+        """新建或更新一条公告，并刷新内存里的「最新一条」。"""
+        stamp = now_iso()
+        nid = (notice_id or "").strip() or uuid.uuid4().hex[:12]
+        existing = await asyncio.to_thread(self._get_notice_sync, nid) if notice_id else None
+        row = {
+            "id": nid,
+            "scope": scope,
+            "eventId": event_id,
+            "title": (title or "").strip()[:120],
+            "body": body or "",
+            "author": author or (existing or {}).get("author", ""),
+            "createdAt": (existing or {}).get("createdAt") or stamp,
+            "updatedAt": stamp,
+        }
+        async with self._lock:
+            await asyncio.to_thread(self._save_notice_sync, row)
+            self._notice_heads = await asyncio.to_thread(self._load_notice_heads_sync)
+        log.info(
+            "公告已保存 | scope=%s | event=%s | id=%s | 标题=%s",
+            scope,
+            event_id or "-",
+            nid,
+            row["title"],
+        )
+        await self._notify(self._config, f"notice:save:{nid}")
+        return row
+
+    async def delete_notice(self, notice_id: str) -> bool:
+        async with self._lock:
+            removed = await asyncio.to_thread(self._delete_notice_sync, notice_id)
+            self._notice_heads = await asyncio.to_thread(self._load_notice_heads_sync)
+        if removed:
+            log.warning("公告已删除 | id=%s", notice_id)
+            await self._notify(self._config, f"notice:delete:{notice_id}")
+        return removed
+
+    # ------------------------------------------------------------------ #
     # 服务器级配置：登录失败限制（类 fail2ban）
     # ------------------------------------------------------------------ #
     def guard_settings(self) -> dict[str, Any]:
@@ -852,6 +1018,38 @@ class ConfigStore:
         with db.connect(self._db_path) as conn:
             db.set_meta(conn, CUSTOM_HTML_KEY, text)
 
+    def _load_server_info_sync(self) -> str:
+        with db.connect(self._db_path) as conn:
+            return db.get_meta(conn, SERVER_INFO_KEY)
+
+    def _set_server_info_sync(self, text: str) -> None:
+        with db.connect(self._db_path) as conn:
+            db.set_meta(conn, SERVER_INFO_KEY, text)
+
+    def _load_notice_heads_sync(self) -> dict[str, dict[str, Any]]:
+        with db.connect(self._db_path) as conn:
+            return db.notice_heads(conn)
+
+    def _list_notices_sync(
+        self, scope: str, event_id: str, limit: int, offset: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        with db.connect(self._db_path) as conn:
+            return db.list_notices(
+                conn, scope=scope, event_id=event_id, limit=limit, offset=offset
+            )
+
+    def _get_notice_sync(self, notice_id: str) -> dict[str, Any] | None:
+        with db.connect(self._db_path) as conn:
+            return db.get_notice(conn, notice_id)
+
+    def _save_notice_sync(self, row: dict[str, Any]) -> None:
+        with db.connect(self._db_path) as conn:
+            db.save_notice(conn, row)
+
+    def _delete_notice_sync(self, notice_id: str) -> bool:
+        with db.connect(self._db_path) as conn:
+            return db.delete_notice(conn, notice_id)
+
     def _load_login_guard_sync(self) -> dict[str, Any]:
         """读登录限制配置（JSON），坏数据一律回落到默认值。"""
         with db.connect(self._db_path) as conn:
@@ -899,6 +1097,8 @@ class ConfigStore:
             self._channel_notice = await asyncio.to_thread(self._load_channel_notice_sync)
             self._site_name = await asyncio.to_thread(self._load_site_name_sync)
             self._custom_html = await asyncio.to_thread(self._load_custom_html_sync)
+            self._server_info = await asyncio.to_thread(self._load_server_info_sync)
+            self._notice_heads = await asyncio.to_thread(self._load_notice_heads_sync)
             self._guard = await asyncio.to_thread(self._load_login_guard_sync)
             self._qqbot = await asyncio.to_thread(self._load_qqbot_sync)
             await self.ensure_server_admin()
@@ -936,7 +1136,10 @@ class ConfigStore:
         if not data.get("rounds") or not data.get("teams"):
             return data
         cfg = Config.model_validate(data)
-        dumped = [r.dump() for r in tournament.resolve_tournament(cfg.teams, cfg.rounds)]
+        dumped = [
+            r.dump()
+            for r in tournament.resolve_tournament(cfg.teams, cfg.rounds, cfg.rules.metric)
+        ]
         if dumped == data.get("rounds"):
             return data
         return {**data, "rounds": dumped}
@@ -1226,14 +1429,14 @@ class ConfigStore:
         """
         async with self._lock:
             template = default_config()
+            current = self._config.dump()
             if copy_roster:
-                current = self._config.dump()
                 template["players"] = current.get("players", [])
                 template["participants"] = current.get("participants", [])
                 # 沿用固定队伍（积分制的「固定队伍」模式也依赖它）；
                 # 新一届没有赛程，可随时在组队台重新随机
                 template["teams"] = current.get("teams", [])
-                for key in ("rules", "stream", "ui", "admin"):
+                for key in ("rules", "stream", "ui"):
                     if key in current:
                         template[key] = current[key]
                 # 比赛类型与排名开关也跟着沿用（同一类赛事通常连着办好几届）
@@ -1374,6 +1577,8 @@ class ConfigStore:
 
     def _delete_sync(self, event_id: str) -> None:
         with db.connect(self._db_path) as conn:
+            # 公告不挂外键（服务器级公告的 event_id 是空串），所以删届时要自己清干净
+            db.delete_event_notices(conn, event_id)
             db.delete_event(conn, event_id)
 
     def _set_current_sync(self, event_id: str) -> None:
@@ -1452,6 +1657,21 @@ class ConfigStore:
         except OSError as exc:
             log.warning("旧文件归档失败（忽略）: %s", exc)
 
+    def _warn_non_ascii_stream_keys(self) -> None:
+        """提示历史数据里的**非 ASCII 推流标识**（这类推流地址根本用不了）。
+
+        刻意只警告、不拒绝启动：这些值可能在库里躺了很久，直接报错会让人打不开站点。
+        但也不能沉默——它们的表现是「推流地址莫名为空」，不给线索就只能靠猜。
+        """
+        bad = [m.display_name for m in self._members if m.stream_id and not m.stream_id.isascii()]
+        bad += [c.display_name for c in self._channels if c.stream_key and not c.stream_key.isascii()]
+        bad += [p.display_name for p in self._config.players if p.stream_key and not p.stream_key.isascii()]
+        if bad:
+            log.warning(
+                "以下推流标识含非 ASCII 字符（推流地址不可用，请改成字母 / 数字 / - / _）| %s",
+                "、".join(dict.fromkeys(bad)),
+            )
+
     # ------------------------------------------------------------------ #
     # 统计与回调
     # ------------------------------------------------------------------ #
@@ -1474,6 +1694,55 @@ class ConfigStore:
         for res in results:
             if isinstance(res, BaseException):
                 log.exception("变更回调执行失败", exc_info=res)
+
+    # ------------------------------------------------------------------ #
+    # 操作日志（最近若干条；只在服务器管理页给管理员看）
+    # ------------------------------------------------------------------ #
+    def _record_activity_sync(
+        self, ts: str, actor: str, actor_uid: str, method: str, path: str, status: int
+    ) -> None:
+        with db.connect(self._db_path) as conn:
+            db.record_activity(
+                conn,
+                ts=ts,
+                actor=actor,
+                actor_uid=actor_uid,
+                method=method,
+                path=path,
+                status=status,
+            )
+            conn.commit()
+
+    async def log_activity(
+        self,
+        *,
+        actor: str,
+        actor_uid: str = "",
+        method: str,
+        path: str,
+        status: int,
+        ts: str = "",
+    ) -> None:
+        """记一条操作日志。
+
+        **绝不能因为它失败而影响请求**——它是观测手段，不是业务逻辑；所以这里
+        吞掉所有异常，只在日志里留一行 warning（磁盘满 / 库被锁都可能发生）。
+        """
+        # 复用 now_iso()：时间格式与赛事数据里的时间戳保持同一套（本地时间）
+        stamp = ts or now_iso().replace("T", " ")
+        try:
+            await asyncio.to_thread(
+                self._record_activity_sync, stamp, actor, actor_uid, method, path, status
+            )
+        except Exception:  # pragma: no cover - 观测失败不该冒泡到请求
+            log.warning("操作日志写入失败 | %s %s", method, path, exc_info=True)
+
+    async def activity(self, limit: int = 60) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._activity_sync, limit)
+
+    def _activity_sync(self, limit: int) -> list[dict[str, Any]]:
+        with db.connect(self._db_path) as conn:
+            return db.list_activity(conn, limit)
 
 
 store = ConfigStore()

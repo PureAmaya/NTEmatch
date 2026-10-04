@@ -23,6 +23,7 @@ import {
   Modal,
   myPermission,
   qs,
+  routePath,
   toast,
 } from './core.js';
 import {
@@ -35,9 +36,11 @@ import {
   isMemberLive,
   liveTag,
   memberAvaHtml,
+  ownerHtml,
   panelHtml,
   PUSH_TIP_LINE,
 } from './ui.js';
+import { renderNoticeBoard, renderServerInfo } from './notices.js';
 import { loadEvents, statusBadge } from './events.js';
 import { refreshLiveHealth } from './live.js';
 
@@ -57,12 +60,14 @@ export async function refreshServerData({ silent = false } = {}) {
     return null;
   }
   try {
-    const [members, config, guard, backups, qqbot] = await Promise.all([
+    const [members, config, guard, backups, qqbot, activity] = await Promise.all([
       api('/members', { auth: true }),
       api('/server/config', { auth: true }),
       api('/server/login-guard', { auth: true }),
       api('/backups', { auth: true }),
       api('/qqbot', { auth: true }),
+      // 操作日志是「顺带看看」的东西：它挂了不该把整页拖垮，所以单独兜底
+      api('/activity', { auth: true }).catch(() => ({ items: [] })),
     ]);
     App.server = {
       members: members.members || [],
@@ -71,6 +76,7 @@ export async function refreshServerData({ silent = false } = {}) {
       guard,
       backups,
       qqbot,
+      activity: activity.items || [],
       at: Date.now(),
     };
     log.debug('服务器数据已加载', App.server.members.length, '位成员');
@@ -92,8 +98,7 @@ const serverGateHtml = () =>
   `<input id="serverKey" type="password" autocomplete="current-password" placeholder="请输入服务器管理员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
   `<p class="gate__hint">密钥在服务启动日志里（首次启动自动生成）；` +
-  `服务器管理员有且只有一个，忘记可在成员管理里轮换。` +
-  `<br>在本机（localhost / 127.0.0.1）直接访问时无需登录。</p>` +
+  `服务器管理员有且只有一个，忘记可在成员管理里轮换。</p>` +
   `</div></div>`;
 
 function memberSearchMatch(m) {
@@ -183,17 +188,69 @@ function memberCardHtml(m) {
   );
 }
 
+/** 成员列表每页几行（超过就分页）。 */
+const MEMBER_ROWS = 4;
+
+/**
+ * 量出成员网格当前有几列。
+ *
+ * ``auto-fill`` 会**把占满宽度的轨道全部生成出来**（哪怕没有卡片），
+ * 所以只渲染一页也能量准，不必先把全部成员铺出来。
+ */
+function memberCols() {
+  const grid = qs('#memberGrid .roster-grid');
+  if (!grid) return 0;
+  const tpl = getComputedStyle(grid).gridTemplateColumns;
+  if (!tpl || tpl === 'none') return 0;
+  return tpl.split(/\s+/).filter(Boolean).length;
+}
+
+/** 分页条：只在真的需要翻页时才出现（成员少的时候一条都不多）。 */
+function memberPagerHtml(page, pages) {
+  const btn = (target, label, disabled) =>
+    `<button class="btn btn--sm" type="button" data-act="member-page" data-page="${target}"` +
+    `${disabled ? ' disabled' : ''}>${label}</button>`;
+  return (
+    `<div class="pager tool-group">` +
+    btn(page - 1, '上一页', page <= 1) +
+    `<span class="pager__now">第 ${page} / ${pages} 页</span>` +
+    btn(page + 1, '下一页', page >= pages) +
+    `</div>`
+  );
+}
+
 /** 只重绘成员网格（搜索时避免整页重建，保住输入焦点）。 */
 export function renderMemberGrid() {
   const host = qs('#memberGrid');
   if (!host) return;
   const data = App.server?.members || [];
   const shown = data.filter((m) => memberSearchMatch(m) && memberFilterMatch(m));
-  host.innerHTML = shown.length
-    ? `<div class="roster-grid">${shown.map(memberCardHtml).join('')}</div>`
-    : `<div class="empty"><b>没有匹配的成员</b>调整搜索或筛选条件</div>`;
+
+  // 一页 = 4 行 × 列数。列数先用上次量到的值（首次默认 3），渲染完再量一次；
+  // 量出来不一样（换窗口宽度 / 换设备）就重绘一次——之后值稳定，不会来回抖。
+  const perPage = Math.max(1, (App.memberCols || 3) * MEMBER_ROWS);
+  const pages = Math.max(1, Math.ceil(shown.length / perPage));
+  const page = Math.min(Math.max(1, App.memberPage || 1), pages);
+  App.memberPage = page;
+  const slice = shown.slice((page - 1) * perPage, page * perPage);
+
+  host.innerHTML =
+    (slice.length
+      ? `<div class="roster-grid">${slice.map(memberCardHtml).join('')}</div>`
+      : `<div class="empty"><b>没有匹配的成员</b>调整搜索或筛选条件</div>`) +
+    (pages > 1 ? memberPagerHtml(page, pages) : '');
+
   const count = qs('#memberCount');
-  if (count) count.textContent = `${shown.length} / ${data.length} 人`;
+  if (count) {
+    count.textContent =
+      `${shown.length} / ${data.length} 人` + (pages > 1 ? ` · 第 ${page} / ${pages} 页` : '');
+  }
+
+  const cols = memberCols();
+  if (cols && cols !== App.memberCols) {
+    App.memberCols = cols;
+    renderMemberGrid(); // 列数变了：重算一页装多少人（下次量到同值即停）
+  }
 }
 
 function membersPanelHtml() {
@@ -249,11 +306,14 @@ function eventAdminCard(e) {
   return (
     `<article class="evt-card evt-card--act">` +
     `<div class="evt-card__head">` +
-    `<button class="evt-card__name" type="button" data-act="event-view" data-id="${esc(e.id)}" data-page="overview">` +
-    `${esc(e.name || e.id)}</button>` +
+    `<a class="evt-card__name" href="${esc(routePath(e.id, 'overview'))}" data-route>` +
+    `${esc(e.name || e.id)}</a>` +
     statusBadge(e.status) +
     (e.hidden ? '<span class="badge badge--pending">已隐藏</span>' : '') +
-    `<span class="panel__hint">${esc(e.ownerUid ? `归属 ${e.ownerUid.slice(0, 8)}` : '归属 服务器')}</span>` +
+    // 显示**头像 + 名字**而不是 uid 前 8 位：那串随机字符对谁都说明不了问题，
+    // uid 留在 tooltip 里给排查用。
+    `<span class="panel__hint" title="归属 uid：${esc(e.ownerUid || '—')}">` +
+    `${e.ownerName ? ownerHtml(e.ownerName, e.ownerAvatar) : '举办者 服务器管理员'}</span>` +
     `</div>` +
     `<div class="evt-card__meta">${e.players || 0} 人 · 已赛 ${e.played || 0} / ${e.rounds || 0} 局` +
     (e.champion ? ` · 榜首 ${esc(e.champion)}` : '') +
@@ -362,7 +422,7 @@ function backupPanelHtml() {
 }
 
 /**
- * 查询接口令牌：给配套的 AstrBot 插件用（命令 + LLM 工具）。
+ * 查询接口令牌：给配套的 AstrBot 插件用（群命令，不依赖任何大模型）。
  *
  * 令牌只存**加盐哈希**，明文只在生成那一次弹出；重置后旧令牌立即失效。
  */
@@ -370,7 +430,9 @@ function botTokenBlockHtml(q) {
   return (
     `<div class="panel__divider" style="margin:12px 0;border-top:1px solid var(--line)"></div>` +
     `<div class="notice">配套插件 <code>astrbot_plugin_nte_match</code>（见项目里 <code>integrations/</code>）` +
-    `可以把赛事数据做成<b>群命令</b>，也能注册成 <b>LLM 工具</b>让机器人自己调用。` +
+    `可以把赛事数据做成 <b>群命令</b>（不经过大模型，答案稳定）。` +
+    `把帮助图放成 <code>static/help.jpg</code>，本域 <code>/help.jpg</code> 即可访问，` +
+    `「比赛帮助」会自动改成回这张图（插件无需配置；没放图就回文字说明）。` +
     `它需要一个只读查询令牌：</div>` +
     `<dl class="kv" style="margin-top:10px">` +
     `<div class="kv__row"><dt>查询 API</dt><dd>${q.hasBotToken ? '已启用（令牌不可查看）' : '未启用'}</dd></div>` +
@@ -490,8 +552,16 @@ function qqbotPanelHtml() {
     `Key 只存服务端，接口不回显、也不进「导出配置」。</div>` +
     `<form class="form form--2" data-form="qqbot" style="margin-top:10px">` +
     fieldSwitch('enabled', '启用群推送', q.enabled === true) +
-    fieldText('baseUrl', 'AstrBot 地址', q.baseUrl || 'https://bot.shiyora.net', {
-      hint: '不带尾部斜杠，例如 https://bot.shiyora.net',
+    // 赛前提醒：站点侧定时巡检（app/remind.py），到点在群里 @ 举办者
+    fieldSwitch('remindEnabled', '赛前提醒（开赛前 @ 举办者）', q.remindEnabled !== false) +
+    fieldText('remindLeads', '提前量（分钟，逗号分隔）', q.remindLeads || '1440,120', {
+      hint: '默认「前一天 + 前 2 小时」；只在【提前量 − 1 小时, 提前量】窗口内发，避免服务重启后把「明天开赛」补发成错话',
+    }) +
+    // 出厂**不预填**任何地址：别人的 AstrBot 地址留在这里，新装的人会「看着配好了、
+    // 其实把消息推给了别人」，与直播地址同一个坑。
+    fieldText('baseUrl', 'AstrBot 地址', q.baseUrl || '', {
+      ph: 'https://你的-AstrBot-地址',
+      hint: '不带尾部斜杠，例如 https://bot.example.com',
     }) +
     fieldText('apiKey', 'AstrBot API Key', '', {
       type: 'password',
@@ -617,21 +687,6 @@ function loginGuardPanelHtml() {
   return panelHtml('登录限制', '类 fail2ban · 服务器级', body);
 }
 
-function serverKeyPanelHtml() {
-  const mode = App.server?.config?.adminKeyMode || '';
-  const body =
-    `<div class="notice">主管理 KEY 一律以<b>加盐 PBKDF2（12 万次迭代）</b>存储，` +
-    `明文与无盐哈希都不再落库${mode && mode !== 'pbkdf2_sha256' ? `。当前库里的还是 <b>${esc(mode)}</b> 格式，设一次新 KEY 即可升级` : ''}。</div>` +
-    `<form class="form form--2" data-form="admin-key" style="margin-top:10px">` +
-    fieldText('key', '新的服务器主管理 KEY', '', {
-      type: 'password',
-      hint: '至少 6 位。保存后所有管理会话立即失效，需用新 KEY 重新登录。',
-    }) +
-    `<div class="form-actions" style="grid-column:1/-1">` +
-    `<button class="btn btn--primary" type="submit">更新主管理 KEY</button></div></form>`;
-  return panelHtml('管理 KEY', '服务器主密钥（与成员密钥独立）', body);
-}
-
 function serverStatusPanelHtml() {
   const cfg = App.server?.config;
   if (!cfg) return '';
@@ -709,8 +764,89 @@ export function renderServerPage() {
     qqbotPanelHtml() +
     loginGuardPanelHtml() +
     serverConfigPanelHtml() +
-    serverKeyPanelHtml();
+    // 服务器信息（一篇说明）与服务器通知（一条条要人马上看到的）放一起：
+    // 都是站点级 Markdown，编辑与渲染在 notices.js / mdeditor.js 里共用一套
+    `<div class="panel" id="serverInfoBox"></div>` +
+    `<div class="panel" id="serverNotices"></div>` +
+    activityPanelHtml();
   renderMemberGrid();
+  // 这两块要请求接口，异步填（不拖慢整页渲染）
+  renderServerInfo(qs('#serverInfoBox'), { title: '服务器信息', manage: true });
+  renderNoticeBoard('server', qs('#serverNotices'), {
+    manage: true,
+    hint: 'Markdown · 打开任何页面都弹',
+  });
+}
+
+/* ------------------------------ 最近操作 ------------------------------ */
+
+/** 写接口 → 人话（认不出来就退回原路径，至少能看出动过哪一块）。 */
+const ACTIVITY_PATH_LABEL = [
+  [/^\/api\/config$/, '保存配置'],
+  [/^\/api\/events$/, '新建届次'],
+  [/^\/api\/events\/[^/]+\/switch$/, '切换届次'],
+  [/^\/api\/events\/[^/]+$/, '修改 / 删除届次'],
+  [/^\/api\/format$/, '切换赛制'],
+  [/^\/api\/event\/(start|unlock)$/, '开赛 / 解锁'],
+  [/^\/api\/reload$/, '重载数据'],
+  [/^\/api\/players/, '选手改动'],
+  [/^\/api\/participants$/, '保存参赛名单'],
+  [/^\/api\/teams/, '队伍改动'],
+  [/^\/api\/tournament/, '淘汰赛操作'],
+  [/^\/api\/schedule/, '生成 / 追加赛程'],
+  [/^\/api\/rounds\/[^/]+\/result$/, '录入比分'],
+  [/^\/api\/rounds\/[^/]+\/walkover$/, '判罚弃权'],
+  [/^\/api\/rounds/, '赛程改动'],
+  [/^\/api\/members/, '成员改动'],
+  [/^\/api\/me(\/rotate)?$/, '我的资料'],
+  [/^\/api\/live\/bans/, '直播封禁'],
+  [/^\/api\/backups/, '备份操作'],
+  [/^\/api\/qqbot/, 'QQ 机器人'],
+  [/^\/api\/server\//, '服务器设置'],
+  [/^\/api\/site\/name$/, '站点名称'],
+  [/^\/api\/channels/, '频道改动'],
+  [/^\/api\/avatar\/upload$/, '上传头像'],
+];
+
+const activityLabel = (path) => {
+  const hit = ACTIVITY_PATH_LABEL.find(([re]) => re.test(path));
+  return hit ? hit[1] : path;
+};
+
+/** 操作日志面板：谁、什么时候、动了哪一块、成没成。 */
+function activityPanelHtml() {
+  const items = App.server?.activity || [];
+  if (!items.length) {
+    return panelHtml(
+      '最近操作',
+      '本机',
+      `<div class="empty"><b>还没有记录</b>有权限的人每次改动都会在这里留一条</div>`
+    );
+  }
+  const rows = items
+    .map((it) => {
+      const status = Number(it.status) || 0;
+      const bad = status >= 400;
+      // 时间戳是「2026-10-04 11:21:50」：截到分钟就够读了
+      const ts = String(it.ts || '').slice(5, 16);
+      return (
+        `<div class="act__row${bad ? ' act__row--bad' : ''}">` +
+        `<span class="act__ts">${esc(ts)}</span>` +
+        `<span class="act__who">${esc(it.actor || '未登录')}</span>` +
+        `<span class="act__what">${esc(activityLabel(String(it.path || '')))}</span>` +
+        `<span class="act__code">${bad ? status : '✓'}</span>` +
+        `<span class="act__path" title="${esc(it.path || '')}">${esc(it.method || '')} ${esc(it.path || '')}</span>` +
+        `</div>`
+      );
+    })
+    .join('');
+  return panelHtml(
+    '最近操作',
+    `${items.length} 条 · 只记接口不记内容`,
+    `<div class="act">${rows}</div>` +
+      `<p class="act__foot">由服务端中间件记录：只保存「谁 / 何时 / 动了哪个接口 / 结果」，` +
+      `不保存提交内容（里面可能有密钥）。只保留最近 600 条。</p>`
+  );
 }
 
 /* ------------------------------ /user 页 ------------------------------ */
@@ -722,9 +858,7 @@ const userGateHtml = () =>
   `<div class="field"><label for="userKey">成员密钥</label>` +
   `<input id="userKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
-  `<p class="gate__hint">没有密钥？请联系服务器管理员在成员管理里为您创建。` +
-  `<br>服务器主管理 KEY 见服务启动日志（默认 <b>NTE-ADMIN</b>）。` +
-  `<br>在本机（localhost / 127.0.0.1）直接访问时无需登录。</p>` +
+  `<p class="gate__hint">没有密钥？请联系服务器管理员在成员管理里为您创建。</p>` +
   `</div></div>`;
 
 function banBanner(ban) {
@@ -744,9 +878,12 @@ function meProfilePanel(m) {
     fieldText('name', '名字', m.name, { hint: '公开展示的名字' }) +
     fieldText('gameUuid', '游戏 UUID', m.gameUuid, { hint: '游戏内 ID；不会下发给访客' }) +
     fieldText('streamId', '推流 ID（全局唯一）', m.streamId, {
-      hint: m.streamId
-        ? `OBS 推流地址：<WebRTC 根地址>/${esc(m.streamId)}/whip；令牌填到 OBS 的「Bearer 令牌」字段。${PUSH_TIP_LINE}`
-        : `设置后即可用「推流 ID + Bearer 令牌」开播；${PUSH_TIP_LINE}`,
+      hint:
+        (m.streamId
+          ? `OBS 推流地址：${esc(pushAddress(m, m.play || {}) || '（站点还没填媒体服务器地址）')}；` +
+            `Bearer 令牌填到 OBS 的「Bearer 令牌」字段。`
+          : '设置后即可用「推流 ID + Bearer 令牌」开播。') +
+        `${PUSH_TIP_LINE}。推流 ID 只能用字母、数字、连字符(-)与下划线(_)。`,
     }) +
     fieldText('qq', 'QQ（可选）', m.qq || '', { hint: '仅服务端用于取头像' }) +
     `<div class="field" style="grid-column:1/-1"><label>头像</label>` +
@@ -766,8 +903,25 @@ function meProfilePanel(m) {
   return panelHtml('我的资料', `uid ${m.uid}`, banBanner(m.banned) + body);
 }
 
+/**
+ * 推流地址（完整）。
+ *
+ * 优先用后端在「本人视角」里下发的完整地址；拿不到就从观看地址反推
+ * （``<base>/<流名>`` → ``<base>/<流名>/whip``）；都没有就返回空串。
+ * **界面上不留 `<WebRTC 根地址>` 这种占位符**——地址本来就在配置里。
+ */
+function pushAddress(m, play) {
+  if (m.push?.whipPush) return m.push.whipPush;
+  const suffix = m.streamId ? `/${m.streamId}` : '';
+  if (play.webrtc && suffix && play.webrtc.endsWith(suffix)) {
+    return `${play.webrtc.slice(0, -suffix.length)}${suffix}/whip`;
+  }
+  return '';
+}
+
 function meRoomPanel(m) {
   const play = m.play || {};
+  const pushUrl = pushAddress(m, play);
   const body =
     `<form class="form form--2" data-form="me-room">` +
     fieldText('roomTitle', '直播间名字', m.roomTitle, {
@@ -776,10 +930,17 @@ function meRoomPanel(m) {
     `<div style="grid-column:1/-1" class="notice">` +
     (m.streamId
       ? `OBS → 推流：服务选 <b>WHIP</b>，服务器填 ` +
-        `<code>&lt;WebRTC 根地址&gt;/${esc(m.streamId)}/whip</code>，` +
+        `<code>${esc(pushUrl || '（站点还没填媒体服务器地址）')}</code>，` +
         `Bearer 令牌填到 OBS 的「Bearer 令牌」字段。` +
         (play.webrtc ? `<br>观看（WebRTC）：<code>${esc(play.webrtc)}</code>` : '') +
-        (play.hls ? `<br>观看（HLS）：<code>${esc(play.hls)}</code>` : '')
+        (play.hls ? `<br>观看（HLS）：<code>${esc(play.hls)}</code>` : '') +
+        `<br><b>推流建议</b>：${PUSH_TIP_LINE}。` +
+        `<br>令牌是<b>每人一把</b>、且只能推你自己的推流 ID：拿别人的令牌推不动，` +
+        `没带令牌会被媒体服务器直接拒绝。` +
+        (pushUrl
+          ? ''
+          : `<br><b>注意</b>：站点还没填媒体服务器地址（「服务器 → 直播配置」），` +
+            `所以这里给不出完整推流地址。`)
       : '尚未设置推流 ID；设置后直播间会出现在「频道」里。') +
     `</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存直播间名字</button></div>` +
@@ -817,8 +978,7 @@ function meAccountPanel() {
     `<div class="tool-group" style="margin-top:10px">` +
     `<button class="btn btn--sm btn--danger" type="button" data-act="logout">退出登录</button>` +
     `</div>` +
-    `<div class="notice" style="margin-top:10px">退出后需重新输入密钥才能编辑资料；` +
-    `本站其余页面（总览 / 赛程 / 直播…）本来就是公开只读的。</div>`;
+    `<div class="notice" style="margin-top:10px">退出后需重新输入密钥才能继续编辑资料。</div>`;
   return panelHtml('账户', '登出', body);
 }
 
@@ -831,14 +991,14 @@ export function renderUserPage() {
   }
   const m = App.me?.member;
   if (!m) {
-    // 正常不会走到这里：本机免登录与主 KEY 登录都会绑到唯一的服务器管理员成员上
+    // 正常不会走到这里：登录（含本机免登录）都会绑到某位成员上
     host.innerHTML =
       panelHtml(
         '我的',
         App.me?.name || '服务器管理员',
-        `<div class="notice">当前会话没有绑定成员资料（key 级会话）。` +
-          `本机免登录 / 主管理 KEY 登录都会绑定到唯一的<b>服务器管理员成员</b>；` +
-          `若看到这条提示，说明还没有管理员成员，请到「管理 → 成员管理」创建一个。</div>`
+        `<div class="notice">当前会话没有绑定成员资料。` +
+          `正常情况（成员密钥登录、本机免登录）都会绑定到那位成员；` +
+          `若看到这条提示，说明服务器上还没有管理员成员，请到「服务器 → 成员管理」创建一个。</div>`
       ) + meAccountPanel();
     return;
   }
@@ -883,7 +1043,7 @@ function openMemberModal(member) {
       fieldText('streamId', '推流 ID（全局唯一）', m.streamId || '', {
         hint: duplicateOf(m)
           ? `该推流 ID 与 ${duplicateOf(m).join('、')} 重复，会串流，请改成唯一值`
-          : '成员用「推流 ID + Bearer 令牌」推流；留空则不能推流',
+          : '成员用「推流 ID + Bearer 令牌」推流；留空则不能推流。只能用字母、数字、- 与 _',
       }) +
       fieldText('roomTitle', '直播间名字（可选）', m.roomTitle || '') +
       fieldText('qq', 'QQ（可选）', m.qq || '', { hint: '仅服务端用于取头像' }) +
@@ -1065,6 +1225,11 @@ export async function handleMemberAction(act, el) {
       App.eventsTried = false;
       await refreshServerData();
       renderServerPage();
+      return true;
+    // 成员分页（只在成员超过 4 行时才画得出这两个按钮）
+    case 'member-page':
+      App.memberPage = Math.max(1, Number(el.dataset.page) || 1);
+      renderMemberGrid();
       return true;
     case 'backup-create': {
       try {
@@ -1341,6 +1506,10 @@ export async function handleMemberForm(formEl) {
           cooldownSeconds: Number(v.cooldownSeconds) || 0,
           maxPerHour: Number(v.maxPerHour) || 30,
           maxParts: Number(v.maxParts) || 8,
+          // 赛前提醒：开关 + 提前量（分钟，逗号分隔）。服务端会再规整一次，
+          // 这里原样传字符串即可（写错了不会存成坏配置）。
+          remindEnabled: v.remindEnabled === true,
+          remindLeads: v.remindLeads,
         },
       });
       toast('群推送设置已保存', 'ok');

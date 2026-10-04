@@ -26,6 +26,9 @@ import {
   toast,
 } from './core.js';
 import { PUSH_TIP_LINE } from './ui.js';
+import { startClockTicker } from './clock.js';
+import { hydrateIcons } from './icons.js';
+import { checkNotices } from './notices.js';
 import { loadEvents, renderEventsGroups, renderHomeGroups } from './events.js';
 import { installDnD as installTeamDnD } from './teams.js';
 import {
@@ -74,12 +77,50 @@ import {
 let route = { eventId: '', page: 'home', channelId: '' };
 
 /**
+ * 导航序号：每次 ``goto`` 自增。
+ *
+ * 每个 ``await`` 之后都比对一次 —— 途中又有人点了别的页面（序号变了）
+ * 就直接放弃这次导航，先到的响应不会把后点的那一页覆盖掉。
+ */
+let gotoSeq = 0;
+
+/* ---------------------------- 导航反馈 ---------------------------- */
+// 最短显示时长：本机毫秒级返回时「闪一下」也要看得见，否则点完像没反应
+const NAV_MIN_MS = 260;
+let navShownAt = 0;
+let navHideTimer = null;
+
+/** 导航开始：顶部进度条立刻出现（不确定进度 → 来回滚动的光带）。 */
+function startNavProgress() {
+  clearTimeout(navHideTimer);
+  navHideTimer = null;
+  navShownAt = performance.now();
+  qs('#navProgress')?.classList.add('is-on');
+}
+
+/** 导航结束：至少显示 NAV_MIN_MS 再淡出，避免快得看不见。 */
+function stopNavProgress() {
+  const wait = Math.max(0, NAV_MIN_MS - (performance.now() - navShownAt));
+  clearTimeout(navHideTimer);
+  navHideTimer = setTimeout(() => {
+    navHideTimer = null;
+    qs('#navProgress')?.classList.remove('is-on');
+  }, wait);
+}
+
+/** 把「正在加载」标在用户刚点的那个卡片 / 入口上（比全局遮罩更贴手）。 */
+function markBusy(el) {
+  qsa('.is-busy').forEach((node) => node.classList.remove('is-busy'));
+  el?.closest('.evt-card, .home-entry')?.classList.add('is-busy');
+}
+
+/**
  * 直接落到错误页（403 / 404）。
  *
  * **地址栏保持原样**：错的地址留着更诚实（刷新还是这一屏，也方便把链接发给管理员看），
  * 所以这里既不 pushState 也不 replaceState。它自己算独立页，页签里只剩「主页」。
  */
-async function gotoDenied(info) {
+async function gotoDenied(info, seq = 0) {
   App.denied = info;
   App.routeEvent = '';
   App.private = null;
@@ -94,51 +135,77 @@ async function gotoDenied(info) {
   if (App.state) syncTabs(App.state, 'denied');
   setView('denied', { silent: true });
   renderPublic();
+  window.scrollTo(0, 0);
+  if (seq === gotoSeq) stopNavProgress();
+  qsa('.is-busy').forEach((node) => node.classList.remove('is-busy'));
   log.info('进入错误页', info.code, info.title);
 }
 
-async function goto(eventId = '', page = 'home', { replace = false, channelId = '' } = {}) {
+async function goto(
+  eventId = '',
+  page = 'home',
+  { replace = false, fromPop = false, scrollY = null, channelId = '' } = {}
+) {
   const want = PAGES.includes(page) ? page : 'home';
   const standalone = STANDALONE_PAGES.includes(want);
   const id = standalone ? '' : String(eventId || '');
+  // 这次导航的序号：后面每个 await 之后都比一次，过期就安静退出
+  const seq = ++gotoSeq;
+  const alive = () => seq === gotoSeq;
+  startNavProgress();
 
   // 需要权限的入口：没权限直接给错误页，而不是悄悄回落到别的页面
   if (want === 'events' && !canManageEvents()) {
-    return gotoDenied({
-      code: '403',
-      title: '「全部赛事」只对赛事管理员开放',
-      desc:
-        '这一页里有新建 / 重命名 / 封存 / 删除等操作，需要赛事管理员或服务器管理员权限。' +
-        '看比赛本身不需要权限——直接在主页点某一届就行。',
-    });
+    return gotoDenied(
+      {
+        code: '403',
+        title: '「全部赛事」只对赛事管理员开放',
+        desc:
+          '这一页里有新建 / 重命名 / 封存 / 删除等操作，需要赛事管理员或服务器管理员权限。' +
+          '看比赛本身不需要权限——直接在主页点某一届就行。',
+      },
+      seq
+    );
   }
   if (want === 'server' && !isServerAdmin()) {
-    return gotoDenied({
-      code: '403',
-      title: '服务器管理仅限服务器管理员',
-      desc:
-        '成员、届次、备份、QQ 机器人、直播封禁这些都是服务器级设置。' +
-        '如果你只是想改自己的资料，请从右上角「头像 + 用户名」进「我的」。',
-    });
+    return gotoDenied(
+      {
+        code: '403',
+        title: '服务器管理仅限服务器管理员',
+        desc:
+          '成员、届次、备份、QQ 机器人、直播封禁这些都是服务器级设置。' +
+          '如果你只是想改自己的资料，请从右上角「头像 + 用户名」进「我的」。',
+      },
+      seq
+    );
   }
   if (want === 'manage' && !canManageEvents()) {
-    return gotoDenied({
-      code: '403',
-      title: '没有赛事管理权限',
-      desc: '这一届的管理页需要赛事管理员或服务器管理员权限。赛程与战况仍然可以在总览 / 赛程页看。',
-    });
+    return gotoDenied(
+      {
+        code: '403',
+        title: '没有赛事管理权限',
+        desc: '这一届的管理页需要赛事管理员或服务器管理员权限。赛程与战况仍然可以在总览 / 赛程页看。',
+      },
+      seq
+    );
   }
 
   // 赛事页必须带届 ID（``/overview`` 这种是手敲的）→ 回主页
   if (!standalone && !id) return goto('', 'home', { replace: true });
   // 深链 / 刷新进来时届次列表可能还没到手，先补一次再判断这一届存不存在
-  if (id && !App.events.length) await loadEvents();
+  if (id && !App.events.length) {
+    await loadEvents();
+    if (!alive()) return;
+  }
   if (id && !App.events.some((e) => e.id === id)) {
-    return gotoDenied({
-      code: '404',
-      title: `没有这一届：${id}`,
-      desc: '它可能已经被删除；如果它被设成了「隐藏」，则只有服务器管理员能看到。',
-    });
+    return gotoDenied(
+      {
+        code: '404',
+        title: `没有这一届：${id}`,
+        desc: '它可能已经被删除；如果它被设成了「隐藏」，则只有服务器管理员能看到。',
+      },
+      seq
+    );
   }
 
   const switchedEvent = App.routeEvent !== id;
@@ -157,6 +224,7 @@ async function goto(eventId = '', page = 'home', { replace = false, channelId = 
       log.error('状态加载失败', err);
       toast(err.message, 'err');
     }
+    if (!alive()) return;
     if (want === 'server') {
       // 每次进入本页重新拉一次，并复位「只试一次」标记
       App.serverTried = false;
@@ -185,6 +253,7 @@ async function goto(eventId = '', page = 'home', { replace = false, channelId = 
       } catch (err) {
         log.warn('切换届次失败，按只读处理', err.message);
       }
+      if (!alive()) return;
     }
     if (id === App.eventId) {
       try {
@@ -194,11 +263,13 @@ async function goto(eventId = '', page = 'home', { replace = false, channelId = 
         log.error('状态加载失败', err);
         toast(err.message, 'err');
       }
+      if (!alive()) return;
       try {
         App.liveInfo = (await api('/live/info')).endpoints || App.liveInfo;
       } catch (err) {
         log.warn('直播信息加载失败', err);
       }
+      if (!alive()) return;
       // 隐私字段 / 推流地址只对有赛事管理权限的人拉（普通成员会被 403）
       if (canManageEvents()) await refreshPrivate();
     } else {
@@ -217,18 +288,25 @@ async function goto(eventId = '', page = 'home', { replace = false, channelId = 
         return goto('', 'home', { replace: true });
       }
     }
+    if (!alive()) return;
   }
 
   // 只读查看别人的届时，管理页直接给错误页（点卡片进来的是总览，不受影响）
   if (want === 'manage' && App.state?.readOnly) {
-    return gotoDenied({
-      code: '403',
-      title: '这一届不归你管',
-      desc:
-        '赛事管理员只能管理自己创建的届，服务器管理员可以管理全部届次。' +
-        '赛程、战况与选手名单都还能正常查看。',
-    });
+    return gotoDenied(
+      {
+        code: '403',
+        title: '这一届不归你管',
+        desc:
+          '赛事管理员只能管理自己创建的届，服务器管理员可以管理全部届次。' +
+          '赛程、战况与选手名单都还能正常查看。',
+      },
+      seq
+    );
   }
+
+  // 数据到手了，再看这一轮导航是不是还有效（期间可能有人点了别的页面）
+  if (!alive()) return;
 
   // 页面可用性要等状态到手才能定（已完结的届没有直播页）→ 不可用就回落
   const pg = pageAvailable(want, App.state) ? want : standalone ? 'home' : 'overview';
@@ -236,23 +314,91 @@ async function goto(eventId = '', page = 'home', { replace = false, channelId = 
   // 从主页点「频道」进来时不改地址，免得后退键变得更绕。在页面里换台由
   // hooks.syncChannelUrl 用 replaceState 更新，不新增历史。
   const chKey = pg === 'channels' && channelId ? channelId : '';
-  route = { eventId: standalone ? '' : id, page: pg, channelId: chKey };
-  const path = routePath(route.eventId, pg, chKey);
-  if (location.pathname !== path) history[replace ? 'replaceState' : 'pushState']({ ...route }, '', path);
+  const next = { eventId: standalone ? '' : id, page: pg, channelId: chKey };
+  // 主页 / 全部赛事页把搜索词也带在地址上（?q=…）：刷新、收藏、分享都不丢
+  const q = pg === 'home' || pg === 'events' ? App.homeSearch.trim() : '';
+  const query = q ? `?q=${encodeURIComponent(q)}` : '';
+  const basePath = routePath(next.eventId, pg, chKey);
+  const path = `${basePath}${query}`;
+  // 同一个页面只是刷新数据（数据变更后 hooks.refreshState 会走 replace）：不该滚回顶部
+  const routeChanged = route.eventId !== next.eventId || route.page !== next.page;
+  route = next;
+  if (location.pathname !== basePath || location.search !== query) {
+    if (!replace) {
+      // 先把**离开的这一页**的滚动位置记进它自己的 history entry，后退时才能回原位
+      history.replaceState(
+        { ...(history.state || {}), scrollY: Math.round(window.scrollY) },
+        '',
+        location.href
+      );
+    }
+    history[replace ? 'replaceState' : 'pushState']({ ...next, q }, '', path);
+  }
 
   // 先把页签可见性同步好，否则 setView 会因为「页签被收起来」而回落到总览。
   // 这里必须把目标页传进去：此刻 App.view 还是上一页的值。
   if (App.state) syncTabs(App.state, pg);
-  setView(pg, { silent: true });
-  renderPublic();
-  renderAdmin();
+  await withViewTransition(() => {
+    setView(pg, { silent: true });
+    renderPublic();
+    renderAdmin();
+  });
+  // 滚动：从历史回来回原位；新导航回顶部；同页刷新保持不动
+  if (fromPop && scrollY != null) window.scrollTo(0, scrollY);
+  else if (routeChanged) window.scrollTo(0, 0);
+  stopNavProgress();
+  qsa('.is-busy').forEach((node) => node.classList.remove('is-busy'));
   log.debug('路由', path, '届', route.eventId || '(独立页)');
+}
+
+/** 从地址栏读搜索词（`?q=`）——刷新 / 分享 / 前进后退都以它为准。 */
+function searchFromUrl() {
+  try {
+    return new URLSearchParams(location.search).get('q') || '';
+  } catch {
+    return '';
+  }
+}
+
+/** 把搜索词写回地址（`replaceState`，不新增历史）。 */
+function syncSearchParam(term) {
+  const params = new URLSearchParams(location.search);
+  const clean = String(term || '').trim();
+  if (clean) params.set('q', clean);
+  else params.delete('q');
+  const search = params.toString();
+  const url = `${location.pathname}${search ? `?${search}` : ''}`;
+  if (url === `${location.pathname}${location.search}`) return;
+  history.replaceState({ ...(history.state || {}), q: clean }, '', url);
+}
+
+/**
+ * 页面切换过渡（View Transitions API）。
+ *
+ * 只有 ``#stage`` 注册了 ``view-transition-name``，顶栏 / 底栏留在根快照里，
+ * 而根伪元素不挂动画 —— 于是**只有舞台淡入淡出**，过渡短、也不会整页闪一下。
+ * 不支持该 API（或用户要求减少动效）时就是硬切，功能完全不受影响。
+ */
+function withViewTransition(paint) {
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+  if (!document.startViewTransition || reduce) {
+    paint();
+    return Promise.resolve();
+  }
+  const transition = document.startViewTransition(paint);
+  return transition.finished.catch(() => {});
 }
 
 window.addEventListener('popstate', (ev) => {
   const r = parseRoute();
   const page = r.page || ev.state?.page || (r.eventId ? 'overview' : 'home');
-  goto(r.eventId, page, { replace: true, channelId: r.channelId });
+  App.homeSearch = searchFromUrl(); // 前进 / 后退：搜索词也以地址栏为准
+  goto(r.eventId, page, {
+    replace: true,
+    fromPop: true, // 后退 / 前进：恢复那条记录当时的滚动位置
+    scrollY: typeof ev.state?.scrollY === 'number' ? ev.state.scrollY : null,
+    channelId: r.channelId,
+  });
 });
 
 /* --------------------------- 视图切换 --------------------------- */
@@ -264,7 +410,8 @@ function setView(view, { silent = false } = {}) {
   if (tab && tab.hidden) view = App.routeEvent ? 'overview' : 'home';
   App.view = view;
   document.documentElement.dataset.view = view;
-  qsa('.tab').forEach((t) => t.setAttribute('aria-selected', String(t.dataset.view === view)));
+  // 页签是「导航」不是「选项卡」：用 aria-current 标出当前页（配 <nav> 语义正确）
+  qsa('.tab').forEach((t) => t.setAttribute('aria-current', String(t.dataset.view === view)));
   qsa('.view').forEach((v) => {
     v.hidden = v.dataset.view !== view;
   });
@@ -391,6 +538,9 @@ function applyState(data, { force = false } = {}) {
   const changed = App.state?.revision !== data.revision;
   App.state = data;
   if (changed) log.info('状态已更新', 'revision', data.revision);
+  // 有新通知就弹窗（服务器通知任何路由都弹，赛事通知只在本届弹；
+  // 是否「新」由本机已读记录决定，见 notices.js）
+  checkNotices(data);
   if (!force && App.renderedKey === stateKey(data) && App.renderedView === App.view) {
     log.debug('状态未变化，跳过重绘', 'revision', data.revision);
     return;
@@ -413,6 +563,7 @@ async function loadInitial() {
     log.warn('届次列表加载失败', err);
   }
   const r = parseRoute();
+  App.homeSearch = searchFromUrl(); // 直接打开带 ?q= 的链接：搜索框要预填上
   // 只给了届次（/e001）就补总览；什么都没有（/）就是主页
   await goto(r.eventId, r.page || (r.eventId ? 'overview' : 'home'), {
     replace: true,
@@ -462,6 +613,23 @@ function bindStatic() {
 
   // 全局动作委托：舞台内元素交给 live.js 自己的委托，避免重复处理
   document.addEventListener('click', (e) => {
+    // 1) 站内真链接（`a[data-route]`）：**左键普通点击**才接管成路由，
+    //    中键 / ⌘+点击 / Shift+点击一律放行给浏览器 —— 于是「在新标签页打开」
+    //    「复制链接地址」都是原生行为，无 JS 时也还能用（渐进增强）。
+    const link = e.target.closest('a[data-route]');
+    if (link && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+      // 卡片里的操作按钮（重命名 / 删除…）压在拉伸链接上面，别当成跳转
+      if (!e.target.closest('button, input, select, textarea, label')) {
+        const href = link.getAttribute('href') || '';
+        if (href.startsWith('/')) {
+          e.preventDefault();
+          markBusy(link); // 把「正在加载」标在这张卡上，等换页完成再撤掉
+          const r = parseRoute(href);
+          goto(r.eventId, r.page || (r.eventId ? 'overview' : 'home'), { channelId: r.channelId });
+          return;
+        }
+      }
+    }
     if (e.target.closest('#liveStage')) return;
     // 复制按钮在 data-act 之前拦下：带 data-copy 的都走这里（含 data-act="copy" 的按钮）
     const copyBtn = e.target.closest('[data-copy]');
@@ -510,7 +678,10 @@ function bindStatic() {
     if (!run) return;
     App.homeSearch = e.target.value;
     clearTimeout(homeTimer);
-    homeTimer = setTimeout(run, 120);
+    homeTimer = setTimeout(() => {
+      syncSearchParam(App.homeSearch); // 地址跟着变（刷新 / 分享都不丢）
+      run();
+    }, 120);
   };
   qs('#homeBody')?.addEventListener('input', onEventsSearch);
   qs('#eventsBoard')?.addEventListener('input', onEventsSearch);
@@ -539,12 +710,14 @@ function bindStatic() {
   qs('#serverBody').addEventListener('input', (e) => {
     if (e.target.id !== 'memberSearch') return;
     App.memberSearch = e.target.value;
+    App.memberPage = 1; // 换了搜索词就回第一页，否则会停在一个空的第 N 页
     clearTimeout(memberTimer);
     memberTimer = setTimeout(renderMemberGrid, 120);
   });
   qs('#serverBody').addEventListener('change', (e) => {
     if (e.target.id !== 'memberFilter') return;
     App.memberFilter = e.target.value;
+    App.memberPage = 1; // 同上：筛选条件变了，页码归零
     renderMemberGrid();
   });
 
@@ -584,9 +757,16 @@ function bindStatic() {
 
 /* --------------------------- 初始化 --------------------------- */
 async function init() {
+  // 滚动位置自己管：新导航回顶部、后退/前进回原位（见 goto 里的记录与恢复）
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
   Modal.init();
   installStageDelegation();
   installTeamDnD();
+  // 比赛计时器的全局心跳（页面整块重绘也不受影响，见 clock.js 的说明）
+  // 静态 HTML 里的图标（顶栏、底栏页签、页脚链接）：启动时补成内联 SVG。
+  // 标了 data-icon 的地方就这一处水合，之后新增静态图标不用再写 JS。
+  hydrateIcons();
+  startClockTicker();
   hooks.onAuthLost = () => {
     App.me = null;
     App.server = null;

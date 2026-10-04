@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # uv 直接读 uv.lock，装出来的版本和本地一致
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装依赖
+        run: uv sync --extra dev
+
+      - name: 代码风格（ruff）
+        run: uv run ruff check app tests tools
+
+      - name: 单元测试（pytest）
+        run: uv run pytest
+
+      # 前端是原生 ESM：没有打包器，所以这一步就是唯一的「编译期」检查。
+      # node --check 只按扩展名判断模块类型，复制成 .mjs 才是当模块解析。
+      - name: 前端语法（node --check）
+        run: |
+          mkdir -p /tmp/js
+          for f in static/js/*.js; do
+            cp "$f" "/tmp/js/$(basename "${f%.js}").mjs"
+          done
+          for f in /tmp/js/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: 静态资源自检（CSS 配平 / 导入 / 引用）
+        run: uv run python tools/check_assets.py
+
+      - name: 构建镜像
+        run: docker build -t nte-match:ci .

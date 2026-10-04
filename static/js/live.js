@@ -2,7 +2,7 @@
  * 仅依赖核心层；对外暴露 Live 与事件委托安装函数。
  */
 
-import { App, LIVE_PROTO_KEY, api, copyText, hooks, isAdmin, log, qs, toast } from './core.js';
+import { App, LIVE_PROTO_KEY, api, copyText, esc, hooks, isAdmin, log, qs, toast } from './core.js';
 import { PUSH_TIP_LINE, pushUrlOf, roomFor } from './ui.js';
 
 /**
@@ -101,10 +101,12 @@ function makePlayer(ids) {
     if (!cover) return;
     if (video) video.hidden = true;
     cover.hidden = false;
+    // 两个入参都要转义：`msg` 里会带**媒体服务器返回的错误原因**（含 URL / 报文片段），
+    // 那是本站之外的文本，直接当 HTML 插进来就是一个跨站脚本口子。
     cover.innerHTML =
       `<div class="stage-cover__noise"></div>` +
-      `<div class="stage-cover__title">${title}</div>` +
-      `<div class="stage-cover__msg">${msg}</div>`;
+      `<div class="stage-cover__title">${esc(title)}</div>` +
+      `<div class="stage-cover__msg">${esc(msg)}</div>`;
   },
 
   hideCover() {

@@ -1,0 +1,20 @@
+{
+  "name": "NTE 比赛 · 赛事平台",
+  "short_name": "NTE 比赛",
+  "description": "全部赛事与直播间的总入口：赛程、战况、选手与频道。",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#07090f",
+  "theme_color": "#0a1020",
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

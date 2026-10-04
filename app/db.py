@@ -6,7 +6,6 @@
     event_rules     赛制
     event_ui        界面展示配置
     event_stream    直播根地址与播放模式
-    event_admin     管理 KEY（明文或 sha256）
     players         选手（含 UUID / 推流流名 / 替补标记）
     event_participants 本届手动参与名单（有序；空 = 全员参与）
     teams           队伍
@@ -75,12 +74,16 @@ CREATE TABLE IF NOT EXISTS event_rules (
   group_count         INTEGER NOT NULL DEFAULT 0,
   knockout_size       INTEGER NOT NULL DEFAULT 0,
   teams_per_match     INTEGER NOT NULL DEFAULT 2,
-  loser_bracket       INTEGER NOT NULL DEFAULT 1
+  loser_bracket       INTEGER NOT NULL DEFAULT 1,
+  best_of             INTEGER NOT NULL DEFAULT 1,
+  metric              TEXT NOT NULL DEFAULT 'score'
 );
 
 CREATE TABLE IF NOT EXISTS event_ui (
   event_id       TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
   accent         TEXT NOT NULL DEFAULT 'cyan',
+  accent_custom  TEXT NOT NULL DEFAULT '',
+  og_image       TEXT NOT NULL DEFAULT '',
   show_qq        INTEGER NOT NULL DEFAULT 1,
   show_avatar    INTEGER NOT NULL DEFAULT 1,
   reveal_results INTEGER NOT NULL DEFAULT 1,
@@ -97,20 +100,13 @@ CREATE TABLE IF NOT EXISTS event_stream (
   api_pass   TEXT NOT NULL DEFAULT '',
   hls_base   TEXT NOT NULL DEFAULT '',
   stream_key TEXT NOT NULL DEFAULT 'stream',
+  push_token TEXT NOT NULL DEFAULT '',
   mode       TEXT NOT NULL DEFAULT 'auto',
   verify_tls INTEGER NOT NULL DEFAULT 1,
   whip_push  TEXT NOT NULL DEFAULT '',
   poster     TEXT NOT NULL DEFAULT '',
   title      TEXT NOT NULL DEFAULT '',
   note       TEXT NOT NULL DEFAULT ''
-);
-
--- key_hash = 加盐 PBKDF2（新格式）；key / key_sha256 是历史明文 / 无盐哈希，只为兼容旧库
-CREATE TABLE IF NOT EXISTS event_admin (
-  event_id   TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
-  key        TEXT NOT NULL DEFAULT '',
-  key_sha256 TEXT NOT NULL DEFAULT '',
-  key_hash   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS players (
@@ -212,6 +208,29 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL DEFAULT ''
 );
 
+-- 公告（通知）：scope=event 挂在某一届上，scope=server 是站点级的。
+-- 正文是 Markdown 原文，渲染在服务端做（见 app/markdown.py）。
+-- **刻意不放进 events 的配置 JSON 里**：那份配置会随每次改动广播给所有在线客户端，
+-- 把公告正文塞进去等于让每次改比分都重发一遍公告。
+CREATE TABLE IF NOT EXISTS notices (
+  id         TEXT PRIMARY KEY,
+  scope      TEXT NOT NULL DEFAULT 'event',
+  event_id   TEXT NOT NULL DEFAULT '',
+  title      TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL DEFAULT '',
+  author     TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  -- 单调递增的序号：**排序的唯一依据**。时间戳只到秒，同一秒里发的两条通知
+  -- 用时间排是随机的（id 是随机 uuid），「最新一条」会飘。
+  seq        INTEGER NOT NULL DEFAULT 0
+);
+
+-- 只按「作用域 + 届」建索引：排序键（seq）刻意不进索引——
+-- 否则老库补列时会因为「索引里有个还不存在的列」而升级失败（SQLite 不允许
+-- 先建引用不存在列的索引，而补列发生在建表脚本之后）。表本身很小，够用。
+CREATE INDEX IF NOT EXISTS idx_notices_scope ON notices(scope, event_id);
+
 -- 成员频道（日常直播）：**全局**，不挂在任何一届赛事上，跨届共享
 CREATE TABLE IF NOT EXISTS channels (
   id          TEXT PRIMARY KEY,
@@ -265,6 +284,19 @@ CREATE TABLE IF NOT EXISTS live_bans (
   event_id    TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT '',
   created_by  TEXT NOT NULL DEFAULT ''
+);
+
+-- 操作日志：中间件按「写请求」记一条（谁、什么时候、动了哪个接口），
+-- 只在服务器管理页给管理员看。刻意只记方法与路径，**不记请求体**——请求体里
+-- 可能有成员密钥、Bearer 令牌之类的敏感值。
+CREATE TABLE IF NOT EXISTS activity (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          TEXT NOT NULL DEFAULT '',
+  actor       TEXT NOT NULL DEFAULT '',
+  actor_uid   TEXT NOT NULL DEFAULT '',
+  method      TEXT NOT NULL DEFAULT '',
+  path        TEXT NOT NULL DEFAULT '',
+  status      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_event ON players(event_id, position);
@@ -337,13 +369,28 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         "ranked": "INTEGER NOT NULL DEFAULT 1",
     },
     "event_rules": {
-        "format": "TEXT NOT NULL DEFAULT 'tournament'",
-        "group_count": "INTEGER NOT NULL DEFAULT 0",
-        "knockout_size": "INTEGER NOT NULL DEFAULT 0",
-        "teams_per_match": "INTEGER NOT NULL DEFAULT 2",
-        "loser_bracket": "INTEGER NOT NULL DEFAULT 1",
+      "format": "TEXT NOT NULL DEFAULT 'tournament'",
+      "group_count": "INTEGER NOT NULL DEFAULT 0",
+      "knockout_size": "INTEGER NOT NULL DEFAULT 0",
+      "teams_per_match": "INTEGER NOT NULL DEFAULT 2",
+      "loser_bracket": "INTEGER NOT NULL DEFAULT 1",
+      # 系列赛（BO1 / BO3 / BO5 / BO7）：见 models.Rules.best_of
+      "best_of": "INTEGER NOT NULL DEFAULT 1",
+      # 比法（score 计分制 / time 用时制）：见 app/metrics.py
+      "metric": "TEXT NOT NULL DEFAULT 'score'",
+      },
+    "event_ui": {
+        # 自定义主题色与分享图（见 models.UiConfig）
+        "accent_custom": "TEXT NOT NULL DEFAULT ''",
+        "og_image": "TEXT NOT NULL DEFAULT ''",
+    },
+    "notices": {
+        # 排序序号（见 db.save_notice）：老库（本功能刚上线时建的表）靠它补齐
+        "seq": "INTEGER NOT NULL DEFAULT 0",
     },
     "event_stream": {
+        # 主直播间 / 遗留频道的推流令牌（见 models.StreamConfig.push_token）
+        "push_token": "TEXT NOT NULL DEFAULT ''",
         "verify_tls": "INTEGER NOT NULL DEFAULT 1",
         # MediaMTX 控制 API：用来查「谁真的在推流」
         "api_base": "TEXT NOT NULL DEFAULT ''",
@@ -355,10 +402,6 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         # 加盐哈希（新格式）；同表的 *_sha256 是历史无盐格式，仅为兼容旧库保留
         "key_hash": "TEXT NOT NULL DEFAULT ''",
         "bearer_hash": "TEXT NOT NULL DEFAULT ''",
-    },
-    "event_admin": {
-        # 服务器主管理 KEY 的加盐 PBKDF2（新格式）
-        "key_hash": "TEXT NOT NULL DEFAULT ''",
     },
     "teams": {"group_name": "TEXT NOT NULL DEFAULT ''"},
     "rounds": {
@@ -398,6 +441,26 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
 _OBSOLETE_COLUMNS: dict[str, tuple[str, ...]] = {
     "event_stream": ("rtmp_base", "rtsp_base", "rtmp_push", "rtsp_url", "hls_url", "flv_url"),
 }
+
+# 已退休的表：`event_admin` 存的是「主管理 KEY」——那套凭据已经去掉了（登录只认成员密钥），
+# 旧库里留着的哈希不再被任何代码读取。这里直接删表，而不是留着：一张写着
+# `NTE-ADMIN` 哈希的死表，除了让人以为它还有用，唯一的用途就是将来被谁误读回去。
+_RETIRED_TABLES: tuple[str, ...] = ("event_admin",)
+
+
+def _drop_tables(conn: sqlite3.Connection) -> None:
+    """删除已退休的表（幂等）。"""
+    dropped: list[str] = []
+    for table in _RETIRED_TABLES:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if not exists:
+            continue
+        conn.execute(f"DROP TABLE {table}")
+        dropped.append(table)
+    if dropped:
+        log.warning("数据库结构已清理 | 删除退役表=%s", ", ".join(dropped))
 
 
 def _drop_columns(conn: sqlite3.Connection) -> None:
@@ -442,6 +505,7 @@ def init_db(path: Path) -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
         _ensure_columns(conn)
+        _drop_tables(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -487,7 +551,6 @@ def save_event(
     rules = data.get("rules", {})
     ui = data.get("ui", {})
     stream = data.get("stream", {})
-    admin = data.get("admin", {})
     players = data.get("players", [])
     participants = data.get("participants", [])
     teams = data.get("teams", [])
@@ -567,6 +630,8 @@ def save_event(
             "knockout_size": rules.get("knockoutSize", 0),
             "teams_per_match": rules.get("teamsPerMatch", 2),
             "loser_bracket": int(bool(rules.get("loserBracket", True))),
+            "best_of": rules.get("bestOf", 1),
+            "metric": rules.get("metric", "score"),
         },
     )
     _upsert(
@@ -576,6 +641,8 @@ def save_event(
         {
             "event_id": event_id,
             "accent": ui.get("accent", "cyan"),
+            "accent_custom": ui.get("accentCustom", ""),
+            "og_image": ui.get("ogImage", ""),
             "show_qq": int(bool(ui.get("showQq", True))),
             "show_avatar": int(bool(ui.get("showAvatar", True))),
             "reveal_results": int(bool(ui.get("revealResults", True))),
@@ -597,6 +664,7 @@ def save_event(
             "api_pass": stream.get("apiPass", ""),
             "hls_base": stream.get("hlsBase", ""),
             "stream_key": stream.get("streamKey", "stream"),
+            "push_token": stream.get("pushToken", ""),
             "mode": stream.get("mode", "auto"),
             # 是否校验上游 HTTPS 证书（自签名证书时关闭）
             "verify_tls": int(bool(stream.get("verifyTls", True))),
@@ -606,18 +674,6 @@ def save_event(
             "note": stream.get("note", ""),
         },
     )
-    _upsert(
-        conn,
-        "event_admin",
-        ("event_id",),
-        {
-            "event_id": event_id,
-            "key": admin.get("key", ""),
-            "key_sha256": admin.get("keySha256", ""),
-            "key_hash": admin.get("keyHash", ""),
-        },
-    )
-
     # 子表：先清空该届再写入
     for table in (
         "round_players",
@@ -851,7 +907,6 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
     rules = conn.execute("SELECT * FROM event_rules WHERE event_id = ?", (event_id,)).fetchone()
     ui = conn.execute("SELECT * FROM event_ui WHERE event_id = ?", (event_id,)).fetchone()
     stream = conn.execute("SELECT * FROM event_stream WHERE event_id = ?", (event_id,)).fetchone()
-    admin = conn.execute("SELECT * FROM event_admin WHERE event_id = ?", (event_id,)).fetchone()
 
     players = [
         {
@@ -1011,9 +1066,13 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             "knockoutSize": rules["knockout_size"] if rules else 0,
             "teamsPerMatch": rules["teams_per_match"] if rules else 2,
             "loserBracket": bool(rules["loser_bracket"]) if rules else True,
+            "bestOf": rules["best_of"] if rules else 1,
+            "metric": rules["metric"] if rules else "score",
         },
         "ui": {
             "accent": ui["accent"] if ui else "cyan",
+            "accentCustom": ui["accent_custom"] if ui else "",
+            "ogImage": ui["og_image"] if ui else "",
             "showQq": bool(ui["show_qq"]) if ui else True,
             "showAvatar": bool(ui["show_avatar"]) if ui else True,
             "revealResults": bool(ui["reveal_results"]) if ui else True,
@@ -1031,6 +1090,7 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
                 "apiPass": stream["api_pass"],
                 "hlsBase": stream["hls_base"],
                 "streamKey": stream["stream_key"],
+            "pushToken": stream["push_token"],
                 "mode": stream["mode"],
                 "verifyTls": bool(stream["verify_tls"]),
                 "whipPush": stream["whip_push"],
@@ -1041,11 +1101,6 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
         )
         if stream
         else {},
-        "admin": {
-            "key": admin["key"] if admin else "",
-            "keySha256": admin["key_sha256"] if admin else "",
-            "keyHash": admin["key_hash"] if admin else "",
-        },
         "participants": participants,
         "teams": teams,
         "players": players,
@@ -1249,6 +1304,155 @@ def upsert_live_ban(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
     )
 
 
+# --------------------------------------------------------------------------- #
+# 公告（通知）
+# --------------------------------------------------------------------------- #
+def _notice_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "scope": row["scope"],
+        "eventId": row["event_id"],
+        "title": row["title"],
+        "body": row["body"],
+        "author": row["author"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def list_notices(
+    conn: sqlite3.Connection,
+    *,
+    scope: str,
+    event_id: str = "",
+    limit: int = 4,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """分页取公告（最新在前）。返回 ``(当页列表, 总数)``。"""
+    where = "scope = ? AND event_id = ?"
+    params = (scope, event_id)
+    total = int(
+        conn.execute(f"SELECT COUNT(*) AS n FROM notices WHERE {where}", params).fetchone()["n"]
+    )
+    rows = conn.execute(
+        f"SELECT * FROM notices WHERE {where} ORDER BY seq DESC LIMIT ? OFFSET ?",
+        (*params, max(1, int(limit)), max(0, int(offset))),
+    ).fetchall()
+    return [_notice_row(row) for row in rows], total
+
+
+def notice_heads(conn: sqlite3.Connection, limit: int = 400) -> dict[str, dict[str, Any]]:
+    """每个 ``(scope, event_id)`` 的最新一条（**轻量字段**，用于「有没有新通知」）。
+
+    只在启动时读一次并留在内存里：状态广播会用到它，不能每次都查库。
+    """
+    rows = conn.execute(
+        "SELECT scope, event_id, id, title, created_at, updated_at FROM notices "
+        "ORDER BY seq DESC LIMIT ?",
+        (max(1, int(limit)),),
+    ).fetchall()
+    heads: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = f"{row['scope']}:{row['event_id']}"
+        heads.setdefault(
+            key,
+            {
+                "id": row["id"],
+                "scope": row["scope"],
+                "title": row["title"],
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            },
+        )
+    return heads
+
+
+def get_notice(conn: sqlite3.Connection, notice_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM notices WHERE id = ?", (notice_id,)).fetchone()
+    return _notice_row(row) if row else None
+
+
+def save_notice(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    # 序号在这里现取：新建与修改都会拿到一个比现有全部更大的值，
+    # 于是「最新的在前面」永远成立，且不依赖时间戳精度
+    seq = int(conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM notices").fetchone()["n"])
+    _upsert(
+        conn,
+        "notices",
+        ("id",),
+        {
+            "id": row.get("id", ""),
+            "scope": row.get("scope", "event"),
+            "event_id": row.get("eventId", ""),
+            "title": row.get("title", ""),
+            "body": row.get("body", ""),
+            "author": row.get("author", ""),
+            "created_at": row.get("createdAt", ""),
+            "updated_at": row.get("updatedAt", ""),
+            "seq": seq,
+        },
+    )
+
+
+def delete_notice(conn: sqlite3.Connection, notice_id: str) -> bool:
+    cur = conn.execute("DELETE FROM notices WHERE id = ?", (notice_id,))
+    return cur.rowcount > 0
+
+
+def delete_event_notices(conn: sqlite3.Connection, event_id: str) -> int:
+    """删除某一届的全部公告（删届时调用——notices 不挂外键，得自己清）。"""
+    cur = conn.execute("DELETE FROM notices WHERE scope = 'event' AND event_id = ?", (event_id,))
+    return cur.rowcount
+
+
 def delete_live_ban(conn: sqlite3.Connection, ban_id: str) -> bool:
     cur = conn.execute("DELETE FROM live_bans WHERE id = ?", (ban_id,))
     return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------- #
+# 操作日志
+# --------------------------------------------------------------------------- #
+# 只留最近这么多条：这是「给人看最近发生了什么」的窗口，不是审计档案，
+# 老条目对排查没有价值，却会让库一直长。
+ACTIVITY_KEEP = 600
+
+
+def record_activity(
+    conn: sqlite3.Connection,
+    *,
+    ts: str,
+    actor: str,
+    actor_uid: str,
+    method: str,
+    path: str,
+    status: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO activity (ts, actor, actor_uid, method, path, status) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, actor, actor_uid, method, path, int(status)),
+    )
+    # 顺手裁掉超出的老记录（按 id 保留最后 ACTIVITY_KEEP 条）
+    conn.execute(
+        "DELETE FROM activity WHERE id <= (SELECT MAX(id) FROM activity) - ?",
+        (ACTIVITY_KEEP,),
+    )
+
+
+def list_activity(conn: sqlite3.Connection, limit: int = 60) -> list[dict[str, Any]]:
+    keep = max(1, min(int(limit or 60), ACTIVITY_KEEP))
+    rows = conn.execute(
+        "SELECT ts, actor, actor_uid, method, path, status FROM activity ORDER BY id DESC LIMIT ?",
+        (keep,),
+    ).fetchall()
+    return [
+        {
+            "ts": row["ts"],
+            "actor": row["actor"],
+            "actorUid": row["actor_uid"],
+            "method": row["method"],
+            "path": row["path"],
+            "status": int(row["status"] or 0),
+        }
+        for row in rows
+    ]

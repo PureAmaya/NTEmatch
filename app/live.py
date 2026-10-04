@@ -20,6 +20,7 @@ MediaMTX 的 HLS 与 WebRTC 是**两个独立端口**（``8888`` / ``8889``）�
 from __future__ import annotations
 
 import asyncio
+import hmac
 import time
 from typing import Any
 from urllib.parse import parse_qs
@@ -563,6 +564,16 @@ def authorize_publish(key: str, token: str) -> tuple[bool, str]:
             return False, "Bearer 令牌不正确"
         return True, ""
     if key in registered_push_keys():
+        # 主直播间 / 服务器管理员手工建的遗留频道：这类流名不属于任何成员，所以没得
+        # 「按成员认人」。配了「推流令牌」就要令牌；**留空则保持旧的白名单放行**
+        #（向后兼容：不配也能照旧推）。
+        expected = (store.snapshot().stream.push_token or "").strip()
+        if not expected:
+            return True, ""
+        # 按 UTF-8 **字节**比：compare_digest 对含非 ASCII 的 str 会直接抛 TypeError
+        #（用户随手填个中文令牌就把鉴权接口打成 500）——auth._same 里踩过同一个坑。
+        if not token or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+            return False, "该流名需要「推流令牌」（在直播配置里设置的那个）"
         return True, ""
     return False, "该推流流名未在本站登记"
 

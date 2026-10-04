@@ -12,6 +12,7 @@
 
 import {
   App,
+  DEFAULT_SITE_NAME,
   api,
   canManageEvents,
   esc,
@@ -24,7 +25,9 @@ import {
   siteName,
   toast,
 } from './core.js';
-import { isChannelLive, isMemberLive } from './ui.js';
+import { isChannelLive, isMemberLive, ownerHtml } from './ui.js';
+import { icon } from './icons.js';
+import { renderNoticeBoard, renderServerInfo } from './notices.js';
 
 /* ------------------------------ 届次数据 ------------------------------ */
 
@@ -34,8 +37,12 @@ const ownedByMe = (e) => isServerAdmin() || Boolean(e?.ownerUid && e.ownerUid ==
 const STATUS_LABEL = { draft: '筹备中', active: '进行中', closed: '已结束' };
 const STATUS_CLASS = { draft: 'badge--pending', active: 'badge--live', closed: 'badge--done' };
 
+/** 状态徽标：加一枚小图标，扫一眼就能分出「筹备中 / 进行中 / 已结束」。 */
+const STATUS_ICON = { draft: 'clock', active: 'zap', closed: 'checkCircle' };
+
 export const statusBadge = (status) =>
-  `<span class="badge ${STATUS_CLASS[status] || 'badge--pending'}">${STATUS_LABEL[status] || esc(status)}</span>`;
+  `<span class="badge ${STATUS_CLASS[status] || 'badge--pending'}">` +
+  `${icon(STATUS_ICON[status] || 'clock')}${STATUS_LABEL[status] || esc(status)}</span>`;
 
 /** 拉取届列表（默认走缓存；主页 / 全部赛事页进入前会先失效缓存）。 */
 export async function loadEvents(force = false) {
@@ -87,7 +94,7 @@ function groupHtml(group, events, admin) {
     `<button class="home-group__head" type="button" data-act="group-toggle" ` +
     `data-group="${group.key}" aria-expanded="${open}">` +
     `<span class="home-group__caret" aria-hidden="true"></span>` +
-    `<span class="home-group__label">${group.label}</span>` +
+    `<span class="home-group__label">${esc(group.label)}</span>` +
     `<span class="home-group__count">${events.length}</span>` +
     `</button>` +
     `<div class="home-group__body"><div class="home-group__inner">${body}</div></div>` +
@@ -120,10 +127,8 @@ export function renderGroupList(hostId, admin, s = App.state) {
 
 /* ------------------------------ 卡片 ------------------------------ */
 
-const POP_ICON =
-  `<svg viewBox="0 0 24 24" aria-hidden="true">` +
-  `<path d="M13.5 5H19v5.5M19 5l-7.2 7.2M17 14.5V18a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 4 18V7.5A1.5 1.5 0 0 1 5.5 6H9" ` +
-  `fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+/** 「在新窗口打开这一届」的角标图标（图标集里的 external）。 */
+const POP_ICON = icon('external');
 
 /**
  * 一届 = 一张卡片。
@@ -147,6 +152,10 @@ function eventCardHtml(e, admin = false, index = 0) {
   ]
     .filter(Boolean)
     .join(' · ');
+  // 举办者单独一行带头像：进群被问「谁办的」时一眼能答，也对得上人
+  const owner = e.ownerName
+    ? `<div class="evt-card__owner">${ownerHtml(e.ownerName, e.ownerAvatar)}</div>`
+    : '';
   const ops =
     admin && ownedByMe(e)
       ? `<div class="evt-card__ops">` +
@@ -158,17 +167,18 @@ function eventCardHtml(e, admin = false, index = 0) {
         `</div>`
       : '';
   return (
-    `<article class="evt-card evt-card--act" style="--i:${index}" ` +
-    `data-act="event-view" data-id="${esc(e.id)}" data-page="overview" ` +
-    `title="进入这一届：${esc(path)}">` +
+    `<article class="evt-card evt-card--act" style="--i:${index}">` +
     `<div class="evt-card__head">` +
-    `<button class="evt-card__name" type="button" data-act="event-view" data-id="${esc(e.id)}" ` +
-    `data-page="overview">${esc(e.name || e.id)}</button>` +
+    // 真链接 + 拉伸覆盖整张卡：点哪都能进这一届，同时「中键 / ⌘+点击」能开新标签、
+    // 右键能复制链接地址（这些都是 `<button data-act>` 做不到的）
+    `<a class="evt-card__name" href="${esc(path)}" data-route ` +
+    `title="进入这一届：${esc(path)}">${esc(e.name || e.id)}</a>` +
     tags +
-    `<button class="evt-card__pop" type="button" data-act="event-open" data-id="${esc(e.id)}" ` +
-    `data-page="overview" title="在新窗口打开 ${esc(path)}" aria-label="在新窗口打开">${POP_ICON}</button>` +
+    `<a class="evt-card__pop" href="${esc(path)}" target="_blank" rel="noopener" ` +
+    `title="在新窗口打开 ${esc(path)}" aria-label="在新窗口打开">${POP_ICON}</a>` +
     `</div>` +
     (e.brief ? `<div class="evt-card__brief">${esc(e.brief)}</div>` : '') +
+    owner +
     `<div class="evt-card__meta">${meta}</div>` +
     `<div class="evt-card__meta" title="创建 ${esc(fmtFull(e.createdAt))} · 更新 ${esc(fmtFull(e.updatedAt))}">` +
     `起止 ${esc(fmtSpan(e.startTime, e.endTime))}` +
@@ -197,7 +207,7 @@ function channelStats(s) {
 function searchBoxHtml(id) {
   return (
     `<div class="home-search">` +
-    `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M16 16l4.5 4.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>` +
+    icon('search') +
     `<input id="${id}" type="search" autocomplete="off" placeholder="搜索赛事名称 / 编号 / 简介" ` +
     `value="${esc(App.homeSearch)}" aria-label="搜索赛事">` +
     `</div>`
@@ -210,6 +220,84 @@ function searchBoxHtml(id) {
  * 与比赛无关的页面（频道 / 全部赛事 / 我的 / 服务器）都由这里进入，
  * 它们自己只有「主页」一个页签——所以主页是唯一的总入口。
  */
+/* --------------------------- 新装引导（三步开赛） --------------------------- */
+
+/** 引导卡「不再提示」的本机记忆键（换设备的人本来就该再看一眼现状）。 */
+const GUIDE_KEY = 'nte.guide.hidden';
+
+/** 关掉引导卡（由 actions.js 的 data-act="guide-hide" 调用）。 */
+export function hideSetupGuide() {
+  try {
+    localStorage.setItem(GUIDE_KEY, '1');
+  } catch {
+    /* 隐私模式下写不进 localStorage：本次会话照常隐藏即可 */
+  }
+}
+
+/**
+ * 「三步开赛」引导卡：只在**能管赛事的人**眼里出现，而且**缺哪步才说哪步**。
+ *
+ * 刻意不做成导瞄准星 / 弹窗——那会挡住首页。这里就是一张普通卡片：全部满足后
+ * 自然消失；不想看的人点「不再提示」即可。每一步都直接给一条去对应页面的路。
+ */
+function setupGuideHtml(s) {
+  if (!canManageEvents()) return '';
+  try {
+    if (localStorage.getItem(GUIDE_KEY)) return '';
+  } catch {
+    /* 读不到 localStorage 就当没关过 */
+  }
+  const steps = [];
+  if (siteName(s) === DEFAULT_SITE_NAME) {
+    steps.push({
+      title: '给站点起个名',
+      desc: `现在还叫「${DEFAULT_SITE_NAME}」——它会出现在浏览器标签与分享卡片上。`,
+      href: '/admin',
+      cta: '去设置',
+    });
+  }
+  // 「直播」关掉了就不催（有的社区只办比赛不直播）
+  if (s?.stream?.enabled !== false && !String(s?.stream?.baseUrl || '').trim()) {
+    steps.push({
+      title: '填直播服务器地址',
+      desc: '没填的话「直播」页只能给出推流地址，观众那边点不开播放器。',
+      href: '/admin',
+      cta: '去填地址',
+    });
+  }
+  if (!(App.events || []).length) {
+    steps.push({
+      title: '新建一届比赛',
+      desc: '有了届次才会有赛程、名单与排行。',
+      href: '/events',
+      cta: '新建一届',
+    });
+  } else if (Array.isArray(s?.players) && s.players.length === 0) {
+    steps.push({
+      title: '添加参赛选手',
+      desc: '本届还没有选手：先在「选手」页录入名单，再生成赛程。',
+      href: routePath(s?.eventId || '', 'roster'),
+      cta: '去加选手',
+    });
+  }
+  if (!steps.length) return '';
+  return (
+    `<section class="setup panel">` +
+    `<header class="setup__head"><b>把这里跑起来 · 还剩 ${steps.length} 步</b>` +
+    `<button class="setup__skip" type="button" data-act="guide-hide">不再提示</button></header>` +
+    `<ol class="setup__list">` +
+    steps
+      .map(
+        (st, i) =>
+          `<li class="setup__item"><span class="setup__no">${i + 1}</span>` +
+          `<span class="setup__text"><b>${esc(st.title)}</b><span>${esc(st.desc)}</span></span>` +
+          `<a class="btn btn--sm" href="${esc(st.href)}" data-route>${esc(st.cta)}</a></li>`
+      )
+      .join('') +
+    `</ol></section>`
+  );
+}
+
 export function renderHome(s = App.state) {
   const host = qs('#homeBody');
   if (!host) return;
@@ -227,30 +315,36 @@ export function renderHome(s = App.state) {
     `<span class="home-stat home-stat--live"><b>${active}</b><span>进行中</span></span>` +
     `<span class="home-stat"><b>${ch.live}</b><span>直播间在播</span></span>` +
     `</div></section>` +
+    setupGuideHtml(s) +
     `<div class="home-entries">` +
-    `<button class="home-entry home-entry--channel" type="button" data-act="route-channels">` +
+    `<a class="home-entry home-entry--channel" href="/channels" data-route>` +
     `<span class="home-entry__icon" aria-hidden="true">` +
-    `<svg viewBox="0 0 24 24"><path d="M12 3l7.5 4.2v9.6L12 21l-7.5-4.2V7.2z" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linejoin="round"/><path d="M9.7 9.2l4.9 2.8-4.9 2.8z" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linejoin="round"/></svg>` +
+    icon('radio') +
     `</span>` +
     `<span class="home-entry__text"><b>频道</b>` +
     `<span>${ch.total} 个直播间${ch.live ? ` · ${ch.live} 个在播` : ' · 暂时没人在播'}</span></span>` +
     `<span class="home-entry__go" aria-hidden="true">›</span>` +
-    `</button>` +
+    `</a>` +
     (canManageEvents()
-      ? `<button class="home-entry home-entry--admin" type="button" data-act="route-events">` +
+      ? `<a class="home-entry home-entry--admin" href="/events" data-route>` +
         `<span class="home-entry__icon" aria-hidden="true">` +
-        `<svg viewBox="0 0 24 24"><path d="M5 4h14v3H5zM5 10h14v3H5zM5 16h9v3H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>` +
+        icon('tool') +
         `</span>` +
         `<span class="home-entry__text"><b>管理赛事</b>` +
         `<span>新建 / 重命名 / 封存 / 删除${isServerAdmin() ? '（含隐藏届）' : ''}</span></span>` +
         `<span class="home-entry__go" aria-hidden="true">›</span>` +
-        `</button>`
+        `</a>`
       : '') +
     `</div>` +
     `<div class="home-tools">${searchBoxHtml('homeSearch')}</div>` +
     `<div id="homeGroups"></div>` +
+    // 站点级内容放主页最下面：一条条的通知（历史留档）+ 「关于本站」
+    `<div class="panel" id="homeNotices"></div>` +
+    `<div class="panel" id="homeServerInfo" hidden></div>` +
     `</div>`;
   renderHomeGroups(s);
+  renderNoticeBoard('server', qs('#homeNotices'), { hint: '全站弹窗 · 历史留档' });
+  renderServerInfo(qs('#homeServerInfo'));
 }
 
 /** 只重绘主页的分组列表（搜索时用，避免重建搜索框丢焦点）。 */

@@ -18,5 +18,20 @@
     "description": "回复前缀（贴到最前面，便于在群里认出是哪个机器人在说话）",
     "type": "string",
     "default": ""
+  },
+  "help_image": {
+    "description": "「比赛帮助」要发的帮助图。留空（默认）= 用站点内置那张 /help.jpg（即站点 static/help.jpg，没放图则回私聊文字说明）；也可填别的图片网址或 AstrBot 本机路径来覆盖。做图用的文档见 HELP.md",
+    "type": "string",
+    "default": ""
+  },
+  "call_cooldown": {
+    "description": "「比赛召集」冷却：同一会话两次之间的最小间隔（秒，0 = 不限制）",
+    "type": "int",
+    "default": 60
+  },
+  "call_per_hour": {
+    "description": "「比赛召集」每小时上限（同一会话，0 = 不限制）",
+    "type": "int",
+    "default": 6
   }
 }

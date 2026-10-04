@@ -100,6 +100,87 @@ export function fmtDuration(minutes) {
   return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
 }
 
+/* ---------------------------- 比法（metric） ----------------------------
+ * 与后端 app/metrics.py 一一对应：score = 计分制（分高者胜）、
+ * time = 用时制（用时短者胜）。方向、0 的含义、显示格式三件事必须与后端一致，
+ * 否则「预览说 A 胜、结算说 B 胜」——观众只会看到自相矛盾。
+ *
+ * 用时制的数值一律是**毫秒**（整数）：要和后端一样能可靠地求和、比并列。
+ */
+const DNF_WORDS = /^(dnf|dns|dnq|退赛|未完赛|未完成|-|—|\/|无)$/i;
+
+/** 当前比法；认不出来按计分制（老数据没有这个字段）。 */
+export const metricOf = (s) => (s?.rules?.metric === 'time' ? 'time' : 'score');
+export const isTimeMetric = (s) => metricOf(s) === 'time';
+
+/** 毫秒 → 1:23.456 / 83.45（规则与后端 metrics.format_time 完全一致）。 */
+export function fmtMilli(ms) {
+  const n = Math.round(Number(ms) || 0);
+  if (n <= 0) return '—';
+  const dec = n % 10 === 0 ? 2 : 3;
+  const unit = 1000;
+  const p2 = (v) => String(v).padStart(2, '0');
+  const hours = Math.floor(n / (3600 * unit));
+  const minutes = Math.floor(n / (60 * unit)) % 60;
+  const secs = Math.floor(n / unit) % 60;
+  const millis = String(n % unit).padStart(3, '0').slice(0, dec);
+  if (hours) return `${hours}:${p2(minutes)}:${p2(secs)}.${millis}`;
+  if (minutes) return `${minutes}:${p2(secs)}.${millis}`;
+  return `${secs}.${millis}`;
+}
+
+/** 按比法显示一个成绩：time → 时间，score → 数字。 */
+export function fmtVal(value, metric = metricOf()) {
+  return metric === 'time' ? fmtMilli(value) : String(num(value));
+}
+
+/** 按比法解析输入；解析不了抛错（静默当 0 会把人记成「未完赛」）。 */
+export function parseVal(text, metric = metricOf()) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return 0;
+  if (metric !== 'time') {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error(`「${raw}」不是合法的分数`);
+    return Math.max(0, Math.trunc(n)); // 与后端 int() 一致
+  }
+  if (DNF_WORDS.test(raw)) return 0;
+  const parts = raw
+    .replace(/["”″]/g, '.')
+    .replace(/[:：'’′]/g, ':')
+    .split(':')
+    .filter((part) => part !== '');
+  if (!parts.length) return 0;
+  const step = (part) => {
+    const n = Number(part);
+    if (!Number.isFinite(n)) {
+      throw new Error(`「${raw}」不是合法的用时（可写 1:23.456 或 83.45）`);
+    }
+    return n;
+  };
+  let total = step(parts[parts.length - 1]) * 1000;
+  parts
+    .slice(0, -1)
+    .reverse()
+    .forEach((part, i) => {
+      total += step(part) * 60 ** (i + 1) * 1000;
+    });
+  return Math.max(0, Math.round(total));
+}
+
+/**
+ * 成绩比较器（Array#sort 用）：负数 = a 在前。
+ *
+ * **0 / 空 = 没有成绩，永远排在有成绩的后面**——否则用时制里
+ * 「0 秒」会被当成最快的人（与后端 metrics.value_key 同一条约定）。
+ */
+export function cmpVal(a, b, metric = metricOf()) {
+  const noA = !(Number(a) > 0);
+  const noB = !(Number(b) > 0);
+  if (noA !== noB) return noA ? 1 : -1;
+  if (noA) return 0;
+  return metric === 'time' ? Number(a) - Number(b) : Number(b) - Number(a);
+}
+
 /** 当前本地时间，格式化为 <input type="datetime-local"> 需要的值。 */
 export function nowLocalInput(offsetMinutes = 0) {
   const d = new Date(Date.now() + offsetMinutes * 60_000);
@@ -198,6 +279,9 @@ export const App = {
   // 成员管理页的搜索 / 筛选
   memberSearch: '',
   memberFilter: 'all',
+  // 成员分页：当前页 + 上次量到的列数（一页 = 4 行 × 列数，见 renderMemberGrid）
+  memberPage: 1,
+  memberCols: 0,
 };
 
 /** 上层注入的回调，避免核心层反向依赖视图层。 */
@@ -283,15 +367,24 @@ export const PAGES = [
   'events',
   'server',
   'user',
+  'developer',
 ];
 /**
  * 不属于任何一届的独立页（地址不带届 ID）。
  *
  * 这里的分界线就是「页签长什么样」：**只有赛事页（overview…manage）能看到
- * 总览 / 赛程 / 选手 / 直播**；独立页（主页 / 频道 / 赛事列表 / 服务器 / 我的）
- * 页签里只剩一个「主页」——比赛与频道之间不能直接互跳，都得经过主页。
+ * 总览 / 赛程 / 选手 / 直播**；独立页（主页 / 频道 / 赛事列表 / 服务器 / 我的 /
+ * 开发者）页签里只剩一个「主页」——比赛与频道之间不能直接互跳，都得经过主页。
  */
-export const STANDALONE_PAGES = ['home', 'channels', 'events', 'server', 'user', 'denied'];
+export const STANDALONE_PAGES = [
+  'home',
+  'channels',
+  'events',
+  'server',
+  'user',
+  'developer',
+  'denied',
+];
 export const PAGE_LABEL = {
   home: '主页',
   overview: '总览',
@@ -303,6 +396,7 @@ export const PAGE_LABEL = {
   manage: '赛事管理',
   server: '服务器',
   user: '我的',
+  developer: '开发者',
 };
 
 /**
@@ -357,6 +451,7 @@ export function routePath(eventId = '', page = 'overview', channelId = '') {
   if (p === 'events') return '/events';
   if (p === 'server') return '/admin';
   if (p === 'user') return '/user';
+  if (p === 'developer') return '/developer';
   if (!eventId) return p === 'overview' ? '/' : `/${p}`;
   return p === 'overview' ? `/${eventId}` : `/${eventId}/${p}`;
 }
@@ -465,8 +560,18 @@ export function toast(message, kind = 'info', ms = 3600) {
 }
 
 /* -------------------------------- Modal -------------------------------- */
+/**
+ * 全站唯一的弹窗宿主（`#modal`）：所有弹窗——Markdown 编辑器、版权信息、通知、
+ * 成员编辑、确认框——都从这里开关，所以**动画只在这一处实现**，新弹窗自动继承。
+ *
+ * 动效刻意做得很轻：背板淡入淡出 + 面板一点点上浮与微缩放（见 nte.css 的 `.modal`）。
+ * 关闭比打开更快一点：关窗是「这件事做完了」，不该让人等动画。
+ */
+const MODAL_OUT_MS = 110 + 50; // 与 .modal.is-closing 的 transition-duration 对齐，多 50ms 兜底
+
 export const Modal = {
   el: null,
+  _timer: null,
   init() {
     this.el = qs('#modal');
     if (!this.el) return;
@@ -477,20 +582,65 @@ export const Modal = {
       if (e.key === 'Escape' && !Modal.el.hidden) Modal.close();
     });
   },
-  open({ title = '', body = '', footer = '', onMount } = {}) {
+  open({ title = '', body = '', footer = '', onMount, className = '' } = {}) {
+    const alreadyOpen = this.el && !this.el.hidden;
+    // 上一次的淡出还没结束就又要开（比如「保存 → 关掉 → 立刻开下一个」）：取消它，
+    // 否则那个定时器会在新弹窗上补一刀，把刚打开的面板又藏起来。
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
     qs('#modalTitle').textContent = title;
     qs('#modalBody').innerHTML = body;
+    // 弹窗尺寸由调用方按需指定（编辑器要一个大的悬浮窗；普通弹窗保持原样）。
+    // 每次打开都重置，避免上一回的 className 粘在下一个弹窗上。
+    const box = qs('.modal__box', this.el);
+    if (box) box.className = `modal__box${className ? ` ${className}` : ''}`;
     const footEl = qs('#modalFoot');
     footEl.innerHTML = footer;
     footEl.hidden = !footer;
     this.el.hidden = false;
+    this.el.classList.remove('is-closing');
+    if (alreadyOpen) {
+      // 本来就开着（只是换了内容）：直接置成终态，不再播一次入场动画
+      this.el.classList.add('is-open');
+    } else {
+      // 先**强制一次布局**，让浏览器把「初始状态」（透明度 0、略微下沉）真正算出来，
+      // 再切到终态；否则同一个任务里「display:none → 可见」和「opacity 0 → 1」会被
+      // 合并成一次样式计算，浏览器没有可插值的起点，动画根本不播（只闪一下）。
+      //
+      // 读一次 offsetWidth 是最省的办法（等于要求布局）。这也是为什么这里**不用**
+      // requestAnimationFrame：它的回调在本帧绘制**之前**跑，照样会被合并掉。
+      void this.el.offsetWidth;
+      this.el.classList.add('is-open');
+    }
     if (typeof onMount === 'function') onMount(qs('#modalBody'), footEl);
     log.debug('打开弹窗', title);
   },
   close() {
-    if (this.el) this.el.hidden = true;
-    qs('#modalBody').innerHTML = '';
-    qs('#modalFoot').innerHTML = '';
+    if (!this.el || this.el.hidden) {
+      this._reset();
+      return;
+    }
+    // 移除终态 → 面板与背板一起淡出；淡出播完再 hidden，否则会「啪」地消失
+    this.el.classList.remove('is-open');
+    this.el.classList.add('is-closing');
+    this._timer = setTimeout(() => {
+      this._timer = null;
+      if (this.el && !this.el.classList.contains('is-open')) {
+        this.el.hidden = true;
+        this.el.classList.remove('is-closing');
+      }
+      this._reset();
+    }, MODAL_OUT_MS);
+    log.debug('关闭弹窗');
+  },
+  /** 清空内容（弹窗已经不可见时也要清，避免上一份内容留到下一次打开）。 */
+  _reset() {
+    const body = qs('#modalBody');
+    const foot = qs('#modalFoot');
+    if (body) body.innerHTML = '';
+    if (foot) foot.innerHTML = '';
     this._onPick = null;
   },
 };

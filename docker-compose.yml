@@ -1,0 +1,40 @@
+# 一条命令起本站：docker compose up -d
+#
+# 赛事数据都在命名卷里（nte-data），容器重建不丢。第一次启动时去容器日志里
+# 找服务器管理员的登录密钥（只在那一次显示，请立即保存；丢了用 --reset-key 重置）。
+services:
+  nte:
+    build: .
+    image: nte-match
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - nte-data:/data
+    environment:
+      # 前端与 API 同域时留空即可；前端单独部署在别的域名时才需要填（逗号分隔）
+      NTE_CORS_ORIGINS: ""
+      # 想换端口就一并改上面的映射（容器内外要一致）
+      NTE_PORT: "8000"
+      NTE_LOG_LEVEL: "info"
+
+  # ---------------------------------------------------------------------------
+  # 直播（可选）：本站只负责「谁在播 / 观看地址 / 远程掐断」，媒体服务器是独立服务。
+  # 自建时把 MediaMTX 接进来，再在「服务器管理 → 直播配置」里填它的地址
+  # （WebRTC :8889 / HLS :8888 / 控制 API :9997）。
+  #
+  # 注意两件事：
+  #   * WebRTC 用 UDP，端口范围大，用 host 网络最省事；
+  #   * 浏览器只在 HTTPS（或 localhost）下允许这些播放方式，所以生产环境需要
+  #     给媒体服务器配证书（mediamtx 的 webrtcEncryption / hlsEncryption）。
+  #
+  # mediamtx:
+  #   image: bluenviron/mediamtx:latest
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   volumes:
+  #     - ./mediamtx.yml:/mediamtx.yml:ro
+  # ---------------------------------------------------------------------------
+
+volumes:
+  nte-data:

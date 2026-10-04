@@ -11,6 +11,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+from . import metrics
+
 # 选手对外可见的字段：只有名字与头像等展示信息（UUID / QQ / 推流流名不下发）
 PUBLIC_PLAYER_FIELDS = ("id", "name", "avatar", "tag", "substitute", "active", "member_uid")
 
@@ -316,10 +318,16 @@ class LiveBan(NTEModel):
 class Side(NTEModel):
     """一场比赛中的一方（一方 = 一支固定队伍）。
 
-    ``score`` 与 ``points`` 的含义随同场队伍数变化：
+    ``score`` 与 ``points`` 的含义随同场队伍数**与比法**变化：
 
-    * 2 队（组 vs 组）：``score`` = 局分 / 大比分，``points`` = 总小分（可选）
-    * 3~4 队同场：``score`` = 该场得分（排名依据），``points`` = 细则分（可选）
+    * 2 队（组 vs 组）：``score`` = 局分 / 大比分，``points`` = 总成绩（可选）
+    * 3~4 队同场：``score`` = 该场成绩（排名依据），``points`` = 细则分（可选）
+
+    比法（``rules.metric``，见 :mod:`app.metrics`）决定这个「成绩」是什么：
+
+    * 计分制：分数，越大越好（``points`` = 小分，越大越好）；
+    * 用时制：**毫秒**，越小越好（``points`` = 罚时，越小越好）；
+      ``score <= 0`` 表示未完赛 / 退赛，名次垫底。
 
     ``rank`` 为该场名次（1 起），由录入内容**自动推导**，用于小组赛名次分计算。
     """
@@ -344,7 +352,12 @@ class Side(NTEModel):
 
 
 class SetScore(NTEModel):
-    """一局的小分（仅 2 队对阵有意义）。"""
+    """一局的小分（仅 2 队对阵有意义）。
+
+    计分制下是分数（大者赢这局）；用时制下是**毫秒**（小者赢这局，
+    ``0`` = 该局未完赛）。两种比法下都由 :func:`app.tournament.judge_round`
+    汇总成局分与总成绩。
+    """
 
     a: int = 0
     b: int = 0
@@ -510,10 +523,21 @@ class Rules(NTEModel):
     format: MatchFormat = "tournament"
 
     # ---- 通用 ----
+    # 比法（metric）：**哪种数值更好**。方向只在 app/metrics.py 定义一处，
+    # 判定、名次、名次分、晋级与积分榜排序都建立在它上面。
+    #   score = 计分制：分数高者胜（排球、篮球、卡牌、电竞…）
+    #   time  = 用时制：用时短者胜（赛车、跑酷、速通…），数值单位是**毫秒**
+    metric: str = "score"
     team_size: int = 2           # 每队上场人数（默认 2；可按队伍分别调整）
     teams_per_match: int = 2     # 每场同场竞技的队伍数：2 / 3 / 4（小组赛生效）
-    target_score: int = 0        # 单局目标分，0 表示不限制
+    target_score: int = 0        # 单局目标分（仅计分制），0 表示不限制
     allow_draw: bool = False     # 是否允许平局（仅小组赛生效）
+    # 系列赛（BO）：一场分几局，1 = 一局定胜负。
+    # 判定方式见 logic.judge_round——填了各局小分时，「局分」就是各局胜负的计数，
+    # 所以三局两胜不需要单独一套结算：先拿到 ⌈best_of / 2⌉ 局者胜。
+    # 这里只负责「说清楚是几局几胜」并据此校验录入，不改判负逻辑。
+    # 用时制下同样适用：多局 = 跑几次，大比分仍是「赢了几局」，总成绩是各局合计。
+    best_of: int = 1
 
     # ---- 积分制（league）----
     points_win: int = 3          # 胜方积分
@@ -529,6 +553,15 @@ class Rules(NTEModel):
     knockout_size: int = 0       # 淘汰赛规模（2 的幂），0 = 自动取最大可行值
     loser_bracket: bool = True   # 败者组开关：开 = 双败淘汰，关 = 输一场即淘汰
 
+    @field_validator("metric")
+    @classmethod
+    def _clean_metric(cls, value: str) -> str:
+        """比法只认 ``score`` / ``time``，其它一律回落到计分制。
+
+        老数据没有这个字段，因此默认值必须是「维持原行为」的那个。
+        """
+        return metrics.norm(value)
+
     @field_validator("teams_per_match")
     @classmethod
     def _clamp_teams_per_match(cls, value: int) -> int:
@@ -538,6 +571,16 @@ class Rules(NTEModel):
     @classmethod
     def _clamp_team_size(cls, value: int) -> int:
         return max(1, min(6, int(value or 1)))
+
+    @field_validator("best_of")
+    @classmethod
+    def _clean_best_of(cls, value: int) -> int:
+        """系列赛只认奇数局（1 / 3 / 5 / 7）；其它值一律回落到一局定胜负。
+
+        偶数局会出现「各赢一半」，既没法判定也说不清楚，所以直接不收。
+        """
+        raw = int(value or 1)
+        return raw if raw in (1, 3, 5, 7) else 1
 
 
 class StreamConfig(NTEModel):
@@ -564,20 +607,44 @@ class StreamConfig(NTEModel):
 
     enabled: bool = True
     provider: str = "mediamtx"
-    base_url: str = "https://live.shiyora.net:8889"      # WebRTC 端口（WHIP 推 / WebRTC 看）
-    api_base: str = "http://live.shiyora.net:9997"       # MediaMTX 控制 API：读「谁真的在推流」
+    # 地址**一律出厂留空**：每一套部署的媒体服务器都不一样。这里也是「数据库里
+    # 没有直播记录时的兜底值」，所以不能预填某个具体域名——否则新装的站点会
+    # 「看起来配好了、其实连的是别人的服务器」。留空时各处都会提示「未配置」。
+    base_url: str = ""          # WebRTC 端口（WHIP 推 / WebRTC 看）
+    api_base: str = ""          # MediaMTX 控制 API：读「谁真的在推流」
     # 控制 API 的 Basic 认证：mediamtx.yml 里配了 authInternalUsers 时必填
     # （``curl -u 用户名:密码``）。属于凭据：只在管理端下发，绝不进公开状态。
     api_user: str = ""
     api_pass: str = ""
-    hls_base: str = "https://live.shiyora.net:8888"     # HLS 根地址，用于按流名派生
+    hls_base: str = ""          # HLS 根地址，用于按流名派生
     stream_key: str = "stream"
+    # 主直播间 / 遗留频道的**推流令牌**：这些流名不属于任何成员，没法「按成员认人」。
+    # 留空 = 保持旧行为（流名登记过就放行）；填了就必须要这个令牌才能推。
+    # 属于凭据：只在管理端下发，绝不进公开状态。
+    push_token: str = ""
     mode: StreamMode = "auto"
     verify_tls: bool = True     # 校验上游 HTTPS 证书；用自签名证书时关掉
-    whip_push: str = "https://live.shiyora.net:8889/stream/whip"
+    whip_push: str = ""
     poster: str = ""
     title: str = "赛事直播"
     note: str = ""
+
+    @field_validator("push_token")
+    @classmethod
+    def _clean_push_token(cls, value: str) -> str:
+        """推流令牌只收 ASCII（且不含空格）。
+
+        它会出现在 URL 查询串或 Basic 认证头里：非 ASCII 不只会被编码坏掉，
+        还会让 ``hmac.compare_digest`` 直接抛 ``TypeError``（= 鉴权接口 500）。
+        这类字段**宁可直接拒绝**，也不要静默清洗——清洗后的值用户推不动，
+        而他以为自己填对了。
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if not raw.isascii() or any(ch.isspace() for ch in raw):
+            raise ValueError("推流令牌只能包含 ASCII 字符（字母 / 数字 / 符号），且不能有空格")
+        return raw
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -589,23 +656,43 @@ class StreamConfig(NTEModel):
 
 class UiConfig(NTEModel):
     accent: str = "cyan"
+    # 自定义主题色（``#rgb`` / ``#rrggbb``，留空 = 用上面的预设）。
+    # 填了它就覆盖预设：前端会按它推一个和谐的副色（见 views.js 的 applyTheme）。
+    accent_custom: str = ""
+    # 分享图（og:image）：留空 = 用内置那张（/og.png）。可填站内绝对路径或完整 http(s) 地址。
+    og_image: str = ""
     show_qq: bool = True
     show_avatar: bool = True
     reveal_results: bool = True
     ticker: str = ""
 
+    @field_validator("accent_custom")
+    @classmethod
+    def _clean_accent_custom(cls, value: str) -> str:
+        """只收十六进制色（允许省掉 ``#``）；不认识的值一律置空回落预设。
 
-class AdminConfig(NTEModel):
-    """服务器主管理 KEY。
+        这里**只做格式校验**，不判断颜色好不好看——主题色是赛事自己的事。
+        """
+        raw = str(value or "").strip()
+        body = raw.removeprefix("#")
+        if len(body) in (3, 6) and all(ch in "0123456789abcdefABCDEF" for ch in body):
+            return f"#{body.lower()}"
+        return ""
 
-    ``key_hash`` 是**加盐 PBKDF2**（``pbkdf2_sha256$迭代$盐$摘要``，新格式，推荐）；
-    ``key_sha256`` / ``key`` 只为历史数据兼容而保留（无盐哈希 / 明文），
-    一旦重新设置 KEY 就会切换成 ``key_hash``。
-    """
+    @field_validator("og_image")
+    @classmethod
+    def _clean_og_image(cls, value: str) -> str:
+        """分享图只收站内绝对路径或 http(s) 地址，别的一律置空（回落内置图）。
 
-    key: str = ""
-    key_sha256: str = ""
-    key_hash: str = ""
+        刻意**不允许** ``javascript:`` / ``data:`` 这类协议——它会原样出现在
+        ``<meta property="og:image">`` 里。
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith(("/", "http://", "https://")):
+            return raw[:500]
+        return ""
 
 
 class Config(NTEModel):
@@ -616,7 +703,6 @@ class Config(NTEModel):
     rules: Rules = Field(default_factory=Rules)
     stream: StreamConfig = Field(default_factory=StreamConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
-    admin: AdminConfig = Field(default_factory=AdminConfig)
     teams: list[Team] = Field(default_factory=list)
     players: list[Player] = Field(default_factory=list)
     rounds: list[Round] = Field(default_factory=list)

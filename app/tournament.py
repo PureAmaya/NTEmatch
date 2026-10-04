@@ -24,6 +24,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
+from . import metrics
 from .logging_conf import get_logger
 from .models import MAX_SIDES, Player, Round, Rules, Side, Team
 
@@ -180,15 +181,19 @@ def placement_points(side_count: int, rank: int) -> int:
     return max(1, side_count - rank + 1)
 
 
-def judge_round(rnd: Round, *, allow_draw: bool = False) -> str:
+def judge_round(rnd: Round, *, allow_draw: bool = False, metric: str = metrics.SCORE) -> str:
     """按录入内容自动判定本场胜负与名次，返回 winner（``""`` = 尚未确定）。
 
     判定顺序：
 
-    1. 填了各局小分（2 队）→ 局分 = 各局胜负计数，得分 = 各局小分合计；
-    2. 否则比较 ``score``（比分 / 该场得分）；
-    3. 仍然相同再比 ``points``（小分 / 细则分）；
+    1. 填了各局小分（2 队）→ 局分 = 各局胜负计数，成绩 = 各局合计；
+       每局谁赢由**比法**决定（计分制比大、用时制比小，见 :mod:`app.metrics`）；
+    2. 否则比较 ``score``（比分 / 该场成绩）；
+    3. 仍然相同再比 ``points``（小分 / 罚时）；
     4. 还相同：2 队且允许平局 → ``DRAW``；多队并列第一 → 交回管理员指定。
+
+    ``score <= 0`` 在两种比法下都算「没有成绩」（未完赛 / 退赛 / 未填）并垫底——
+    否则用时制里 0 秒会被当成最快的人。
     """
     sides = rnd.sides
     count = len(sides)
@@ -198,9 +203,11 @@ def judge_round(rnd: Round, *, allow_draw: bool = False) -> str:
         for item in rnd.sets:
             totals[0] += item.a
             totals[1] += item.b
-            if item.a > item.b:
+            left = metrics.value_key(item.a, metric)
+            right = metrics.value_key(item.b, metric)
+            if left < right:
                 wins[0] += 1
-            elif item.b > item.a:
+            elif right < left:
                 wins[1] += 1
         for i in (0, 1):
             sides[i].score = wins[i]
@@ -214,7 +221,13 @@ def judge_round(rnd: Round, *, allow_draw: bool = False) -> str:
     if not playing:
         return ""
 
-    order = sorted(playing, key=lambda i: (-sides[i].score, -sides[i].points))
+    # 填了各局时 score 是「赢的局数」（计数，多者胜）；否则 score 就是成绩本身
+    # （按比法比大小）。这个区别见 app/metrics.judge_key。
+    counted = count == 2 and bool(rnd.sets)
+    order = sorted(
+        playing,
+        key=lambda i: metrics.judge_key(sides[i].score, sides[i].points, metric, counted=counted),
+    )
     rank = 0
     previous: tuple[int, int] | None = None
     for position, i in enumerate(order, start=1):
@@ -498,16 +511,28 @@ def build_group_rounds(
     return rounds
 
 
-def table_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    """小组赛排序：名次分 → 净胜分 → 总得分 → 队名（完全确定，无随机）。"""
+def table_sort_key(row: dict[str, Any], metric: str = metrics.SCORE) -> tuple[Any, ...]:
+    """小组赛排序：名次分 → 分项 → 队名（完全确定，无随机）。
+
+    * 计分制：净胜分 → 总得分（都按降序，分多者靠前）；
+    * 用时制：完成场次 → 总用时（未完赛的人**不能**因为「没跑完所以时间短」
+      排到前面，所以完成场次必须排在总用时之前）。
+    """
+    if metrics.lower_is_better(metric):
+        return (-row["placement"], -row["finished"], row["spent"], row["name"])
     return (-row["placement"], -row["diff"], -row["scored"], row["name"])
 
 
-def group_tables(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[str, Any]]]:
+def group_tables(
+    teams: list[Team], rounds: list[Round], metric: str = metrics.SCORE
+) -> dict[str, list[dict[str, Any]]]:
     """小组赛积分表（按小组分组，已排序并标注名次）。
 
     每场按**名次分**结算（2 队 = 2/1，3 队 = 3/2/1，4 队 = 4/3/2/1），
-    因此 2 队对阵与多队同场可以放在同一张表里比较。
+    因此 2 队对阵与多队同场可以放在同一张表里比较；名次分本身与比法无关。
+
+    ``finished`` / ``spent``（完成场次 / 总成绩合计）只在用时制里参与排序，
+    计分制仍按历史上的净胜分与总得分排。
     """
     rows: dict[str, dict[str, Any]] = {
         t.id: {
@@ -523,6 +548,8 @@ def group_tables(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[
             "scored": 0,
             "conceded": 0,
             "diff": 0,
+            "finished": 0,
+            "spent": 0,
             "bestRank": 0,
             "rank": 0,
         }
@@ -541,6 +568,11 @@ def group_tables(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[
             row["played"] += 1
             row["scored"] += side.score
             row["conceded"] += others
+            # 该场的「总成绩」：填了各局就是各局合计，否则就是 score（与前端一致）
+            total = metrics.round_total(side.score, side.points, bool(rnd.sets))
+            if total > 0:
+                row["finished"] += 1
+                row["spent"] += total
             # 平局没有名次，按并列末位参与名次分计算
             place = side.rank or count
             row["placement"] += placement_points(count, place)
@@ -556,14 +588,16 @@ def group_tables(teams: list[Team], rounds: list[Round]) -> dict[str, list[dict[
         bucket = [r for r in rows.values() if r["group"] == key]
         for row in bucket:
             row["diff"] = row["scored"] - row["conceded"]
-        bucket.sort(key=table_sort_key)
+        bucket.sort(key=lambda row: table_sort_key(row, metric))
         for pos, row in enumerate(bucket, start=1):
             row["rank"] = pos
         tables[key] = bucket
     return tables
 
 
-def overall_ranking(tables: dict[str, list[dict[str, Any]]]) -> list[str]:
+def overall_ranking(
+    tables: dict[str, list[dict[str, Any]]], metric: str = metrics.SCORE
+) -> list[str]:
     """小组赛总排名：先所有小组第 1 名（按战绩），再所有第 2 名，依此类推。
 
     这样「前 B 名晋级」等价于：各组名次靠前者优先，保证各组头名稳进淘汰赛。
@@ -572,7 +606,7 @@ def overall_ranking(tables: dict[str, list[dict[str, Any]]]) -> list[str]:
     ranking: list[str] = []
     for pos in range(depth):
         chunk = [rows[pos] for rows in tables.values() if len(rows) > pos]
-        chunk.sort(key=table_sort_key)
+        chunk.sort(key=lambda row: table_sort_key(row, metric))
         ranking.extend(row["teamId"] for row in chunk)
     return ranking
 
@@ -921,20 +955,22 @@ def size_from_rounds(rounds: list[Round]) -> int:
     return sum(1 for r in wb if r.bracket_round == first) * 2
 
 
-def advance_seeds(teams: list[Team], rounds: list[Round]) -> list[str]:
+def advance_seeds(teams: list[Team], rounds: list[Round], metric: str = metrics.SCORE) -> list[str]:
     """当前晋级淘汰赛的种子顺序（小组赛未结束时返回空列表）。"""
     size = size_from_rounds(rounds) or bracket_size(len(teams))
     if not any(r.stage == "group" for r in rounds):
         return [t.id for t in teams][:size]
     if not group_stage_done(rounds):
         return []
-    tables = group_tables(teams, rounds)
-    return overall_ranking(tables)[:size]
+    tables = group_tables(teams, rounds, metric)
+    return overall_ranking(tables, metric)[:size]
 
 
-def resolve_tournament(teams: list[Team], rounds: list[Round]) -> list[Round]:
+def resolve_tournament(
+    teams: list[Team], rounds: list[Round], metric: str = metrics.SCORE
+) -> list[Round]:
     """按当前进程重算整份赛程（小组赛阵容保持原样，淘汰赛按结果推导）。"""
-    return resolve_rounds(rounds, advance_seeds(teams, rounds), teams)
+    return resolve_rounds(rounds, advance_seeds(teams, rounds, metric), teams)
 
 
 def phase_of(rounds: list[Round]) -> str:

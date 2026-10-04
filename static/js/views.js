@@ -12,10 +12,12 @@ import {
   fmtFull,
   fmtRange,
   fmtTime,
+  fmtVal,
   hooks,
   isServerAdmin,
   liveAvailable,
   log,
+  metricOf,
   qs,
   qsa,
   reveal,
@@ -38,6 +40,7 @@ import {
   livePlayers,
   liveTag,
   mainRoom,
+  memberAvaHtml,
   privateOf,
   pushEndpointsOf,
   pushTipsHtml,
@@ -50,6 +53,9 @@ import {
 import { renderEventsView, renderHome } from './events.js';
 import { ChannelLive, Live } from './live.js';
 import { renderServerPage, renderUserPage } from './members.js';
+import { renderDeveloperPage } from './credits.js';
+import { clockHtml } from './clock.js';
+import { renderNoticeBoard } from './notices.js';
 
 const STAGE_LABEL = { group: '小组赛', wb: '胜者组', lb: '败者组', gf: '总决赛' };
 const PHASE_LABEL = {
@@ -113,11 +119,83 @@ function setPanel(id, html) {
 }
 
 /* ------------------------------- HUD ---------------------------------- */
+// 预设名 → 主色（与 nte.css 的 :root[data-accent=...] 一一对应；这里只用于 theme-color）
+const ACCENT_HEX = {
+  cyan: '#22e0e8',
+  violet: '#7d5cff',
+  magenta: '#ff2f8e',
+  amber: '#ffd83d',
+  lime: '#43e58a',
+};
+
+/** 解析 `#rgb` / `#rrggbb`（可省 `#`）→ {r,g,b}；不合法返回 null。 */
+function hexToRgb(value) {
+  const body = String(value || '').trim().replace(/^#/, '');
+  if (!/^(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(body)) return null;
+  const full = body.length === 3 ? body.split('').map((c) => c + c).join('') : body;
+  return {
+    r: parseInt(full.slice(0, 2), 16),
+    g: parseInt(full.slice(2, 4), 16),
+    b: parseInt(full.slice(4, 6), 16),
+  };
+}
+
+const clamp01 = (n) => Math.min(1, Math.max(0, n));
+
+function rgbToHsl({ r, g, b }) {
+  const R = r / 255, G = g / 255, B = b / 255;
+  const max = Math.max(R, G, B), min = Math.min(R, G, B);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (!d) return { h: 0, s: 0, l };
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === R) h = ((G - B) / d + (G < B ? 6 : 0)) / 6;
+  else if (max === G) h = ((B - R) / d + 2) / 6;
+  else h = ((R - G) / d + 4) / 6;
+  return { h: h * 360, s, l };
+}
+
+function hslToHex(h, s, l) {
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const to2 = (v) => Math.round(clamp01(v) * 255).toString(16).padStart(2, '0');
+  return `#${to2(f(0))}${to2(f(8))}${to2(f(4))}`;
+}
+
+/** 主色 → 副色：色相转 +40°。自定义色只有一个输入框，副色得自己推出来。 */
+function companionHex(hex) {
+  const { h, s, l } = rgbToHsl(hexToRgb(hex) || { r: 34, g: 224, b: 232 });
+  return hslToHex((h + 40) % 360, clamp01(Math.max(s, 0.55)), clamp01(Math.min(Math.max(l, 0.42), 0.68)));
+}
+
+/** 手机浏览器的地址栏底色也跟着主题色走（原来是写死的 #0a1020）。 */
+function setThemeColor(hex) {
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta && hex) meta.setAttribute('content', hex);
+}
+
 export function applyTheme(s) {
-  const accent = s.ui?.accent || 'cyan';
-  if (document.documentElement.dataset.accent !== accent) {
-    document.documentElement.dataset.accent = accent;
+  const ui = s.ui || {};
+  const root = document.documentElement;
+  const custom = ui.accentCustom ? hexToRgb(ui.accentCustom) : null;
+  if (custom) {
+    // 自定义主题色：直接覆盖两个变量。data-accent 标成 custom——它没有对应 CSS 规则，
+    // 所以真正生效的是这两条内联变量（预设那几条不会来抢）。
+    const main = `#${[custom.r, custom.g, custom.b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+    root.style.setProperty('--accent', main);
+    root.style.setProperty('--accent-2', companionHex(main));
+    if (root.dataset.accent !== 'custom') root.dataset.accent = 'custom';
+    setThemeColor(main);
+    return;
   }
+  // 回到预设：必须清掉内联变量，否则会一直盖住 :root[data-accent] 的规则
+  root.style.removeProperty('--accent');
+  root.style.removeProperty('--accent-2');
+  const accent = ui.accent || 'cyan';
+  if (root.dataset.accent !== accent) root.dataset.accent = accent;
+  setThemeColor(ACCENT_HEX[accent] || ACCENT_HEX.cyan);
 }
 
 export function renderHeader(s) {
@@ -216,6 +294,8 @@ function eventTimePanelHtml(s) {
 /* ------------------------------ 总览 ---------------------------------- */
 export function renderOverview(s) {
   setPanel('eventBrief', briefPanelHtml(s));
+  // 赛事通知（只读卡片 + 分页）：拉取是异步的，所以先占位再由 notices.js 填内容
+  renderNoticeBoard('event', qs('#noticeBoard'), { hint: '发布后打开本届会自动弹窗' });
   if (s.ranked === false) {
     renderCasualOverview(s);
     return;
@@ -390,6 +470,8 @@ function leagueStandingsHtml(s) {
   const rows = s.standings?.players || [];
   const wide = window.matchMedia('(min-width: 1024px)').matches;
   const canReveal = reveal();
+  const metric = metricOf(s);
+  const time = metric === 'time';
   let body;
   if (!rows.length) {
     body = `<div class="empty"><b>暂无选手数据</b>请在管理端添加参赛选手</div>`;
@@ -406,11 +488,12 @@ function leagueStandingsHtml(s) {
           : canReveal
             ? `${row.winRate}% 胜率`
             : '已封存';
+        const tieCell = time ? fmtVal(row.spent, metric) : sign(row.diff);
         const cells = wide
           ? `<div class="score-cell">${row.played}</div>` +
             `<div class="score-cell">${row.win}</div>` +
             `<div class="score-cell">${row.lose}</div>` +
-            `<div class="score-cell">${canReveal ? sign(row.diff) : '—'}</div>` +
+            `<div class="score-cell">${canReveal ? esc(tieCell) : '—'}</div>` +
             `<div class="points-cell">${canReveal ? avg : '—'}<small>${esc(avgTip)}</small></div>` +
             `<div>${formChips(row.form)}</div>` +
             `<div class="score-cell score-cell--total">${total}</div>`
@@ -422,13 +505,16 @@ function leagueStandingsHtml(s) {
       .join('');
   }
   const minRank = s.standings?.minRankPlayed ?? s.rules?.minRankPlayed ?? 5;
+  // 「净胜」这一列在用时制下换成总用时（列名与取值都跟着比法走）
+  const heads = (wide ? BOARD_HEAD_WIDE : BOARD_HEAD_NARROW).map((head) =>
+    time && head === '净胜' ? '总用时' : head
+  );
   return (
     `<div class="panel__head"><h2>积分榜</h2>` +
     `<span class="panel__hint">按均分排名 · 满 ${minRank} 场参与排名 · ` +
-    `胜 ${s.rules?.pointsWin ?? 3} / 负 ${s.rules?.pointsLose ?? 0} / 平 ${s.rules?.pointsDraw ?? 1}</span></div>` +
-    `<div class="panel__body panel__body--flush">${boardHeadHtml(
-      wide ? BOARD_HEAD_WIDE : BOARD_HEAD_NARROW
-    )}${body}</div>`
+    `胜 ${s.rules?.pointsWin ?? 3} / 负 ${s.rules?.pointsLose ?? 0} / 平 ${s.rules?.pointsDraw ?? 1}` +
+    `${time ? ` · 同分比完成场次与总用时` : ''}</span></div>` +
+    `<div class="panel__body panel__body--flush">${boardHeadHtml(heads)}${body}</div>`
   );
 }
 
@@ -712,7 +798,7 @@ function treeSideHtml(side, key, rnd, ctx) {
     `<b class="btree__name" title="${esc(label)}">${esc(label)}</b>` +
     (info ? `<i class="btree__info" title="${esc(info)}">${esc(info)}</i>` : '') +
     `</span>` +
-    `<b class="btree__score">${decided ? side.score : ''}</b></div>`
+    `<b class="btree__score">${decided ? bigScoreText(side, rnd) : ''}</b></div>`
   );
 }
 
@@ -777,9 +863,13 @@ function groupSectionHtml(s) {
   const ranking = stageDone ? s.ranking || [] : [];
   const advMap = new Map(ranking.map((r) => [r.team.id, r]));
   const anyPlayed = groups.some((g) => (g.rows || []).some((r) => r.played > 0));
+  // 排名依据的后半截随比法变化（见 app/tournament.table_sort_key）
+  const metric = metricOf(App.state);
+  const time = metric === 'time';
+  const tieText = time ? '完成场次 / 总用时' : '净胜分';
   const head =
     `<h3 class="btree__sec">小组赛` +
-    `<span class="panel__hint">${groups.length} 组轮转 · 每场 ${shape} · 按名次分 / 净胜分排名 · ` +
+    `<span class="panel__hint">${groups.length} 组轮转 · 每场 ${shape} · 按名次分 / ${tieText}排名 · ` +
     `前 ${s.format?.size || 0} 名晋级</span></h3>`;
   const tables = groups
     .map((g) => {
@@ -789,7 +879,9 @@ function groupSectionHtml(s) {
         `<div class="gtable"><div class="gtable__head"><b>${esc(g.key)} 组</b>` +
         `<span>${rows.length} 支队 · 每场 ${shape}${started ? '' : ' · 尚未开赛'}</span></div>` +
         `<div class="gtable__cols"><div>#</div><div>队伍</div><div>场次</div><div>胜</div><div>负</div>` +
-        `<div title="第 1 名得分最高">名次分</div><div>净胜</div><div>名次</div></div>` +
+        `<div title="第 1 名得分最高">名次分</div>` +
+        `<div title="${time ? '完成场次与总用时合计' : '得分减失分'}">${time ? '总用时' : '净胜'}</div>` +
+        `<div>名次</div></div>` +
         rows
           .map((row) => {
             const adv = advMap.get(row.teamId);
@@ -802,7 +894,7 @@ function groupSectionHtml(s) {
               `</div>` +
               `<div>${row.played}</div><div>${row.win}</div><div>${row.lose}</div>` +
               `<div class="gtable__pts">${row.placement ?? 0}</div>` +
-              `<div>${sign(row.diff)}</div>` +
+              `<div>${time ? esc(fmtVal(row.spent, metric)) : sign(row.diff)}</div>` +
               `<div>${
                 stageDone && adv?.advanced
                   ? `<span class="badge badge--done">晋级 #${adv.seed}</span>`
@@ -894,6 +986,7 @@ function nowCardHtml(r) {
     `<div class="now-card__head"><span class="round__no">${esc(r.label || r.code)}</span>` +
     `${liveBadgeHtml(r)}${roundBadge('live')}</div>` +
     roundTimeHtml(r) +
+    clockHtml(r.code) +
     `<div class="now-card__vs">${sides.map((side) => nowSideHtml(side)).join('<span class="vs-line__vs">VS</span>')}</div>` +
     cast +
     `<div class="now-card__ops">${ops}</div>` +
@@ -1133,7 +1226,7 @@ function leagueDuoHtml(s, rnd, side) {
   );
 }
 
-const leagueScore = (rnd, side) => (reveal() || rnd.status !== 'done' ? side.score : '–');
+const leagueScore = (rnd, side) => (reveal() || rnd.status !== 'done' ? bigScoreText(side, rnd) : '–');
 
 function leagueOpsHtml(rnd) {
   if (!canEdit()) return '';
@@ -1230,14 +1323,19 @@ function roundTimeHtml(rnd) {
 }
 
 function matchSideHtml(side, key, rnd) {
+  const metric = metricOf(App.state);
   const ready = Boolean(side.teamId);
   const done = rnd.status === 'done';
   const win = done && rnd.winner === key;
   const forfeit = Boolean(side.forfeit);
-  const score = done ? side.score : '';
-  // 多队同场：显示本场名次与（可选的）小分
+  const score = done ? bigScoreText(side, rnd, metric) : '';
+  // 多队同场：显示本场名次与（可选的）细则分
   const rank = done && side.rank ? `<span class="mside__rank">#${side.rank}</span>` : '';
-  const points = done && side.points ? `<span class="mside__pts">小分 ${side.points}</span>` : '';
+  const pointsLabel = metric === 'time' ? ((rnd.sets || []).length ? '总用时' : '罚时') : '小分';
+  const points =
+    done && side.points
+      ? `<span class="mside__pts">${pointsLabel} ${esc(fmtVal(side.points, metric))}</span>`
+      : '';
   const members = (side.players || [])
     .map(
       (p) =>
@@ -1261,14 +1359,25 @@ function matchSideHtml(side, key, rnd) {
   );
 }
 
-/** 各局小分：25:20 · 22:25 · 15:12。 */
+/** 各局成绩：25:20 · 22:25 · 15:12（用时制则是 1:23.45 · 1:25.10）。 */
 function setsChipHtml(rnd) {
   const sets = rnd.sets || [];
   if (!sets.length) return '';
-  return `<span class="chip chip--sets" title="各局小分">${sets
-    .map((s) => `${s.a}:${s.b}`)
+  const metric = metricOf(App.state);
+  const title = metric === 'time' ? '各局用时' : '各局小分';
+  return `<span class="chip chip--sets" title="${title}">${sets
+    .map((s) => `${fmtVal(s.a, metric)}:${fmtVal(s.b, metric)}`)
     .join(' · ')}</span>`;
 }
+
+/**
+ * 大比分 / 该场成绩的显示文本。
+ *
+ * 填了各局时 ``side.score`` 是**赢的局数**（计数：任何比法下都是多者胜），
+ * 否则它就是该场成绩本身（用时制下要显示成 1:23.456）。
+ */
+const bigScoreText = (side, rnd, metric = metricOf()) =>
+  (rnd?.sets || []).length ? String(side.score) : fmtVal(side.score, metric);
 
 /**
  * 已结束比赛的「成绩」：各局小分 + 双方总得分。
@@ -1278,6 +1387,7 @@ function setsChipHtml(rnd) {
  */
 function resultStatsHtml(rnd) {
   if (rnd.status !== 'done') return '';
+  const metric = metricOf(App.state);
   const sides = (rnd.sides || []).slice(0, 2);
   const bits = [];
   const sets = setsChipHtml(rnd);
@@ -1285,8 +1395,10 @@ function resultStatsHtml(rnd) {
   if (sides.length === 2) {
     const points = sides.map((side) => side.points || 0);
     if (points.some((n) => n > 0)) {
+      const label = metric === 'time' ? '总用时' : '总得分';
       bits.push(
-        `<span class="chip chip--total" title="双方总得分">总得分 ${points[0]} : ${points[1]}</span>`
+        `<span class="chip chip--total" title="双方${label}">${label} ` +
+          `${fmtVal(points[0], metric)} : ${fmtVal(points[1], metric)}</span>`
       );
     }
   }
@@ -2085,7 +2197,9 @@ function renderChannelTools(channels) {
   const liveCount = channels.filter((c) => roomLive(c)).length;
   host.innerHTML =
     `<div class="tool-group"><span class="panel__hint">${channels.length} 个频道 · ${liveCount} 个在播</span></div>` +
-    (canEdit()
+    // 频道与公告是**全局**资源（跨届共享），只给服务器管理员动：
+    // 赛事管理员只管自己那一届，不该改别人的常驻频道与公告。
+    (isServerAdmin()
       ? `<div class="tool-group" style="margin-left:auto">` +
         `<button class="btn btn--sm" type="button" data-act="channel-notice-edit">编辑公告</button>` +
         `<button class="btn btn--sm btn--primary" type="button" data-act="channel-add">新增频道</button></div>`
@@ -2126,7 +2240,8 @@ function channelCardHtml(c) {
       ? `<button class="btn btn--sm btn--danger" type="button" data-act="member-ban" ` +
         `data-uid="${esc(c.uid)}">掐断 / 封禁</button>`
       : '') +
-    (!c.member && canEdit()
+    // 手工建的频道是全局资源：只有服务器管理员能改 / 删（成员直播间走成员资料）
+    (!c.member && isServerAdmin()
       ? `<button class="btn btn--sm" type="button" data-act="channel-edit" data-id="${esc(c.id)}">编辑</button>` +
         `<button class="btn btn--sm btn--danger" type="button" data-act="channel-del" data-id="${esc(c.id)}">删除</button>`
       : '') +
@@ -2259,11 +2374,18 @@ export function renderDenied() {
   const d = App.denied || {};
   host.innerHTML =
     `<div class="deny">` +
+    // 一句「锁住的门」的 HUD 插画：stroke 直接用主题色变量，所以换主题 / 自定义色都会跟着变
+    `<svg class="deny__art" viewBox="0 0 96 64" aria-hidden="true" fill="none" ` +
+    `stroke="var(--accent)" stroke-linecap="round" stroke-linejoin="round">` +
+    `<path d="M48 8 67 19v22L48 52 29 41V19z" stroke-width="2.6" opacity=".8"/>` +
+    `<path d="M31 45 65 15" stroke-width="3.2" stroke="var(--accent-2)"/>` +
+    `<path d="M6 30h12M78 30h12" stroke-width="2.6" opacity=".55"/>` +
+    `</svg>` +
     `<div class="deny__code" aria-hidden="true">${esc(d.code || '403')}</div>` +
     `<h1 class="deny__title">${esc(d.title || '这里进不去')}</h1>` +
     (d.desc ? `<p class="deny__desc">${esc(d.desc)}</p>` : '') +
     `<div class="tool-group">` +
-    `<button class="btn btn--primary" type="button" data-act="route-home">回主页</button>` +
+    `<a class="btn btn--primary" href="/" data-route>回主页</a>` +
     `</div></div>`;
 }
 
@@ -2278,6 +2400,7 @@ const VIEW_RENDERERS = {
   events: renderEventsView,
   server: renderServerPage,
   user: renderUserPage,
+  developer: renderDeveloperPage,
   denied: renderDenied,
 };
 
@@ -2354,8 +2477,10 @@ export function syncHeader() {
   const name = me.name || m?.name || '已登录';
   const ava = qs('#meAvatar');
   if (ava) {
+    // 成员头像要走 /api/avatar/m/<uid>：avaHtml 是给选手用的（认 player.id），
+    // 拿来渲染成员会拿不到地址、永远只显示首字
     ava.innerHTML = m
-      ? avaHtml(m, 'xs')
+      ? memberAvaHtml(m, 'xs')
       : `<span class="ava ava--xs ava--placeholder">${esc(String(name).slice(0, 1))}</span>`;
   }
   const nameEl = qs('#meName');

@@ -9,11 +9,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import mimetypes
 import os
 import random
 import re
 import time
 from contextlib import asynccontextmanager, suppress
+from html import escape
 from typing import Any
 from urllib.parse import quote
 
@@ -33,16 +35,20 @@ from . import (
     backup,
     backup_api,
     bot_api,
+    credits,
     league,
     live,
     logic,
     login_guard,
+    media,
+    metrics,
+    notices_api,
     qqbot_api,
+    remind,
     tournament,
 )
 from . import members as members_api
-from .auth import Session, admin_key_mode, auth, hash_password, is_factory_key
-from .defaults import DEFAULT_ADMIN_KEY
+from .auth import Session, auth
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
 from .models import MAX_SIDES, Channel, Config, NTEModel, Player, Round, SetScore, Team
@@ -68,13 +74,33 @@ SESSION_HEADER = "X-NTE-Token"
 #
 # 思路：静态资源带内容版本号 -> 可 immutable 长缓存，回源几乎为 0；
 #       /api/** 一律 no-store，避免边缘把动态状态缓存住；
-#       index.html 短缓存（no-cache），保证版本号变更后能立刻生效。
+#       index.html **绝不缓存**，保证版本号变更后能立刻生效。
 # 中间件用纯 ASGI 实现，不对响应体做缓冲，避免影响直播流式代理。
 # --------------------------------------------------------------------------- #
 _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
 _NO_STORE = "no-store"
-_NO_CACHE = "no-cache"
+#: 未带版本号的静态路径：允许 304，但不许直接用缓存的旧副本
+_REVALIDATE_CACHE = "no-cache"
+_CACHE_BY_MODE = {
+    "immutable": _IMMUTABLE_CACHE,
+    "revalidate": _REVALIDATE_CACHE,
+    "no-store": _NO_STORE,
+}
 _VERSIONED_STATIC_RE = re.compile(r"^/static/v/[0-9a-f]{6,}/(?P<rest>.+)$")
+
+#: 首页（HTML）的缓存头，**必须**让边缘与浏览器每次都回源问一次。
+#:
+#: 为什么不能只写 ``no-cache``：版本号是**注入进 HTML** 的，而带版号的 CSS / JS 是
+#: ``immutable``（一年）。一旦这份 HTML 被某个中间层（CDN / 反代 / 浏览器启发式缓存）
+#: 留住了，它会连带把**一整年的旧样式**钉死——改完 CSS 刷新还是旧样子，且怎么强刷
+#: 都没用（因为强刷只绕过本地缓存，绕不过 CDN）。
+#: 所以这里把 CDN 认得更死的几条一起写上：``no-store`` + ``must-revalidate`` +
+#: ``max-age=0`` + ``Pragma`` / ``Expires``（老中间层的兼容字段）。
+_HTML_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def _compute_asset_version() -> str:
@@ -120,6 +146,10 @@ class EdgeCacheMiddleware:
             scope["path"] = "/static/" + match.group("rest")
             scope["raw_path"] = scope["path"].encode()
             mode = "immutable"
+        elif path.startswith("/static/"):
+            # 未带版本号的静态路径（手输 / 旧收藏）：绝不长缓存，但允许 304 —— 否则
+            # 浏览器会按启发式规则自己缓存一份，改了文件也可能继续跑旧代码。
+            mode = "revalidate"
         elif path.startswith(("/api/", "/ws")):
             mode = "no-store"
 
@@ -130,19 +160,248 @@ class EdgeCacheMiddleware:
         async def send_with_cache(message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                # 已有显式策略的路由（如头像）保持不动
+                # 已有显式策略的路由（如头像、公告图片）保持不动
                 if "cache-control" not in headers:
-                    headers["Cache-Control"] = _IMMUTABLE_CACHE if mode == "immutable" else _NO_STORE
+                    headers["Cache-Control"] = _CACHE_BY_MODE.get(mode, _NO_STORE)
             await send(message)
 
         await self.app(scope, receive, send_with_cache)
 
 
+#: 安全响应头（保守一组）：只加不会与站内自定义 HTML / 头像 / 直播流打架的那几条。
+#: ``Strict-Transport-Security`` 刻意不在其中——它只在 HTTPS 下有意义，
+#: 而且一旦浏览器记住就会把同域的 http 请求也强制升级，坑本地调试与内网部署。
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "frame-ancestors 'self'",
+    "X-Frame-Options": "SAMEORIGIN",
+    # 本站**不使用**定位 / 麦克风 / 摄像头 / 支付（推流走 OBS 的 WHIP，不是浏览器采集），
+    # 所以直接声明「用不到」：万一以后被注入脚本，它连权限提示都弹不出来。
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=(), payment=()",
+}
+
+
+class SecurityHeadersMiddleware:
+    """一组**保守**的安全响应头（只在没有显式设置时补上）。
+
+    刻意只加「不会与站内自定义 HTML / 头像 / 直播流打架」的那几条：
+
+    * ``X-Content-Type-Options: nosniff``：上传物与静态文件不按内容被猜成脚本；
+    * ``Referrer-Policy: no-referrer``：会话令牌会出现在 ``?token=`` 里
+      （导出与备份下载必须走它），别让它随 Referer 漏给第三方；
+    * ``Content-Security-Policy: frame-ancestors 'self'``：防点击劫持。
+      **只写这一条指令**——全量 CSP 会跟「自定义 HTML、QQ 头像、HLS/m3u8」
+      互相打架，而 frame-ancestors 只管「谁能用 iframe 嵌我们」；
+    * ``X-Frame-Options: SAMEORIGIN``：给不认 CSP 的老浏览器兜底。
+
+    不加 ``Strict-Transport-Security``：它只在 HTTPS 下有意义，而且一旦浏览器
+    记住就会把同域的 http 请求也强制升级——本地调试与内网部署会被它坑。
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in _SECURITY_HEADERS.items():
+                    if name.lower() not in headers:
+                        headers[name] = value
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+class AuditMiddleware:
+    """把「写请求」记一条到操作日志：谁、什么时候、动了哪个接口。
+
+    三条刻意的取舍：
+
+    * **只记方法 + 路径 + 状态码，不记请求体**——请求体里会出现成员密钥、Bearer
+      令牌、管理 KEY 这类值，抄进库就等于多存了一份敏感信息。
+    * **跳过登录与媒体服务器回调**：前者带密钥，后者是 MediaMTX 每个推流会话都会
+      打过来的（``/api/live/auth``），记下来只会把日志冲干净。
+    * **只读接口一般不记**（量大又没有追查价值），但**机器人接口的鉴权失败要记**：
+      那是「还有实例在用旧令牌」的唯一线索。
+    """
+
+    _SKIP = ("/api/auth", "/api/live/auth")
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        method = str(scope.get("method", "GET")).upper()
+        is_write = method not in ("GET", "HEAD", "OPTIONS")
+        is_bot = path.startswith("/api/bot/")
+        if not path.startswith("/api/") or (not is_write and not is_bot):
+            await self.app(scope, receive, send)
+            return
+        if path.startswith(self._SKIP):
+            await self.app(scope, receive, send)
+            return
+
+        captured = {"status": 0}
+
+        async def remember(message) -> None:
+            if message["type"] == "http.response.start":
+                captured["status"] = int(message.get("status", 0))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, remember)
+        finally:
+            # 响应已发完才写库：日志再慢也拖不住请求
+            status = captured["status"]
+            if is_write or status in (401, 403):
+                await self._record(scope, method, path, status)
+
+    @staticmethod
+    async def _record(scope, method: str, path: str, status: int) -> None:
+        try:
+            token = ""
+            for raw_key, raw_value in scope.get("headers") or []:
+                if raw_key.decode("latin-1").lower() == SESSION_HEADER.lower():
+                    token = raw_value.decode("latin-1")
+                    break
+            session = auth.get(token) if token else None
+            await store.log_activity(
+                actor=(session.name or session.label) if session else "未登录",
+                actor_uid=session.uid if session else "",
+                method=method,
+                path=path,
+                status=status,
+            )
+        except Exception:  # pragma: no cover - 观测失败绝不能影响刚发出去的响应
+            log.warning("操作日志记录失败 | %s %s", method, path, exc_info=True)
+
+
 _index_cache: tuple[str, str] | None = None
 
+# 独立页的标题 / 描述（分享到群里时预览卡片用的就是它们）
+_STANDALONE_META: dict[str, tuple[str, str]] = {
+    "channels": ("频道", "成员直播间与日常播台，点开直接看。"),
+    "events": ("全部赛事", "新建 / 重命名 / 封存 / 删除届次。"),
+    "admin": ("服务器管理", "成员、届次、备份、QQ 机器人与直播封禁。"),
+    "user": ("我的", "个人资料、直播间名字与凭据轮换。"),
+    "developer": ("开发者", "关于作者、联系方式与开源许可。"),
+}
+_TITLE_RE = re.compile(r"<title>.*?</title>", re.DOTALL)
+_DESC_RE = re.compile(r'<meta name="description" content=".*?">', re.DOTALL)
+_EVENT_STATUS_CN = {"draft": "筹备中", "active": "进行中", "closed": "已结束"}
 
-def render_index() -> HTMLResponse:
-    """输出注入了资源版本号的首页（进程内缓存，版本变化时失效）。"""
+
+def _abs_url(base: str, path: str) -> str:
+    """站内相对路径 → 绝对地址。分享抓取（QQ / 微信）只认绝对 URL。"""
+    clean = (path or "").strip()
+    if clean.startswith(("http://", "https://")):
+        return clean
+    if not clean.startswith("/"):
+        clean = "/" + clean.lstrip("/")
+    return f"{(base or '').rstrip('/')}{clean}"
+
+
+def _og_image() -> str:
+    """分享图：界面配置里填了就用它，否则用内置那张 ``/og.png``。
+
+    配置读不到（极端情况）也要能出图——分享卡片宁可样式旧一点，也不能没有图。
+    """
+    try:
+        custom = str(store.snapshot().ui.og_image or "").strip()
+    except Exception:  # pragma: no cover - 读配置失败不该把整页拖挂
+        log.warning("读取分享图配置失败，回落到内置图", exc_info=True)
+        custom = ""
+    return custom or "/og.png"
+
+
+async def page_meta(path: str, base_url: str = "") -> dict[str, str]:
+    """这一屏的标题 / 描述 / 分享图（**服务端**算好）。
+
+    前端本来也会改 ``document.title``，但分享到 QQ / 微信时抓取的是**原始 HTML**，
+    所以标题与 og 标签必须在服务端就写对——否则任何链接的预览卡片都是首页那句。
+    """
+    site = store.site_name()
+    seg = (path or "").strip("/").split("/")[0]
+    title, desc = site, f"{site}：全部赛事与直播间的总入口。"
+    if seg in _STANDALONE_META:
+        # 独立页要**先判**：它们的段名（events / admin / user / channels / developer）
+        # 同样长得像届次 ID，先查届次的话下面这张表永远轮不到——
+        # 于是分享卡片一直用首页那句（这个顺序 bug 修过一次，别再换回来）。
+        # 与前端路由一致：`parseRoute` 也是先认 PAGES 再当届次。
+        label, text = _STANDALONE_META[seg]
+        title, desc = f"{label} | {site}", text
+    elif seg and re.fullmatch(r"[A-Za-z0-9_-]{2,40}", seg):
+        try:
+            for item in await store.list_events():
+                if item["id"] == seg and not item.get("hidden"):
+                    name = item.get("name") or seg
+                    bits = [
+                        _EVENT_STATUS_CN.get(str(item.get("status")), ""),
+                        f"{item.get('players') or 0} 人",
+                    ]
+                    if item.get("champion"):
+                        bits.append(f"榜首 {item['champion']}")
+                    title = f"{name} | {site}"
+                    desc = str(item.get("brief") or "").strip() or " · ".join(b for b in bits if b)
+                    break
+        except Exception:
+            # 取不到就退回默认文案：首页是必经之路，绝不能让 meta 读失败把整页拖挂
+            log.warning("赛事 meta 读取失败 | id=%s", seg, exc_info=True)
+    return {
+        "title": title,
+        "desc": desc,
+        "site": site,
+        "image": _abs_url(base_url, _og_image()),
+        "url": _abs_url(base_url, path or "/"),
+    }
+
+
+def _inject_meta(html: str, meta: dict[str, str]) -> str:
+    """把标题 / 描述 / og 标签塞进（已缓存的）基础 HTML。"""
+    title = escape(meta["title"])
+    desc = escape(meta["desc"])
+    site = escape(meta.get("site") or meta["title"])
+    image = escape(meta.get("image") or "")
+    link = escape(meta.get("url") or "")
+    og = (
+        f'<meta property="og:title" content="{title}">'
+        f'<meta property="og:description" content="{desc}">'
+        f'<meta property="og:type" content="website">'
+        f'<meta property="og:site_name" content="{site}">'
+        f'<meta property="og:locale" content="zh_CN">'
+    )
+    if link:
+        og += f'<meta property="og:url" content="{link}">'
+    if image:
+        og += f'<meta property="og:image" content="{image}">'
+        if image.endswith("/og.png"):
+            # 只有内置那张能保证尺寸；自定义图不替他声明宽高（免得卡片被裁歪）
+            og += (
+                '<meta property="og:image:width" content="1200">'
+                '<meta property="og:image:height" content="630">'
+            )
+    # summary_large_image 才能把图铺成横向大卡（默认 summary 只有小方图）
+    og += '<meta name="twitter:card" content="summary_large_image">'
+    out = _TITLE_RE.sub(f"<title>{title}</title>", html, count=1)
+    out = _DESC_RE.sub(f'<meta name="description" content="{desc}">', out, count=1)
+    return out.replace("</head>", f"{og}</head>", 1)
+
+
+def render_index(meta: dict[str, str]) -> HTMLResponse:
+    """输出首页：注入了资源版本号 + 这一屏的标题 / og 标签。
+
+    基础 HTML 按资源版本号做进程内缓存；标题与 og 是逐请求拼进去的（字符串操作，可忽略）。
+    """
     global _index_cache
     page = STATIC_DIR / "index.html"
     if not page.exists():
@@ -152,7 +411,8 @@ def render_index() -> HTMLResponse:
         html = page.read_text(encoding="utf-8").replace("/static/", f"/static/v/{version}/")
         _index_cache = (version, html)
         log.info("已注入静态资源版本 | version=%s", version)
-    return HTMLResponse(_index_cache[1], headers={"Cache-Control": _NO_CACHE})
+    # 这份 HTML 绝不能进任何缓存（理由见 _HTML_CACHE_HEADERS）
+    return HTMLResponse(_inject_meta(_index_cache[1], meta), headers=dict(_HTML_CACHE_HEADERS))
 
 
 # --------------------------------------------------------------------------- #
@@ -303,11 +563,6 @@ class EventMetaPayload(NTEModel):
     hidden: bool | None = None
 
 
-class AdminKeyPayload(NTEModel):
-    key: str = ""
-    store_hash: bool = True
-
-
 class ParticipantsPayload(NTEModel):
     """本届参与名单。``player_ids`` 为空表示未指定（视为全员参与）。"""
 
@@ -339,6 +594,9 @@ def build_public_state(cfg: Config) -> dict[str, Any]:
     state["eventStatus"] = cfg.event.status
     # 站点名称（全局，服务器管理员设定）：顶栏 / 浏览器标签 / 主页都用它
     state["siteName"] = store.site_name()
+    # 最新一条通知（**只有 id / 标题 / 时间**，正文按需再取）：
+    # 前端据此判断「有没有没看过的新通知」并弹窗；正文不进广播，免得每次改比分都重发。
+    state["notices"] = store.notice_heads()
     state["channels"] = logic.channel_views(cfg, store.channels())
     # 频道板块的公告（全局，纯展示）：放异环相关的说明 / 活动文案
     state["channelNotice"] = store.channel_notice()
@@ -378,6 +636,9 @@ async def lifespan(app: FastAPI):
     await hub.broadcast_state(build_public_state(store.snapshot()))
     # 周期性自动备份：常驻巡检，到点才真的打包（没开启时只是每 5 分钟看一眼设置）
     backup_task = asyncio.create_task(backup.auto_backup_loop())
+    # 赛前提醒：开赛前一天 / 前两小时在群里 @ 举办者（见 app/remind.py）。
+    # 只在「聊天机器人推送开着」且举办者登记了 QQ 时才真的发得出去。
+    remind_task = asyncio.create_task(remind.loop())
     # 直播探测按需触发（前端在直播 / 频道页请求 /api/live/health 时才探一次），
     # 因此这里不启动任何常驻任务，没人看直播时后端不做任何探测。
     cfg = store.snapshot()
@@ -385,23 +646,17 @@ async def lifespan(app: FastAPI):
     log.info("NTE 比赛平台已启动 | 当前届: %s (%s)", cfg.event.name, store.current_id)
     log.info("数据库: %s", store.path)
     log.info("本机访问: http://127.0.0.1:%s", os.getenv("NTE_PORT", "8000"))
+    log.info("登录方式：成员密钥（服务器管理员忘记密钥可执行 `uv run python -m app --reset-key`）")
     log.info("=" * 68)
-    if is_factory_key(cfg.admin):
-        log.warning("-" * 68)
-        log.warning("初始管理 KEY：%s", DEFAULT_ADMIN_KEY)
-        log.warning("首次登录后请到「管理端 → 管理 KEY」修改；修改后此处不再显示。")
-        log.warning("以后若忘记 KEY：停止服务后执行 `uv run python -m app --reset-key`。")
-        log.warning("-" * 68)
-    else:
-        log.info(
-            "管理 KEY 已自定义（此处不再显示）；忘记时可停止服务后执行 `uv run python -m app --reset-key` 重置。"
-        )
     try:
         yield
     finally:
         backup_task.cancel()
         with suppress(asyncio.CancelledError):
             await backup_task
+        remind_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await remind_task
         await store.stop()
         await avatars.aclose()
         # 先收掉还没跑完的探测任务，再关连接池：否则它可能在关池的瞬间发起请求
@@ -410,14 +665,22 @@ async def lifespan(app: FastAPI):
         log.info("服务已停止")
 
 
+# 交互式接口文档（/api/docs、/redoc、/api/openapi.json）：**默认关闭**。
+# 它们会把全部接口、参数与数据模型摊开给任何访客看——自用站点并不需要，
+# 而「知道有哪些接口」正是扫描器第一步。要对接 / 调试时设 NTE_DOCS=1 打开。
+_DOCS_ON = os.getenv("NTE_DOCS", "").strip().lower() in ("1", "true", "yes", "on")
+
 app = FastAPI(
     title="NTE 比赛",
     description="NTE 比赛（异环）通用赛事平台：自动分组 / 积分结算 / 实时排行 / 直播推流",
     version="0.1.0",
     lifespan=lifespan,
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
+    docs_url="/api/docs" if _DOCS_ON else None,
+    redoc_url="/redoc" if _DOCS_ON else None,
+    openapi_url="/api/openapi.json" if _DOCS_ON else None,
 )
+if not _DOCS_ON:
+    log.info("交互式接口文档已关闭（需要时设 NTE_DOCS=1 打开）")
 
 # 跨域默认**关闭**：前端由本站同源提供，正常不需要任何 CORS。
 # 确有跨域需求（前端单独部署在别的域名）时，用 NTE_CORS_ORIGINS 显式列出允许的来源；
@@ -437,12 +700,17 @@ else:
     log.info("未配置 NTE_CORS_ORIGINS：仅允许同源访问（前端与 API 同域时无需配置）")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(EdgeCacheMiddleware)
+# 安全响应头（保守一组，见 SecurityHeadersMiddleware 的取舍说明）
+app.add_middleware(SecurityHeadersMiddleware)
+# 操作日志（只记非 GET 的 /api 请求；见 AuditMiddleware 的取舍说明）
+app.add_middleware(AuditMiddleware)
 
 app.include_router(live.router)
 app.include_router(members_api.router)
 app.include_router(backup_api.router)
 app.include_router(qqbot_api.router)
 app.include_router(bot_api.router)
+app.include_router(notices_api.router)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -466,17 +734,38 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     )
 
 
+def _error_message(exc: ValueError) -> str:
+    """把校验异常整理成**一句话**。
+
+    pydantic 的 ``ValidationError``（内部构造模型时抛出，如保存直播配置）是
+    ``ValueError`` 的子类，``str()`` 出来是「1 validation error for Config\\
+    stream.pushToken\\n  Value error, 推流令牌只能…」这种多行调试文本。
+    这里只取第一条错误的正文，前端 toast 才读得懂。
+    """
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            first = (errors() or [{}])[0]
+            msg = str(first.get("msg") or "").removeprefix("Value error, ").strip()
+            if msg:
+                return msg
+        except Exception:  # pragma: no cover - 取不出来就退回整段文本
+            log.debug("整理校验错误失败（忽略）", exc_info=True)
+    return str(exc)
+
+
 @app.exception_handler(ValueError)
 async def business_error_handler(request: Request, exc: ValueError) -> JSONResponse:
-    """业务校验失败（人数不足、时间不合法等）统一回 400 JSON。
+    """业务校验失败（人数不足、时间不合法、流名含非法字符等）统一回 400 JSON。
 
     兜底用：漏掉 try/except 的校验不会再变成没有响应体的 500，
     前端始终能拿到 ``{error}`` 文案。
     """
-    log.info("业务校验失败 | %s %s | %s", request.method, request.url.path, exc)
+    message = _error_message(exc)
+    log.info("业务校验失败 | %s %s | %s", request.method, request.url.path, message)
     return JSONResponse(
         status_code=400,
-        content={"ok": False, "error": str(exc), "status": 400},
+        content={"ok": False, "error": message, "status": 400},
     )
 
 
@@ -543,10 +832,10 @@ async def api_diagnostics(_: Session = Depends(require_event)) -> dict[str, Any]
         "updatedAt": cfg.updated_at,
         "ws": hub.stats(),
         "avatarCache": avatars.cache_stats(),
+        # 公告图片占用（与头像缓存并列：这两个是唯一会自己长大的数据目录）
+        "uploads": media.stats(),
         "live": live.stream_endpoints(),
         "issues": validate_config(cfg),
-        # 主管理 KEY 的存储形态：pbkdf2_sha256（推荐）/ sha256（历史无盐）/ plain / unset
-        "adminKeyMode": admin_key_mode(cfg.admin),
         # 还有几位成员的凭据是历史无盐格式（建议轮换）
         "legacyCredentials": len(store.legacy_credential_members()),
     }
@@ -573,7 +862,10 @@ def _server_session(label: str) -> Session:
 
 @app.post("/api/auth")
 async def api_auth(payload: AuthPayload, request: Request) -> dict[str, Any]:
-    """登录：成员密钥（随机生成、哈希存储）或服务器管理员管理 KEY。
+    """登录：**只认成员密钥**（随机生成、加盐哈希存储）。
+
+    服务器管理员也只是「权限最高的成员」，用他自己的成员密钥登录即可；
+    本站没有独立于成员之外的「主管理 KEY」——管理权限完全由登录后的身份决定。
 
     ``/api/auth`` 是**唯一**的暴力破解入口，因此这里挂了登录失败限制
     （类 fail2ban，见 ``login_guard`` 模块）：同一 IP 在时间窗内失败过多会被
@@ -617,23 +909,15 @@ async def api_auth(payload: AuthPayload, request: Request) -> dict[str, Any]:
             "name": member.display_name,
             "permission": member.permission,
         }
-    # 2) 出厂 / 自定义管理 KEY（服务器管理员主密钥，向后兼容）
-    cfg = store.snapshot()
-    if auth.verify_key(key, cfg.admin):
-        login_guard.record_success(ip)
-        session = _server_session("server-key")
-        log.warning("服务器管理员以管理 KEY 登录 | ip=%s | 成员=%s", ip, session.uid or "(缺)")
-        return {
-            "ok": True,
-            "token": session.token,
-            "expiresAt": int(session.expires_at),
-            "uid": session.uid,
-            "name": session.name,
-            "permission": session.permission,
-        }
+    # 2) 没命中任何成员 → 登录失败。
+    #    这里刻意**不再有**「主管理 KEY」这条路径：那套凭据已退休（见 README「登录与权限」）。
     banned = 0 if local else login_guard.record_failure(ip, settings)
-    log.warning("登录失败：密钥不正确 | ip=%s%s", ip, f"（已封禁 {banned}s）" if banned else "")
-    raise HTTPException(status_code=401, detail="密钥不正确")
+    log.warning("登录失败：成员密钥不正确 | ip=%s%s", ip, f"（已封禁 {banned}s）" if banned else "")
+    raise HTTPException(
+        status_code=401,
+        detail="成员密钥不正确。密钥由服务器管理员在「服务器 → 成员管理」里生成；"
+        "服务器管理员本人若忘记密钥，可在服务器上执行 `uv run python -m app --reset-key` 重置。",
+    )
 
 
 @app.post("/api/auth/local")
@@ -680,23 +964,17 @@ async def api_auth_check(session: Session = Depends(require_admin)) -> dict[str,
 
 
 @app.post("/api/admin/key")
-async def api_admin_key(
-    payload: AdminKeyPayload, session: Session = Depends(require_server)
-) -> dict[str, Any]:
-    """更新服务器管理员的主管理 KEY（仅服务器管理员）。
+async def api_admin_key_disabled() -> dict[str, Any]:
+    """已退休：主管理 KEY 没有了，凭据一律走「成员管理」。
 
-    默认只写 sha256，不留明文；更新后注销全部会话（需用新 KEY 重新登录）。
+    保留这条路由只为**给出明确答复**：老前端 / 老脚本调它时，得到的是一句
+    「已移除，用成员密钥」，而不是 404 那种让人以为「是不是我地址写错了」的沉默。
     """
-    raw = (payload.key or "").strip()
-    if len(raw) < 6:
-        raise HTTPException(status_code=400, detail="管理 KEY 至少 6 位")
-    # 一律写**加盐 PBKDF2**：明文与无盐 sha256 都不再落库（payload.store_hash 已无意义，
-    # 保留字段只为兼容旧前端）
-    patch = {"admin": {"key": "", "keySha256": "", "keyHash": hash_password(raw)}}
-    await store.update(patch, actor="web:admin-key")
-    revoked = auth.revoke_all()
-    log.warning("管理 KEY 已更新（加盐 PBKDF2） | 已注销会话=%d", revoked)
-    return {"ok": True, "mode": "pbkdf2_sha256", "reauth": True}
+    raise HTTPException(
+        status_code=410,
+        detail="主管理 KEY 已移除。登录与管理都走成员密钥："
+        "服务器管理员的密钥可在「服务器 → 成员管理 → 轮换密钥」重新生成。",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -773,8 +1051,8 @@ async def api_event_create(
 ) -> dict[str, Any]:
     """新建一届并切换过去；可选沿用当前届的名单与规则，并选择赛制。
 
-    新建的届归属创建者：赛事管理员之后只能管理 / 删除自己创建的届
-    （服务器管理员用管理 KEY 登录，``uid`` 为空，创建的届归服务器管理）。
+    新建的届归属创建者：赛事管理员之后只能管理 / 删除自己创建的届；
+    服务器管理员创建的届也归他自己，但他的身份能管全部届。
     """
     fmt = (payload.format or "").strip()
     if fmt not in ("", "league", "tournament"):
@@ -972,9 +1250,10 @@ async def api_private(_: Session = Depends(require_current_event)) -> dict[str, 
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
-# 这些字段不能经 /api/config 改动：版本号 / 时间戳由服务端维护，
-# 管理 KEY（admin）只能走 /api/admin/key（且仅服务器管理员）。
-_PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version", "admin"}
+# 这些字段不能经 /api/config 改动：版本号 / 时间戳一律由服务端维护。
+# 凭据**没有任何**可经这里改动的字段——成员密钥走成员管理的轮换接口，
+# 主管理 KEY 那套已整体退休（见 README「登录与权限」）。
+_PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version"}
 
 
 def event_locked() -> bool:
@@ -1030,6 +1309,17 @@ async def api_update_config(
             for k, v in event_patch.items()
             if k not in _LOCK_PATCH_KEYS and k not in ("locked_at",)
         }
+        # 「比赛开始后也能改，结束后只读」：赛后只放开通知，赛事信息不再让改。
+        # 注意只在**真的改了内容**时才拒绝——前端保存别的字段时常会带上原值。
+        if (
+            current.status == "closed"
+            and "rulesText" in kept
+            and str(kept["rulesText"] or "") != current.rules_text
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="本届已结束：赛事信息只能查看；要发布内容请改用「赛事通知」",
+            )
         clean["event"] = {**kept, "startTime": start, "endTime": end}
     # 娱乐模式（排名开关关闭）不判胜负：强制允许平局，录分时不必指定胜方
     if clean.get("event", {}).get("ranked") is False:
@@ -1197,12 +1487,12 @@ async def api_reload(_: Session = Depends(require_current_event)) -> dict[str, A
 async def api_export(_: Session = Depends(require_current_event)) -> Response:
     """导出当前届为 JSON（备份 / 迁移用；也可作为导入他处的快照）。
 
-    **不含任何凭据**：主管理 KEY（``admin``，可能含哈希甚至历史明文）在这里剥掉，
-    成员凭据也只在 ``members`` 表里、不属于届配置。导出的文件可以随便传阅。
+    **不含任何凭据**：届配置里本来就没有凭据字段（成员密钥、Bearer 令牌都在
+    ``members`` 表里，主管理 KEY 那套已整体退休），这里再把 ``members`` 兜底剥掉，
+    确保导出的文件可以随便传阅。
     """
     cfg = store.snapshot()
     data = cfg.dump()
-    data.pop("admin", None)     # 服务器主管理 KEY 属于服务器级，绝不进导出文件
     data.pop("members", None)   # 兜底：万一哪天届配置里混进成员凭据
     payload = json.dumps(data, ensure_ascii=False, indent=2)
     filename = f"{store.current_id}-{cfg.event.name or 'event'}.json"
@@ -1227,6 +1517,9 @@ async def api_upsert_player(payload: Player, _: Session = Depends(require_curren
         player.id = f"p{seq:02d}"
     if not player.name:
         raise HTTPException(status_code=400, detail="选手名称不能为空")
+    # 推流流名只收 ASCII（含中文/空格的地址用不了，比较时还会抛异常）；
+    # 非法字符直接报错，不静默丢字符
+    player.stream_key = logic.check_stream_key(player.stream_key, "推流流名")
     # 推流流名必须唯一：重复会让两位选手推到同一个地址（串流），保存前先查库
     if player.stream_key:
         clash = next(
@@ -1333,7 +1626,7 @@ async def api_set_participants(
 # 与赛事届次无关，因此**不受开赛锁定影响**，也不需要切换届次。
 # --------------------------------------------------------------------------- #
 @app.post("/api/channels")
-async def api_channel_save(payload: Channel, _: Session = Depends(require_event)) -> dict[str, Any]:
+async def api_channel_save(payload: Channel, _: Session = Depends(require_server)) -> dict[str, Any]:
     """新增 / 更新一个成员频道。
 
     * 流名（``streamKey``）**全局唯一**：与选手以及其它频道都不能重复（否则串流）；
@@ -1343,7 +1636,10 @@ async def api_channel_save(payload: Channel, _: Session = Depends(require_event)
     channel = payload.model_copy()
     if not channel.name.strip():
         raise HTTPException(status_code=400, detail="频道名不能为空")
-    key = logic.clean_key(channel.stream_key)
+    # 流名只收 ASCII（同成员推流 ID）；非法字符直接报错。
+    # 校验通过后把**规整值**写回，避免存下带首尾空格的流名。
+    key = logic.check_stream_key(channel.stream_key, "频道流名")
+    channel.stream_key = key
     if key:
         clash_member = next(
             (m for m in store.members() if logic.clean_key(m.stream_id) == key), None
@@ -1391,7 +1687,7 @@ class ChannelNoticePayload(NTEModel):
 
 @app.put("/api/channels/notice")
 async def api_channel_notice(
-    payload: ChannelNoticePayload, _: Session = Depends(require_event)
+    payload: ChannelNoticePayload, _: Session = Depends(require_server)
 ) -> dict[str, Any]:
     """设置「频道」板块的公告 / 异环相关内容（全局，与届次无关）。"""
     text = await store.set_channel_notice(payload.text, actor="web:channel-notice")
@@ -1418,7 +1714,7 @@ async def api_site_name(
 
 
 @app.delete("/api/channels/{channel_id}")
-async def api_channel_delete(channel_id: str, _: Session = Depends(require_event)) -> dict[str, Any]:
+async def api_channel_delete(channel_id: str, _: Session = Depends(require_server)) -> dict[str, Any]:
     """删除一个成员频道。"""
     removed = await store.delete_channel(channel_id, actor="web:channel-delete")
     if not removed:
@@ -2326,6 +2622,9 @@ async def api_round_result(
     allow_draw = (not ranked) or (
         cfg_now.rules.allow_draw and target.stage in ("group", "league")
     )
+    # 比法决定「谁赢」：计分制比分高者胜，用时制用时短者胜（见 app/metrics.py）
+    metric = metrics.norm(cfg_now.rules.metric)
+    time_based = metrics.lower_is_better(metric)
 
     side_count = len(target.sides)
     valid_keys = [chr(ord("A") + i) for i in range(side_count)]
@@ -2382,16 +2681,19 @@ async def api_round_result(
 
         _write_entered(rnd)
         model = Round.model_validate(rnd)
-        auto = tournament.judge_round(model, allow_draw=allow_draw)
+        auto = tournament.judge_round(model, allow_draw=allow_draw, metric=metric)
         winner = explicit or auto
         if explicit and explicit != "DRAW" and explicit != auto:
             # 人工指定第 1 名：把指定方钉在 1，其余按得分顺序依次排 2、3、4
             keys = [chr(ord("A") + i) for i in range(len(model.sides))]
             winner_index = keys.index(explicit) if explicit in keys else -1
             if winner_index >= 0:
+                counted = len(model.sides) == 2 and bool(model.sets)
                 others = sorted(
                     (i for i in range(len(model.sides)) if i != winner_index),
-                    key=lambda i: (-model.sides[i].score, -model.sides[i].points),
+                    key=lambda i: metrics.judge_key(
+                        model.sides[i].score, model.sides[i].points, metric, counted=counted
+                    ),
                 )
                 model.sides[winner_index].rank = 1
                 for offset, index in enumerate(others, start=2):
@@ -2399,7 +2701,8 @@ async def api_round_result(
             model.winner = winner
         if not winner:
             if ranked:
-                who = "并列第一" if side_count > 2 else "比分相同"
+                tied_text = "用时相同" if time_based else "比分相同"
+                who = "并列第一" if side_count > 2 else tied_text
                 hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
                 raise HTTPException(status_code=400, detail=f"{who}，无法判定晋级：{hint}")
             # 娱乐模式：分不出胜负就直接记平局，绝不因为「没点胜方」而卡住记录
@@ -2642,15 +2945,44 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 操作日志
+# --------------------------------------------------------------------------- #
+@app.get("/api/activity")
+async def api_activity(
+    limit: int = 60,
+    _: Session = Depends(require_server),  # noqa: B008  (FastAPI 依赖注入惯例)
+) -> dict[str, Any]:
+    """最近的操作日志（服务器管理员）。
+
+    记录由 :class:`AuditMiddleware` 完成：只记非 GET 的 ``/api`` 请求的
+    「谁 + 何时 + 方法 + 路径 + 状态码」，**请求体一律不记**。
+    """
+    items = await store.activity(max(1, min(int(limit or 60), 600)))
+    return {"items": items}
+
+
+@app.get("/api/credits")
+async def api_credits() -> dict[str, Any]:
+    """版权与开源组件清单（页脚「开源组件」面板用）。
+
+    公开只读：都是「本站在用哪些开源作品、各自什么许可」这类信息，
+    没有任何凭据，也不需要登录——署名本来就应该让任何人都看得到。
+    """
+    return {"ok": True, **credits.payload()}
+
+
+# --------------------------------------------------------------------------- #
 # 静态资源
 # --------------------------------------------------------------------------- #
 if STATIC_DIR.exists():
+    # PWA manifest 的 MIME 不在 Python 默认表里，不注册会被当成 octet-stream 而拒绝加载
+    mimetypes.add_type("application/manifest+json", ".webmanifest")
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", include_in_schema=False)
-async def index() -> Response:
-    return render_index()
+async def index(request: Request) -> Response:
+    return render_index(await page_meta("/", str(request.base_url)))
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -2661,14 +2993,57 @@ async def favicon() -> Response:
     return Response(status_code=204)
 
 
+@app.get("/og.png", include_in_schema=False)
+async def og_image() -> Response:
+    """默认分享图（1200×630）。放在这里而不是 /static 下：路径短、且不受资源版本号影响。
+
+    管理端在「界面配置」里填了「分享图」就会改用那张，这个路由只是兜底。
+    """
+    art = STATIC_DIR / "og.png"
+    if not art.exists():
+        raise HTTPException(status_code=404, detail="没有内置分享图")
+    return FileResponse(art, media_type="image/png", headers={"Cache-Control": "public, max-age=600"})
+
+
+#: 「帮助图」认这几个文件名（按顺序取第一个存在的）。JPEG 优先：同画面比 PNG 小得多，
+#: 而 QQ 会再压一道、不吃 PNG 的无损；SVG 放最后（QQ 对它支持不好）。
+HELP_IMAGE_NAMES = ("help.jpg", "help.jpeg", "help.png", "help.webp", "help.svg")
+
+
+@app.api_route("/help.jpg", methods=["GET", "HEAD"], include_in_schema=False)
+async def help_image() -> Response:
+    """QQ 机器人**帮助图**：把图丢进 `static/`（如 `static/help.jpg`）就能用。
+
+    为什么单开一条路由、而不是让插件填 `/static/help.jpg`：路径短、**不受资源版本号
+    影响**，换图后地址不变——插件那边的 `help_image` 一次配好就不用再动（同 `/og.png`）。
+
+    **必须显式写上 HEAD**：插件判断「站点上有没有这张图」用的就是一次 HEAD（比 GET 省流量），
+    而 FastAPI 的 `@app.get` **不挂 HEAD**（会回 405）——那样插件会一直以为没图，
+    帮助图静默地永远不生效（这个坑真踩过，`test_api` 里有防回归）。
+
+    没放图时回 404 并说清放哪儿，而不是给一张空白图：群友看到的是插件的文字说明兜底，
+    站长在日志/调试里能立刻知道是「图还没放」而不是「配置填错了」。
+    """
+    for name in HELP_IMAGE_NAMES:
+        art = STATIC_DIR / name
+        if art.exists():
+            media = mimetypes.guess_type(name)[0] or "image/png"
+            # 不缓存：图本来就很少被请求（有人问才取一次），换图要立刻生效
+            return FileResponse(art, media_type=media, headers={"Cache-Control": "no-cache"})
+    raise HTTPException(
+        status_code=404,
+        detail="还没有帮助图：把图存成 static/help.jpg（或 .png / .webp），或改插件配置用别的地址",
+    )
+
+
 @app.get("/{full_path:path}", include_in_schema=False)
-async def spa_fallback(full_path: str) -> Response:
+async def spa_fallback(request: Request, full_path: str) -> Response:
     """非 API 路径统一回落到首页，方便移动端直接收藏子路径。"""
     if full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="接口不存在")
     if not (STATIC_DIR / "index.html").exists():
         raise HTTPException(status_code=404, detail="页面不存在")
-    return render_index()
+    return render_index(await page_meta(full_path, str(request.base_url)))
 
 
 __all__ = ["app"]

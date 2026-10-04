@@ -1,20 +1,26 @@
 """NTE 比赛 × AstrBot 插件。
 
-把「NTE 比赛」平台的赛事数据接进群聊，**同一份能力给两个入口**：
+把「NTE 比赛」平台的赛事数据接进群聊，**全部能力都是群命令**（``@filter.command``）：
+不注册任何 ``llm_tool``、也不调用任何大模型——命中哪条命令、回什么，全由字符串匹配
+与站点数据决定，同一个问题问两次结果一样，不依赖 LLM provider 是否配好。
 
-* **群命令**（打字即用，不走大模型）—— 由 ``@filter.command`` 注册，覆盖常见问法；
-* **LLM 工具**（兜底）—— 由 ``@filter.llm_tool`` 注册，命令覆盖不到的自由问法交给它。
+唯一「不查数据」的是一条快捷键：**问帮助**可以直接回一张帮助图——默认就发**站点内置的
+那张**（把图放成站点里的 ``static/help.jpg`` 即可，地址 ``/help.jpg``；没有图就回文字说明，
+见 README 与 ``HELP.md``），方便贴群公告。
 
 插件本身**不做业务计算**，只调站点的只读查询 API（``/api/bot/*``），
 所以文案、赛制、分页逻辑全在站点那一侧，改一处两边同步。
 
 安装：把本目录整个复制到 AstrBot 的 ``data/plugins/`` 下，然后在 AstrBot 的
 插件配置里填 **站点地址** 与 **查询 API 令牌**（站点「服务器 → QQ 机器人」生成）。
+
+源码：https://github.com/PureAmaya/NTEmatch （AGPL-3.0，© 早八时睡觉的你）
 """
 
 from __future__ import annotations
 
 import re
+import time
 
 import httpx
 import astrbot.api.star as star
@@ -39,9 +45,102 @@ def _conf(config, key: str, default):
     return raw
 
 
+def _sender_id(event) -> str:
+    """发消息者的 QQ。不同 AstrBot 版本字段位置不同，逐个试，取不到就回空串。"""
+    try:
+        value = event.get_sender_id()
+        if value:
+            return str(value)
+    except Exception:  # noqa: BLE001  (老版本没有这个方法)
+        pass
+    obj = getattr(event, "message_obj", None)
+    sender = getattr(obj, "sender", None) if obj is not None else None
+    return str(getattr(sender, "user_id", "") or "")
+
+
+def _chat_key(event) -> str:
+    """这次会话的标识（群号优先，其次私聊对象），用于按会话计冷却。"""
+    for getter in ("get_group_id", "get_sender_id"):
+        try:
+            value = getattr(event, getter)()
+        except Exception:  # noqa: BLE001  (同上)
+            value = ""
+        if value:
+            return str(value)
+    return "global"
+
+
+def _self_id(event) -> str:
+    """机器人自己的 QQ（用来把「@机器人」从被 @ 名单里剔掉）。取不到就回空串。"""
+    for getter in ("get_self_id", "get_bot_id"):
+        try:
+            value = getattr(event, getter)()
+        except Exception:  # noqa: BLE001  (老版本没有这个方法)
+            value = ""
+        if value:
+            return str(value)
+    obj = getattr(event, "message_obj", None)
+    return str(getattr(obj, "self_id", "") or "")
+
+
+def _at_targets(event) -> list[str]:
+    """消息里**被 @ 的人**的 QQ（按顺序、去重）。
+
+    为什么从消息链里取、而不是让用户手打 QQ：手打的号码最容易抄错一位，而授权是
+    写操作——抄错就等于给陌生人开了权限。@ 由平台保证是真实存在的账号。
+
+    会剔掉机器人自己（唤醒时必然 @ 了它）与发消息者本人。
+    """
+    out: list[str] = []
+    obj = getattr(event, "message_obj", None)
+    chain = getattr(obj, "message", None) or []
+    skip = {_self_id(event), _sender_id(event)}
+    for seg in chain:
+        qq = getattr(seg, "qq", None)
+        if qq is None and isinstance(seg, dict):
+            qq = seg.get("qq")
+        clean = "".join(ch for ch in str(qq or "") if ch.isdigit())
+        if clean and clean not in skip and clean not in out:
+            out.append(clean)
+    return out
+
+
+def _at_names(event) -> dict[str, str]:
+    """被 @ 的人显示名（At 组件里的 ``name``，没有就空）——用作新成员的名字。"""
+    out: dict[str, str] = {}
+    obj = getattr(event, "message_obj", None)
+    chain = getattr(obj, "message", None) or []
+    for seg in chain:
+        qq = getattr(seg, "qq", None)
+        if qq is None and isinstance(seg, dict):
+            qq = seg.get("qq")
+        name = getattr(seg, "name", None)
+        if name is None and isinstance(seg, dict):
+            name = seg.get("name")
+        clean = "".join(ch for ch in str(qq or "") if ch.isdigit())
+        if clean and name:
+            out.setdefault(clean, str(name))
+    return out
+
+
+def _page_number(raw) -> int:
+    """把「2」「第2页」「2 页」这类写法解析成页码；解析不出就回第 1 页。
+
+    **参数为什么不用 int 注解**：AstrBot 的命令过滤器在参数带 int 默认值时，会对实参做
+    ``int(...)`` 强转，转不动会**直接抛异常**（而不是忽略这次匹配），整条命令失效——
+    可用户随手写「第2页」再正常不过。所以这里收成字符串、自己宽松解析。
+    """
+    digits = re.sub(r"\D", "", str(raw or ""))
+    return min(999, max(1, int(digits))) if digits else 1
+
+
+# 帮助文本：**唯一的说明来源**——群里回的是它，``HELP.md``（做帮助图用）也照着它写。
+# 改命令时顺手改这两处，别让它们各说一套。
+#
+# 分几块：命令清单 → 届次怎么写 → 怎么参加 → 怎么触发 → 什么会私聊发你。
 HELP_TEXT = (
     "【NTE 比赛】可用命令：\n"
-    "· 比赛 —— 当前赛事的信息 + 进度\n"
+    "· 比赛 [届次] —— 该届的信息 + 进度\n"
     "· 比赛直播 —— 现在谁在直播（主直播间 + 选手 / 成员机位的观看地址）\n"
     "· 比赛列表 [页码] —— 全部赛事\n"
     "· 比赛信息 [届次] —— 时间 / 赛制 / 人数 / 简介 / 是否排名\n"
@@ -52,25 +151,75 @@ HELP_TEXT = (
     "· 比赛名单 [届次] —— 参赛名单（选手 / 队伍 / 替补）\n"
     "· 比赛冠军 [届次] —— 冠军（或积分制榜首前三）\n"
     "· 比赛届次 —— 全部届次的编号与名称（填参数用）\n"
-    "· 比赛召集 [届次] —— @ 参赛者，请他们到场准备\n"
-    "· 比赛帮助 —— 就是本条\n"
-    "届次可以写 e001 / 1 / 第2届 / 名称里的几个字，不填就是当前主赛事；\n"
-    "比赛直播与比赛列表是全局信息，不用填届次。"
+    "· 比赛召集 [届次] —— @ 参赛者到场（仅本届举办者 / 服务器管理员，带冷却）\n"
+    "· 比赛我的 —— 你自己的推流地址 + 直播间地址（私聊发你）\n"
+    "· 比赛授权 @某人 —— 把群友设为赛事管理员（仅服务器管理员；不是成员会自动建号）\n"
+    "· 比赛添加 @某人 —— 把群友添加为普通成员（仅服务器管理员）\n"
+    "· 比赛帮助 —— 就是本条（私聊发你）\n"
+    "上面带 [届次] 的命令**必须写明哪一届**：写 e001 / 1 / 第2届 / 名称里的几个字都行\n"
+    "（不知道有哪些届就发「比赛届次」）；不带 [届次] 的命令不用填。\n"
+    "比赛直播与比赛列表是全局信息，不用填届次。\n"
+    "—— 怎么参加 ——\n"
+    "参赛不用自己注册：本届举办者在站点里把你排进名单就行，群里 @ 你就是要开打了。\n"
+    "想用「比赛我的」查自己的推流地址，得先成为成员（服务器管理员发：比赛添加 @你）。\n"
+    "—— 怎么触发 ——\n"
+    "要先 @ 机器人 再说命令，或按 AstrBot 里设的唤醒前缀发（例如「/比赛进度」）。\n"
+    "光打「比赛进度」不会触发：这是 AstrBot 的命令过滤规则（必须被 @ 或命中唤醒前缀），\n"
+    "不是本插件能改的——不 @ 就不会有任何回复。\n"
+    "—— 会私聊发给你的东西 ——\n"
+    "命令说明、你自己的推流地址、新成员的登录密钥都走私聊（只该你看到）。\n"
+    "私聊发不出去（没加机器人好友）时，地址与说明会退回群里；\n"
+    "但**登录密钥不会**——密钥只显示一次，泄在群里等于白送一个账号。"
 )
 
 
+def _image_result(event, image: str):
+    """发一张图：优先用框架的 ``image_result``，取不到就退化成 OneBot 的 CQ 码。
+
+    留这个兜底是为了跨版本：AstrBot 各版本的 event 接口不完全一样，而 CQ 码是 OneBot
+    的通用写法（站点推流端发 @ 用的也是同一套惯例）。最坏情况下它显示成一条带链接的
+    消息，而不是「什么都不发」。
+    """
+    maker = getattr(event, "image_result", None)
+    if callable(maker):
+        return maker(image)
+    return event.plain_result(f"[CQ:image,file={image}]")
+
+
 class NTEMatchPlugin(star.Star):
-    """赛事查询：群命令（优先）+ LLM 工具（兜底）。"""
+    """赛事查询：全部能力都是群命令，不依赖任何大模型。"""
 
     def __init__(self, context: star.Context, config: dict | None = None):
         super().__init__(context)
-        self.config = config or {}
-        self.base_url = str(_conf(self.config, "base_url", "http://127.0.0.1:8000")).rstrip("/")
-        self.token = str(_conf(self.config, "api_token", ""))
-        self.timeout = float(_conf(self.config, "timeout", 10))
-        self.reply_prefix = str(_conf(self.config, "reply_prefix", ""))
-        if not self.token:
-            logger.warning("[NTE 比赛] 还没填查询 API 令牌，命令会报「未启用」")
+        # 配置**不在构造时读死**：不同 AstrBot 版本注入配置的时机不一样（有的是实例化
+        # 之后由框架赋值），读死了会一直用默认值、命令通通报「令牌不正确」。
+        # 这里只保证「别把框架已经放好的 config 覆盖掉」。
+        if config is not None:
+            self.config = config
+        elif not hasattr(self, "config"):
+            self.config = {}
+        self._client: httpx.AsyncClient | None = None
+        # 「召集」的冷却记录：{会话: [时间戳, ...]}（只留一小时内）
+        self._call_times: dict[str, list[float]] = {}
+
+    # ------------------------------------------------------------------ #
+    # 配置（每次读取，见上面关于注入时机的说明）
+    # ------------------------------------------------------------------ #
+    @property
+    def base_url(self) -> str:
+        return str(_conf(self.config, "base_url", "http://127.0.0.1:8000")).rstrip("/")
+
+    @property
+    def token(self) -> str:
+        return str(_conf(self.config, "api_token", ""))
+
+    @property
+    def timeout(self) -> float:
+        return float(_conf(self.config, "timeout", 10))
+
+    @property
+    def reply_prefix(self) -> str:
+        return str(_conf(self.config, "reply_prefix", ""))
 
     # ------------------------------------------------------------------ #
     # 与站点通信
@@ -79,19 +228,44 @@ class NTEMatchPlugin(star.Star):
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
+    def _http(self) -> httpx.AsyncClient:
+        """复用一个连接池：每条命令都新建 client，等于每次都重新握手。"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
     async def _get(self, path: str, **params) -> dict:
         """调一次站点接口；失败时返回 ``{"ok": False, "error": "..."}``（不抛异常）。"""
         url = f"{self.base_url}/api/bot/{path}"
         clean = {k: v for k, v in params.items() if v not in (None, "")}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(url, headers=self._headers, params=clean)
+            resp = await self._http().get(url, headers=self._headers, params=clean, timeout=self.timeout)
         except httpx.HTTPError as exc:
             logger.warning("[NTE 比赛] 请求失败 %s：%s", url, exc)
             return {"ok": False, "error": f"连不上比赛平台（{exc}）"}
+        return self._handle(resp)
+
+    async def _post(self, path: str, payload: dict) -> dict:
+        """调一次站点的**写**接口（授权 / 添加成员 / 私聊投递）。
+
+        与 :meth:`_get` 共用错误处理，差别只在 403：写接口的 403 是「你（这个 QQ）
+        没有权限」，站点那边已经写好了人话提示（例如「只有服务器管理员能…」），直接透传；
+        读接口的 403 基本只有一个原因：查询 API 没启用。
+        """
+        url = f"{self.base_url}/api/bot/{path}"
+        try:
+            resp = await self._http().post(
+                url, headers=self._headers, json=payload, timeout=self.timeout
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("[NTE 比赛] 请求失败 %s：%s", url, exc)
+            return {"ok": False, "error": f"连不上比赛平台（{exc}）"}
+        return self._handle(resp, write=True)
+
+    def _handle(self, resp: httpx.Response, *, write: bool = False) -> dict:
         if resp.status_code == 401:
             return {"ok": False, "error": "查询令牌不正确，请到站点重新生成后在插件配置里更新"}
-        if resp.status_code == 403:
+        if resp.status_code == 403 and not write:
             return {"ok": False, "error": "查询接口未启用：请先在站点「服务器 → QQ 机器人」生成令牌"}
         if resp.status_code >= 400:
             try:
@@ -99,11 +273,24 @@ class NTEMatchPlugin(star.Star):
                 detail = str(body.get("error") or body.get("detail") or "")
             except Exception:  # noqa: BLE001
                 detail = resp.text[:120]
+            if write:
+                return {"ok": False, "error": detail or f"平台返回 HTTP {resp.status_code}"}
             return {"ok": False, "error": f"平台返回 HTTP {resp.status_code}：{detail}"}
         try:
             return resp.json()
         except ValueError:
             return {"ok": False, "error": "平台返回的不是 JSON"}
+
+    async def _notify(self, qq: str, text: str) -> dict:
+        """让**站点**把一条消息私聊给某个 QQ。
+
+        为什么不自己发：站点已经握着 AstrBot 的 API Key 与统一发送通道（群推送走的就是
+        它），插件不必再去猜某个 AstrBot 版本的私聊接口。私聊只用来发**只该本人看到**的
+        东西：登录密钥、推流地址、命令说明。
+        """
+        if not qq:
+            return {"ok": False, "error": "没有可用的 QQ"}
+        return await self._post("notify", {"qq": qq, "text": text})
 
     async def _query(
         self, kind: str, event_id: str = "", ref: str = "", page: int = 1, at: bool = True
@@ -134,15 +321,24 @@ class NTEMatchPlugin(star.Star):
     async def _resolve_event(self, token: str) -> tuple[str, str]:
         """把用户写的「届次」解析成编号，返回 ``(编号, 错误提示)``。
 
-        支持：留空（当前主赛事）/ ``e001`` / ``1`` / ``第2届`` / 名称里的几个字。
-        **找不到时会列出可用编号**——用户自己就能改对，不用去问大模型。
+        **届次必须写明**：``e001`` / ``1`` / ``第2届`` / 名称里的几个字（不写就提示补上，见下）。
+        找不到时会**列出可用编号**——用户自己就能改对。
+
+        为什么不给「不填 = 某一届」的默认值：站点内部确实有个「当前届」指针
+        （``store.current_id``，谁最近打开 / 新建过就是谁），但它是**实现细节**，
+        前台早就不对外提这个概念了。拿它当默认值，群友看到的会是「碰运气」的数据——
+        同一句话今天问是这届、明天问变成那届。
         """
         raw = (token or "").strip()
+        if not raw:
+            # 先回提示、再谈查数据：连届次都没写时不必去问站点
+            return "", (
+                "要写明是「哪一届」：命令后面带上届的名称或编号，例如「… 春节」或「… e001」。\n"
+                "发「比赛届次」可以看到全部届的编号与名称。"
+            )
         rows, error = await self._events()
         if error:
             return "", error
-        if not raw:
-            return "", ""
         if not rows:
             return "", "平台上还没有赛事。"
         for item in rows:
@@ -175,13 +371,153 @@ class NTEMatchPlugin(star.Star):
         for text in self._texts(await self._query(kind, target, ref, page)):
             yield text
 
+    def _call_allowed(self, event) -> tuple[bool, str]:
+        """「召集」的冷却闸：同一会话的最小间隔 + 每小时上限。
+
+        为什么单独做、不复用站点那套推送限流：站点限流只作用于网页「推送到群」的
+        HTTP 路径；插件是**直接往群里发**的，根本不经过它。而召集天生会 @ 一大片人，
+        没有闸门就等于让任何人反复刷群。
+        """
+        chat = _chat_key(event)
+        now = time.time()
+        cooldown = float(_conf(self.config, "call_cooldown", 60) or 0)
+        per_hour = int(_conf(self.config, "call_per_hour", 6) or 0)
+        hits = [t for t in self._call_times.get(chat, []) if now - t < 3600]
+        if hits and cooldown > 0 and now - hits[-1] < cooldown:
+            return False, f"刚召集过，请 {int(cooldown - (now - hits[-1])) + 1} 秒后再试。"
+        if per_hour > 0 and len(hits) >= per_hour:
+            return False, f"这个会话一小时内已经召集过 {len(hits)} 次了，先等等吧。"
+        hits.append(now)
+        self._call_times[chat] = hits
+        return True, ""
+
     # ------------------------------------------------------------------ #
     # 群命令
     # ------------------------------------------------------------------ #
     @filter.command("比赛帮助", alias={"赛事帮助", "比赛命令", "比赛功能", "ntehelp", "比赛help"})
     async def cmd_help(self, event: AstrMessageEvent):
-        """列出可用命令。"""
+        """把帮助发给你：**发图优先**（图比一屏文字好读，也方便群友转发 / 贴公告），
+        没有图才把命令说明**私聊**发给你（群里只留一句提示，免得刷屏）。
+
+        私聊发不出去（未加好友 / 没配推送）时退回群里回——总比让人干等强。
+        """
+        image = await self._help_image()
+        if image:
+            # 帮助图有意发在**当前会话**（谁问发哪），不像文字那样走私聊：
+            # 它就是拿来给人看的，藏着反而没用。
+            yield _image_result(event, image)
+            return
+        who = _sender_id(event)
+        if who:
+            sent = await self._notify(who, HELP_TEXT)
+            if sent.get("ok"):
+                yield event.plain_result("命令说明已私聊发给你，按那个用就行。")
+                return
+            logger.info("[NTE 比赛] 私聊帮助失败，改为群内回复：%s", sent.get("error"))
         yield event.plain_result(HELP_TEXT)
+
+    async def _help_image(self) -> str:
+        """这次该发哪张帮助图；回空串 = 「没有图，走文字说明」。
+
+        * 配了 ``help_image`` 就用它——**不替你把关**：你写的地址你自己清楚；
+        * 没配则默认用**站点内置那张**（把图放成 ``static/help.jpg``，地址就是 ``/help.jpg``），
+          但要先探一下在不在：默认值得开箱即用，可也不能对着一个还没放图的站点
+          发一张破图（群友看到的会是加载失败的占位）。探不到就老实回文字说明。
+        """
+        configured = str(_conf(self.config, "help_image", "")).strip()
+        if configured:
+            return configured
+        url = f"{self.base_url}/help.jpg"
+        try:
+            resp = await self._http().head(url, timeout=min(5.0, self.timeout))
+        except httpx.HTTPError as exc:
+            # 站点没起来 / 网络不通：按「没有图」处理，回文字说明（此时推送多半也不通）
+            logger.debug("[NTE 比赛] 探测内置帮助图失败：%s", exc)
+            return ""
+        return url if resp.status_code == 200 else ""
+
+    # ------------------------------------------------------------------ #
+    # 写操作：授权 / 添加群友（只有服务器管理员，权限由**站点**按 QQ 判定）
+    # ------------------------------------------------------------------ #
+    async def _grant(self, event, permission: str):
+        """公共流程：解析被 @ 的人 → 调站点 → 密码私聊给本人 → 群里只报结果。
+
+        **登录密钥永远不进群**：即使私聊失败，也只说「没能私聊发出去」，让本人自己
+        找服务器管理员重置——密钥只出现一次，泄在群里就等于白送一个账号。
+        """
+        targets = _at_targets(event)
+        if not targets:
+            return event.plain_result(
+                "没看到你 @ 谁。用法：@机器人 比赛授权 @某人\n"
+                "（先 @ 对方，再发命令；手打 QQ 容易抄错，所以只认 @）"
+            )
+        target = targets[0]
+        data = await self._post(
+            "members",
+            {
+                "actorQq": _sender_id(event),
+                "targetQq": target,
+                "name": _at_names(event).get(target, ""),
+                "permission": permission,
+            },
+        )
+        if not data.get("ok"):
+            return event.plain_result(str(data.get("error") or "操作失败"))
+        label = "赛事管理员" if permission == "event_admin" else "普通成员"
+        who = str(data.get("name") or target)
+        if data.get("created"):
+            secret = str(data.get("secretKey") or "")
+            if not secret:  # 理论上不会发生；真发生了也别把「有密钥」说成没有
+                return event.plain_result(f"已把 {who} 添加为{label}。")
+            sent = await self._notify(
+                target,
+                f"【NTE 比赛】你好 {who}，服务器管理员把你设为了{label}。\n"
+                f"登录密钥（只显示这一次，请立即保存）：{secret}\n"
+                "用法：打开站点 → 用这把密钥登录（/user 改自己的资料；有权限的话 /admin 是服务器管理）。\n"
+                "密钥别转给别人；丢了可以让服务器管理员在成员管理里重置一次。",
+            )
+            if sent.get("ok"):
+                return event.plain_result(f"已把 {who} 添加为{label}，登录密钥已私聊发给 TA。")
+            return event.plain_result(
+                f"已把 {who} 添加为{label}，但登录密钥**没能私聊发出去**"
+                f"（{sent.get('error') or '未知原因'}）。\n"
+                "密钥只显示这一次、站里也取不回，请让 TA 找服务器管理员重置一次密钥。"
+            )
+        if data.get("changed"):
+            return event.plain_result(f"{who} 已改为{label}（密钥与令牌不变）。")
+        return event.plain_result(f"{who} 已经是{label}，无需改动。")
+
+    @filter.command("比赛授权", alias={"授权赛事管理员", "授予赛事管理员", "设为赛事管理员"})
+    async def cmd_grant(self, event: AstrMessageEvent):
+        """把 @ 到的群友设为**赛事管理员**（还不是成员就自动建号）。只有服务器管理员能用。"""
+        yield await self._grant(event, "event_admin")
+
+    @filter.command("比赛添加", alias={"添加成员", "添加群友", "比赛添加成员", "设为成员"})
+    async def cmd_add(self, event: AstrMessageEvent):
+        """把 @ 到的群友添加为**普通成员**。只有服务器管理员能用。"""
+        yield await self._grant(event, "member")
+
+    @filter.command("比赛我的", alias={"我的推流", "我的直播间", "推流地址", "我的地址"})
+    async def cmd_mine(self, event: AstrMessageEvent):
+        """查**自己**的推流地址与直播间地址（私聊发给你，不刷群）。"""
+        who = _sender_id(event)
+        if not who:
+            yield event.plain_result("没识别到你的 QQ，请稍后再试。")
+            return
+        data = await self._get("my-links", qq=who)
+        if not data.get("ok"):
+            yield event.plain_result(str(data.get("error") or "查询失败"))
+            return
+        text = "\n\n".join(data.get("parts") or []) or "（没有可显示的内容）"
+        sent = await self._notify(who, text)
+        if sent.get("ok"):
+            yield event.plain_result("你的推流与直播间地址已私聊发给你，去查收。")
+            return
+        # 私聊发不出去（没加好友 / 没配推送）→ 直接回在这里，别让人干等。
+        # 推流地址本身不是密码（令牌才是），所以退化成群内回复是可接受的。
+        yield event.plain_result(
+            f"（私聊没发出去：{sent.get('error') or '未知原因'}，直接回在这里）\n{text}"
+        )
 
     @filter.command("比赛", alias={"当前比赛", "赛事", "ntematch"})
     async def cmd_current(self, event: AstrMessageEvent):
@@ -204,9 +540,13 @@ class NTEMatchPlugin(star.Star):
     @filter.command(
         "比赛列表", alias={"全部比赛", "历届", "往届", "比赛目录", "nte列表", "有哪些比赛"}
     )
-    async def cmd_list(self, event: AstrMessageEvent, page: int = 1):
-        """全部赛事（分页）。"""
-        data = await self._query("list", page=max(1, int(page or 1)))
+    async def cmd_list(self, event: AstrMessageEvent, page: str = ""):
+        """全部赛事（分页）：`比赛列表 2` / `比赛列表 第2页` 都认。
+
+        参数**刻意收成字符串**（而不是 int）：见 :func:`_page_number` 的说明——
+        写成 int 时，非数字参数会让 AstrBot 的参数强转抛异常，命令直接失效。
+        """
+        data = await self._query("list", page=_page_number(page))
         for text in self._texts(data):
             yield event.plain_result(text)
 
@@ -221,7 +561,8 @@ class NTEMatchPlugin(star.Star):
             yield event.plain_result("平台上还没有赛事。")
             return
         data = await self._get("events")
-        lines = [f"共 {len(rows)} 届（当前主赛事：{data.get('current') or '—'}）"]
+        # 不再标「哪一届是当前届」：届次现在必须写明，服务器那个指针跟群友无关
+        lines = [f"共 {len(rows)} 届赛事（发命令时写明届次，编号或名称都行）："]
         for item in sorted(rows, key=lambda x: str(x.get("id", ""))):
             mark = "（当前）" if item.get("id") == data.get("current") else ""
             state = {"active": "进行中", "closed": "已结束", "draft": "筹备中"}.get(item.get("status"), "")
@@ -285,10 +626,36 @@ class NTEMatchPlugin(star.Star):
 
         插件跑在 AstrBot 里面，所以这里用 ``At`` 消息组件发**真正的 @**——
         走 HTTP 推送时（OpenAPI 没有 at 段）做不到。
+
+        两道闸门：**认身份**（只有本届举办者 / 服务器管理员能召集，按 QQ 对号）
+        与**冷却**（同一会话最小间隔 + 每小时上限，防刷屏）。
         """
         target, error = await self._resolve_event(event_id)
         if error:
             yield event.plain_result(error)
+            return
+        # ① 认身份：召集会 @ 一大片人，不该谁都能触发
+        managers = await self._get("managers", eventId=target)
+        if not managers.get("ok"):
+            yield event.plain_result(f"查询失败：{managers.get('error') or '未知原因'}")
+            return
+        allowed = {str(q) for q in (managers.get("qqs") or [])}
+        if not allowed:
+            yield event.plain_result(
+                f"{managers.get('note') or '本届还没有登记 QQ 的赛事管理员'}。\n"
+                "请先在站点「我的」页填上自己的 QQ（服务器管理员或本届举办者），再试一次。"
+            )
+            return
+        if _sender_id(event) not in allowed:
+            yield event.plain_result(
+                "召集需要赛事管理员身份：只有本届举办者或服务器管理员能召集。\n"
+                "（在站点「我的」页登记了 QQ 才能对上号；需要权限请联系服务器管理员。）"
+            )
+            return
+        # ② 冷却：防刷屏（默认 60 秒间隔 / 每小时 6 次，可在插件配置里调）
+        ok, reason = self._call_allowed(event)
+        if not ok:
+            yield event.plain_result(reason)
             return
         who = await self._get("participants", eventId=target)
         texts = self._texts(await self._query("call", target, at=False))  # 文本里不夹 CQ 码
@@ -307,75 +674,34 @@ class NTEMatchPlugin(star.Star):
             yield event.plain_result(f"{head}\n" + "\n".join(texts))
 
     # ------------------------------------------------------------------ #
-    # LLM 工具（命令覆盖不到的自由问法，交给大模型兜底）
+    # 生命周期
     # ------------------------------------------------------------------ #
-    @filter.llm_tool(name="nte_match_query")
-    async def tool_query(
-        self,
-        event: AstrMessageEvent,
-        kind: str = "detail",
-        event_id: str = "",
-        ref: str = "",
-        page: int = 1,
-    ) -> str:
-        """查询 NTE 比赛平台的数据。想回答「比赛进行到哪了 / 谁在打 / 结果如何 / 有哪些比赛」时调用。
+    async def initialize(self):
+        """插件加载后**探活一次**：地址或令牌配错时，立刻在日志里说清楚。
 
-        Args:
-            event(object): 消息事件上下文（框架注入，不用填）。
-            kind(string): 查询类型：event（信息）/ live（当前直播）/ progress（进度）/ result（结果）/ detail（综合）/ next（下一场）/ roster（名单）/ champion（冠军）/ list（全部赛事）/ call（召集文案）。
-            event_id(string): 届次，可以是 e001、1、第2届 或名称片段；留空表示当前主赛事。
-            ref(string): 场次编号，例如 L-1；仅在 kind=detail 时用于细看某一场。
-            page(int): 页码，从 1 开始；仅在 kind=list 时有效。
+        站点侧专门留了 ``/api/bot/ping`` 就是给这一步用的——否则要等到群友发命令，
+        才发现「令牌忘了填」，而且错误只能靠 401 / 403 的文案去猜。
         """
-        allowed = {
-            "event",
-            "live",
-            "progress",
-            "result",
-            "detail",
-            "list",
-            "call",
-            "next",
-            "roster",
-            "champion",
-        }
-        key = kind if kind in allowed else "detail"
-        target, error = await self._resolve_event(event_id)
-        if error:
-            return error
-        data = await self._query(key, target, ref, page)
+        try:
+            data = await self._get("ping")
+        except Exception as exc:  # noqa: BLE001  (探活失败绝不能影响插件加载)
+            logger.warning("[NTE 比赛] 探活异常（忽略）：%s", exc)
+            return
         if not data.get("ok"):
-            return f"查询失败：{data.get('error') or '未知原因'}"
-        return data.get("text") or "（没有可显示的内容）"
-
-    @filter.llm_tool(name="nte_match_events")
-    async def tool_events(self, event: AstrMessageEvent) -> str:
-        """列出 NTE 比赛平台上的全部赛事（编号 / 名称 / 状态 / 规模 / 榜首）。需要挑选某一届再深入查询时先调用它。
-
-        Args:
-            event(object): 消息事件上下文（框架注入，不用填）。
-        """
-        data = await self._get("events")
-        if not data.get("ok"):
-            return f"查询失败：{data.get('error') or '未知原因'}"
-        rows = data.get("events") or []
-        if not rows:
-            return "平台上还没有赛事。"
-        lines = [f"共 {len(rows)} 届赛事（当前主赛事：{data.get('current') or '—'}）"]
-        for item in rows:
-            bits = [
-                "当前" if item.get("current") else "",
-                {"active": "进行中", "closed": "已结束", "draft": "筹备中"}.get(item.get("status"), ""),
-                "娱乐模式" if item.get("ranked") is False else "排名制",
-                f"{item.get('players') or 0} 人",
-                f"已赛 {item.get('played') or 0}/{item.get('rounds') or 0}",
-            ]
-            line = f"· {item.get('id')} {item.get('name')}：" + "，".join(dict.fromkeys(b for b in bits if b))
-            if item.get("brief"):
-                line += f"（{item['brief']}）"
-            lines.append(line)
-        return "\n".join(lines)
+            logger.warning("[NTE 比赛] 自检未通过：%s", data.get("error") or "未知原因")
+            return
+        current = (data.get("currentEvent") or {}).get("name") or "—"
+        logger.info(
+            "[NTE 比赛] 已连接站点 | 站点当前届=%s | 共 %s 届",
+            current,
+            data.get("eventCount") or 0,
+        )
 
     async def terminate(self):
-        """插件卸载 / 停用（本插件没有常驻资源，留空即可）。"""
+        """插件卸载 / 停用：把复用的连接池关掉。"""
+        if self._client is not None and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:  # noqa: BLE001  (关闭失败不值得报错)
+                logger.debug("[NTE 比赛] 关闭连接池失败（忽略）", exc_info=True)
         logger.info("[NTE 比赛] 插件已停用")

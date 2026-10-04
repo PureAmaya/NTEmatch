@@ -43,8 +43,9 @@ QQBOT_KEY = "qqbot"
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": False,
-    # AstrBot 面板地址（不带尾部斜杠）；默认是你这台
-    "baseUrl": "https://bot.shiyora.net",
+    # AstrBot 面板地址（不带尾部斜杠）。出厂**留空**：每套部署的 AstrBot 地址都不一样，
+    # 预填某个具体地址会让人「看着配好了、其实把消息（连同 API Key）发到别人的机器人上」。
+    "baseUrl": "",
     # 在 AstrBot → WebUI → 设置 → OpenAPI 里创建，形如 abk_xxx
     "apiKey": "",
     # 目标会话：可以填完整 UMO，也可以只填群号（按 platform 拼成 …:GroupMessage:群号）
@@ -67,6 +68,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "maxPerHour": 30,
     # 单次推送最多分几段（分段之间还会各停 0.5 秒）
     "maxParts": 8,
+    # ---- 赛前提醒（见 app/remind.py）----
+    # 开关：到点自动在群里 @ 举办者。需要「已启用推送」+ 举办者登记了 QQ 才发得出去。
+    "remindEnabled": True,
+    # 提前量（分钟，逗号分隔）：默认「前一天」与「前 2 小时」。
+    # 只在【提前量 - 1 小时, 提前量】这个窗口内发——服务器中途重启，
+    # 不会把「明天开赛」这条补发成「还有 3 小时开赛」。
+    "remindLeads": "1440,120",
 }
 SETTINGS_KEYS = tuple(DEFAULT_SETTINGS)
 # 这些键不接受前端回填（避免把「已配置」的 Key 用空串覆盖掉）
@@ -163,8 +171,22 @@ def normalize_settings(patch: dict[str, Any], current: dict[str, Any]) -> dict[s
             if internal:
                 clean[key] = str(value or "")
             continue
-        if key in ("enabled",):
+        if key in ("enabled", "remindEnabled"):
+            # 注意：**别让布尔键落到下面的 else**——那里会把 False 存成字符串 "False"，
+            # 而字符串恒为真，开关就再也关不掉了。
             clean[key] = bool(value)
+        elif key == "remindLeads":
+            # 只留数字与逗号：写错的（比如「一天, 2小时」）宁可回落到默认值，
+            # 也不要存成一个永远解析不出提前量的配置
+            raw = re.sub(r"[^\d,，]", "", str(value or "")).replace("，", ",")
+            parsed = {
+                int(part)
+                for part in raw.split(",")
+                if part.strip().isdigit() and 5 <= int(part) <= 20160
+            }
+            clean[key] = ",".join(str(x) for x in sorted(parsed, reverse=True)) or str(
+                DEFAULT_SETTINGS[key]
+            )
         elif key == "maxChars":
             # 下限与 split_message 的硬下限一致（200），否则「每页几届」和
             # 「单条切多长」两处口径会打架，算出来的页反而塞不进一条消息
@@ -240,11 +262,18 @@ async def send_text(
     if not settings.get("apiKey"):
         result["detail"] = "未配置 AstrBot API Key"
         return result
+    # 地址必须显式检查：留空时 httpx 会抛 UnsupportedProtocol（**不是** HTTPError，
+    # 不会被下面的 except 接住），最后变成 500。宁可在这里给一句人话。
+    base = str(settings.get("baseUrl") or "").strip()
+    if not base:
+        result["detail"] = "未配置 AstrBot 地址（到「服务器 → QQ 机器人」填写）"
+        return result
     if not target:
         result["detail"] = "未配置目标会话（群号 / UMO）"
         return result
 
-    url = f"{str(settings['baseUrl']).rstrip('/')}{settings['path']}"
+    path = str(settings.get("path") or "/api/v1/im/message")
+    url = f"{base.rstrip('/')}{path}"
     headers = {
         "Authorization": f"Bearer {settings['apiKey']}",
         "X-API-Key": str(settings["apiKey"]),
@@ -603,6 +632,79 @@ def at_text(qqs: list[str], settings: dict[str, Any]) -> str:
     return "".join(f"[CQ:at,qq={qq}]" for qq in qqs)
 
 
+def private_umo(settings: dict[str, Any], qq: str) -> str:
+    """某个 QQ 的**私聊**会话（UMO）：``{platform}:FriendMessage:{QQ}``。
+
+    与群会话（``…:GroupMessage:群号``）同一套拼法，只有类型段不同——AstrBot 用 UMO
+    同时表达「发到哪个会话」。私聊拿来发**只该本人看到**的东西（登录密钥、推流地址、帮助）。
+    """
+    clean = "".join(ch for ch in str(qq or "") if ch.isdigit())
+    if not clean:
+        return ""
+    platform = str(settings.get("platform") or "aiocqhttp").strip() or "aiocqhttp"
+    return f"{platform}:FriendMessage:{clean}"
+
+
+def remind_leads(settings: dict[str, Any]) -> list[int]:
+    """解析赛前提醒的提前量（分钟），从大到小。非法值直接忽略。"""
+    raw = str(settings.get("remindLeads") or "")
+    out: list[int] = []
+    for chunk in raw.replace("，", ",").split(","):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if not digits:
+            continue
+        value = int(digits)
+        if 5 <= value <= 20160 and value not in out:  # 5 分钟 ~ 14 天
+            out.append(value)
+    return sorted(out, reverse=True)
+
+
+def _lead_label(minutes: int) -> str:
+    """「1 天」/「2 小时」/「30 分钟」——写进提醒标题里。"""
+    if minutes >= 1440 and minutes % 1440 == 0:
+        return f"{minutes // 1440} 天"
+    if minutes >= 60:
+        hours = minutes / 60
+        return f"{int(hours)} 小时" if hours == int(hours) else f"{hours:.1f} 小时"
+    return f"{minutes} 分钟"
+
+
+def build_remind_message(
+    cfg: Config,
+    *,
+    lead_minutes: int,
+    owner_qq: str = "",
+    owner_name: str = "",
+    settings: dict[str, Any],
+    base_url: str = "",
+) -> str:
+    """赛前提醒：@ 举办者 + 开赛时间 + 一句「该做什么」。
+
+    举办者没登记 QQ 时退化成 ``@名字``（纯文本）——总比什么都不说强，
+    同时也能让人意识到「该去把 QQ 填上」。
+    """
+    name = cfg.event.name or cfg.event.title or "比赛"
+    lines: list[str] = []
+    mention = at_text([owner_qq], settings) if owner_qq else ""
+    if mention:
+        lines.append(mention)
+    elif owner_name:
+        lines.append(f"@{owner_name}")
+    lines.append(f"【NTE 比赛】{name} · {_lead_label(lead_minutes)}后开赛")
+    start = _fmt_dt(cfg.event.start_time)
+    if start:
+        delta = _human_delta(cfg.event.start_time)
+        lines.append(f"开赛时间：{start}{f'（{delta}）' if delta else ''}")
+    if cfg.event.venue:
+        lines.append(f"场地：{cfg.event.venue}")
+    if cfg.event.organizer:
+        lines.append(f"主办：{cfg.event.organizer}")
+    lines.append("记得通知参赛选手、确认名单与直播设置。")
+    if base_url:
+        lines.append(f"赛程与名单：{base_url}")
+    return "\n".join(lines)
+
+
 def build_call_message(
     cfg: Config, state: dict[str, Any], settings: dict[str, Any], members: list[Any] | None = None
 ) -> str:
@@ -772,7 +874,13 @@ def build_events_message(
             line += f"\n    {item['brief']}"
         lines.append(line)
     if pages > 1:
-        lines.append(f"（发送「下一页」可看第 {min(page + 1, pages)} 页）" if page < pages else "（已是最后一页）")
+        # 这里必须给**真实存在**的写法：以前写「发送「下一页」」，但「下一页」既不是
+        # 命令也不是别名，用户照着发只会石沉大海。
+        lines.append(
+            f"（发「比赛列表 {min(page + 1, pages)}」看下一页；共 {pages} 页）"
+            if page < pages
+            else f"（已是最后一页，共 {pages} 页）"
+        )
     return "\n".join(lines), pages
 
 

@@ -37,13 +37,14 @@ from typing import Any
 
 from . import avatars, db
 from .logging_conf import get_logger
-from .store import PROJECT_ROOT, store
+from .store import BACKUP_ROOT, store
 
 log = get_logger("backup")
 
-# 备份文件存放目录（项目根下的 backups/，与 config/ data/ 平级）。
+# 备份文件存放目录（默认项目根下的 backups/，与 config/ data/ 平级；
+# 由 NTE_DATA_DIR 统一挪走后也跟着走，见 store.DATA_ROOT）。
 # 设置文件与备份文件同目录（``backups/settings.json``），因此改这一个常量就够了。
-BACKUP_DIR = PROJECT_ROOT / "backups"
+BACKUP_DIR = BACKUP_ROOT
 
 
 def settings_path() -> Path:

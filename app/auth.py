@@ -1,21 +1,20 @@
 """管理端鉴权与**凭据哈希**。
 
-管理 KEY 保存在数据库里，前端只提交 KEY 换取一次性会话令牌，令牌存于服务端内存
-并带过期时间——KEY 本身不会出现在任何响应中。
-
-凭据（登录密钥 / Bearer 令牌 / 主管理 KEY）一律**加盐**存储，明文永不落库：
+凭据只存在库里（加盐哈希），前端提交密钥换取一次性会话令牌，令牌存于服务端内存
+并带过期时间——密钥本身不会出现在任何响应中。
 
 | 凭据 | 熵 | 哈希 | 理由 |
 | --- | --- | --- | --- |
 | 成员登录密钥 | ≈192 位随机 | `hmac_sha256$salt$digest` | 逐条随机盐，**不可能**被彩虹表 / 交叉比对 |
 | Bearer 令牌 | ≈256 位随机 | 同上 | 同上；推流鉴权回调时校验一次，必须够快 |
-| 服务器主管理 KEY | 人手输入（低熵） | `pbkdf2_sha256$迭代$salt$digest` | 会被字典暴力破解，必须**慢**哈希 + 随机盐 |
 
-> 为什么高熵凭据不套 PBKDF2 迭代：它们本来就是 192~256 位随机串，攻击者没有
-> 「弱口令」可猜，迭代只会让每次推流鉴权白烧几十毫秒。真正需要慢哈希的是
-> **人选的**主管理 KEY（例如出厂的 `NTE-ADMIN`），那里老老实实 12 万次迭代。
-> 两类都带随机盐，哈希值里已经包含盐与参数，**随数据库 / 备份一起走**，
-> 因此导出、备份、还原到别的机器都不影响校验。
+> 为什么不用 PBKDF2 迭代：这两类凭据本来就是 192~256 位随机串，攻击者没有「弱口令」
+> 可猜，迭代只会让每次推流鉴权白烧几十毫秒。带随机盐的哈希值里已经包含盐与参数，
+> **随数据库 / 备份一起走**，因此导出、备份、还原到别的机器都不影响校验。
+>
+> 历史遗留：早期版本有一把**人手输入**的「服务器主管理 KEY」，那种低熵凭据才需要慢
+> 哈希（12 万次 PBKDF2）；该凭据已退休，但 ``verify_secret`` 仍然认 PBKDF2 格式，
+> 这样老库里万一还留着这种哈希也不会被误判成「密码错误」。
 """
 
 from __future__ import annotations
@@ -28,9 +27,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from .defaults import DEFAULT_ADMIN_KEY
 from .logging_conf import get_logger
-from .models import AdminConfig
 
 log = get_logger("auth")
 
@@ -38,8 +35,8 @@ DEFAULT_TTL = 12 * 3600
 
 # 哈希格式前缀（带前缀 = 加盐的新格式；没有前缀 = 历史的裸 sha256，见 verify_secret）
 HMAC_PREFIX = "hmac_sha256"
+# PBKDF2 前缀只为「读得懂老库里的值」而保留，新凭据一律用 hash_secret（见模块文档）
 PBKDF2_PREFIX = "pbkdf2_sha256"
-PBKDF2_ITERATIONS = 120_000
 SALT_BYTES = 16
 
 
@@ -70,13 +67,6 @@ def hash_secret(raw: str) -> str:
     salt = secrets.token_bytes(SALT_BYTES)
     digest = hmac.new(salt, raw.encode("utf-8"), hashlib.sha256).digest()
     return f"{HMAC_PREFIX}${_b64(salt)}${_b64(digest)}"
-
-
-def hash_password(raw: str, *, iterations: int = PBKDF2_ITERATIONS) -> str:
-    """低熵凭据（服务器主管理 KEY）：**随机盐 + PBKDF2 迭代**。"""
-    salt = secrets.token_bytes(SALT_BYTES)
-    digest = hashlib.pbkdf2_hmac("sha256", raw.encode("utf-8"), salt, max(1, iterations))
-    return f"{PBKDF2_PREFIX}${iterations}${_b64(salt)}${_b64(digest)}"
 
 
 def is_legacy_hash(stored: str) -> bool:
@@ -113,46 +103,14 @@ def verify_secret(raw: str, stored: str) -> bool:
     return _same(sha256_hex(raw), stored.lower())
 
 
-def verify_admin_key(provided: str, admin: AdminConfig) -> bool:
-    """校验服务器主管理 KEY：加盐哈希 → 历史 sha256 → 历史明文。"""
-    raw = (provided or "").strip()
-    if not raw:
-        return False
-    if admin.key_hash:
-        return verify_secret(raw, admin.key_hash)
-    if admin.key_sha256:
-        return _same(sha256_hex(raw), admin.key_sha256.strip().lower())
-    expected = admin.key or ""
-    return bool(expected) and _same(raw, expected)
-
-
-def admin_key_mode(admin: AdminConfig) -> str:
-    """主管理 KEY 当前的存储形态（诊断面板展示用）。"""
-    if admin.key_hash:
-        return PBKDF2_PREFIX if admin.key_hash.startswith(PBKDF2_PREFIX) else HMAC_PREFIX
-    if admin.key_sha256:
-        return "sha256"      # 历史无盐
-    return "plain" if admin.key else "unset"
-
-
-def is_factory_key(admin: AdminConfig) -> bool:
-    """是否仍是出厂 KEY（明文且未被改动）。
-
-    改成哈希存储、或改成其它值后都视为「已自定义」，此时启动日志不会再输出 KEY。
-    """
-    if (admin.key_hash or "").strip() or (admin.key_sha256 or "").strip():
-        return False
-    return (admin.key or "") == DEFAULT_ADMIN_KEY
-
-
 @dataclass
 class Session:
     token: str
     created_at: float
     expires_at: float
     label: str = "admin"
-    # 会话身份：服务器管理员用 ``uid=""``（出厂 / 自定义管理 KEY 登录）；
-    # 成员用自己的 ``uid`` 登录，``permission`` 决定他能做什么。
+    # 会话身份：一律绑定到登录的那位成员（``permission`` 决定他能做什么）。
+    # ``uid=""`` 只在极端情况出现——本机免登录时那位管理员成员记录缺失。
     uid: str = ""
     name: str = ""
     permission: str = "server_admin"
@@ -174,12 +132,6 @@ class AuthManager:
         self._sessions: dict[str, Session] = {}
 
     # ------------------------------------------------------------------ #
-    def verify_key(self, provided: str, admin: AdminConfig) -> bool:
-        """校验服务器主管理 KEY（加盐 PBKDF2 / 历史 sha256 / 历史明文）。"""
-        ok = verify_admin_key(provided, admin)
-        log.debug("管理 KEY 校验 | 结果=%s | 形态=%s", ok, admin_key_mode(admin))
-        return ok
-
     def issue(
         self,
         label: str = "admin",
@@ -244,7 +196,7 @@ class AuthManager:
             log.info("管理会话已注销 | 剩余=%d", len(self._sessions))
 
     def revoke_all(self) -> int:
-        """注销全部会话（例如管理 KEY 变更后强制重新登录）。"""
+        """注销全部会话（例如轮换成员密钥后强制重新登录）。"""
         count = len(self._sessions)
         self._sessions.clear()
         if count:

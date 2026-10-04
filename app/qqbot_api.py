@@ -48,7 +48,7 @@ async def _owner_of(event_id: str) -> str:
 async def _require_push(session: Session, event_id: str = "") -> str:
     """推送权限：服务器管理员放行任意届；赛事管理员只能推**自己创建**的届。
 
-    返回最终要操作的届 id（``event_id`` 留空 = 当前主赛事）。
+    返回最终要操作的届 id（``event_id`` 留空 = 当前届，即 ``store.current_id``）。
     """
     if not session.can_manage_events:
         raise HTTPException(status_code=403, detail="需要赛事管理员或服务器管理员权限")

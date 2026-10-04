@@ -3,6 +3,7 @@
  */
 
 import { App, esc, qsa, toLocalInput } from './core.js';
+import { icon, panelIcon } from './icons.js';
 
 const PLACEHOLDER = (name, size) =>
   `<span class="ava ava--${size} ava--placeholder" title="${esc(name)}">${esc(String(name).slice(0, 1))}</span>`;
@@ -267,6 +268,18 @@ export function avaHtml(player, size = 'sm') {
 
 export const playerById = (id) => (App.state?.players || []).find((p) => p.id === id);
 
+/**
+ * 举办者徽标：头像 + 名字（没头像时自动回落成首字母）。
+ *
+ * 复用 ``avaHtml`` 的头像逻辑；``id`` 留空是故意的——举办者不是机位，
+ * 不该被套上「直播中」光环。
+ */
+export const ownerHtml = (name, avatar = '') =>
+  name
+    ? `<span class="owner">${avaHtml({ id: '', name, avatar }, 'sm')}` +
+      `<span class="owner__name">${esc(name)}</span></span>`
+    : '';
+
 /** 选手行：头像 + 姓名 + 编号等元信息（积分制榜表用；UUID / QQ 不下发）。 */
 export function whoHtml(player, { size = 'sm', form = [] } = {}) {
   const name = player ? player.name || player.tag || player.id : '未知选手';
@@ -339,8 +352,15 @@ export const rankCell = (rank) =>
     ? `<div class="rank rank--none" title="场次不足，不参与排名">—</div>`
     : `<div class="rank${rank <= 3 ? ` rank--${rank}` : ''}">${rank}</div>`;
 
+/**
+ * 一个面板：标题（带图标）+ 右上角提示 + 正文。
+ *
+ * 图标按标题关键词自动挑（见 icons.panelIcon）——面板头全站几十处，
+ * 这样美化和以后新增面板都不用逐处配图标。
+ */
 export const panelHtml = (title, hint, body, extraClass = '') =>
-  `<div class="panel${extraClass}"><div class="panel__head"><h2>${esc(title)}</h2>` +
+  `<div class="panel${extraClass}"><div class="panel__head">` +
+  `<h2>${icon(panelIcon(title))}${esc(title)}</h2>` +
   `<span class="panel__hint">${esc(hint)}</span></div><div class="panel__body">${body}</div></div>`;
 
 /* ------------------------------ 比赛规则 ------------------------------ */
@@ -357,6 +377,8 @@ export function rulebookBodyHtml(s) {
   const facts = rb.facts || {};
   const chips = [
     ['赛制', facts.formatLabel || ''],
+    // 比法：计分制 / 用时制——它决定「哪种数值更好」（后端 app/metrics.py）
+    ['比法', facts.metricLabel || ''],
     ['参赛', facts.format === 'league' ? `${facts.players || 0} 人` : `${facts.teams || 0} 支队`],
     ['每队', `${facts.teamSize || 0} 人`],
     facts.format === 'league'
@@ -388,7 +410,9 @@ export function rulebookBodyHtml(s) {
       )
       .join('')}</div>` +
     `<div class="rules__secs">${sections}</div>` +
-    (rb.note ? `<div class="rules__note"><b>赛事说明</b>${esc(rb.note)}</div>` : '') +
+    // 赛事信息是服务端渲染好的 Markdown（严格白名单，见 app/markdown.py），
+    // 所以直接当 HTML 放进去；没有内容时整块不显示
+    (rb.noteHtml ? `<div class="rules__note"><b>赛事说明</b><div class="md">${rb.noteHtml}</div></div>` : '') +
     `</div>`
   );
 }

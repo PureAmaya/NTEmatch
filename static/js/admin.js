@@ -29,6 +29,8 @@ import {
 } from './ui.js';
 import { mount as mountTeams } from './teams.js';
 import { qqbotPushPanelHtml, refreshQqbotStatusBox } from './members.js';
+import { icon } from './icons.js';
+import { renderNoticeBoard } from './notices.js';
 
 /* --------------------------- 面板渲染 ---------------------------
  *
@@ -100,6 +102,52 @@ function restoreFocus(info) {
   }
 }
 
+/**
+ * 当前这一届是否归我管。
+ *
+ * 服务器管理员放行任意届；赛事管理员与届的 ``ownerUid`` 比对成员 uid。
+ * **拿不到届列表时不拦**：界面上的判断只是「提前把话说清楚」，真正的门禁在后端
+ * （``security.require_event_owned``）。宁可让他看到面板后收到一次 403，
+ * 也不要因为前端数据还没到位就把有权限的人挡在门外。
+ */
+function canManageThisEvent() {
+  if (isServerAdmin()) return true;
+  const event = (App.events || []).find((e) => e.id === App.eventId);
+  if (!event) return true;
+  return Boolean(event.ownerUid && event.ownerUid === App.me?.uid);
+}
+
+/** 成员权限：能看不能管，给出出路。 */
+const memberNoPowerHtml = () =>
+  `<div class="panel"><div class="panel__head"><h2>赛事管理</h2>` +
+  `<span class="panel__hint">当前权限：成员</span></div><div class="panel__body">` +
+  `<div class="notice notice--warn">你是以<b>成员</b>身份登录的，不能管理赛事。` +
+  `可在「我的」页修改个人资料、直播间名字与凭据；` +
+  `如需创建 / 管理赛事，请联系服务器管理员把你的权限提升为「赛事管理员」。</div>` +
+  `<div class="tool-group" style="margin-top:10px">` +
+  `<button class="btn btn--sm btn--primary" type="button" data-act="route-user">前往「我的」</button>` +
+  `</div></div></div>`;
+
+/** 「这一届不是你举办的」：写清归属 + 给出路，而不是让保存失败去解释。 */
+function notMyEventHtml() {
+  const event = (App.events || []).find((e) => e.id === App.eventId);
+  const name = event?.name || App.eventId || '这一届';
+  const owner = event?.ownerName || '';
+  return (
+    `<div class="panel"><div class="panel__head"><h2>赛事管理</h2>` +
+    `<span class="panel__hint">当前权限：赛事管理员</span></div><div class="panel__body">` +
+    `<div class="notice notice--warn">「<b>${esc(name)}</b>」不是你举办的，所以这里不能改。` +
+    (owner
+      ? `这一届由 <b>${esc(owner)}</b> 举办。`
+      : '这一届没有登记举办者（历史数据），只有服务器管理员能管。') +
+    `</div>` +
+    `<div class="tool-group" style="margin-top:10px">` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="route-events">看我举办的届</button>` +
+    `<button class="btn btn--sm" type="button" data-act="route-home">回主页</button>` +
+    `</div></div></div>`
+  );
+}
+
 export function renderAdmin({ force = false } = {}) {
   const gate = qs('#adminGate');
   const panel = qs('#adminPanel');
@@ -119,21 +167,21 @@ export function renderAdmin({ force = false } = {}) {
     gate.innerHTML = gateHtml();
   } else if (!canManageEvents()) {
     gate.innerHTML = '';
-    panel.innerHTML =
-      `<div class="panel"><div class="panel__head"><h2>赛事管理</h2>` +
-      `<span class="panel__hint">当前权限：成员</span></div><div class="panel__body">` +
-      `<div class="notice notice--warn">你是以<b>成员</b>身份登录的，不能管理赛事。` +
-      `可在「我的」页修改个人资料、直播间名字与凭据；` +
-      `如需创建 / 管理赛事，请联系服务器管理员把你的权限提升为「赛事管理员」。</div>` +
-      `<div class="tool-group" style="margin-top:10px">` +
-      `<button class="btn btn--sm btn--primary" type="button" data-act="route-user">前往「我的」</button>` +
-      `</div></div></div>`;
-  } else if (App.state) {
+    panel.innerHTML = memberNoPowerHtml();
+  } else if (!App.state) {
+    return; // 登录了但状态还没到：先不动，等状态到位指纹会变、再画
+  } else if (!canManageThisEvent()) {
+    gate.innerHTML = '';
+    panel.innerHTML = notMyEventHtml();
+  } else {
     gate.innerHTML = '';
     panel.innerHTML = adminPanelHtml(App.state);
     mountTeams(qs('#teamHost'));
-  } else {
-    return; // 登录了但状态还没到：先不动，等状态到位指纹会变、再画
+    // 赛事通知（卡片列表 + 分页）：异步拉取，所以先占位再填
+    renderNoticeBoard('event', qs('#adminNotices'), {
+      manage: true,
+      hint: 'Markdown · 打开本届即弹窗',
+    });
   }
 
   applyEdits(panel, edits);
@@ -149,15 +197,13 @@ const isLeague = (s = App.state) => (s?.rules?.format || 'tournament') === 'leag
 
 const gateHtml = () =>
   `<div class="panel"><div class="gate">` +
-  `<div class="gate__title">赛事管理登录</div>` +
-  `<p class="gate__desc">用<b>成员密钥</b>或<b>服务器管理 KEY</b> 登录，以解锁比分录入、赛程生成与配置编辑。` +
-  `（普通成员只能修改自己的资料，见「我的」页。）</p>` +
-  `<div class="field"><label for="adminKey">密钥</label>` +
-  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥或管理 KEY"></div>` +
+  `<div class="gate__title">登录后管理赛事</div>` +
+  `<p class="gate__desc">用你的<b>成员密钥</b>登录就行——能管哪几届由<b>身份</b>决定：` +
+  `服务器管理员可管全部届，赛事管理员只能管<b>自己举办的</b>届，普通成员只能改自己的资料。</p>` +
+  `<div class="field"><label for="adminKey">成员密钥</label>` +
+  `<input id="adminKey" type="password" autocomplete="current-password" placeholder="请输入成员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
-  `<p class="gate__hint">成员密钥由服务器管理员在「服务器 → 成员管理」里生成。` +
-  `<br>服务器主 KEY 见服务启动日志（默认 <b>NTE-ADMIN</b>，请登录后尽快修改）。` +
-  `<br>在本机（localhost / 127.0.0.1）直接访问时无需登录。</p>` +
+  `<p class="gate__hint">成员密钥由服务器管理员在「服务器 → 成员管理」里生成。</p>` +
   `</div></div>`;
 
 const EVENT_STATE_TEXT = {
@@ -193,13 +239,52 @@ function eventTimeEditorHtml(t) {
   );
 }
 
+/** 系列赛（BO）选项：只给奇数局，因为偶数局可能出现「各赢一半」。 */
+const SERIES_OPTIONS = [
+  ['1', '一局定胜负（BO1）'],
+  ['3', '三局两胜（BO3）'],
+  ['5', '五局三胜（BO5）'],
+  ['7', '七局四胜（BO7）'],
+];
+const SERIES_HINT =
+  '每场打几局。填了「各局小分」时，局分就是各局胜负的计数（先赢过半者胜），' +
+  '不需要另外填大比分；只填大比分的老习惯也照旧可用';
+
+/**
+ * 比法：决定「哪种数值更好」。这是全套赛制里最底层的一个开关——
+ * 判定、名次、名次分、晋级与积分榜排序都跟着它走（后端见 app/metrics.py）。
+ */
+const METRIC_OPTIONS = [
+  ['score', '计分制（分数高者胜）'],
+  ['time', '用时制（用时短者胜）'],
+];
+const METRIC_HINT =
+  '计分制给排球、篮球这类比分制项目；用时制给赛车、跑酷、速通这类计时项目。' +
+  '用时制下成绩按 1:23.456 或 83.45 录入（内部按毫秒存），未填或填 0 视为「未完赛」并垫底。' +
+  '改它等于改已有成绩的含义，赛中一般不要动';
+
+/**
+ * 比法提示：如果当前「比赛类型」另有惯用比法（如赛车 → 用时制），
+ * 就在提示里说出来——**只提示、不自动改**，赛制是组织者定的。
+ */
+function metricHint(current) {
+  const suggested = App.state?.sport?.metric;
+  if (!suggested || suggested === current) return METRIC_HINT;
+  const label = suggested === 'time' ? '用时制' : '计分制';
+  return `${METRIC_HINT}。（当前比赛类型通常用「${label}」，需要的话在上面切换）`;
+}
+
 /** 锦标赛制规则表单。 */
 function tournamentRulesForm(rules, s) {
   const maxSize = s?.format?.maxSize || 0;
   const perMatch = Number(rules.teamsPerMatch) || 2;
   const loser = rules.loserBracket !== false;
+  const time = (rules.metric || 'score') === 'time';
   return (
     `<form class="form form--2" data-form="rules">` +
+    fieldSelect('metric', '比法（怎么算赢）', rules.metric ?? 'score', METRIC_OPTIONS, {
+      hint: metricHint(rules.metric ?? 'score'),
+    }) +
     fieldSelect(
       'teamSize',
       '每个组的人数',
@@ -228,7 +313,13 @@ function tournamentRulesForm(rules, s) {
         ? `2 的幂且不超过 ${maxSize}（当前 ${s?.format?.teams || 0} 支队）；改后需重新生成赛程`
         : '2 的幂，如 16 表示十六强；需先组队',
     }) +
-    fieldNum('targetScore', '单局目标分 (0 不限)', rules.targetScore) +
+    // 单局目标分只对计分制有意义（用时制的「目标」是跑完而不是够分）
+    (time
+      ? ''
+      : fieldNum('targetScore', '单局目标分 (0 不限)', rules.targetScore)) +
+    fieldSelect('bestOf', '系列赛（每场几局）', rules.bestOf ?? 1, SERIES_OPTIONS, {
+      hint: SERIES_HINT,
+    }) +
     fieldSwitch('allowDraw', '小组赛允许平局', rules.allowDraw) +
     `<div class="notice" style="grid-column:1/-1">赛制：确定参与名单 → <b>随机组队</b>（队友随机、全程固定）→ ` +
     `小组赛轮转（每场 ${perMatch === 2 ? '组 vs 组' : `${perMatch} 队同场`}，按名次分排名）→ ` +
@@ -240,8 +331,12 @@ function tournamentRulesForm(rules, s) {
 
 /** 积分制规则表单。 */
 function leagueRulesForm(rules) {
+  const time = (rules.metric || 'score') === 'time';
   return (
     `<form class="form form--2" data-form="rules">` +
+    fieldSelect('metric', '比法（怎么算赢）', rules.metric ?? 'score', METRIC_OPTIONS, {
+      hint: metricHint(rules.metric ?? 'score'),
+    }) +
     fieldNum('teamSize', '每队人数', rules.teamSize, { hint: '2 即 2v2，每局自动从参与名单排阵' }) +
     fieldNum('totalRounds', '总轮次', rules.totalRounds) +
     fieldNum('pointsWin', '胜方积分', rules.pointsWin) +
@@ -250,11 +345,15 @@ function leagueRulesForm(rules) {
     fieldNum('minRankPlayed', '参与排名最少场次', rules.minRankPlayed ?? 5, {
       hint: '不足该场次的选手列在榜尾、不参与名次（仍显示场次与得分）',
     }) +
+    fieldSelect('bestOf', '系列赛（每场几局）', rules.bestOf ?? 1, SERIES_OPTIONS, {
+      hint: SERIES_HINT,
+    }) +
     fieldSwitch('allowDraw', '允许平局', rules.allowDraw) +
     fieldSwitch('includeSubstitutes', '人数不足时启用替补', rules.includeSubstitutes) +
     fieldSwitch('fairRotation', '公平轮换（均衡出场）', rules.fairRotation) +
     `<div class="notice" style="grid-column:1/-1">赛制：每局从参与名单自动排 2v2 阵容 → 逐局独立结算 → ` +
-    `按<b>均分（总得分 ÷ 场次）</b>排名，积分记在实际出场的选手名下。</div>` +
+    `按<b>均分（总得分 ÷ 场次）</b>排名${time ? '，同分再比完成场次与总用时' : ''}，` +
+    `积分记在实际出场的选手名下。</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存规则</button></div></form>`
   );
 }
@@ -393,6 +492,8 @@ export function adminPanelHtml(s) {
   const ui = s.ui || {};
 
   const eventTime = s.eventTime || {};
+  // 已结束的届：赛事信息转为只读（服务端同样会拒），但通知照旧可发
+  const closed = (evt.status || 'active') === 'closed';
   const eventForm = `<form class="form form--2" data-form="event">` +
     fieldText('title', '赛事标题', evt.title) +
     fieldText('subtitle', '副标题', evt.subtitle) +
@@ -422,9 +523,23 @@ export function adminPanelHtml(s) {
       hint: '留空 = 尚未结束 / 待定；填了即视为已结束',
     }) +
     `<div style="grid-column:1/-1">${eventTimeEditorHtml(eventTime)}</div>` +
-    `<div style="grid-column:1/-1">${fieldArea('rulesText', '补充说明', evt.rulesText, {
-      hint: '选填：会附在用户端「比赛规则」面板的末尾（规则主体由赛制参数自动生成）',
-    })}</div>` +
+    // 赛事信息（Markdown）改用 MD 编辑器：表单里**不再放 textarea**，
+    // 否则「保存赛事信息」会把编辑器写好的内容用旧值覆盖回去。
+    `<div style="grid-column:1/-1" class="infocard">` +
+    `<div class="infocard__head"><b>赛事信息</b>` +
+    `<span class="panel__hint">Markdown · 图片 · 显示在「比赛规则」末尾</span>` +
+    (closed
+      ? `<span class="badge badge--lose">已结束 · 只读</span>`
+      : `<button class="btn btn--sm" type="button" data-act="event-info-edit">${icon('edit')}编辑</button>`) +
+    `</div>` +
+    (s.rulebook?.noteHtml
+      ? `<div class="md infocard__body">${s.rulebook.noteHtml}</div>`
+      : `<div class="infocard__body"><span class="panel__hint">还没有内容；点「编辑」写参赛须知、场地位置等。</span></div>`) +
+    (closed
+      ? `<div class="notice" style="margin-top:8px">本届已结束：赛事信息只能查看；` +
+        `要继续发内容请用下面的「赛事通知」（赛后仍可发）。</div>`
+      : '') +
+    `</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存赛事信息</button></div></form>`;
 
   const rulesForm = isLeague(s) ? leagueRulesForm(rules) : tournamentRulesForm(rules, s);
@@ -433,6 +548,12 @@ export function adminPanelHtml(s) {
     fieldSelect('accent', '主题色', ui.accent, [
       ['cyan', '青'], ['violet', '紫'], ['magenta', '品红'], ['amber', '琥珀'], ['lime', '青柠'],
     ]) +
+    fieldText('accentCustom', '自定义主题色', ui.accentCustom, {
+      hint: '十六进制，如 #ff6a00；填了就覆盖上面的预设（副色按色相自动推出来）',
+    }) +
+    fieldText('ogImage', '分享图（og:image）', ui.ogImage, {
+      hint: '留空 = 内置那张 /og.png；可填 /static/xxx.png 或完整网址，1200×630 最佳',
+    }) +
     // 注：UUID / QQ 属于隐私字段，任何情况下都不下发用户端，因此不再提供开关
     fieldSwitch('showAvatar', '显示选手头像', ui.showAvatar) +
     fieldSwitch('revealResults', '公开展示结果', ui.revealResults) +
@@ -453,7 +574,15 @@ export function adminPanelHtml(s) {
     ) +
     fieldText('provider', '服务类型', stream.provider) +
     fieldText('streamKey', '默认流名（兜底）', stream.streamKey, {
-      hint: '仅在选手没有流名时使用；选手各自的地址由他的推流流名决定（整届固定不变）',
+      hint:
+        '仅在选手没有流名时使用；选手各自的地址由他的推流流名决定（整届固定不变）。' +
+        '流名只能用字母、数字、连字符(-)与下划线(_)',
+    }) +
+    fieldText('pushToken', '推流令牌（主直播间 / 遗留频道）', stream.pushToken, {
+      hint:
+        '留空 = 这些流名只要登记过就能推（旧行为）；填了则推它们也必须带这个令牌。' +
+        '成员机位不受它影响——那边一律要求「推流 ID + 该成员自己的 Bearer 令牌」。' +
+        '令牌只收 ASCII 字符（字母 / 数字 / 符号）且不能有空格',
     }) +
     fieldSwitch('verifyTls', '校验源站 HTTPS 证书', stream.verifyTls !== false, {
       hint: '只影响「信号探测」；自签名证书时关掉。观众侧仍需浏览器信任的证书',
@@ -488,24 +617,15 @@ export function adminPanelHtml(s) {
     `<div style="grid-column:1/-1">${fieldArea('note', '备注', stream.note)}</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存直播配置</button></div></form>`;
 
-  const keyForm =
-    `<div class="notice">一律以<b>加盐 PBKDF2</b> 存储（明文与无盐哈希都不落库），` +
-    `也不会出现在「导出配置」的文件里。</div>` +
-    `<form class="form form--2" data-form="admin-key" style="margin-top:10px">` +
-    fieldText('key', '新的管理 KEY', '', {
-      type: 'password',
-      hint: '至少 6 位。保存后所有管理会话立即失效，需用新 KEY 重新登录。',
-    }) +
-    `<div class="form-actions" style="grid-column:1/-1">` +
-    `<button class="btn btn--primary" type="submit">更新管理 KEY</button></div></form>`;
-
   // 已完结的届只留只读信息：编辑面板整体上锁，只放行「恢复进行」
   const finished = isFinished(s);
   const editing =
     // 开赛状态放在最前：下面哪些面板会被冻结，一眼可见
     lockPanelHtml(s) +
     formatPanelHtml(s) +
-    panelHtml('赛事信息', '公开展示', eventForm) +
+    panelHtml('赛事信息', '公开展示 · Markdown', eventForm) +
+    // 赛事通知：发布后打开本届的人会自动弹窗；赛后仍可发（只有赛事信息会转为只读）
+    `<div class="panel" id="adminNotices"></div>` +
     // 推送到群：赛事管理员（自己创建的届）与服务器管理员都能用
     (canManageEvents() && !finished ? qqbotPushPanelHtml(s) : '') +
     panelHtml(
@@ -531,20 +651,6 @@ export function adminPanelHtml(s) {
 
   return (
     panelHtml('系统状态', '实时诊断', `<div id="diagBox" class="kv"><div class="kv__row"><dt>加载中</dt><dd>…</dd></div></div>`) +
-    // 服务器主 KEY 属于服务器级：只有服务器管理员能改
-    (isServerAdmin() ? panelHtml('管理 KEY', '服务器主密钥', keyForm) : '') +
-    panelHtml(
-      '赛事地址',
-      `${esc(s.eventId || 'e000')} · 独立路由`,
-      `<div class="notice">这一届有自己的独立地址 <code>/${esc(s.eventId || 'e000')}</code>：` +
-        `可以刷新、收藏、分享；页签里的「主页」随时回到总入口。` +
-        `全部届次在主页的「管理赛事」里。</div>` +
-        `<div class="tool-group" style="margin-top:10px">` +
-        `<button class="btn btn--sm" type="button" data-act="route-events">全部赛事</button>` +
-        `<button class="btn btn--sm" type="button" data-act="route-home">回主页</button>` +
-        `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新届次列表</button>` +
-        `</div>`
-    ) +
     (finished
       ? `<div class="panel"><div class="panel__head"><h2>已结束</h2>` +
         `<span class="panel__hint">${esc(s.eventId || '')} · 只读</span></div>` +
@@ -741,7 +847,7 @@ export async function refreshDiagnostics() {
       ['在线客户端', d.ws?.online ?? 0],
       ['广播次数', d.ws?.broadcasts ?? 0],
       ['头像缓存', `${d.avatarCache?.files ?? 0} 文件 / ${Math.round((d.avatarCache?.bytes || 0) / 1024)} KB`],
-      ['鉴权模式', d.adminKeyMode],
+      ['公告图片', `${d.uploads?.files ?? 0} 个 / ${Math.round((d.uploads?.bytes || 0) / 1024)} KB`],
       ['待升级凭据', d.legacyCredentials ? `${d.legacyCredentials} 位成员仍是旧格式` : '无'],
       ['赛制状态', scheduleQualityText()],
     ]

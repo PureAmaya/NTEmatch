@@ -16,6 +16,7 @@ from collections.abc import Iterable, Iterator
 from itertools import combinations
 from typing import Any
 
+from . import metrics
 from .logging_conf import get_logger
 from .models import Config, Player, Round, Side, SideKey
 
@@ -600,6 +601,9 @@ def _empty_stat(player_id: str) -> dict[str, Any]:
         "scored": 0,
         "conceded": 0,
         "diff": 0,
+        # 用时制的 tiebreak 用：完成场次与总用时（计分制下不参与排序）
+        "finished": 0,
+        "spent": 0,
         "rest": 0,
         "streak": 0,
         "bestStreak": 0,
@@ -612,12 +616,15 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
 
     排名规则：
     * 场次 ``>= rules.min_rank_played`` 才参与排名，按**均分（总得分 ÷ 场次）**降序；
-      均分相同再比总得分、胜场、净胜。
+      均分相同再比总得分、胜场，最后比「分项」——计分制看净胜分，
+      用时制看完成场次 + 总用时（见 :mod:`app.metrics`）。
     * 场次不足者 ``rank`` 为 ``None``、``qualified`` 为 ``False``，统一排在榜尾。
     * 榜内只统计**本届参与名单**中的选手；已打过已结算对局的选手即便被移出名单，
       其成绩仍保留，避免历史记录凭空消失。
     """
     rules = cfg.rules
+    metric = metrics.norm(rules.metric)
+    time_based = metrics.lower_is_better(metric)
     played_ids = {
         pid
         for rnd in cfg.rounds
@@ -630,7 +637,9 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
 
     completed = [r for r in cfg.rounds if r.status == "done" and r.winner]
     for rnd in sorted(completed, key=lambda r: r.index):
-        _apply_round(stats, rnd, rules.points_win, rules.points_lose, rules.points_draw)
+        _apply_round(
+            stats, rnd, rules.points_win, rules.points_lose, rules.points_draw, metric
+        )
 
     # 轮空统计：未完成的局不计入
     for rnd in cfg.rounds:
@@ -648,15 +657,22 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
     qualified = [row for row in stats.values() if row["played"] >= threshold]
     unqualified = [row for row in stats.values() if row["played"] < threshold]
 
-    qualified.sort(
-        key=lambda s: (
-            -s["average"],
-            -s["points"],
-            -s["win"],
-            -s["diff"],
-            players[s["playerId"]].display_name,
+    def rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        """名次依据：均分 → 总积分 → 胜场 → 分项 → 姓名（完全确定，无随机）。
+
+        分项随比法变化：计分制看净胜分（分多者优）；用时制看完成场次 + 总用时——
+        未完赛的人不能因为「没跑完所以时间短」占到便宜。
+        """
+        tail: tuple[Any, ...] = (-row["finished"], row["spent"]) if time_based else (-row["diff"],)
+        return (
+            -row["average"],
+            -row["points"],
+            -row["win"],
+            *tail,
+            players[row["playerId"]].display_name,
         )
-    )
+
+    qualified.sort(key=rank_key)
     unqualified.sort(
         key=lambda s: (
             -s["played"],
@@ -697,6 +713,7 @@ def _apply_round(
     points_win: int,
     points_lose: int,
     points_draw: int,
+    metric: str = metrics.SCORE,
 ) -> None:
     winner = rnd.winner
     if winner not in ("A", "B", "DRAW"):
@@ -722,6 +739,11 @@ def _apply_round(
             row["scored"] += side.score
             row["conceded"] += other.score
             row["diff"] += side.score - other.score
+            # 该场的总成绩（填了各局就是各局合计）：用时制用它排 tiebreak
+            total = metrics.round_total(side.score, side.points, bool(rnd.sets))
+            if total > 0:
+                row["finished"] += 1
+                row["spent"] += total
             if result == "win":
                 row["streak"] += 1
                 row["bestStreak"] = max(row["bestStreak"], row["streak"])

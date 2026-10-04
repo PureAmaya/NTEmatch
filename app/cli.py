@@ -1,14 +1,13 @@
 """命令行入口：启动服务与维护工具。
 
-不传参数即启动服务；``--reset-key`` 用于忘记管理 KEY 时在本机重置
+不传参数即启动服务；``--reset-key`` 用于**忘记服务器管理员密钥**时在本机重置
 （凭据就是「能访问服务器上的数据库文件」，这是自托管应用的常规做法）。
 
 ::
 
     uv run python -m app                     启动服务
-    uv run python -m app --reset-key         重置管理 KEY（随机生成）
-    uv run python -m app --reset-key 新KEY    重置管理 KEY（指定值）
-    uv run python -m app --reset-key -e e002 指定某一届
+    uv run python -m app --reset-key         重置服务器管理员密钥（随机生成）
+    uv run python -m app --reset-key 新密钥   重置服务器管理员密钥（指定值）
 """
 
 from __future__ import annotations
@@ -21,10 +20,9 @@ import sys
 import uvicorn
 
 from . import db
-from .auth import hash_password
-from .defaults import DEFAULT_ADMIN_KEY
+from .auth import hash_secret
 from .logging_conf import get_logger, setup_logging
-from .store import DB_PATH
+from .store import DB_PATH, now_iso
 
 log = get_logger("cli")
 boot_log = get_logger("boot")
@@ -38,12 +36,11 @@ USAGE = """NTE 比赛 · 命令行
   python -m app                            启动服务（默认 0.0.0.0:8000）
   python -m app --port 8123                换个端口启动
   python -m app --host 127.0.0.1 -p 8123   同时指定监听地址
-  python -m app --reset-key [新KEY]         重置管理 KEY（省略则随机生成）
-  python -m app --reset-key -e e002         重置指定届次的管理 KEY
+  python -m app --reset-key [新密钥]        重置服务器管理员的登录密钥（省略则随机生成）
   python -m app --help                     显示本帮助
 
 端口与监听地址也可以走环境变量 NTE_PORT / NTE_HOST，命令行参数优先。
-忘记管理 KEY 时：先停止服务 → 执行 --reset-key → 用打印出的新 KEY 登录。
+忘记服务器管理员密钥时：先停止服务 → 执行 --reset-key → 用打印出的新密钥登录。
 """
 
 
@@ -98,57 +95,58 @@ def serve(host: str | None = None, port: int | None = None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 重置管理 KEY
+# 重置服务器管理员密钥
 # --------------------------------------------------------------------------- #
-def reset_admin_key(new_key: str | None = None, event_id: str | None = None) -> int:
-    """把某一届的管理 KEY 重置为 sha256 存储的新值，返回进程退出码。"""
+def reset_admin_key(new_key: str | None = None) -> int:
+    """重置「服务器管理员」这位成员的登录密钥，返回进程退出码。
+
+    为什么必须留着它：登录**只认成员密钥**，而全站只有一位服务器管理员——他把密钥
+    弄丢就再没人能进管理端补发密钥。所以留一条「能碰到数据库文件的人可以重置」的路，
+    这是自托管应用的常规做法（凭据 = 对数据库文件的访问权）。
+
+    重置的是**成员凭据**，与届次无关：主管理 KEY 那套（按届存储、全局生效）已经退休。
+    """
     if not DB_PATH.exists():
         print(f"未找到数据库: {DB_PATH}")
         print("请先执行 `uv run python -m app` 启动一次服务，让它初始化数据。")
         return 1
 
+    key = (new_key or "").strip()
+    generated = not key
+    if generated:
+        key = generate_key()
+    if len(key) < MIN_KEY_LEN:
+        print(f"密钥至少 {MIN_KEY_LEN} 位，请重新执行。")
+        return 1
+
     db.init_db(DB_PATH)
     with db.connect(DB_PATH) as conn:
-        events = db.list_events(conn)
-        if not events:
-            print("数据库中还没有任何届次，请先启动一次服务。")
+        members = db.list_members(conn)
+        admin = next((m for m in members if m["permission"] == "server_admin"), None)
+        if admin is None:
+            print("数据库里还没有服务器管理员成员。")
+            print("请先执行 `uv run python -m app` 启动一次服务（启动时会自动创建并打印密钥）。")
             return 1
-
-        target = (event_id or "").strip() or db.get_meta(conn, db.CURRENT_KEY) or events[0]["id"]
-        entry = next((e for e in events if e["id"] == target), None)
-        if entry is None:
-            print(f"届次 {target} 不存在。现有届次: {', '.join(e['id'] for e in events)}")
-            return 1
-
-        key = (new_key or "").strip()
-        generated = not key
-        if generated:
-            key = generate_key()
-        if len(key) < MIN_KEY_LEN:
-            print(f"管理 KEY 至少 {MIN_KEY_LEN} 位，请重新执行。")
-            return 1
-
-        # 加盐 PBKDF2：命令行重置同样不写明文、也不写无盐哈希
+        # 与「成员管理 → 轮换密钥」写同样的格式：加盐哈希，并清掉历史无盐列（不留两套）
         conn.execute(
-            "INSERT INTO event_admin (event_id, key, key_sha256, key_hash) VALUES (?, '', '', ?) "
-            "ON CONFLICT(event_id) DO UPDATE SET key = '', key_sha256 = '', "
-            "key_hash = excluded.key_hash",
-            (target, hash_password(key)),
+            "UPDATE members SET key_hash = ?, key_sha256 = '', updated_at = ? WHERE uid = ?",
+            (hash_secret(key), now_iso(), admin["uid"]),
         )
+        name = admin["name"] or "服务器管理员"
 
-    log.warning("管理 KEY 已通过命令行重置 | 届=%s", target)
+    log.warning("服务器管理员密钥已通过命令行重置 | uid=%s", admin["uid"])
     line = "=" * 62
     print()
     print(line)
-    print(f"  届次 {target}（{entry.get('name') or '未命名'}）的管理 KEY 已重置")
-    print(f"  新 KEY（{'随机生成' if generated else '指定'}）：{key}")
-    print("  存储方式：sha256 —— 数据库里不再保留明文")
+    print(f"  服务器管理员「{name}」的登录密钥已重置")
+    print(f"  新密钥（{'随机生成' if generated else '指定'}）：{key}")
+    print("  存储方式：加盐 PBKDF2 —— 数据库里不再保留明文")
     print(line)
     if _port_in_use(int(os.getenv("NTE_PORT", "8000"))):
         print("  ⚠ 检测到服务仍在运行：请先停止它再重新启动，")
-        print("    否则内存里的旧配置可能在下一次改动时覆盖本次重置。")
-    print("  下一步：重启服务 → 管理端 → 用上面的 KEY 登录")
-    print(f"  安全提示：出厂 KEY 是 {DEFAULT_ADMIN_KEY}，请尽快改成自己的。")
+        print("    否则内存里的旧成员数据可能在下一次改动时覆盖本次重置。")
+    print("  下一步：重启服务 → 用上面的密钥登录（/admin 或 /user）")
+    print("  登录后可在「服务器 → 成员管理」里轮换密钥 / 令牌。")
     print(line)
     return 0
 
@@ -202,17 +200,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args and args[0] == "--reset-key":
         rest = args[1:]
-        event_id: str | None = None
         if "-e" in rest:
-            pos = rest.index("-e")
-            if pos + 1 < len(rest):
-                event_id = rest[pos + 1]
-            rest = rest[:pos] + rest[pos + 2 :]
+            # 以前可以「重置某一届的管理 KEY」；主管理 KEY 退休后这个参数没有意义了，
+            # 明确报错比默默忽略好——否则用户会以为重置没生效。
+            print("--reset-key 现在重置的是「服务器管理员」成员的登录密钥，与届次无关，")
+            print("不再接受 -e <届次> 参数。直接执行 `python -m app --reset-key` 即可。")
+            return 2
         if rest and rest[0].startswith("-"):
             print(f"无法识别的参数: {' '.join(rest)}")
             print(USAGE)
             return 2
-        return reset_admin_key(rest[0] if rest else None, event_id)
+        return reset_admin_key(rest[0] if rest else None)
 
     if args:
         print(f"无法识别的参数: {' '.join(args)}")
