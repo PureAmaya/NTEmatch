@@ -7,6 +7,9 @@
 * ``--transfer-admin``：**换人**——把服务器管理员交给另一位成员，旧管理员删除或降级，
   并给接任者派发新密钥（界面上做不到：既不能提升别人，也不能降级唯一的管理员）。
 
+另外，``--help`` 末段列出了配套脚本（生成分享图 / **QQ 机器人帮助图**、前端资源自检）——
+那两个图片脚本与运行无关，Pillow 只在生成时需要。
+
 ::
 
     uv run python -m app                     启动服务
@@ -52,6 +55,22 @@ USAGE = """NTE 比赛 · 命令行
 端口与监听地址也可以走环境变量 NTE_PORT / NTE_HOST，命令行参数优先。
 忘记服务器管理员密钥时：先停止服务 → 执行 --reset-key → 用打印出的新密钥登录。
 要换人时：先停止服务 → 执行 --transfer-admin → 用新管理员的密钥登录。
+
+配套脚本（与运行无关，按需执行；Pillow 只在生成图片时需要，不进运行依赖）：
+
+  uv run --with pillow python tools/make_help_card.py
+      生成 QQ 机器人帮助图 → static/help.jpg
+      群里「比赛帮助」发的就是这张图：站点在 /help.jpg 提供它，插件先探一下在不在
+      （没放图则回私聊文字说明，不会发破图）。图上的文字在 tools/help_card_content.py，
+      改了命令重跑一次即可；测试会比对它与插件的 HELP_TEXT，漂了会红。
+      出图时另写一个 static/help.jpg.src.sha256（源文件指纹）——自检与测试据此拦住
+      「改了文案忘了重画」（那意味着群里发着一张写着旧命令的图）。
+
+  uv run --with pillow python tools/make_share_card.py
+      重画默认分享图 → static/og.png（og:image；改主色后重跑一次）
+
+  uv run python tools/check_assets.py
+      前端静态资源自检（CSS 括号配平 / 相对导入 / 图标名 / 引用的资源），CI 也跑
 """
 
 

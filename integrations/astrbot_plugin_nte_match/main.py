@@ -134,6 +134,80 @@ def _page_number(raw) -> int:
     return min(999, max(1, int(digits))) if digits else 1
 
 
+#: 「比赛届次」里表示「只看自己创建的」的词（写「我的」/「我」/「mine」都算）。
+_MINE_WORDS = frozenset({"我的", "我", "自己", "自己创建", "我创建", "mine"})
+
+#: 明确要「全部」的词（默认也是全部，写出来只是让人安心）。
+_ALL_WORDS = frozenset({"全部", "所有", "全部届次", "all"})
+
+
+def _ids_args(*raw: str) -> tuple[str, int]:
+    """解析「比赛届次」的参数，返回 ``(scope, page)``；``scope`` 取 ``all`` / ``mine``。
+
+    认三类词：``我的``（只看自己创建的）、``全部``（默认）、页码（``2`` / ``第2页``）。
+    顺序随意——「比赛届次 2 我的」与「比赛届次 我的 2」都算数；认不出的词**直接忽略**
+    （宁可回默认视图，也别为一个错别字把人挡在命令外面）。
+
+    参数为什么收成字符串：见 :func:`_page_number`——带 int 注解时 AstrBot 会做强转，
+    非数字参数会让整条命令失效。
+    """
+    scope = "all"
+    page = 1
+    for chunk in raw:
+        for word in re.split(r"[\s,，、]+", str(chunk or "").strip()):
+            low = word.lower()
+            if not low:
+                continue
+            if low in _MINE_WORDS:
+                scope = "mine"
+            elif low in _ALL_WORDS:
+                scope = "all"
+            elif re.fullmatch(r"第?\s*\d+\s*页?", word):
+                page = _page_number(word)
+    return scope, page
+
+
+def _call_denied_text(data: dict) -> str:
+    """召集被拒时说清原因与**下一步动作**（纯函数，方便单测）。
+
+    规则只有一条：**谁创建的届，谁可以召集**（服务器管理员的全局权限另算，
+    见站点 ``/api/bot/managers``）。所以被拒只有两种可能：
+
+    1. 这一届**不是你创建的** —— 那就告诉他：你自己哪几届能召集、该敲哪条命令；
+    2. **群里认不出你**（你没在站点「我的」页登记 QQ），或本届创建者没登记 QQ
+       —— 名单为空时谁都召集不了，得先把 QQ 补上。
+
+    以前这里只回一句「召集需要赛事管理员身份：只有本届举办者或服务器管理员能召集」，
+    对一位**正是赛事管理员**的人说，等于什么都没说（他甚至会以为站点把他的角色弄丢了）。
+    现在先给结论、再给能立刻做的动作（全程纯文本，不带 Markdown）。
+    """
+    owner = data.get("owner") or {}
+    owner_name = str(owner.get("name") or "").strip()
+    if not (data.get("qqs") or []):
+        # 名单为空 ≠ 「你没权限」，而是这一届此刻没有能召集的人
+        if owner_name and not owner.get("hasQq"):
+            return (
+                f"这一届是「{owner_name}」创建的，但他还没在站点登记 QQ，所以现在谁都召集不了。\n"
+                "让他到站点「我的」页填上自己的 QQ（群里只能靠 QQ 认人），"
+                "或让服务器管理员来召集。"
+            )
+        return (
+            f"{data.get('note') or '这一届现在没有可召集的人'}。\n"
+            "召集权限＝这一届的创建者或服务器管理员；在站点「我的」页登记 QQ 才能对上号。"
+        )
+    lines = ["召集要「本届创建者」或服务器管理员——赛事管理员能召集的是他自己创建的那些届。"]
+    mine = [m for m in (data.get("mine") or []) if m.get("id")]
+    if mine:
+        listed = "、".join(f"{m.get('name') or m['id']}（{m['id']}）" for m in mine[:5])
+        lines.append(f"你自己创建的届：{listed}。用「比赛召集 <届次>」召集你那届的人。")
+    else:
+        lines.append(
+            "没查到你创建的届：在站点新建一届后就能召集它的人；"
+            "如果你建过，先到「我的」页登记 QQ（群里只能靠 QQ 认人）。"
+        )
+    return "\n".join(lines)
+
+
 # 帮助文本：**唯一的说明来源**——群里回的是它，``HELP.md``（做帮助图用）也照着它写。
 # 改命令时顺手改这两处，别让它们各说一套。
 #
@@ -150,8 +224,9 @@ HELP_TEXT = (
     "· 比赛详情 [届次] [场次] —— 综合信息；给场次编号就细说那一场\n"
     "· 比赛名单 [届次] —— 参赛名单（选手 / 队伍 / 替补）\n"
     "· 比赛冠军 [届次] —— 冠军（或积分制榜首前三）\n"
-    "· 比赛届次 —— 全部届次的编号与名称（填参数用）\n"
-    "· 比赛召集 [届次] —— @ 参赛者到场（仅本届举办者 / 服务器管理员，带冷却）\n"
+    "· 比赛届次 [我的] [页码] —— 届次编号与名称（填参数前先发它；写「我的」只看自己创建的，\n"
+    "  一页装不下时私聊发你）\n"
+    "· 比赛召集 [届次] —— @ 参赛者到场（本届创建者＝举办者 / 服务器管理员，带冷却）\n"
     "· 比赛我的 —— 你自己的推流地址 + 直播间地址（私聊发你）\n"
     "· 比赛重置密钥 [@某人] —— 换登录密钥（旧密钥立即失效；私聊发本人）\n"
     "· 比赛重置令牌 [@某人] —— 换直播令牌（要先有推流码；私聊发本人）\n"
@@ -172,7 +247,8 @@ HELP_TEXT = (
     "光打「比赛进度」不会触发：这是 AstrBot 的命令过滤规则（必须被 @ 或命中唤醒前缀），\n"
     "不是本插件能改的——不 @ 就不会有任何回复。\n"
     "—— 会私聊发给你的东西 ——\n"
-    "命令说明、你自己的推流地址、新成员的登录密钥都走私聊（只该你看到）。\n"
+    "命令说明、你自己的推流地址、届次很多时的届次列表、新成员的登录密钥都走私聊\n"
+    "（只该你看到）。\n"
     "私聊发不出去（没加机器人好友）时，地址与说明会退回群里；\n"
     "但**登录密钥不会**——密钥只显示一次，泄在群里等于白送一个账号。"
 )
@@ -298,10 +374,24 @@ class NTEMatchPlugin(star.Star):
         return await self._post("notify", {"qq": qq, "text": text})
 
     async def _query(
-        self, kind: str, event_id: str = "", ref: str = "", page: int = 1, at: bool = True
+        self,
+        kind: str,
+        event_id: str = "",
+        ref: str = "",
+        page: int = 1,
+        at: bool = True,
+        scope: str = "",
+        qq: str = "",
     ) -> dict:
         return await self._get(
-            "query", kind=kind, eventId=event_id, ref=ref, page=page, at="" if at else "0"
+            "query",
+            kind=kind,
+            eventId=event_id,
+            ref=ref,
+            page=page,
+            at="" if at else "0",
+            scope=scope,
+            qq=qq,
         )
 
     def _texts(self, data: dict) -> list[str]:
@@ -631,23 +721,38 @@ class NTEMatchPlugin(star.Star):
             yield event.plain_result(text)
 
     @filter.command("比赛届次", alias={"届次列表", "比赛编号"})
-    async def cmd_ids(self, event: AstrMessageEvent):
-        """列出全部届次的编号与名称（填参数时用）。"""
-        rows, error = await self._events()
-        if error:
-            yield event.plain_result(error)
+    async def cmd_ids(self, event: AstrMessageEvent, arg: str = "", page: str = ""):
+        """届次编号列表（**填参数前先发它**）：`比赛届次` / `比赛届次 我的` / `比赛届次 2`。
+
+        三种用法叠在一起：默认全部；写「我的」只看**自己创建的**届（按 QQ 认人，
+        站点侧过滤）；页码翻页。**一页装不下时走私聊发本人**——在群里刷一长串届次
+        纯属噪音，而喊命令的人多半只是想抄一个编号。私聊发不出去（没加好友 /
+        没配推送）就退回群里发当前页。
+
+        参数收成字符串、由 :func:`_ids_args` 宽松解析：顺序随意，认不出的词忽略。
+        """
+        scope, page_num = _ids_args(arg, page)
+        sender = _sender_id(event)
+        data = await self._query("ids", page=page_num, scope=scope, qq=sender)
+        if not data.get("ok"):
+            yield event.plain_result(f"查询失败：{data.get('error') or '未知原因'}")
             return
-        if not rows:
-            yield event.plain_result("平台上还没有赛事。")
-            return
-        data = await self._get("events")
-        # 不再标「哪一届是当前届」：届次现在必须写明，服务器那个指针跟群友无关
-        lines = [f"共 {len(rows)} 届赛事（发命令时写明届次，编号或名称都行）："]
-        for item in sorted(rows, key=lambda x: str(x.get("id", ""))):
-            mark = "（当前）" if item.get("id") == data.get("current") else ""
-            state = {"active": "进行中", "closed": "已结束", "draft": "筹备中"}.get(item.get("status"), "")
-            lines.append(f"· {item['id']} {item.get('name')}{mark} · {state}")
-        yield event.plain_result(self.reply_prefix + "\n".join(lines))
+        texts = self._texts(data)
+        pages = int(data.get("pages") or 1)
+        if pages > 1 and sender:
+            # 多于一页 → 私聊；群里只留一句「发到私聊了」+ 下一页怎么写
+            sent = await self._notify(sender, "\n".join(texts))
+            if sent.get("ok"):
+                nxt = min(int(data.get("page") or 1) + 1, pages)
+                mine = "我的 " if scope == "mine" else ""
+                yield event.plain_result(
+                    f"届次较多（共 {pages} 页），已私聊发你第 {data.get('page')} 页；"
+                    f"还要看就发「比赛届次 {mine}{nxt}」。"
+                )
+                return
+            logger.info("[NTE 比赛] 届次私聊失败，改为群内回复：%s", sent.get("error"))
+        for text in texts:
+            yield event.plain_result(text)
 
     @filter.command("比赛信息", alias={"赛事信息", "比赛时间", "nteginfo"})
     async def cmd_event(self, event: AstrMessageEvent, event_id: str = ""):
@@ -707,30 +812,28 @@ class NTEMatchPlugin(star.Star):
         插件跑在 AstrBot 里面，所以这里用 ``At`` 消息组件发**真正的 @**——
         走 HTTP 推送时（OpenAPI 没有 at 段）做不到。
 
-        两道闸门：**认身份**（只有本届举办者 / 服务器管理员能召集，按 QQ 对号）
+        两道闸门：**认身份**（只有**本届创建者**或服务器管理员能召集，按 QQ 对号）
         与**冷却**（同一会话最小间隔 + 每小时上限，防刷屏）。
+
+        认身份的规则是「谁创建的届谁可以召集」：一位赛事管理员能召集的是*他自己创建
+        那些届*，不是任何一届——所以被拒时把「你自己哪几届能召集」一并回给他
+        （理由见 :func:`_call_denied_text`）。
         """
         target, error = await self._resolve_event(event_id)
         if error:
             yield event.plain_result(error)
             return
-        # ① 认身份：召集会 @ 一大片人，不该谁都能触发
-        managers = await self._get("managers", eventId=target)
+        # ① 认身份：召集会 @ 一大片人，不该谁都能触发。
+        # 带上提问者的 QQ：被拒时站点会顺便回「他自己创建的届」，提示才说得具体
+        # （见 _callable_events）。
+        sender = _sender_id(event)
+        managers = await self._get("managers", eventId=target, qq=sender)
         if not managers.get("ok"):
             yield event.plain_result(f"查询失败：{managers.get('error') or '未知原因'}")
             return
         allowed = {str(q) for q in (managers.get("qqs") or [])}
-        if not allowed:
-            yield event.plain_result(
-                f"{managers.get('note') or '本届还没有登记 QQ 的赛事管理员'}。\n"
-                "请先在站点「我的」页填上自己的 QQ（服务器管理员或本届举办者），再试一次。"
-            )
-            return
-        if _sender_id(event) not in allowed:
-            yield event.plain_result(
-                "召集需要赛事管理员身份：只有本届举办者或服务器管理员能召集。\n"
-                "（在站点「我的」页登记了 QQ 才能对上号；需要权限请联系服务器管理员。）"
-            )
+        if not allowed or sender not in allowed:
+            yield event.plain_result(_call_denied_text(managers))
             return
         # ② 冷却：防刷屏（默认 60 秒间隔 / 每小时 6 次，可在插件配置里调）
         ok, reason = self._call_allowed(event)

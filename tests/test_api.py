@@ -182,6 +182,129 @@ async def test_bot_managers_lists_only_managers():
         await store.set_qqbot({"botApiTokenHash": ""}, actor="test", internal=True)
 
 
+async def test_bot_managers_follow_event_creator():
+    """召集权限只有一条：**谁创建的届，谁可以召集**（服务器管理员另有全局权限）。
+
+    这才是「赛事管理员也能召集自己那届」的准确含义——赛事管理员能召集的是
+    *他自己创建*的届；服务器管理员建的届，他召集不了。另外带 ``qq`` 时会回
+    ``mine``（他自己创建的届），插件据此把「你该敲哪条命令」直接告诉他。
+    """
+    from app.auth import hash_secret
+    from app.models import Member
+
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    token = "nte_test_managers_owner_token"
+    prev_current = store.current_id
+    await store.set_qqbot({"botApiTokenHash": hash_secret(token)}, actor="test", internal=True)
+    await store.save_member(
+        Member(uid="u_owner_test", name="小队长", qq="20001", permission="event_admin")
+    )
+    await store.save_member(Member(uid="u_root_test", name="服管", qq="20002", permission="server_admin"))
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=app)
+    own = ""
+    theirs = ""
+    try:
+        await store.create_event("小队长自己的届", owner_uid="u_owner_test")
+        own = store.current_id
+        await store.create_event("服管建的届", owner_uid="u_root_test")
+        theirs = store.current_id
+        async with httpx.AsyncClient(transport=transport, base_url="http://nte.test") as c:
+            mine = (
+                await c.get(
+                    "/api/bot/managers", params={"eventId": own, "qq": "20001"}, headers=headers
+                )
+            ).json()
+            other = (
+                await c.get(
+                    "/api/bot/managers", params={"eventId": theirs, "qq": "20001"}, headers=headers
+                )
+            ).json()
+
+        # ① 自己创建的届：创建者本人能召集（服务器管理员的全局权限也在名单里）
+        assert "20001" in mine["qqs"], "届的创建者必须能召集自己那届"
+        assert mine["owner"] == {"name": "小队长", "hasQq": True}
+        assert [m["id"] for m in mine["mine"]] == [own]
+        # ② 服务器管理员建的届：赛事管理员不在名单里（谁创建的谁召集）
+        assert "20001" not in other["qqs"], "服务器管理员建的届，赛事管理员不该能召集"
+        assert "20002" in other["qqs"], "服务器管理员能召集自己建的届"
+        assert other["owner"]["name"] == "服管"
+        # ③ mine 只跟「问的人」有关：换一届看，他自己那届依然列在里面
+        assert [m["id"] for m in other["mine"]] == [own]
+    finally:
+        await store.switch_event(prev_current)
+        for eid in (own, theirs):
+            if eid and eid != prev_current:
+                await store.delete_event(eid)
+        await store.delete_member("u_owner_test")
+        await store.delete_member("u_root_test")
+        await store.set_qqbot({"botApiTokenHash": ""}, actor="test", internal=True)
+
+
+async def test_bot_ids_scope_mine_filters_by_creator():
+    """「比赛届次 我的」在**站点侧**过滤：认人靠 QQ（ownerUid → 成员 → qq）。
+
+    过滤放这里而不是插件：插件拿不到 uid 与成员表，只能靠站点认人。另外
+    ``scope=mine`` 不认人时直接 **400**——宁可报清楚，也别悄悄回个空列表，
+    那会让人以为「我一届都没建过」。
+    """
+    from app.auth import hash_secret
+    from app.models import Member
+
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    token = "nte_test_ids_mine_token"
+    prev_current = store.current_id
+    await store.set_qqbot({"botApiTokenHash": hash_secret(token)}, actor="test", internal=True)
+    await store.save_member(
+        Member(uid="u_ids_owner", name="小办", qq="30001", permission="event_admin")
+    )
+    await store.save_member(Member(uid="u_ids_root", name="服管", qq="30002", permission="server_admin"))
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = httpx.ASGITransport(app=app)
+    mine_id = ""
+    other_id = ""
+    try:
+        await store.create_event("小办自己的届", owner_uid="u_ids_owner")
+        mine_id = store.current_id
+        await store.create_event("服管建的届", owner_uid="u_ids_root")
+        other_id = store.current_id
+        async with httpx.AsyncClient(transport=transport, base_url="http://nte.test") as c:
+            mine = (
+                await c.get(
+                    "/api/bot/query",
+                    params={"kind": "ids", "scope": "mine", "qq": "30001"},
+                    headers=headers,
+                )
+            ).json()
+            # kind=ids 是全局信息：不写届次也照样能查（这里刻意不带 eventId）
+            every = (
+                await c.get("/api/bot/query", params={"kind": "ids"}, headers=headers)
+            ).json()
+            no_qq = await c.get(
+                "/api/bot/query", params={"kind": "ids", "scope": "mine"}, headers=headers
+            )
+
+        assert mine["ok"] is True
+        assert "你创建的届" in mine["text"]
+        assert "小办自己的届" in mine["text"]
+        assert "服管建的届" not in mine["text"], "别人的届不该出现在「我的」里"
+        assert "小办自己的届" in every["text"] and "服管建的届" in every["text"]
+        assert no_qq.status_code == 400
+        assert "qq" in no_qq.text
+    finally:
+        await store.switch_event(prev_current)
+        for eid in (mine_id, other_id):
+            if eid and eid != prev_current:
+                await store.delete_event(eid)
+        await store.delete_member("u_ids_owner")
+        await store.delete_member("u_ids_root")
+        await store.set_qqbot({"botApiTokenHash": ""}, actor="test", internal=True)
+
+
 async def test_bot_token_is_accepted_from_headers_only():
     """机器人令牌只认请求头：``?token=`` 即使完全正确也必须被拒。
 

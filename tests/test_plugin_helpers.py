@@ -147,7 +147,7 @@ def test_config_shapes_are_tolerated(plugin_module):
 
 
 def test_help_text_explains_how_to_trigger(plugin_module):
-    """帮助里必须写清「要先 @ 机器人或带唤醒前缀」——关掉大模型后这是唯一的说明。"""
+    """帮助里必须写清「要先 @ 机器人或带唤醒前缀」——这是**唯一**的说明来源。"""
     text = plugin_module.HELP_TEXT
     assert "@ 机器人" in text
     assert "唤醒前缀" in text
@@ -323,6 +323,102 @@ def test_call_gate_can_be_disabled(plugin_module):
         assert plugin._call_allowed(_FakeEvent(group="g1"))[0] is True
 
 
+def test_call_denied_text_names_the_creator_without_qq(plugin_module):
+    """名单为空时要说清「创建者没登记 QQ」，而不是含糊地说「你没权限」。
+
+    这是最容易卡死的那一种：届是某位赛事管理员建的，但他没在站点「我的」页填 QQ，
+    于是**谁都召集不了**（连他自己也不知道该去补 QQ）——旧文案只说「需要赛事管理员身份」，
+    他明明是赛事管理员，看完只会更糊涂。
+    """
+    text = plugin_module._call_denied_text(
+        {"qqs": [], "owner": {"name": "小队长", "hasQq": False}, "note": ""}
+    )
+    assert "小队长" in text
+    assert "QQ" in text
+
+
+def test_call_denied_text_points_at_my_own_events(plugin_module):
+    """被拒但自己建过届：直接给出届次与可用的命令（他多半只是写错了届次）。
+
+    规则是「谁创建的届谁可以召集」，所以赛事管理员能召集的是**自己创建的那些届**——
+    提示里必须把这句话写出来，否则他会以为站点不认他的赛事管理员身份。
+    """
+    text = plugin_module._call_denied_text(
+        {
+            "qqs": ["20002"],
+            "owner": {"name": "服管", "hasQq": True},
+            "mine": [{"id": "e005", "name": "小队长杯"}],
+        }
+    )
+    assert "e005" in text and "比赛召集" in text
+    assert "**" not in text, "发到群里的是纯文本，别夹 Markdown 记号"
+
+
+def test_call_denied_text_guides_when_i_created_nothing(plugin_module):
+    """自己一届都没建过：告诉他「建一届就能召集」以及可能是 QQ 没登记。"""
+    text = plugin_module._call_denied_text(
+        {"qqs": ["20002"], "owner": {"name": "服管", "hasQq": True}, "mine": []}
+    )
+    assert "QQ" in text
+    assert "**" not in text
+
+
+def test_ids_args_parse_scope_and_page(plugin_module):
+    """「比赛届次」的参数：认「我的」与页码，顺序随意，认不出的词一律忽略。"""
+    parse = plugin_module._ids_args
+    assert parse() == ("all", 1)
+    assert parse("我的") == ("mine", 1)
+    assert parse("我的", "2") == ("mine", 2)
+    assert parse("2", "我的") == ("mine", 2)  # 顺序随意，别逼用户记顺序
+    assert parse("第2页") == ("all", 2)
+    assert parse("全部", "3") == ("all", 3)
+    assert parse("随便写的") == ("all", 1)  # 认不出就当没写，别把人挡在命令外面
+
+
+async def test_ids_go_private_when_multiple_pages(plugin_module):
+    """一页装不下 → 私聊发本人，群里只留一句指引（明细不进群，免得刷屏）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    seen: dict = {}
+
+    async def fake_query(kind, **kwargs):
+        seen["kind"] = kind
+        seen.update(kwargs)
+        return {"ok": True, "page": 1, "pages": 3, "parts": ["第 1 页明细"]}
+
+    async def fake_notify(qq, text):
+        seen["private"] = (qq, text)
+        return {"ok": True}
+
+    plugin._query = fake_query
+    plugin._notify = fake_notify
+    out = [r async for r in plugin.cmd_ids(_FakeEvent(sender="10001", group="g1"), "我的", "2")]
+
+    assert seen["kind"] == "ids"
+    assert seen["scope"] == "mine" and seen["page"] == 2
+    assert seen["qq"] == "10001"  # 「我的」靠这个 QQ 认人，站点侧过滤
+    assert seen["private"][0] == "10001" and "第 1 页明细" in seen["private"][1]
+    assert len(out) == 1
+    assert "私聊" in out[0]["text"]
+    assert "比赛届次 我的 2" in out[0]["text"]  # 下一页怎么写，要写真实可用的
+    assert "第 1 页明细" not in out[0]["text"]
+
+
+async def test_ids_stay_in_group_when_single_page(plugin_module):
+    """一页装得下（≤10 届）→ 照旧在群里回，不折腾私聊。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_query(kind, **kwargs):
+        return {"ok": True, "page": 1, "pages": 1, "parts": ["共 3 届（第 1 / 1 页）"]}
+
+    async def fake_notify(qq, text):
+        raise AssertionError("只有一页时不该走私聊")
+
+    plugin._query = fake_query
+    plugin._notify = fake_notify
+    out = [r async for r in plugin.cmd_ids(_FakeEvent(sender="10001", group="g1"))]
+    assert [r["text"] for r in out] == ["共 3 届（第 1 / 1 页）"]
+
+
 async def test_event_commands_require_an_explicit_event(plugin_module):
     """不写届次 → 直接提示「写明哪一届」，**不再默默套用服务器那个指针**。
 
@@ -357,6 +453,54 @@ def test_help_doc_lists_every_command(plugin_module):
     for name in commands:
         assert name in plugin_module.HELP_TEXT, f"HELP_TEXT 里缺命令：{name}"
         assert name in doc, f"HELP.md 里缺命令：{name}"
+
+
+def _load_help_card_content():
+    """读帮助图的内容模块（**零依赖**，不装 Pillow 也能核对文案）。"""
+    path = Path(__file__).resolve().parent.parent / "tools" / "help_card_content.py"
+    spec = importlib.util.spec_from_file_location("help_card_content", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_help_card_is_not_older_than_its_text():
+    """帮助图不能比文案旧：``static/help.jpg.src.sha256`` 要与当前文案的指纹一致。
+
+    图上的命令群友会照着打（精确匹配，错一个字就是**毫无反应**），所以「改了文案忘了
+    重画」必须有人喊出来——出图脚本把源文件指纹写进那个小文件，这里比对
+    （``tools/check_assets.py`` 查的是同一条）。
+    """
+    card = _load_help_card_content()
+    art = Path(__file__).resolve().parent.parent / "static" / "help.jpg"
+    stamp = art.with_name(art.name + ".src.sha256")
+    assert art.exists(), "static/help.jpg 不见了（群里「比赛帮助」发的那张）"
+    assert stamp.exists(), (
+        f"缺指纹文件 {stamp.name}：跑 uv run --with pillow python tools/make_help_card.py"
+    )
+    assert stamp.read_text(encoding="utf-8").strip() == card.source_digest(), (
+        "帮助图比文案旧：跑 uv run --with pillow python tools/make_help_card.py 重画"
+    )
+
+
+def test_help_card_lists_exactly_the_same_commands(plugin_module):
+    """帮助图上的命令必须与 `HELP_TEXT` **完全一致**。
+
+    图是代码渲染的（`tools/make_help_card.py`，文字在 `tools/help_card_content.py`），
+    所以两边能对得上；这条用例盯住「插件加了命令忘了画」或「图上写错一条」——
+    图上的命令错一个字，群友照着打就是**毫无反应**（命令是精确匹配的，没有兜底）。
+    """
+    card = _load_help_card_content()
+    on_card = {cmd.split()[0] for _title, rows in card.SECTIONS for cmd, _desc in rows}
+    in_text = {
+        line.strip()[2:].split()[0]
+        for line in plugin_module.HELP_TEXT.splitlines()
+        if line.strip().startswith("· ")
+    }
+    assert on_card == in_text, (
+        f"图上少了 {sorted(in_text - on_card)}；图上多了 {sorted(on_card - in_text)}"
+    )
 
 
 def test_plugin_registers_no_llm_tools(plugin_module):

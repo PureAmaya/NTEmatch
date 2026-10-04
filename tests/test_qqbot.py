@@ -80,3 +80,56 @@ def test_list_message_hint_points_to_a_real_command():
     assert pages > 1
     assert "发「比赛列表 2」" in text
     assert "发送「下一页」" not in text  # 「下一页」既不是命令也不是别名
+
+
+def _ids_events(count: int) -> list[dict]:
+    return [
+        {"id": f"e{i:03d}", "name": f"第 {i} 届", "status": "active"}
+        for i in range(1, count + 1)
+    ]
+
+
+def test_ids_message_pages_and_points_at_a_real_command():
+    """届次列表（填参数用）：分页，翻页提示同样是**真实可用**的写法。"""
+    text, pages = qqbot.build_ids_message(_ids_events(12), page=1)
+    assert pages == 2
+    assert "共 12 届（第 1 / 2 页）" in text
+    assert "e001" in text and "e010" in text
+    assert "e011" not in text  # 第二页的内容不该混进第一页
+    assert "发「比赛届次 2」" in text
+
+    text2, pages2 = qqbot.build_ids_message(_ids_events(12), page=2)
+    assert pages2 == 2
+    assert "e011" in text2 and "e012" in text2
+    assert "e001 第 1 届" not in text2
+    assert "最后一页" in text2
+
+
+def test_ids_message_skips_hidden_events():
+    """隐藏届不列：机器人解析届次用的 /api/bot/events 也看不到它们，
+    列出来只会让人照着发一句「没找到这一届」。"""
+    events = _ids_events(3) + [{"id": "e099", "name": "隐藏届", "status": "closed", "hidden": True}]
+    text, pages = qqbot.build_ids_message(events)
+    assert pages == 1
+    assert "共 3 届" in text
+    assert "隐藏届" not in text
+
+
+def test_ids_message_mine_scope_wording():
+    """「我的」视图：标题说是「你创建的届」，翻页提示也带「我的」。"""
+    text, _ = qqbot.build_ids_message(_ids_events(11), page=1, scope="mine")
+    assert "你创建的届" in text
+    assert "发「比赛届次 我的 2」" in text
+    empty, _ = qqbot.build_ids_message([], scope="mine")
+    assert "还没有创建过届次" in empty
+
+
+def test_dispatch_ids_uses_the_ids_builder():
+    """dispatch 的 ``ids`` 走 build_ids_message，并把 scope 传下去（措辞与提示都靠它）。"""
+    out = qqbot.dispatch(
+        "ids", settings={"maxChars": 1200}, events=_ids_events(11), page=1, scope="mine"
+    )
+    text = "".join(out["parts"])
+    assert out["pages"] == 2
+    assert "你创建的届" in text
+    assert "**" not in text  # 出站一律纯文本

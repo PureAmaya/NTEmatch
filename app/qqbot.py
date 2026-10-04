@@ -884,6 +884,52 @@ def build_events_message(
     return "\n".join(lines), pages
 
 
+def build_ids_message(
+    events: list[dict[str, Any]], *, page: int = 1, per_page: int = 10, scope: str = "all"
+) -> tuple[str, int]:
+    """届次编号列表（**填参数用**；分页）。返回 ``(文本, 总页数)``。
+
+    与 :func:`build_events_message`（比赛列表）的分工：那个说的是「有哪些比赛、各自什么
+    情况」，这个只给**能写进命令里的编号**——行更短，所以每页塞得更多。
+
+    隐藏届**不列**：机器人这边按 ``/api/bot/events``（同样过滤隐藏项）解析届次，
+    列出来只会让人照着发一句「没找到这一届」。
+
+    ``scope == "mine"`` 时标题改成「你创建的届」——调用方（``/api/bot/query``）已经
+    按 QQ 过滤好了列表，这里只负责措辞与翻页提示里的命令该带不带「我的」。
+    """
+    rows = [item for item in events if not item.get("hidden")]
+    total = len(rows)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(pages, int(page or 1)))
+    chunk = rows[(page - 1) * per_page : page * per_page]
+    scope_args = "我的 " if scope == "mine" else ""
+    lines = [
+        (
+            f"【NTE 比赛】{'你创建的届' if scope == 'mine' else '届次列表'}："
+            f"共 {total} 届（第 {page} / {pages} 页）"
+        )
+    ]
+    if not chunk:
+        lines.append(
+            "（你还没有创建过届次：在站点新建一届后，这里就能看到它）"
+            if scope == "mine"
+            else "（暂无赛事）"
+        )
+    for pos, item in enumerate(chunk, start=(page - 1) * per_page + 1):
+        state = EVENT_STATUS.get(item.get("status"), "")
+        head = f"{pos}. {item.get('id')} {item.get('name') or item.get('id')}"
+        lines.append(f"{head} · {state}" if state else head)
+    if pages > 1:
+        # 翻页提示必须给**真实可用**的写法：以前写「下一页」，而它既不是命令也不是别名
+        lines.append(
+            f"（发「比赛届次 {scope_args}{min(page + 1, pages)}」看下一页；共 {pages} 页）"
+            if page < pages
+            else f"（已是最后一页，共 {pages} 页）"
+        )
+    return "\n".join(lines), pages
+
+
 def build_detail_message(cfg: Config, state: dict[str, Any], ref: str = "") -> str:
     """某一届的信息 + 进度 + 结果；给了 ``ref`` 就详细说那一场（对局）。"""
     name = cfg.event.name or cfg.event.title or "比赛"
@@ -998,6 +1044,7 @@ KIND_META: dict[str, tuple[str, str]] = {
     "call": ("召集参赛", "列出参与名单与 @ 片段，请他们到场准备"),
     "result": ("比赛结果", "冠军 / 榜单 + 逐场比分"),
     "list": ("比赛列表", "全部届次（分页；过长自动分段）"),
+    "ids": ("届次列表", "全部届次的编号与名称（分页；写「我的」只看自己创建的）"),
     "detail": ("单届详情", "信息 + 进度 + 结果；带 ref 时细说某一场"),
     "next": ("下一场", "正在打的场次；没有就报下一场与计划时间"),
     "roster": ("参赛名单", "本届参与名单（名字 / 编号 / 替补 / 队伍）"),
@@ -1017,11 +1064,15 @@ def dispatch(
     page: int = 1,
     members: list[Any] | None = None,
     live_info: dict[str, Any] | None = None,
+    scope: str = "all",
 ) -> dict[str, Any]:
     """构建要发的消息（不发送）。返回 ``{parts, pages, page}``。
 
     ``kind == "live"``（当前直播）需要调用方先 ``await live.collect_live()`` 把
     数据取好传进来——本模块只负责排版，不做网络探测（它跑在 ``to_thread`` 里）。
+
+    ``scope`` 只给 ``ids`` 用：调用方若已按 QQ 过滤成「他自己创建的届」，这里就按
+    「你创建的届」措辞并把翻页提示写成带「我的」的命令。
     """
     limit = int(settings.get("maxChars") or 1200)
     pages = 1
@@ -1029,6 +1080,8 @@ def dispatch(
         text, pages = build_events_message(
             events or [], page=page, per_page=max(3, min(20, limit // 90))
         )
+    elif kind == "ids":
+        text, pages = build_ids_message(events or [], page=page, scope=scope)
     elif kind == "event":
         text = build_event_message(cfg, state or {})
     elif kind == "progress":

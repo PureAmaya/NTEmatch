@@ -167,6 +167,20 @@ def test_cli_rejects_the_removed_event_option(capsys):
     assert "届次无关" in capsys.readouterr().out
 
 
+def test_cli_help_points_to_the_help_card_script(capsys):
+    """``--help`` 里要点出「帮助图怎么生成」——否则没人知道那张图是从哪来的。
+
+    帮助图是 `比赛帮助` 真正发出去的东西，也是新人了解命令的唯一入口；
+    脚本藏得太深就会出现「图是旧的没人会重做」。
+    """
+    assert cli.main(["--help"]) == 0
+    out = capsys.readouterr().out
+    assert "tools/make_help_card.py" in out
+    assert "static/help.jpg" in out
+    assert "help_card_content" in out, "要指出图上文字在哪个文件（改命令时才知道去改哪儿）"
+    assert "tools/check_assets.py" in out
+
+
 def test_config_no_longer_carries_an_admin_key():
     """配置模型里没有 ``admin`` 字段了：读回旧库也不会再冒出一把「主 KEY」。
 

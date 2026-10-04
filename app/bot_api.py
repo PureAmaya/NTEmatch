@@ -11,7 +11,7 @@
 | `GET /api/bot/manifest` | 能力清单（有哪些查询、各自能问什么） |
 | `GET /api/bot/events` | 届次的结构化列表（比纯文本更好解析，供脚本 / 其它接入方用） |
 | `GET /api/bot/participants` | 本届参与者的 QQ（插件用它发真正的 @） |
-| `GET /api/bot/managers` | **有资格召集**的人的 QQ（服务器管理员 + 举办者） |
+| `GET /api/bot/managers` | **有资格召集**的人的 QQ（**该届创建者** + 服务器管理员）；带 `qq` 时另回他自己创建过哪些届 |
 | `GET /api/bot/query` | 直接拿到**可以原样发到群里**的纯文本（分段已切好） |
 | `GET /api/bot/whoami` | 按 QQ 认人：这个人在站内是什么身份、有没有权限 |
 | `POST /api/bot/members` | 群里授权 / 添加成员（**仅服务器管理员**；新建成员时**站点直接把密钥私聊给本人**） |
@@ -292,20 +292,29 @@ async def api_bot_manifest(
                 "note": "全局信息（不挑届次）：主直播间 + 正在推流的选手 / 成员机位",
             },
             {"command": "比赛列表", "kind": "list", "args": "页码（可选）", "alias": ["全部比赛", "历届", "往届", "比赛目录", "有哪些比赛"]},
-            {"command": "比赛届次", "kind": "—", "args": "—", "alias": ["届次列表", "比赛编号"], "note": "用 /api/bot/events"},
-            {"command": "比赛信息", "kind": "event", "args": "届次（可选）", "alias": ["赛事信息", "比赛时间", "nteginfo"]},
-            {"command": "比赛进度", "kind": "progress", "args": "届次（可选）", "alias": ["进度", "赛程", "赛程进度", "现在打谁", "打到哪了", "谁领先", "什么情况"]},
-            {"command": "比赛下一场", "kind": "next", "args": "届次（可选）", "alias": ["下一场", "下场", "接下来", "现在打", "接着打谁", "等下打谁"]},
-            {"command": "比赛结果", "kind": "result", "args": "届次（可选）", "alias": ["结果", "成绩", "比分", "赢了吗", "什么比分", "结果咋样"]},
-            {"command": "比赛冠军", "kind": "champion", "args": "届次（可选）", "alias": ["冠军", "榜首", "谁赢了"]},
-            {"command": "比赛名单", "kind": "roster", "args": "届次（可选）", "alias": ["参赛名单", "选手名单", "比赛选手", "队伍", "都有谁"]},
-            {"command": "比赛详情", "kind": "detail", "args": "届次 + 场次（可选）", "alias": ["赛事详情", "场次详情", "单场"]},
+            {
+                "command": "比赛届次",
+                "kind": "ids",
+                "args": "「我的」/ 页码（都可选）",
+                "alias": ["届次列表", "比赛编号"],
+                "note": (
+                    "编号与名称（分页）。写「我的」只看自己创建的；一页装不下时插件会私聊发本人"
+                    "（不是群发）"
+                ),
+            },
+            {"command": "比赛信息", "kind": "event", "args": "届次（必填）", "alias": ["赛事信息", "比赛时间", "nteginfo"]},
+            {"command": "比赛进度", "kind": "progress", "args": "届次（必填）", "alias": ["进度", "赛程", "赛程进度", "现在打谁", "打到哪了", "谁领先", "什么情况"]},
+            {"command": "比赛下一场", "kind": "next", "args": "届次（必填）", "alias": ["下一场", "下场", "接下来", "现在打", "接着打谁", "等下打谁"]},
+            {"command": "比赛结果", "kind": "result", "args": "届次（必填）", "alias": ["结果", "成绩", "比分", "赢了吗", "什么比分", "结果咋样"]},
+            {"command": "比赛冠军", "kind": "champion", "args": "届次（必填）", "alias": ["冠军", "榜首", "谁赢了"]},
+            {"command": "比赛名单", "kind": "roster", "args": "届次（必填）", "alias": ["参赛名单", "选手名单", "比赛选手", "队伍", "都有谁"]},
+            {"command": "比赛详情", "kind": "detail", "args": "届次（必填） + 场次（可选）", "alias": ["赛事详情", "场次详情", "单场"]},
             {
                 "command": "比赛召集",
                 "kind": "call",
-                "args": "届次（可选）",
+                "args": "届次（必填）",
                 "alias": ["召集参赛", "集合", "喊人"],
-                "note": "@ 由插件用 At 组件发；只有本届举办者 / 服务器管理员能召集（名单见 /api/bot/managers）",
+                "note": "@ 由插件用 At 组件发；只有本届创建者（举办者）/ 服务器管理员能召集（名单见 /api/bot/managers）",
             },
             {
                 "command": "比赛我的",
@@ -396,45 +405,106 @@ async def api_bot_participants(
     }
 
 
+def _events_of_qq(events: list[dict[str, Any]], qq: str) -> list[dict[str, Any]]:
+    """从届次列表里挑出这个 QQ **自己创建**的那些。
+
+    认人靠 QQ：``ownerUid`` → 成员资料 → ``qq``（群里只能靠 QQ 认人，这是唯一的对号方式）。
+    与 ``/managers`` 的 ``mine`` 同一口径——那边的「你能召集哪些届」就是这里的子集。
+
+    过滤放在**站点**这一侧：插件不该自己去猜谁是创建者（它拿不到 uid 与成员表）。
+    """
+    if not qq:
+        return []
+    by_uid = {m.uid: m for m in store.members() if m.active}
+    out: list[dict[str, Any]] = []
+    for item in events:
+        owner = by_uid.get(str(item.get("ownerUid") or ""))
+        if owner and str(owner.qq or "") == qq:
+            out.append(item)
+    return out
+
+
+async def _callable_events(qq: str) -> list[dict[str, str]]:
+    """这个 QQ **自己创建**的届——也就是他能召集的那些。
+
+    为什么要它：一个赛事管理员在群里被拒时，光说「你不是本届创建者」他无从下手——
+    他可能只是**写错了届次**。有了这份清单，插件就能直接告诉他
+    「你自己创建的届是「小队长杯」（e005），用『比赛召集 e005』」。
+
+    口径与 ``/api/bot/events`` 一致：隐藏届不算（那种届机器人也解析不到），
+    回的是 ``{id, name}``，不含 uid。
+    """
+    visible = [item for item in await store.list_events() if not item.get("hidden")]
+    return [
+        {"id": str(item["id"]), "name": str(item.get("name") or item["id"])}
+        for item in _events_of_qq(visible, qq)
+    ]
+
+
 @router.get("/managers")
 async def api_bot_managers(
     event_id: str = Query(default="", alias="eventId"),
+    qq: str = Query(default="", description="提问者的 QQ；填了就顺便回他自己能召集哪些届"),
     _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
 ) -> dict[str, Any]:
-    """本届**有资格召集**的人的 QQ（服务器管理员 + 举办者）。
+    """本届**有资格召集**的人的 QQ（**该届创建者** + 服务器管理员）。
+
+    规则只有一条：**谁创建的届，谁可以召集**。服务器管理员另有一层全局权限
+    （他创建的届自然归他，别人建的届他也能召集）。所以这里**不看「赛事管理员」这个
+    身份**：一位赛事管理员能召集的是*他自己创建的那些届*，不是随便是哪一届。
 
     为什么要这个接口：召集会 @ 全场参赛者，属于「会打扰很多人」的动作；而**在群里
-    只能靠 QQ 认人**——谁是这一届的举办者，只有站点这边知道。插件拿这个名单比对
+    只能靠 QQ 认人**——谁是这一届的创建者，只有站点这边知道。插件拿这个名单比对
     发命令的人，不在名单里就拒绝。
 
-    只回 QQ 列表，不回 uid / 权限等其它信息；名单为空时 ``note`` 里说明原因
-    （常见原因：举办者还没在「我的」页填 QQ）。
+    另外两个字段是给**被拒的人**看的（插件据此把原因说清楚，见插件 ``_call_denied_text``）：
+
+    * ``owner``：本届创建者叫什么、有没有登记 QQ——「名单为空」时这句话就是全部解释；
+    * ``mine``：带 ``qq`` 参数时，回这个 QQ 自己创建的届（他可照着一句
+      「比赛召集 <届次>」召集自己那届）。
+
+    只回 QQ 列表与创建者的名字，不回 uid / 权限；名单为空时 ``note`` 里说明原因
+    （最常见：创建者还没在「我的」页填 QQ）。
     """
     target = (event_id or "").strip() or store.current_id
     try:
         cfg = store.snapshot() if target == store.current_id else await store.read_event(target)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=f"没有这一届：{target}") from exc
+    members = {m.uid: m for m in store.members()}
     owner_uid = str(cfg.event.owner_uid or "")
+    owner = members.get(owner_uid) if owner_uid else None
     qqs: list[str] = []
-    for member in store.members():
+    for member in members.values():
         if not member.active or not member.qq:
             continue
         if member.permission == "server_admin" or (owner_uid and member.uid == owner_uid):
             qqs.append(str(member.qq))
     unique = list(dict.fromkeys(qqs))
-    return {
+    if unique:
+        note = "召集权限：本届创建者 + 服务器管理员（按成员资料里的 QQ 认人）"
+    elif owner is not None and not owner.qq:
+        note = f"本届由「{owner.name}」创建，但他还没在站点登记 QQ，现在没有能召集的人"
+    else:
+        note = "本届没有登记 QQ 的创建者或服务器管理员，无法判断谁有资格召集"
+    payload: dict[str, Any] = {
         "ok": True,
         "eventId": target,
         "eventName": cfg.event.name or cfg.event.title,
         "qqs": unique,
         "count": len(unique),
-        "note": (
-            "召集权限：服务器管理员 + 本届举办者（按成员资料里的 QQ 认人）"
-            if unique
-            else "本届还没有登记 QQ 的服务器管理员或举办者，无法判断谁有资格召集"
-        ),
+        "owner": {
+            # 创建者的名字（站点成员列表里本来就公开）与「他登记 QQ 了没」。
+            # 「名单为空」时，这两项就是唯一说得清的原因（见 note 与插件提示）。
+            "name": (owner.name if owner else ""),
+            "hasQq": bool(owner and owner.qq),
+        },
+        "note": note,
     }
+    asker = (qq or "").strip()
+    if asker:
+        payload["mine"] = await _callable_events(asker)
+    return payload
 
 
 @router.get("/query")
@@ -444,6 +514,8 @@ async def api_bot_query(
     ref: str = Query(default=""),
     page: int = Query(default=1),
     at: bool = Query(default=True, description="召集类是否带 @ 片段（插件自己发 At 时传 0）"),
+    scope: str = Query(default="all", description="ids 用：all = 全部；mine = 只看这个 QQ 创建的"),
+    qq: str = Query(default="", description="发命令那个人的 QQ（scope=mine 时用）"),
     settings: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
 ) -> dict[str, Any]:
     """按类型组装**可直接发到群里**的纯文本。
@@ -456,11 +528,17 @@ async def api_bot_query(
     key = (kind or "event").strip().lower()
     if key not in qqbot.KINDS:
         raise HTTPException(status_code=400, detail=f"kind 只能是 {' / '.join(qqbot.KINDS)}")
+    scope_key = (scope or "all").strip().lower()
+    if scope_key not in ("all", "mine"):
+        raise HTTPException(status_code=400, detail="scope 只能是 all（全部）或 mine（自己创建的）")
+    if scope_key == "mine" and not _clean_qq(qq):
+        # 「只看自己创建的」不认人就没法做：宁可报清楚，也别悄悄回个空列表
+        raise HTTPException(status_code=400, detail="scope=mine 要带上 qq（发命令那个人的 QQ）")
     target = (event_id or "").strip() or store.current_id
     cfg = None
     state: dict[str, Any] = {}
-    # list 与 live 都是**全局**信息，不需要挑届次（live 是成员机位 / 主直播间的事）
-    if key not in ("list", "live"):
+    # list / ids / live 都是**全局**信息，不需要挑届次（live 是成员机位 / 主直播间的事）
+    if key not in ("list", "ids", "live"):
         try:
             if target == store.current_id:
                 cfg = store.snapshot()
@@ -472,17 +550,23 @@ async def api_bot_query(
             raise HTTPException(status_code=404, detail=f"没有这一届：{target}") from exc
     # 「当前直播」显式**真探一次**：这是有人此刻要答案的场合（最多等 3 秒，单飞锁防惊群）
     live_info = await live.collect_live() if key == "live" else None
+    events = await store.list_events()
+    if key == "ids" and scope_key == "mine":
+        # 「只看自己创建的」在站点这一侧过滤（认人靠 QQ：ownerUid → 成员 → qq），
+        # 插件拿到的就是成品——它不该自己去猜谁是届的创建者。
+        events = _events_of_qq(events, _clean_qq(qq))
     result = await asyncio.to_thread(
         qqbot.dispatch,
         key,
         settings=settings,
         cfg=cfg,
         state=state,
-        events=await store.list_events(),
+        events=events,
         ref=ref,
         page=page,
         members=store.members(),
         live_info=live_info,
+        scope=scope_key,
     )
     return {
         "ok": True,

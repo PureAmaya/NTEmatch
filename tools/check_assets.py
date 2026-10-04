@@ -8,13 +8,15 @@
 3. **导入的符号真的被导出**（``import { foo }`` 而 ``x.js`` 里根本没有 ``foo``）——
    这类错没有任何静态检查兜着，只有在浏览器里点开那个页面才会炸；
 4. ``index.html`` 里引用的 ``/static/...`` 文件真的存在；
-5. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）。
+5. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）；
+6. **帮助图不比它的文案旧**（``static/help.jpg`` 由脚本渲染，见该函数注释）。
 
 用法：``uv run python tools/check_assets.py``
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -193,6 +195,45 @@ def check_sync_tabs_fallback() -> list[str]:
     return []
 
 
+def _help_digest() -> str | None:
+    """当前文案「应该」对应的指纹（直接加载 tools/help_card_content.py：它是零依赖的）。"""
+    path = ROOT / "tools" / "help_card_content.py"
+    spec = importlib.util.spec_from_file_location("help_card_content", path)
+    if spec is None or spec.loader is None:  # pragma: no cover - 文件在就不会走到
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return str(module.source_digest())
+
+
+def check_help_card_freshness() -> list[str]:
+    """帮助图不能比它的文案旧（``static/help.jpg`` vs ``tools/help_card_content.py``）。
+
+    这张图是**代码渲染**的（``tools/make_help_card.py``），上面每一条命令群友都会照着打；
+    文案改了不重画，发出去的就是一张写着旧命令的图——命令精确匹配，照着打**毫无反应**，
+    而且群里没人知道为什么。图没有版本号（地址固定 ``/help.jpg``），所以出图时把源文件
+    指纹写进 ``static/help.jpg.src.sha256``，这里比对。没放图（帮助图是可选的）就跳过。
+    """
+    art = ROOT / "static" / "help.jpg"
+    if not art.exists():
+        print("  --  没有 static/help.jpg（帮助图可选，跳过）")
+        return []
+    want = _help_digest()
+    if want is None:  # pragma: no cover - 见上
+        return []
+    stamp = art.with_name(art.name + ".src.sha256")
+    got = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else ""
+    if got != want:
+        return [
+            (
+                "static/help.jpg 比它的文案旧（或指纹缺失）：跑一次 "
+                "`uv run --with pillow python tools/make_help_card.py` 重画"
+            )
+        ]
+    print("  OK  帮助图与文案同步（static/help.jpg）")
+    return []
+
+
 def main() -> int:
     print("前端静态资源自检：")
     problems = (
@@ -202,6 +243,7 @@ def main() -> int:
         + check_icons()
         + check_index_assets()
         + check_sync_tabs_fallback()
+        + check_help_card_freshness()
     )
     for line in problems:
         print(f"  !! {line}")
