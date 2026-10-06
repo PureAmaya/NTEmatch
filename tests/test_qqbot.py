@@ -226,6 +226,114 @@ def test_round_call_without_known_qq_says_so():
     assert "先在成员资料里补上 QQ" in text
 
 
+# --------------------------------------------------------------------------- #
+# 录分那一刻自动播报的那条：**只讲这一场**
+# --------------------------------------------------------------------------- #
+def _result_cfg(rounds):
+    from app.models import Config, Player
+
+    cfg = Config.model_validate(default_config())
+    cfg.event.name = "单场结果用例"
+    cfg.players = [Player(id="p1", name="白"), Player(id="p2", name="x")]
+    cfg.participants = []
+    cfg.rounds = rounds
+    return cfg
+
+
+def test_match_result_message_covers_one_match_only():
+    """届名 + 场次 + 比分 + 胜方 + 时间；**别的场次一个字都不提**。"""
+    from app import logic
+    from app.models import Round, Side
+
+    played = Round(
+        index=1,
+        code="G-A-1-1",
+        stage="group",
+        label="A 组 · 第 1 轮 · 第 1 场",
+        bracket_round=1,
+        slot=1,
+        status="done",
+        winner="A",
+        sides=[Side(player_ids=["p1"], score=3), Side(player_ids=["p2"], score=1)],
+        started_at="2026-10-06T21:05",
+        finished_at="2026-10-06T21:20",
+        duration_minutes=15,
+    )
+    other = Round(
+        index=2,
+        code="G-A-1-2",
+        stage="group",
+        label="A 组 · 第 1 轮 · 第 2 场",
+        bracket_round=1,
+        slot=2,
+        status="done",
+        winner="B",
+        sides=[Side(player_ids=["p1"], score=0), Side(player_ids=["p2"], score=5)],
+    )
+    cfg = _result_cfg([played, other])
+    text = qqbot.build_match_result_message(cfg, logic.round_view(cfg, played))
+    assert text.splitlines()[0] == "【NTE 比赛】单场结果用例 · 比赛结果"
+    assert "A 组 · 第 1 轮 · 第 1 场" in text
+    assert "白 3:1 vs x" in text
+    assert "胜方：白" in text
+    assert "时间：2026年10月6日 21:05 → 21:20（用时 15 分钟）" in text
+    assert "第 2 场" not in text and "0:5" not in text, "之前打过的场次不该出现在这条里"
+
+
+def test_match_result_message_lists_every_side_of_a_multi_team_heat():
+    """3~4 队同场：比分逐队列出 + 名次列全（第 1 名就是胜方）。"""
+    from app import logic
+    from app.models import Player, Round, Side
+
+    heat = Round(
+        index=1,
+        code="G-A-1-1",
+        stage="group",
+        label="A 组 · 第 1 轮 · 第 1 场",
+        bracket_round=1,
+        slot=1,
+        status="done",
+        winner="A",
+        sides=[
+            Side(player_ids=["p1"], score=3, rank=1),
+            Side(player_ids=["p2"], score=2, rank=2),
+            Side(player_ids=["p3"], score=1, rank=3),
+            Side(player_ids=["p4"], score=0, rank=4),
+        ],
+    )
+    cfg = _result_cfg([heat])
+    cfg.players = [
+        Player(id="p1", name="白"),
+        Player(id="p2", name="x"),
+        Player(id="p3", name="R"),
+        Player(id="p4", name="M"),
+    ]
+    text = qqbot.build_match_result_message(cfg, logic.round_view(cfg, heat))
+    assert "白 3 · x 2 · R 1 · M 0" in text
+    assert "名次：第 1 白，第 2 x，第 3 R，第 4 M" in text
+
+
+def test_match_result_message_says_draw():
+    """平局就直说「平局」，别去猜谁赢。"""
+    from app import logic
+    from app.models import Round, Side
+
+    rnd = Round(
+        index=1,
+        code="G-A-1-1",
+        stage="group",
+        label="A 组 · 第 1 轮 · 第 1 场",
+        bracket_round=1,
+        slot=1,
+        status="done",
+        winner="DRAW",
+        sides=[Side(player_ids=["p1"], score=1), Side(player_ids=["p2"], score=1)],
+    )
+    cfg = _result_cfg([rnd])
+    text = qqbot.build_match_result_message(cfg, logic.round_view(cfg, rnd))
+    assert "结果：平局" in text and "胜方" not in text
+
+
 def test_list_message_hint_points_to_a_real_command():
     """列表翻页提示必须让用户发**真实存在**的命令（以前写「发送「下一页」」）。"""
     events = [

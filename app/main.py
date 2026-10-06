@@ -676,8 +676,8 @@ async def lifespan(app: FastAPI):
     # 赛前提醒：开赛前一天 / 前两小时在群里 @ 举办者（见 app/remind.py）。
     # 只在「聊天机器人推送开着」且举办者登记了 QQ 时才真的发得出去。
     remind_task = asyncio.create_task(remind.loop())
-    # 打完后自动播报：每打完一轮在群里发一次比赛结果（见 app/announce.py）。
-    # 结算那一刻就会立刻试一次，这个巡检是兜底（重启 / 上次发失败 / 分两次录完）。
+    # 打完一场就播报一场：录分那一刻发一次**这一场**的结果（见 app/announce.py）。
+    # 结算时就会立刻试一次，这个巡检是兜底（重启 / 上次发失败）。
     announce_task = asyncio.create_task(announce.loop())
     # 直播常驻探测：**没人访问也一直在探**（间隔见 live.WATCH_INTERVAL），
     # 状态变了就通过 WebSocket 推给在线客户端；请求路径始终只读缓存、一秒都不等它。
@@ -2880,7 +2880,7 @@ async def api_round_status(
 
     cfg = await store.mutate(_round_mutator(ref, apply), actor="web:round-status")
     if status != "done":
-        # 退回「未开始 / 进行中」＝这一轮又没打完了：同样清掉自动播报的标记
+        # 退回「未开始 / 进行中」＝这一场又没结果了：同样清掉自动播报的标记
         await announce.forget(cfg, ref)
     return {"ok": True, "revision": cfg.revision}
 
@@ -2894,10 +2894,7 @@ _ROUND_TIME_FIELDS = (
 
 @app.post("/api/rounds/{ref}/walkover")
 async def api_round_walkover(
-    ref: str,
-    payload: RoundWalkoverPayload,
-    request: Request,
-    _: Session = Depends(require_current_event),
+    ref: str, payload: RoundWalkoverPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """判某一方弃权（长期没人 / 人数不足）：该方垫底，其余各方自动晋级。
 
@@ -2957,8 +2954,8 @@ async def api_round_walkover(
         reason,
         settled.winner if settled else "",
     )
-    # 弃权也可能把这一轮打完（两方对阵时直接结算），与录分走同一条自动播报
-    asyncio.create_task(announce.after_settle(site=str(request.base_url).rstrip("/")))
+    # 弃权就是给这一场判了结果（两方对阵直接结算），与录分走同一条自动播报
+    asyncio.create_task(announce.after_settle())
     return {
         "ok": True,
         "revision": cfg.revision,
@@ -3036,10 +3033,7 @@ async def api_round_times(
 
 @app.post("/api/rounds/{ref}/result")
 async def api_round_result(
-    ref: str,
-    payload: RoundResultPayload,
-    request: Request,
-    _: Session = Depends(require_current_event),
+    ref: str, payload: RoundResultPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
     """录入比赛结果并结算。
 
@@ -3197,9 +3191,9 @@ async def api_round_result(
         len(payload.sets),
         payload.duration_minutes,
     )
-    # 每打完一轮自动播报一次比赛结果（见 app/announce.py）：**起个任务就跑、不等它**——
-    # 发图要几百毫秒，不该让人录完分还等在那里；出错也只记日志，巡检会再兜一次。
-    asyncio.create_task(announce.after_settle(site=str(request.base_url).rstrip("/")))
+    # 立刻播报**这一场**的结果（见 app/announce.py）：**起个任务就跑、不等它**——
+    # 发消息要几百毫秒，不该让人录完分还等在那里；出错也只记日志，巡检会再兜一次。
+    asyncio.create_task(announce.after_settle())
     return {
         "ok": True,
         "revision": cfg.revision,
@@ -3253,8 +3247,8 @@ async def api_round_reset(ref: str, _: Session = Depends(require_current_event))
             rnd["note"] = "｜".join(part for part in kept if part.strip())
 
     cfg = await store.mutate(_round_mutator(ref, apply), actor="web:round-reset")
-    # 重置之后这一轮不再算「打完」：把自动播报的去重标记清掉，
-    # 改完数据重新结算时会**再播报一次**（留着标记不改才奇怪）。
+    # 重置之后这一场不再算「有结果」：把自动播报的去重标记清掉，
+    # 改完数据重新录分时会**再播报一次**（留着标记不改才奇怪）。
     await announce.forget(cfg, ref)
     return {"ok": True, "revision": cfg.revision}
 

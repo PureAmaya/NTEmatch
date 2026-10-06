@@ -1281,6 +1281,55 @@ def build_result_message(cfg: Config, state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_match_result_message(cfg: Config, rnd: dict[str, Any]) -> str:
+    """**一场**比赛的结果（``rnd`` 是 ``logic.round_view`` 的那一场）。
+
+    自动播报（见 :mod:`app.announce`）用的就是它：录分那一刻发一条「刚刚这场怎么样」。
+    与 :func:`build_result_message` 的分工是**内容边界**——那一份是整届（已赛场次 +
+    排名 + 逐场比分），只配手工推送；自动播报要是一并发整届，等于把之前打过的场次再刷
+    一遍屏（用户明确不要这个）。
+    """
+    sc = cfg.rules.scoring
+    name = cfg.event.name or cfg.event.title or "比赛"
+    sides = rnd.get("sides") or []
+    lines = [
+        f"【NTE 比赛】{name} · 比赛结果",
+        str(rnd.get("label") or rnd.get("code") or "本场"),
+        logic.round_sides_text(rnd, sc),
+    ]
+    winner = str(rnd.get("winner") or "")
+    if winner == "DRAW":
+        lines.append("结果：平局")
+    elif winner and len(sides) > 2:
+        # 同场 3~4 队：按名次列一遍（第 1 名就是胜方），别只报「谁赢」把其余队伍丢掉
+        ranked = sorted((s for s in sides if s.get("rank")), key=lambda s: int(s.get("rank") or 0))
+        if ranked:
+            lines.append(
+                "名次：" + "，".join(f"第 {int(s.get('rank'))} {logic.side_label(s)}" for s in ranked)
+            )
+    elif winner:
+        hit = next((s for s in sides if s.get("winner")), None)
+        lines.append(f"胜方：{logic.side_label(hit) if hit else winner}")
+    sets = rnd.get("sets") or []
+    if sets:
+        # 各轮成绩按计分口径显示（时间型 / 小数 / 整数），与网页同一套
+        lines.append(
+            f"各轮{sc.label_text}："
+            + " / ".join(f"{sc.format(i.get('a', 0))}:{sc.format(i.get('b', 0))}" for i in sets)
+        )
+    start = _fmt_dt(rnd.get("startedAt") or "", with_weekday=False)
+    end = _fmt_dt(rnd.get("finishedAt") or "", with_weekday=False)
+    when = start
+    if start and end and start.split(" ", 1)[0] == end.split(" ", 1)[0]:
+        when = f"{start} → {end.split(' ', 1)[-1]}"  # 同一天只写一次日期
+    elif end:
+        when = f"{start} → {end}" if start else end
+    minutes = int(rnd.get("durationMinutes") or rnd.get("duration") or 0)
+    if when:
+        lines.append(f"时间：{when}" + (f"（用时 {minutes} 分钟）" if minutes else ""))
+    return "\n".join(lines)
+
+
 def build_next_message(cfg: Config, state: dict[str, Any]) -> str:
     """下一场（正在打就报正在打的）：只回答「接下来看哪场」，比进度更聚焦。"""
     name = cfg.event.name or cfg.event.title or "比赛"

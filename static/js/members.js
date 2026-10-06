@@ -644,8 +644,8 @@ function qqbotPanelHtml() {
     fieldText('remindLeads', '提前量（分钟，逗号分隔）', q.remindLeads || '1440,120', {
       hint: '默认「前一天 + 前 2 小时」；只在【提前量 − 1 小时, 提前量】窗口内发，避免服务重启后把「明天开赛」补发成错话',
     }) +
-    // 打完后自动播报：站点侧巡检（app/announce.py），每打完一轮发一次比赛结果
-    fieldSwitch('autoResultEnabled', '打完后自动播报（每打完一轮发一次比赛结果）', q.autoResultEnabled !== false) +
+    // 打完就播报：录分那一刻发一条**这一场**的结果（app/announce.py）
+    fieldSwitch('autoResultEnabled', '打完自动播报（每场录完比分发一条本场结果）', q.autoResultEnabled !== false) +
     // 出厂**不预填**任何地址：别人的 AstrBot 地址留在这里，新装的人会「看着配好了、
     // 其实把消息推给了别人」，与直播地址同一个坑。
     fieldText('baseUrl', 'AstrBot 地址', q.baseUrl || '', {
