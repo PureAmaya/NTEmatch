@@ -83,6 +83,23 @@ def _self_id(event) -> str:
     return str(getattr(obj, "self_id", "") or "")
 
 
+def _stream_key_arg(*raw: str) -> str:
+    """从命令参数里挑出「流名」，只剔掉**纯数字**。
+
+    为什么要剔：``比赛直播注册`` 既可能带流名（``比赛直播注册 tom``），也可能只是 @ 了个人
+    （``比赛直播注册 @某人``）——平台有时会把被 @ 的 QQ 当成一个参数传进来，
+    而「一串纯数字」当流名没有任何意义（还会把别人的号段占成流名）。
+
+    其余参数**原样交给站点**去校验：错字要当场报错，不能静默换一个自动流名
+    （那会让人以为「我起的名字生效了」）。
+    """
+    for chunk in raw:
+        text = str(chunk or "").strip()
+        if text and not text.isdigit():
+            return text
+    return ""
+
+
 def _at_targets(event) -> list[str]:
     """消息里**被 @ 的人**的 QQ（按顺序、去重）。
 
@@ -217,20 +234,25 @@ HELP_TEXT = (
     "· 比赛 [届次] —— 该届的信息 + 进度\n"
     "· 比赛直播 —— 现在谁在直播（主直播间 + 选手 / 成员机位的观看地址）\n"
     "· 比赛列表 [页码] —— 全部赛事\n"
-    "· 比赛信息 [届次] —— 时间 / 赛制 / 人数 / 简介 / 是否排名\n"
+    "· 比赛信息 [届次] —— 时间 / 赛制 / 人数 / 简介 / 比赛规则（发一张卡片图）\n"
     "· 比赛进度 [届次] —— 已赛多少、正在打谁 vs 谁\n"
     "· 比赛下一场 [届次] —— 接下来看哪场（含计划时间）\n"
     "· 比赛结果 [届次] —— 冠军 / 榜单 + 逐场比分\n"
     "· 比赛详情 [届次] [场次] —— 综合信息；给场次编号就细说那一场\n"
     "· 比赛名单 [届次] —— 参赛名单（选手 / 队伍 / 替补）\n"
     "· 比赛冠军 [届次] —— 冠军（或积分制榜首前三）\n"
+    "· 比赛UID [@某人] —— 游戏 UUID（群里直接回；不 @ 就是你自己）\n"
     "· 比赛届次 [我的] [页码] —— 届次编号与名称（填参数前先发它；写「我的」只看自己创建的，\n"
     "  一页装不下时私聊发你）\n"
     "· 比赛召集 [届次] —— @ 参赛者到场（本届创建者＝举办者 / 服务器管理员，带冷却）\n"
-    "· 比赛我的 —— 你自己的推流地址 + 直播间地址（私聊发你）\n"
+    "· 比赛我的 —— 你的推流地址 + 直播间地址（私聊发你）\n"
+    "· 比赛直播注册 [流名] [@某人] —— 开播要用的东西一次给全：缺推流码 / 令牌就补上，\n"
+    "  连推流地址与注意事项一起私聊发本人\n"
+    "· 比赛资料 [字段 新值] [@某人] —— 资料 + 每项怎么改（私聊发你），\n"
+    "  字段：名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ；写「清空」就清掉那一项\n"
     "· 比赛重置密钥 [@某人] —— 换登录密钥（旧密钥立即失效；私聊发本人）\n"
     "· 比赛重置令牌 [@某人] —— 换直播令牌（要先有推流码；私聊发本人）\n"
-    "· 比赛改推流码 <流名> [@某人] —— 改推流码（英文 / 数字；令牌不变）\n"
+    "· 比赛改推流码 <流名> [@某人] —— 改推流码（等同「比赛资料 推流码 <流名>」）\n"
     "· 比赛授权 @某人 —— 把群友设为赛事管理员（仅服务器管理员；不是成员会自动建号）\n"
     "· 比赛添加 @某人 —— 把群友添加为普通成员（仅服务器管理员；密钥私聊发给本人）\n"
     "· 比赛帮助 —— 就是本条（私聊发你）\n"
@@ -240,17 +262,23 @@ HELP_TEXT = (
     "—— 怎么参加 ——\n"
     "参赛不用自己注册：本届举办者在站点里把你排进名单就行，群里 @ 你就是要开打了。\n"
     "想用「比赛我的」查自己的推流地址，得先成为成员（服务器管理员发：比赛添加 @你）。\n"
-    "「比赛我的 / 比赛重置密钥 / 比赛重置令牌 / 比赛改推流码」不 @ 人就是**只动自己那份**\n"
-    "（按你发命令的 QQ 认人）；带上 @某人 才是替 TA 改，那要服务器管理员，新值也只发 TA 本人。\n"
+    "—— 你自己的东西 ——\n"
+    "不知道从哪下手就发「比赛资料」：它会把你现在有什么、每一项怎么改都列出来。\n"
+    "要开播（推流）发「比赛直播注册」：缺推流码就给你一个、缺令牌就发一把，\n"
+    "推流地址与 OBS 注意事项一起私聊发你；只顾着查地址就发「比赛我的」。\n"
+    "游戏 UUID 发「比赛UID」（群里就能看，@ 某人可以看别人的）。\n"
+    "「比赛我的 / 比赛资料 / 比赛直播注册 / 比赛重置密钥 / 比赛重置令牌 / 比赛改推流码」\n"
+    "不 @ 人就是**只动自己那份**（按你发命令的 QQ 认人）；带上 @某人 才是替 TA 做，\n"
+    "那要服务器管理员，结果也只发 TA 本人。\n"
     "—— 怎么触发 ——\n"
     "要先 @ 机器人 再说命令，或按 AstrBot 里设的唤醒前缀发（例如「/比赛进度」）。\n"
     "光打「比赛进度」不会触发：这是 AstrBot 的命令过滤规则（必须被 @ 或命中唤醒前缀），\n"
     "不是本插件能改的——不 @ 就不会有任何回复。\n"
     "—— 会私聊发给你的东西 ——\n"
-    "命令说明、你自己的推流地址、届次很多时的届次列表、新成员的登录密钥都走私聊\n"
+    "命令说明、你自己的推流地址、资料、届次很多时的届次列表、新成员的登录密钥都走私聊\n"
     "（只该你看到）。\n"
-    "私聊发不出去（没加机器人好友）时，地址与说明会退回群里；\n"
-    "但**登录密钥不会**——密钥只显示一次，泄在群里等于白送一个账号。"
+    "私聊发不出去（没加机器人好友）时，资料与说明会退回群里；\n"
+    "但**登录密钥与直播令牌不会**——它们只显示一次，泄在群里等于白送一个账号。"
 )
 
 
@@ -458,13 +486,32 @@ class NTEMatchPlugin(star.Star):
         return "", f"没找到「{raw}」这一届。可用编号：{listed}\n（发「比赛届次」看全部）"
 
     async def _run(self, kind: str, event_id: str = "", ref: str = "", page: int = 1):
-        """公共流程：解析届次 → 查询 → 逐段产出文本。"""
+        """公共流程：解析届次 → 查询 → 逐块产出结果。
+
+        块有两种：``("image", 地址)``（服务端生成的比赛卡片：信息 + 自动生成的规则）
+        与 ``("text", 内容)``。**顺序就是服务端给的顺序**（先图后文），别在这里重排——
+        「比赛信息」有卡片时，文字部分只省下一行说明（内容都在图里）。
+
+        站点没装 Pillow 时 ``card`` 为 null、文本里也已经带了规则摘要，
+        所以这里**不需要**分支：有图就发图，没图就发文本。
+        """
         target, error = await self._resolve_event(event_id)
         if error:
-            yield error
+            yield ("text", error)
             return
-        for text in self._texts(await self._query(kind, target, ref, page)):
-            yield text
+        data = await self._query(kind, target, ref, page)
+        card = data.get("card") or {}
+        if card.get("url"):
+            yield ("image", str(card["url"]))
+        for text in self._texts(data):
+            yield ("text", text)
+
+    def _emit(self, event, block):
+        """把一块结果变成 AstrBot 的返回：图走 ``image_result``，文本走 ``plain_result``。"""
+        kind, value = block
+        if kind == "image":
+            return _image_result(event, value)
+        return event.plain_result(value)
 
     def _call_allowed(self, event) -> tuple[bool, str]:
         """「召集」的冷却闸：同一会话的最小间隔 + 每小时上限。
@@ -689,11 +736,139 @@ class NTEMatchPlugin(star.Star):
         async for item in self._credential(event, "streamId", key):
             yield item
 
+    # ------------------------------------------------------------------ #
+    # 资料 / 直播注册 / 游戏 UUID：用户自助（管理员可 @ 代办，私信仍只发本人）
+    # ------------------------------------------------------------------ #
+    @filter.command("比赛资料", alias={"我的资料", "个人资料", "改资料", "比赛我的资料"})
+    async def cmd_profile(self, event: AstrMessageEvent, field: str = "", value: str = "", more: str = ""):
+        """查看 / 修改自己的资料（**私聊发你**）：QQ、名字、游戏 UUID、B站 房间号、推流码、直播间标题。
+
+        用法一：``比赛资料`` —— 私聊发完整资料，并把「每一项怎么改」一起写清楚；
+        用法二：``比赛资料 名字 新名字``（字段可以是 名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ）；
+        用法三：``比赛资料 B站 清空`` —— 清掉那一项。
+
+        为什么统一成这一条：以前「改推流码」单独一条、改名 / 改 UUID 没有入口，
+        用户得记好几条命令。现在**一条命令一块表**，私聊那份资料里还写着每种改法。
+
+        结果**只私聊发给被改的那个人**：服务器管理员 @ 某人 代办时，私聊也发给 TA
+        （要发给谁由站点回的 ``toQq`` 决定，插件不会发错人）。
+        """
+        who = _sender_id(event)
+        if not who:
+            yield event.plain_result("没识别到你的 QQ，请稍后再试。")
+            return
+        targets = _at_targets(event)
+        target = targets[0] if targets else ""
+        args = [str(x).strip() for x in (field, value, more) if str(x or "").strip()]
+        if target:
+            # 被 @ 的人的 QQ 有时会混进参数里：它不是字段名，剔掉
+            args = [x for x in args if not (x.isdigit() and x == target)]
+        if not args:
+            data = await self._get("profile", qq=who, targetQq=target)
+        else:
+            data = await self._post(
+                "profile",
+                {
+                    "qq": who,
+                    "targetQq": target,
+                    "field": args[0],
+                    "value": " ".join(args[1:]) if len(args) > 1 else "",
+                },
+            )
+        if not data.get("ok"):
+            yield event.plain_result(str(data.get("error") or "操作失败"))
+            return
+        to_qq = str(data.get("toQq") or target or who)
+        text = "\n\n".join(data.get("parts") or []) or str(data.get("text") or "")
+        other = bool(data.get("forOther"))
+        changed = [str(x) for x in (data.get("changed") or [])]
+        sent = await self._notify(to_qq, text)
+        note = ("已改：" + "、".join(changed)) if changed else "资料"
+        if sent.get("ok"):
+            if other:
+                yield event.plain_result(f"{note}；新资料只私聊发给了 TA 本人（你这边看不到）。")
+                return
+            yield event.plain_result(f"{note}已私聊发给你，去查收（每项怎么改也写在里面）。")
+            return
+        if other:
+            yield event.plain_result(
+                f"{note}；但私聊没能发给 TA（{sent.get('error') or '未知原因'}）。\n"
+                "让 TA 加机器人好友后自己发一次「比赛资料」就能看到。"
+            )
+            return
+        # 自己看自己的资料：没有敏感内容（密钥 / 令牌只有「有没有设置」），
+        # 私聊发不出去时直接回在群里，别让人白等
+        yield event.plain_result(
+            f"（私聊没发出去：{sent.get('error') or '未知原因'}，直接回在这里）\n{text}"
+        )
+
+    @filter.command("比赛直播注册", alias={"直播注册", "开播注册", "注册直播", "比赛开播注册"})
+    async def cmd_stream_setup(self, event: AstrMessageEvent, arg1: str = "", arg2: str = ""):
+        """直播注册：把「开播要用的东西」一次给你（**缺什么补什么**）。
+
+        三种情况：
+        * 没推流码也没令牌 → 生成推流码 + 一把新令牌，连推流地址与注意事项一起私聊给你；
+        * 只有推流码 → 推流码照用，补一把新令牌；
+        * 两个都有 → **什么都不改**，只把推流码 / 推流地址 / 直播间地址与注意事项给你，
+          并提醒「令牌忘了就再发一次这条命令」。
+
+        还能顺手指定流名：``比赛直播注册 tom``。管理员 @ 某人 可代办，私聊仍只发 TA。
+        """
+        who = _sender_id(event)
+        if not who:
+            yield event.plain_result("没识别到你的 QQ，请稍后再试。")
+            return
+        targets = _at_targets(event)
+        data = await self._post(
+            "stream-setup",
+            {
+                "qq": who,
+                "targetQq": targets[0] if targets else "",
+                "streamKey": _stream_key_arg(arg1, arg2),
+            },
+        )
+        if not data.get("ok"):
+            yield event.plain_result(str(data.get("error") or "操作失败"))
+            return
+        note = str(data.get("note") or "已处理")
+        other = bool(data.get("forOther"))
+        if data.get("sent"):
+            if other:
+                yield event.plain_result(f"{note}——让 TA 去私聊查收（你这边看不到内容）。")
+                return
+            yield event.plain_result(f"{note}，去私聊查收（推流地址、令牌与注意事项都在里面）。")
+            return
+        # 私聊发不出去：**绝不把令牌打进群**（它等同于推流凭据，泄了就能顶掉他的画面）
+        if other:
+            yield event.plain_result(
+                f"{note}；但私聊没能发给 TA（{data.get('detail') or '未知原因'}）。\n"
+                "让 TA 加机器人好友后自己发一次「比赛直播注册」——那时才拿得到令牌。"
+            )
+            return
+        yield event.plain_result(
+            f"{note}；但私聊没能发出去（{data.get('detail') or '未知原因'}）。\n"
+            "令牌不能在群里发，所以：先加机器人好友，再发一次「比赛直播注册」就能拿到。"
+        )
+
+    @filter.command("比赛UID", alias={"游戏UID", "游戏uuid", "我的UID", "异环UID", "比赛uid"})
+    async def cmd_uid(self, event: AstrMessageEvent):
+        """游戏 UUID：**群里直接回**——不用私聊、也不用管理员权限。
+
+        不 @ 人 = 查自己；``比赛UID @某人`` = 查那个人。举办者收名单时要的就是这一串
+        （游戏里加人得靠它），所以它必须能在群里当着人答出来。
+        """
+        data = await self._get("uid", qq=_sender_id(event), targetQq=(_at_targets(event) or [""])[0])
+        if not data.get("ok"):
+            yield event.plain_result(str(data.get("error") or "查询失败"))
+            return
+        for text in self._texts(data):
+            yield event.plain_result(text)
+
     @filter.command("比赛", alias={"当前比赛", "赛事", "ntematch"})
     async def cmd_current(self, event: AstrMessageEvent):
         """当前赛事的信息 + 进度。"""
-        async for text in self._run("detail"):
-            yield event.plain_result(text)
+        async for block in self._run("detail"):
+            yield self._emit(event, block)
 
     @filter.command(
         "比赛直播",
@@ -756,9 +931,9 @@ class NTEMatchPlugin(star.Star):
 
     @filter.command("比赛信息", alias={"赛事信息", "比赛时间", "nteginfo"})
     async def cmd_event(self, event: AstrMessageEvent, event_id: str = ""):
-        """某一届的比赛信息。"""
-        async for text in self._run("event", event_id):
-            yield event.plain_result(text)
+        """某一届的比赛信息：**发一张卡片图**（名字 / 时间 / 赛制 / 人数 + 完整比赛规则）。"""
+        async for block in self._run("event", event_id):
+            yield self._emit(event, block)
 
     @filter.command(
         "比赛进度",
@@ -766,44 +941,44 @@ class NTEMatchPlugin(star.Star):
     )
     async def cmd_progress(self, event: AstrMessageEvent, event_id: str = ""):
         """赛程进展：已赛多少、正在打谁 vs 谁。"""
-        async for text in self._run("progress", event_id):
-            yield event.plain_result(text)
+        async for block in self._run("progress", event_id):
+            yield self._emit(event, block)
 
     @filter.command(
         "比赛下一场", alias={"下一场", "下场", "接下来", "现在打", "接着打谁", "等下打谁"}
     )
     async def cmd_next(self, event: AstrMessageEvent, event_id: str = ""):
         """接下来看哪一场（正在打就报正在打的）。"""
-        async for text in self._run("next", event_id):
-            yield event.plain_result(text)
+        async for block in self._run("next", event_id):
+            yield self._emit(event, block)
 
     @filter.command(
         "比赛结果", alias={"结果", "成绩", "比分", "nte结果", "赢了吗", "什么比分", "结果咋样"}
     )
     async def cmd_result(self, event: AstrMessageEvent, event_id: str = ""):
         """比赛结果：冠军 / 榜单 + 逐场比分。"""
-        async for text in self._run("result", event_id):
-            yield event.plain_result(text)
+        async for block in self._run("result", event_id):
+            yield self._emit(event, block)
 
     @filter.command("比赛冠军", alias={"冠军", "榜首", "谁赢了"})
     async def cmd_champion(self, event: AstrMessageEvent, event_id: str = ""):
         """冠军（锦标赛）或榜首前三（积分制）。"""
-        async for text in self._run("champion", event_id):
-            yield event.plain_result(text)
+        async for block in self._run("champion", event_id):
+            yield self._emit(event, block)
 
     @filter.command(
         "比赛名单", alias={"参赛名单", "选手名单", "比赛选手", "队伍", "都有谁"}
     )
     async def cmd_roster(self, event: AstrMessageEvent, event_id: str = ""):
         """参赛名单（选手 / 队伍 / 替补）。"""
-        async for text in self._run("roster", event_id):
-            yield event.plain_result(text)
+        async for block in self._run("roster", event_id):
+            yield self._emit(event, block)
 
     @filter.command("比赛详情", alias={"赛事详情", "场次详情", "单场"})
     async def cmd_detail(self, event: AstrMessageEvent, event_id: str = "", ref: str = ""):
         """某一届的详情；带场次编号（如 L-1）时细说那一场。"""
-        async for text in self._run("detail", event_id, ref):
-            yield event.plain_result(text)
+        async for block in self._run("detail", event_id, ref):
+            yield self._emit(event, block)
 
     @filter.command("比赛召集", alias={"召集参赛", "集合", "喊人"})
     async def cmd_call(self, event: AstrMessageEvent, event_id: str = ""):

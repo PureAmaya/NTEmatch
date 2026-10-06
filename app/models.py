@@ -14,7 +14,7 @@ from pydantic.alias_generators import to_camel
 from . import metrics
 
 # 选手对外可见的字段：只有名字与头像等展示信息（UUID / QQ / 推流流名不下发）
-PUBLIC_PLAYER_FIELDS = ("id", "name", "avatar", "tag", "substitute", "active", "member_uid")
+PUBLIC_PLAYER_FIELDS = ("id", "name", "avatar", "tag", "active", "member_uid")
 
 # 成员权限：成员 < 赛事管理员 < 服务器管理员。
 # 服务器管理员全局有且只有一个（程序启动时自检，见 store.ensure_server_admin）。
@@ -30,6 +30,8 @@ PUBLIC_MEMBER_FIELDS = (
     "game_uuid",
     "stream_id",
     "room_title",
+    # B站直播间号：本来就是公开信息（跳转地址里就有它），展示出来才能给观众跳转链接
+    "bili_room",
     "permission",
     "active",
 )
@@ -69,7 +71,11 @@ class NTEModel(BaseModel):
 # 选手 / 队伍
 # --------------------------------------------------------------------------- #
 class Player(NTEModel):
-    """参赛选手。``qq`` 用于拉取头像，``substitute`` 标记替补。"""
+    """参赛选手。``qq`` 用于拉取头像。
+
+    选手**没有**「替补」这一类别：谁上场由每场比赛的
+    :class:`Substitution` 决定，名单本身始终是一份完整的参赛池。
+    """
 
     id: str = ""
     name: str = ""
@@ -79,7 +85,6 @@ class Player(NTEModel):
     tag: str = ""             # 选手编号，如 NTE-07
     stream_key: str = ""      # 推流流名（如 stream / live），用于自动派生推流与播放地址
     note: str = ""
-    substitute: bool = False
     active: bool = True
     member_uid: str = ""      # 关联的全局成员（选手就是成员）；空 = 独立选手
 
@@ -208,6 +213,10 @@ class Member(NTEModel):
 
     ``stream_id`` 是这位成员的推流 ID（也是他在媒体服务器上的推流路径），
     与令牌一起构成推流凭据；只有两者同时正确才允许推流（见 ``live`` 模块）。
+
+    ``bili_room`` 是他的 **B站直播间号**（可空）。它和 MediaMTX 那套完全独立：
+    成员在 B站开播时，我们**只探测开播状态并直嵌官方外链播放器**，
+    视频流不经本站中继（见 ``live.bilibili_*``）。
     """
 
     uid: str = ""             # 网站用户 UUID（全局唯一，自动生成；不可修改）
@@ -217,6 +226,7 @@ class Member(NTEModel):
     game_uuid: str = ""       # 游戏内 UUID
     stream_id: str = ""       # 推流 ID（全局唯一）
     room_title: str = ""      # 直播间名字（成员可自行修改）
+    bili_room: str = ""       # B站直播间号（数字；空 = 没有 B站 直播间）
     note: str = ""
     permission: MemberPermission = "member"
     active: bool = True
@@ -257,6 +267,22 @@ class Member(NTEModel):
     def _clean_stream_id(cls, value: str) -> str:
         """只保留 URL 路径安全字符，避免拼出越界路径。"""
         return "".join(ch for ch in value.strip().strip("/") if ch.isalnum() or ch in "-_")
+
+    @field_validator("bili_room")
+    @classmethod
+    def _clean_bili_room(cls, value: str) -> str:
+        """B站房间号只留数字：直接粘房间链接 / 「房间号 12345」都能收。
+
+        非空却抠不出数字时**报错**而不是静默清空——否则用户以为填上了，
+        界面上却一直没有 B站 这一路，还得回来猜为什么。
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            raise ValueError("B站直播间号只能填数字（也可以直接粘直播间链接）")
+        return digits[:12]
 
     @property
     def display_name(self) -> str:
@@ -318,16 +344,16 @@ class LiveBan(NTEModel):
 class Side(NTEModel):
     """一场比赛中的一方（一方 = 一支固定队伍）。
 
-    ``score`` 与 ``points`` 的含义随同场队伍数**与比法**变化：
+    ``score`` 与 ``points`` 的含义随同场队伍数**与是否分了轮次**变化：
 
-    * 2 队（组 vs 组）：``score`` = 局分 / 大比分，``points`` = 总成绩（可选）
+    * 2 队、**填了轮次**：``score`` = 大比分（赢的轮数），``points`` = 各轮成绩合计
+    * 2 队、没填轮次：``score`` = 本场成绩，``points`` = 小分（可选）
     * 3~4 队同场：``score`` = 该场成绩（排名依据），``points`` = 细则分（可选）
 
-    比法（``rules.metric``，见 :mod:`app.metrics`）决定这个「成绩」是什么：
-
-    * 计分制：分数，越大越好（``points`` = 小分，越大越好）；
-    * 用时制：**毫秒**，越小越好（``points`` = 罚时，越小越好）；
-      ``score <= 0`` 表示未完赛 / 退赛，名次垫底。
+    这里的「成绩」是什么由 ``rules.scoring`` 决定（见 :mod:`app.metrics`）：
+    自然数 / 小数存**千分之一** / 时间存**毫秒**；方向由判断标准决定
+    （数值高胜或数值低胜）。**数值型的 0 是合法读数**（0 分），「未完赛 / 退赛 / 未填」
+    则是 ``MISSING``（``-1``）；时间型的 0 仍然是「没有成绩」。没有成绩的一方名次垫底。
 
     ``rank`` 为该场名次（1 起），由录入内容**自动推导**，用于小组赛名次分计算。
     """
@@ -335,7 +361,9 @@ class Side(NTEModel):
     player_ids: list[str] = Field(default_factory=list)
     team_id: str = ""
     label: str = ""
-    score: int = 0
+    # 本场成绩：默认「没有成绩」（MISSING）。注意 0 是**合法读数**（0 分），
+    # 所以「没填」不能用 0 表示，见 app/metrics.MISSING。
+    score: int = metrics.MISSING
     points: int = 0
     rank: int = 0
     forfeit: bool = False     # 弃权（长期没人 / 人数不足）：名次垫底，对方自动晋级
@@ -352,15 +380,16 @@ class Side(NTEModel):
 
 
 class SetScore(NTEModel):
-    """一局的小分（仅 2 队对阵有意义）。
+    """一轮的成绩（仅 2 队对阵有意义），也就是界面上的「第 N 轮」。
 
-    计分制下是分数（大者赢这局）；用时制下是**毫秒**（小者赢这局，
-    ``0`` = 该局未完赛）。两种比法下都由 :func:`app.tournament.judge_round`
-    汇总成局分与总成绩。
+    存的是该轮的**成绩**（按 ``rules.scoring`` 解析后的整数；时间 = 毫秒、
+    小数 = 千分之一）。数值型的 ``0`` 是合法读数，「没填」是 ``MISSING``——
+    整轮都没填的行由前端滤掉（后端也只按填了的那一方计），不会进这里。
+    胜负由判断标准决定，再由 :func:`app.tournament.judge_round` 汇总成大比分与合计成绩。
     """
 
-    a: int = 0
-    b: int = 0
+    a: int = metrics.MISSING
+    b: int = metrics.MISSING
 
 
 class Round(NTEModel):
@@ -384,7 +413,7 @@ class Round(NTEModel):
     sides: list[Side] = Field(default_factory=lambda: [Side(), Side()])
     winner: WinnerCode = ""
     note: str = ""
-    # 各局小分（2 队时用于自动推导局分与总得分）
+    # 各轮成绩（2 队时用于自动推导大比分与总成绩）
     sets: list[SetScore] = Field(default_factory=list)
     duration_minutes: int = 0  # 用时（分钟），0 = 未登记（回退到起止时间差）
     # 本场是否安排直播：直播开关 + 直播选手提示
@@ -470,6 +499,39 @@ class Round(NTEModel):
 
 
 # --------------------------------------------------------------------------- #
+# 替补（对局级，仅积分制）
+# --------------------------------------------------------------------------- #
+# 生效范围：
+#   round = 仅这一场比赛；
+#   rest  = 这一场比赛**及其之后**的比赛；
+#   event = 全场（本届所有比赛）。
+SubScope = Literal["round", "rest", "event"]
+
+
+class Substitution(NTEModel):
+    """一处替补：把 ``from_id`` 换成 ``to_id``，按 ``scope`` 决定影响哪些比赛。
+
+    替补**不是**选手的一种类别（名单里没有「替补选手」），而是「哪场比赛谁换谁」
+    的一条登记：报名池始终是完整的一份，谁上场由这里决定。
+
+    ``anchor`` 是生效起点（对局 ``code``）：``round`` 只影响这一场，``rest``
+    影响这一场及其之后的全部比赛；``event`` 从头到尾生效，因此不需要起点。
+
+    应用时会把阵容**真的改写进对局**（已结算的对局不改写，保留当时阵容与比分），
+    所以积分榜、场次与净胜分天然按真正上场的人统计；保留这条记录只为展示与取消。
+    """
+
+    id: str = ""
+    from_id: str = ""         # 被换下的选手
+    to_id: str = ""           # 替补上场的选手
+    scope: SubScope = "round"
+    anchor: str = ""          # 生效起点（对局 code）；scope=event 时为空
+    note: str = ""
+    created_at: str = ""
+    created_by: str = ""
+
+
+# --------------------------------------------------------------------------- #
 # 赛事配置
 # --------------------------------------------------------------------------- #
 class EventInfo(NTEModel):
@@ -522,29 +584,27 @@ class Rules(NTEModel):
 
     format: MatchFormat = "tournament"
 
-    # ---- 通用 ----
-    # 比法（metric）：**哪种数值更好**。方向只在 app/metrics.py 定义一处，
-    # 判定、名次、名次分、晋级与积分榜排序都建立在它上面。
-    #   score = 计分制：分数高者胜（排球、篮球、卡牌、电竞…）
-    #   time  = 用时制：用时短者胜（赛车、跑酷、速通…），数值单位是**毫秒**
+    # ---- 计分口径（见 app/metrics.py）----
+    # 类型决定怎么解析与怎么显示：
+    #   integer 自然数（原值）/ decimal 小数（存千分之一）/ time 时间（存毫秒）
+    value_type: str = ""
+    # 展示标签：得分 / 评分 / 用时 / 自定义；空 = 按类型给默认
+    value_label: str = ""
+    # 判断标准：high 数值高胜 / low 数值低胜；空 = 按类型推（时间 → 数值低胜）
+    better: str = ""
+    # 旧口径比法名（score / time）：只为读老数据与老版本兼容保留，
+    # 由 value_type 单向同步，**不要在业务代码里读它**（读 rules.scoring）。
     metric: str = "score"
     team_size: int = 2           # 每队上场人数（默认 2；可按队伍分别调整）
     teams_per_match: int = 2     # 每场同场竞技的队伍数：2 / 3 / 4（小组赛生效）
-    target_score: int = 0        # 单局目标分（仅计分制），0 表示不限制
+    target_score: int = 0        # 单局目标分（仅自然数 / 小数），0 表示不限制
     allow_draw: bool = False     # 是否允许平局（仅小组赛生效）
-    # 系列赛（BO）：一场分几局，1 = 一局定胜负。
-    # 判定方式见 logic.judge_round——填了各局小分时，「局分」就是各局胜负的计数，
-    # 所以三局两胜不需要单独一套结算：先拿到 ⌈best_of / 2⌉ 局者胜。
-    # 这里只负责「说清楚是几局几胜」并据此校验录入，不改判负逻辑。
-    # 用时制下同样适用：多局 = 跑几次，大比分仍是「赢了几局」，总成绩是各局合计。
-    best_of: int = 1
 
     # ---- 积分制（league）----
     points_win: int = 3          # 胜方积分
     points_lose: int = 0         # 负方积分
     points_draw: int = 1         # 平局积分
     total_rounds: int = 5        # 总轮次
-    include_substitutes: bool = True
     fair_rotation: bool = True   # 均衡出场、避免连续轮空与重复搭档
     min_rank_played: int = 5     # 参与排名的最少场次
 
@@ -553,14 +613,31 @@ class Rules(NTEModel):
     knockout_size: int = 0       # 淘汰赛规模（2 的幂），0 = 自动取最大可行值
     loser_bracket: bool = True   # 败者组开关：开 = 双败淘汰，关 = 输一场即淘汰
 
-    @field_validator("metric")
-    @classmethod
-    def _clean_metric(cls, value: str) -> str:
-        """比法只认 ``score`` / ``time``，其它一律回落到计分制。
+    @model_validator(mode="after")
+    def _normalize_scoring(self) -> Rules:
+        """把「计分类型 / 标签 / 判断标准」规整成一套完整口径。
 
-        老数据没有这个字段，因此默认值必须是「维持原行为」的那个。
+        老数据只有 ``metric``：``time`` → 时间 + 用时 + 数值低胜，其余 → 自然数 +
+        得分 + 数值高胜——数值一个字节都不动，只是把含义拆成了三个字段。
         """
-        return metrics.norm(value)
+        scoring = metrics.Scoring.resolve(
+            value_type=self.value_type,
+            label=self.value_label,
+            better=self.better,
+            metric=self.metric,
+        )
+        self.value_type = scoring.value_type
+        self.value_label = scoring.label
+        self.better = scoring.better
+        self.metric = metrics.legacy_metric(scoring.value_type)
+        return self
+
+    @property
+    def scoring(self) -> metrics.Scoring:
+        """本赛制的计分口径：判定、显示与解析都从它出发。"""
+        return metrics.Scoring(
+            value_type=self.value_type, label=self.value_label, better=self.better
+        )
 
     @field_validator("teams_per_match")
     @classmethod
@@ -571,16 +648,6 @@ class Rules(NTEModel):
     @classmethod
     def _clamp_team_size(cls, value: int) -> int:
         return max(1, min(6, int(value or 1)))
-
-    @field_validator("best_of")
-    @classmethod
-    def _clean_best_of(cls, value: int) -> int:
-        """系列赛只认奇数局（1 / 3 / 5 / 7）；其它值一律回落到一局定胜负。
-
-        偶数局会出现「各赢一半」，既没法判定也说不清楚，所以直接不收。
-        """
-        raw = int(value or 1)
-        return raw if raw in (1, 3, 5, 7) else 1
 
 
 class StreamConfig(NTEModel):
@@ -605,7 +672,6 @@ class StreamConfig(NTEModel):
     自签名证书时关掉即可——观众侧仍需要浏览器信任的证书。
     """
 
-    enabled: bool = True
     provider: str = "mediamtx"
     # 地址**一律出厂留空**：每一套部署的媒体服务器都不一样。这里也是「数据库里
     # 没有直播记录时的兜底值」，所以不能预填某个具体域名——否则新装的站点会
@@ -628,6 +694,17 @@ class StreamConfig(NTEModel):
     poster: str = ""
     title: str = "赛事直播"
     note: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        """直播**没有总开关**：只要有赛事就允许直播。
+
+        这个属性恒为 ``True``，只为兼容既有读法（``live.stream_endpoints``、
+        ``/api/private``）而保留——曾经的「启用直播」开关已随「赛事直播管理」一起移除：
+        关掉开关并不会让媒体服务器停止接受推流，只会让本站自己看不见直播，
+        是个只会误导人的假开关。真正要拦推流请用推流鉴权（见 README 的安全清单）。
+        """
+        return True
 
     @field_validator("push_token")
     @classmethod
@@ -707,8 +784,13 @@ class Config(NTEModel):
     players: list[Player] = Field(default_factory=list)
     rounds: list[Round] = Field(default_factory=list)
     # 本届实际参与的选手 ID；手填的「参与名单」。
-    # 为空表示未指定，视为报名池中全部启用选手参与（兼容旧数据）。
+    # ``participants_set=False`` 且名单为空 = **未指定**，视为报名池全员参与（兼容旧数据）；
+    # 一旦显式保存过（哪怕存的是空名单），``participants_set=True``——空名单就是空名单，
+    # 否则「全不选后保存」会被当成「没指定」而变回全员。
     participants: list[str] = Field(default_factory=list)
+    participants_set: bool = False
+    # 本届生效中的替补登记（仅积分制，见 :class:`Substitution`）
+    substitutions: list[Substitution] = Field(default_factory=list)
 
     @field_validator("participants")
     @classmethod

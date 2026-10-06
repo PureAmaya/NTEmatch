@@ -5,7 +5,11 @@
     manifest.json          备份元信息（格式版本 / 时间 / 原因 / 内容清单）
     config/nte.sqlite3     数据库快照（用 SQLite 官方 backup API 取一致性快照，
                            WAL 里尚未落盘的内容也一并带上）
-    data/avatars/**        本地上传的头像
+    data/uploads/**        上传的图片（通知 / 赛事信息里的插图、本地上传的头像）
+    data/avatars/**        旧布局的本地头像（只在老备份里出现）
+
+``data/uploads`` 与 ``data/avatars`` 是**同一个内容仓库的两种历史布局**：打包时都收，
+还原时都往统一目录里并（见 ``media.merge_legacy``），所以新旧备份互相都倒得回去。
 
 QQ 头像缓存（``data/avatar_cache``）**不进备份**：它可再生，下次请求自己补回来，
 装进来只会白白撑大体积。
@@ -35,7 +39,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import avatars, db
+from . import avatars, db, media
 from .logging_conf import get_logger
 from .store import BACKUP_ROOT, store
 
@@ -185,8 +189,7 @@ def snapshot_db(src: Path, dst: Path) -> None:
         source.close()
 
 
-def _avatar_files() -> list[Path]:
-    root = avatars.AVATAR_DIR
+def _files_under(root: Path) -> list[Path]:
     if not root.is_dir():
         return []
     return [p for p in sorted(root.rglob("*")) if p.is_file()]
@@ -200,20 +203,24 @@ def create_backup(reason: str = "manual") -> dict[str, Any]:
     tmp_db = BACKUP_DIR / f".{name}.tmpdb"
     try:
         snapshot_db(store.path, tmp_db)
-        root = avatars.AVATAR_DIR
-        files = _avatar_files()
+        # 图片收两份：统一仓库（现在的布局）+ 旧头像目录（还没收拢的历史文件）。
+        # 两边都收才不会漏——迁移是异步做的，备份可能赶在它前面。
+        roots = ((media.UPLOAD_DIR, "data/uploads"), (avatars.AVATAR_DIR, "data/avatars"))
+        packed = [(root, prefix, _files_under(root)) for root, prefix in roots]
         manifest = {
             "format": FORMAT,
             "createdAt": now_iso(),
             "reason": reason or "manual",
             "database": DB_MEMBER,
-            "avatars": len(files),
+            "media": len(packed[0][2]),
+            "avatars": len(packed[1][2]),
             "app": "nte-match",
         }
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_db, DB_MEMBER)
-            for path in files:
-                zf.write(path, f"data/avatars/{path.relative_to(root).as_posix()}")
+            for root, prefix, files in packed:
+                for path in files:
+                    zf.write(path, f"{prefix}/{path.relative_to(root).as_posix()}")
             zf.writestr(MANIFEST_MEMBER, json.dumps(manifest, ensure_ascii=False, indent=2))
     except BaseException:
         target.unlink(missing_ok=True)
@@ -222,10 +229,11 @@ def create_backup(reason: str = "manual") -> dict[str, Any]:
         tmp_db.unlink(missing_ok=True)
     meta = describe(target)
     log.warning(
-        "已创建数据备份 | %s | %.1f KB | 原因=%s | 头像=%d",
+        "已创建数据备份 | %s | %.1f KB | 原因=%s | 图片=%d | 旧头像=%d",
         meta["name"],
         meta["size"] / 1024,
         reason,
+        meta["media"],
         meta["avatars"],
     )
     return meta
@@ -251,6 +259,7 @@ def describe(path: Path) -> dict[str, Any]:
         "size": stat.st_size,
         "createdAt": created,
         "reason": manifest.get("reason") or "",
+        "media": int(manifest.get("media") or 0),
         "avatars": int(manifest.get("avatars") or 0),
         "ok": bool(manifest),
     }
@@ -365,17 +374,35 @@ def _replace_db(new_db: Path) -> None:
     db.init_db(target)
 
 
-def _replace_avatars(src: Path) -> int:
-    """用备份里的头像目录替换现有目录（备份里没有这一项就保持不动）。"""
-    if not src.is_dir():
+def _replace_pictures(work: Path) -> int:
+    """用备份里的图片重建统一仓库（备份里没有这一项就保持不动）。
+
+    两个来源都收：``data/uploads``（现在的布局）与 ``data/avatars``（旧备份）。
+    它们本就是同一个内容仓库，同名文件必然同内容，直接跳过即可——**这正是去重**：
+    旧备份里「同一张图在头像与公告各一份」，倒回来只有一份。
+    """
+    sources = [work / "data" / "uploads", work / "data" / "avatars"]
+    present = [src for src in sources if src.is_dir()]
+    if not present:
         return 0
-    root = avatars.AVATAR_DIR
+    root = media.UPLOAD_DIR
     root.parent.mkdir(parents=True, exist_ok=True)
     staged = root.with_name(f"{root.name}.restoring")
     shutil.rmtree(staged, ignore_errors=True)
-    shutil.copytree(src, staged)
+    staged.mkdir(parents=True, exist_ok=True)
+    for src in present:
+        for path in sorted(src.rglob("*")):
+            if not path.is_file():
+                continue
+            target = staged / path.relative_to(src)
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
     shutil.rmtree(root, ignore_errors=True)
     os.replace(staged, root)
+    # 旧布局目录已并入统一仓库：留着它，下次启动的收拢又会把同样的文件搬一遍
+    shutil.rmtree(avatars.AVATAR_DIR, ignore_errors=True)
     return sum(1 for p in root.rglob("*") if p.is_file())
 
 
@@ -394,17 +421,17 @@ def restore_file(path: Path, *, safety: bool = True) -> dict[str, Any]:
         new_db = work / "config" / "nte.sqlite3"
         _check_database(new_db)
         _replace_db(new_db)
-        avatars_restored = _replace_avatars(work / "data" / "avatars")
+        pictures = _replace_pictures(work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     log.warning(
-        "已从备份还原 | %s | 备份时间=%s | 头像=%d | 安全备份=%s",
+        "已从备份还原 | %s | 备份时间=%s | 图片=%d | 安全备份=%s",
         path.name,
         manifest.get("createdAt") or "?",
-        avatars_restored,
+        pictures,
         (safety_meta or {}).get("name") or "无",
     )
-    return {"manifest": manifest, "safety": safety_meta, "avatars": avatars_restored}
+    return {"manifest": manifest, "safety": safety_meta, "media": pictures}
 
 
 def restore_upload(data: bytes, *, original: str = "", keep_upload: bool = True) -> dict[str, Any]:

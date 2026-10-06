@@ -20,10 +20,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from . import markdown, media
+from . import markdown, media, qqbot
 from .logging_conf import get_logger
 from .models import NTEModel
 from .security import (
@@ -53,6 +53,8 @@ class NoticePayload(NTEModel):
     event_id: str = ""
     title: str = ""
     body: str = ""
+    # 发布时顺带推到 QQ 群（可选；权限与「推送到群」同一套）
+    push: bool = False
 
 
 class TextPayload(NTEModel):
@@ -159,11 +161,74 @@ async def api_get_notice(
     return {"ok": True, "notice": _card(row, full=True)}
 
 
+#: 顺带推到群时，正文最多带这么多字（完整内容在站点看：通知可能有 2 万字）
+PUSH_BODY_CHARS = 700
+
+
+async def _push_notice(
+    *, scope: str, event_id: str, title: str, body: str, request: Request
+) -> dict[str, Any]:
+    """把刚发布的通知**顺带**推到 QQ 群（发布时勾了「同时发到群」才会调）。
+
+    四条刻意的取舍：
+
+    * **失败不算发布失败**：通知已经存下了，群发不出去只是「这次没送到群里」，
+      所以只回一句原因，**不抛异常**——否则管理员会以为通知没发出去而重发一遍，
+      站点里就会多出一条重复通知；
+    * **走同一套限流**：与「推送到群」共用额度，免得手滑连发几条把群刷爆；
+      被限流时把「还要等几秒」一起回给前端，人能看懂也就不用瞎试；
+    * **只推摘要 + 站点链接**：通知可以有 2 万字，全推会把群刷成一屏；正文转纯文本
+      （群不认 Markdown）后截断，末尾给一句「完整内容在站点查看」；
+    * **不 @ 人**：通知是「所有人都该知道」的事，不是召集；@ 人是 ``比赛召集`` 的活。
+    """
+    settings = store.qqbot_settings()
+    if not (settings.get("enabled") and settings.get("apiKey") and qqbot.resolved_umo(settings)):
+        return {"ok": False, "detail": "未启用群推送（到「服务器 → QQ 机器人」配置）"}
+    allowed, reason, wait = await qqbot.limiter.acquire(settings)
+    if not allowed:
+        return {"ok": False, "detail": reason, "retryAfter": wait}
+
+    label = "服务器通知" if scope == "server" else "赛事通知"
+    site = str(request.base_url).rstrip("/")
+    link = site if scope == "server" else f"{site}/{event_id}"
+    summary = markdown.to_text(body, PUSH_BODY_CHARS)
+    text = "\n".join(
+        part
+        for part in (
+            f"【NTE 比赛 · {label}】{markdown.to_text(title, MAX_TITLE_CHARS)}",
+            "",
+            summary,
+            "",
+            f"（完整内容在站点查看：{link}）",
+        )
+        if part
+    )
+    parts = qqbot.split_message(text, int(settings.get("maxChars") or 1200))
+    sent = await qqbot.send_parts(parts, settings=settings)
+    if not sent["ok"]:
+        log.warning("通知顺带推群失败 | %s | %s", title, sent["detail"])
+        return {"ok": False, "detail": sent["detail"]}
+    log.warning(
+        "通知已顺带推群 | 范围=%s | 届=%s | 段=%s | 标题=%s",
+        scope,
+        event_id or "-",
+        sent.get("sent"),
+        title,
+    )
+    return {"ok": True, "detail": "", "sent": sent.get("sent"), "total": sent.get("total")}
+
+
 @router.post("/api/notices")
 async def api_create_notice(
-    payload: NoticePayload, session: Session = Depends(require_event)
+    request: Request,
+    payload: NoticePayload,
+    session: Session = Depends(require_event),
 ) -> dict[str, Any]:
-    """发布通知。赛事通知要「自己那届」，服务器通知要服务器管理员。"""
+    """发布通知。赛事通知要「自己那届」，服务器通知要服务器管理员。
+
+    ``push=true`` 时**顺带推到 QQ 群**（摘要 + 站点链接）；推不出去不影响发布本身，
+    结果放在响应的 ``push`` 字段里，由前端提示（见 :func:`_push_notice`）。
+    """
     scope = _clean_scope(payload.scope)
     if scope == "server":
         if not session.is_server:
@@ -180,14 +245,25 @@ async def api_create_notice(
         body=body,
         author=session.name or session.label,
     )
-    return {"ok": True, "notice": _card(row, full=True)}
+    result: dict[str, Any] = {"ok": True, "notice": _card(row, full=True)}
+    if payload.push:
+        result["push"] = await _push_notice(
+            scope=scope, event_id=eid, title=title, body=body, request=request
+        )
+    return result
 
 
 @router.put("/api/notices/{notice_id}")
 async def api_update_notice(
-    notice_id: str, payload: NoticePayload, session: Session = Depends(require_event)
+    notice_id: str,
+    request: Request,
+    payload: NoticePayload,
+    session: Session = Depends(require_event),
 ) -> dict[str, Any]:
-    """编辑通知（作用域不能改：改了就相当于换了个发布对象）。"""
+    """编辑通知（作用域不能改：改了就相当于换了个发布对象）。
+
+    改完也支持 ``push=true`` 顺带推到群：改期 / 改时间之后往往正是要再喊一次的时候。
+    """
     row = await store.get_notice(notice_id)
     if row is None:
         raise HTTPException(status_code=404, detail="通知不存在")
@@ -205,7 +281,16 @@ async def api_update_notice(
         body=body,
         author=row.get("author") or session.name or session.label,
     )
-    return {"ok": True, "notice": _card(saved, full=True)}
+    result: dict[str, Any] = {"ok": True, "notice": _card(saved, full=True)}
+    if payload.push:
+        result["push"] = await _push_notice(
+            scope=row["scope"],
+            event_id=row.get("eventId", ""),
+            title=title,
+            body=body,
+            request=request,
+        )
+    return result
 
 
 @router.delete("/api/notices/{notice_id}")
@@ -265,14 +350,7 @@ async def api_media_file(name: str) -> FileResponse:
     path = media.resolve(name)
     if path is None:
         raise HTTPException(status_code=404, detail="图片不存在")
-    return FileResponse(
-        path,
-        media_type=media.mime_for(path),
-        headers={
-            "Cache-Control": "public, max-age=31536000, immutable",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    return FileResponse(path, media_type=media.mime_for(path), headers=dict(media.IMMUTABLE_HEADERS))
 
 
 @router.get("/api/media")

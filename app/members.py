@@ -55,6 +55,7 @@ class MemberPayload(NTEModel):
     game_uuid: str = ""
     stream_id: str = ""
     room_title: str = ""
+    bili_room: str = ""       # B站直播间号（可空；填了就在直播页给一路 B站 机位）
     note: str = ""
     permission: str = "member"
     active: bool = True
@@ -76,6 +77,7 @@ class MePayload(NTEModel):
     game_uuid: str = ""
     stream_id: str = ""
     room_title: str = ""
+    bili_room: str = ""
     note: str = ""
 
 
@@ -243,6 +245,7 @@ async def api_member_save(
         game_uuid=payload.game_uuid,
         stream_id=stream_id,
         room_title=payload.room_title,
+        bili_room=payload.bili_room,
         note=payload.note,
         permission=permission,  # type: ignore[arg-type]
         active=payload.active,
@@ -256,10 +259,16 @@ async def api_member_save(
     # 同步到各届里关联的选手（选手就是成员）
     await store.propagate_member(saved, actor=f"web:member-save:{session.uid or 'server'}")
     view = _member_public(saved, session)
+    # B站 房间号**变了**才当场验一次（只提示不拦保存）：填错了当场就知道，而不是等到
+    # 开播那天；没变就不打扰 B站（探测要等最多几秒，跟房间号无关的保存不该受它拖累）。
+    warnings: list[str] = []
+    if existing is None or existing.bili_room != saved.bili_room:
+        warnings = [msg for msg in [await live.bili_check(saved.bili_room)] if msg]
     return {
         "ok": True,
         "member": view,
         "created": existing is None,
+        "warnings": warnings,
         # 明文凭据：**仅此一次**（前端弹窗展示后即丢弃，刷新页面不再可见）
         "secretKey": key_plain,
         "bearerToken": bearer_plain,
@@ -347,13 +356,22 @@ async def api_me_update(payload: MePayload, session: Session = Depends(require_a
             "game_uuid": payload.game_uuid,
             "stream_id": stream_id,
             "room_title": payload.room_title,
+            "bili_room": payload.bili_room,
             "note": payload.note,
         }
     )
     saved, _key, _bearer = await store.save_member(updated)
     # 成员改了自己的资料：同步到各届里关联的选手
     await store.propagate_member(saved, actor=f"web:me-save:{session.uid}")
-    return {"ok": True, "member": _member_public(saved, session, self_view=True)}
+    # 同上：只在房间号真的变了时才去问 B站（避免每次存资料都多等几秒）
+    warnings: list[str] = []
+    if member.bili_room != saved.bili_room:
+        warnings = [msg for msg in [await live.bili_check(saved.bili_room)] if msg]
+    return {
+        "ok": True,
+        "member": _member_public(saved, session, self_view=True),
+        "warnings": warnings,
+    }
 
 
 @router.post("/me/rotate")
@@ -474,6 +492,79 @@ async def api_login_guard_unban(
 async def api_login_guard_clear(session: Session = Depends(require_server)) -> dict[str, Any]:
     """清空全部登录封禁与失败计数（仅服务器管理员）。"""
     return {"ok": True, "cleared": login_guard.clear()}
+
+
+# --------------------------------------------------------------------------- #
+# 封禁 IP 列表（分页 / 搜索 / 过滤 / 改时长 / 人工封禁）
+# --------------------------------------------------------------------------- #
+@router.get("/server/bans")
+async def api_bans(
+    page: int = Query(default=1),
+    size: int = Query(default=20),
+    q: str = Query(default=""),
+    kind: str = Query(default=""),
+    session: Session = Depends(require_server),
+) -> dict[str, Any]:
+    """封禁列表（仅服务器管理员）。
+
+    分页 / 搜索 / 过滤都在服务端做：被攻击时这张表可能有成百上千条，
+    全量丢给前端再筛，既费流量、又恰好在最需要它快的时候最慢。
+
+    ``kind``：空 = 全部，``permanent`` 永久，``temp`` 临时，``auto`` 自动，``manual`` 手动。
+    """
+    settings = store.guard_settings()
+    data = login_guard.bans_page(
+        page=page,
+        size=size,
+        query=q,
+        kind=kind,
+        window=int(settings.get("windowSeconds") or 300),
+    )
+    return {"ok": True, **data, "settings": settings}
+
+
+class BanPayload(NTEModel):
+    """人工封禁一个 IP。``seconds=0`` = 永久；``reason`` 会显示在列表里。"""
+
+    ip: str = ""
+    seconds: int = 3600
+    reason: str = "手动封禁"
+
+
+@router.delete("/server/bans/{ip}")
+async def api_ban_remove(ip: str, session: Session = Depends(require_server)) -> dict[str, Any]:
+    """解除某个 IP 的封禁（与「登录限制」里那个接口同一个动作，路径更贴切）。"""
+    return {"ok": True, "ip": ip, "removed": login_guard.unban(ip)}
+
+
+@router.put("/server/bans")
+async def api_ban_add(
+    payload: BanPayload, session: Session = Depends(require_server)
+) -> dict[str, Any]:
+    """人工封禁一个 IP（仅服务器管理员）。
+
+    ``seconds=0`` 表示**永久**。人工封禁**优先于白名单**——管理员点了封禁却拦不住，
+    比没有这个功能更糟（见 :func:`app.login_guard._whitelist_bypasses`）。
+    """
+    seconds = max(0, int(payload.seconds or 0))
+    if seconds > 315360000:
+        raise HTTPException(status_code=400, detail="封禁时长太大（0 = 永久，其余请填秒数）")
+    try:
+        fresh = login_guard.ban(
+            payload.ip,
+            seconds,
+            reason=(payload.reason or "手动封禁").strip()[:60] or "手动封禁",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    actor = session.name or session.uid or "?"
+    log.warning(
+        "人工封禁 IP | ip=%s | 时长=%s | 操作者=%s",
+        payload.ip,
+        "永久" if seconds == 0 else f"{seconds}s",
+        actor,
+    )
+    return {"ok": True, "ip": payload.ip, "created": fresh, "seconds": seconds}
 
 
 # --------------------------------------------------------------------------- #

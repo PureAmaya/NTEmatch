@@ -10,7 +10,7 @@
  * 3. 列表卡片只给摘要（后端已截成一段话），超过 4 条就分页。
  */
 
-import { App, Modal, api, esc, fmtFull, log, toast } from './core.js';
+import { App, Modal, api, esc, fmtFull, hooks, log, toast } from './core.js';
 import { iconBtn } from './icons.js';
 import { openMarkdownEditor } from './mdeditor.js';
 
@@ -77,12 +77,24 @@ export function checkNotices(state = App.state) {
 
 /** 打开单条通知（含渲染后的正文）。 */
 export async function openNoticeReader(noticeId, scope = 'event') {
+  if (!noticeId) {
+    toast('这条通知的编号丢了，刷新页面后重试', 'err', 6000);
+    return;
+  }
   let notice;
   try {
     const res = await api(`/notices/${encodeURIComponent(noticeId)}`);
-    notice = res.notice;
+    notice = res && res.notice;
   } catch (err) {
+    // 这里以前只写日志：点了「查看全文」什么也不发生，看起来就是「按钮无效」。
+    // 现在一律说出来，并且 404（多半已经被删）时顺手把列表换成最新的。
     log.warn('通知读取失败', err);
+    toast(err.message || '通知读取失败，请稍后再试', 'err', 7000);
+    if (err.status === 404) await refreshNotices(scope);
+    return;
+  }
+  if (!notice) {
+    toast('通知内容为空（可能刚被修改），请刷新后重试', 'err', 6000);
     return;
   }
   // 打开即视为已读：关掉窗口不该又弹一次（改过之后 updatedAt 变了，会再弹）
@@ -172,11 +184,15 @@ export async function loadNotices(scope, page = 1, { force = false } = {}) {
  *
  * ``manage`` 为真时多出「发布 / 编辑 / 删除」——权限由调用方决定传不传
  * （前端只做展示，真正的闸门在服务端）。
+ *
+ * 宿主是不是可见也由这里定：总览页的 ``#noticeBoard`` 在 HTML 里是预置的 ``hidden``
+ * 占位，以前只填内容、从不显示，于是「赛事通知」面板在用户端永远看不见。
+ * 规则：有内容就显示；管理面板即使一条都没有也要显示（那里要能点「发布通知」）。
  */
 export async function renderNoticeBoard(scope, host, { manage = false, page = 0, hint = '' } = {}) {
   if (!host) return;
   App.noticeHosts = App.noticeHosts || {};
-  App.noticeHosts[scope] = { host, manage, hint };
+  App.noticeHosts[scope] = { host, hostId: host.id || '', manage, hint };
   const want = page || (App.notices && App.notices[scope]?.page) || 1;
   // 状态里那一条「最新通知」变了就强制重取：这样**别人刚发的通知**会随
   // WebSocket 推送自动出现在列表里，不用手动刷新页面
@@ -194,6 +210,7 @@ export async function renderNoticeBoard(scope, host, { manage = false, page = 0,
     return;
   }
   const tips = [hint, `共 ${data.total} 条 · 每页 ${PAGE_SIZE} 条`].filter(Boolean).join(' · ');
+  host.hidden = !(data.total > 0 || manage);
   host.innerHTML =
     `<div class="panel__head"><h2>${esc(SCOPE_LABEL[scope])}</h2>` +
     `<span class="panel__hint">${esc(tips)}</span>` +
@@ -205,12 +222,29 @@ export async function renderNoticeBoard(scope, host, { manage = false, page = 0,
     pagerHtml(data, scope);
 }
 
+/**
+ * 现在真正挂在页面上的宿主。
+ *
+ * 管理页整块重绘会换掉 `#adminNotices` 这个元素，早先记下的引用就成了「幽灵」——
+ * 往里写内容没人看得见（表现就是「保存 / 删除后界面没变」）。所以按 **id 现查**，
+ * 查不到再退回引用（宿主没有 id 的情况）。
+ */
+function liveHostOf(target) {
+  if (!target) return null;
+  if (target.hostId) {
+    const el = document.getElementById(target.hostId);
+    if (el) return el;
+  }
+  return target.host && target.host.isConnected ? target.host : null;
+}
+
 /** 翻页（由 actions.js 的分发调用）。 */
 export async function goNoticePage(scope, page) {
   const target = (App.noticeHosts || {})[scope];
-  if (!target) return;
+  const host = liveHostOf(target);
+  if (!target || !host) return;
   const data = await loadNotices(scope, Math.max(1, Number(page) || 1), { force: true });
-  await renderNoticeBoard(scope, target.host, {
+  await renderNoticeBoard(scope, host, {
     manage: target.manage,
     hint: target.hint,
     page: data.page,
@@ -219,14 +253,25 @@ export async function goNoticePage(scope, page) {
 
 /** 变更之后刷新（管理面板 + 总览 / 主页里的只读板都换新）。 */
 export async function refreshNotices(scope) {
-  const targets = Object.entries(App.noticeHosts || {}).filter(([key]) => key === scope);
-  for (const [, target] of targets) {
-    await renderNoticeBoard(scope, target.host, {
-      manage: target.manage,
-      hint: target.hint,
-      page: 1,
-    });
-  }
+  const target = (App.noticeHosts || {})[scope];
+  const host = liveHostOf(target);
+  if (!target || !host) return;
+  await renderNoticeBoard(scope, host, {
+    manage: target.manage,
+    hint: target.hint,
+    page: 1,
+  });
+}
+
+/**
+ * 保存 / 删除之后把该刷的都刷一遍。
+ *
+ * 先让 app.js 整体重绘一次（管理面板、服务器页、总览都算），再按 id 找到新的
+ * 通知面板填内容——这样「改完立刻能看到结果」在任何页面上都成立。
+ */
+async function refreshAfterChange(scope) {
+  if (hooks.onSaved) hooks.onSaved();
+  await refreshNotices(scope);
 }
 
 /* ------------------------------ 发布与编辑 ------------------------------ */
@@ -244,6 +289,14 @@ export async function composeNotice(scope = 'event', noticeId = '') {
       return;
     }
   }
+  // 「同时发到 QQ 群」：只有推送确实就绪（已启用 + 有 Key + 有目标会话）才给出这个勾选，
+  // 否则勾了也只能得到一句「未启用」。查一次状态（轻量只读接口，赛事管理员也能调）。
+  let canPush = false;
+  try {
+    canPush = (await api('/qqbot/status', { auth: true })).ready === true;
+  } catch (err) {
+    log.debug('推送状态未知，不显示「同时发到群」', err);
+  }
   openMarkdownEditor({
     title: existing ? '编辑通知' : `发布${SCOPE_LABEL[scope] || '通知'}`,
     titleLabel: '通知标题',
@@ -253,8 +306,17 @@ export async function composeNotice(scope = 'event', noticeId = '') {
     hint:
       `${SCOPE_LABEL[scope] || ''}：发布后打开站点的人会自动弹窗看到` +
       `${scope === 'event' ? '（只在本届内弹）' : '（任何页面都弹）'}。`,
-    onSave: async ({ title, text }) => {
-      const payload = { scope, title, body: text };
+    extras: canPush
+      ? [
+          {
+            name: 'push',
+            label: '同时发到 QQ 群',
+            hint: '群里只发摘要 + 站点链接（完整内容在站点看）；发不出去不影响通知本身',
+          },
+        ]
+      : [],
+    onSave: async ({ title, text, extras }) => {
+      const payload = { scope, title, body: text, push: Boolean(extras?.push) };
       const res = existing
         ? await api(`/notices/${encodeURIComponent(existing.id)}`, {
             method: 'PUT',
@@ -264,16 +326,29 @@ export async function composeNotice(scope = 'event', noticeId = '') {
         : await api('/notices', { method: 'POST', auth: true, body: payload });
       markNoticeSeen(res.notice); // 自己发的不用再弹给自己看
       toast(existing ? '通知已更新' : '通知已发布', 'ok');
-      await refreshNotices(scope);
+      // 顺带推群的结果单独说一句：推不出去时通知**已经发好了**，别说成失败
+      const pushed = res.push;
+      if (pushed) {
+        toast(
+          pushed.ok
+            ? `已同时推到群里（${pushed.sent}/${pushed.total} 段）`
+            : `通知已发布，但没能推到群里：${pushed.detail || '未知原因'}`,
+          pushed.ok ? 'ok' : 'warn',
+          9000
+        );
+      }
+      await refreshAfterChange(scope);
     },
   });
 }
 
 export async function removeNotice(scope, noticeId) {
+  // 删除是不可逆的（通知没有回收站），一律先问一句
+  if (!window.confirm('删除这条通知？删掉之后打开站点的所有人都看不到它了。')) return;
   try {
     await api(`/notices/${encodeURIComponent(noticeId)}`, { method: 'DELETE', auth: true });
     toast('通知已删除', 'ok');
-    await refreshNotices(scope);
+    await refreshAfterChange(scope);
   } catch (err) {
     toast(err.message || '删除失败', 'err');
   }
@@ -299,8 +374,16 @@ export async function editEventInfo() {
     hint: '会显示在用户端「比赛规则」面板末尾（规则主体仍由赛制参数自动生成）。',
     placeholder: '例：参赛须知、场地位置、注意事项……',
     onSave: async ({ text }) => {
-      await api('/config', { method: 'PUT', auth: true, body: { event: { rulesText: text } } });
+      const res = await api('/config', {
+        method: 'PUT',
+        auth: true,
+        body: { event: { rulesText: text } },
+      });
+      // 服务端返回了新的整份状态就直接用；没有就现拉一次，省得界面停在旧内容上
+      if (res && res.state) App.state = res.state;
+      else if (hooks.refreshState) await hooks.refreshState();
       toast('赛事信息已保存', 'ok');
+      if (hooks.onSaved) hooks.onSaved();
     },
   });
 }
@@ -320,7 +403,9 @@ export async function editServerInfo() {
     onSave: async ({ text }) => {
       await api('/server/info', { method: 'PUT', auth: true, body: { text } });
       toast('服务器信息已保存', 'ok');
+      // 服务器信息在内存里缓存了一份：清掉缓存再整页重绘，否则界面还是旧内容
       App.serverInfo = null;
+      if (hooks.onSaved) hooks.onSaved();
     },
   });
 }

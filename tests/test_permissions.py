@@ -193,17 +193,39 @@ def test_public_reads_stay_public():
 
 
 def test_media_server_settings_are_server_only():
-    """``/api/config`` 里的**直播媒体服务器设置**只有服务器管理员能改。
+    """``/api/config`` 里的**直播配置整块**只有服务器管理员能改。
 
     这条闸门是**按补丁内容**判的（同一个接口还要给赛事管理员改赛制与文案），静态列表
-    看不出来，所以在这里单钉一条：赛事管理员碰地址 / 凭据一律 403，只能开关「启用直播」。
+    看不出来，所以在这里单钉一条。
+
+    注意这里**没有例外键**：直播早年有个「启用直播」的开关（当时赛事管理员能拨），
+    那个开关已经整体移除（只要有赛事就允许直播），于是赛事管理员这边一个可改的
+    直播字段都不剩——漏掉任何一个键都等于给了一条改站点级配置的旁路。
     """
     event_admin = SimpleNamespace(is_server=False)
-    for key in ("baseUrl", "apiBase", "apiUser", "apiPass", "apiPassClear", "whipPush", "pushToken"):
+    for key in (
+        "provider",
+        "baseUrl",
+        "apiBase",
+        "apiUser",
+        "apiPass",
+        "apiPassClear",
+        "hlsBase",
+        "streamKey",
+        "pushToken",
+        "mode",
+        "verifyTls",
+        "whipPush",
+        "poster",
+        "title",
+        "note",
+        "enabled",
+    ):
         with pytest.raises(HTTPException) as err:
             _apply_stream_patch({key: "x"}, event_admin)
         assert err.value.status_code == 403, f"{key} 没被拦住"
-    _apply_stream_patch({"enabled": False}, event_admin)  # 开关放行：整站直播的开关
+    # 服务器管理员放行
+    _apply_stream_patch({"title": "场馆直播"}, SimpleNamespace(is_server=True))
 
 
 def test_ui_config_is_server_only():

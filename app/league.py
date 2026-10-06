@@ -42,25 +42,17 @@ def joined_players(cfg: Config) -> list[Player]:
 
 
 def active_pool(cfg: Config) -> list[Player]:
-    """本届参与 + 启用 + 有名称的选手（**含替补**：补赛时优先照顾出场少的人）。"""
+    """本届参与 + 启用 + 有名称的选手（补赛时优先照顾出场少的人）。"""
     return [p for p in joined_players(cfg) if p.active and p.name]
 
 
 def rotation_pool(cfg: Config) -> list[Player]:
-    """参与自动轮换的选手池。
+    """参与自动轮换的选手池：本届参与名单里「启用且有名称」的人。
 
-    优先使用正式选手；人数不足以凑满一场时才启用替补，
-    替补始终可以随后通过管理端手动换上。
+    「替补」不再是选手的一种类别（见 :class:`app.models.Substitution`）——谁上场
+    由赛程里的替补登记决定，所以这里不再区分正式 / 替补，名单里的人都参与轮换。
     """
-    actives = active_pool(cfg)
-    mains = [p for p in actives if not p.substitute]
-    subs = [p for p in actives if p.substitute]
-    need = max(2, cfg.rules.team_size * 2)
-    if cfg.rules.include_substitutes and len(mains) < need:
-        pool = mains + subs
-        log.debug("正式选手不足(%d<%d)，启用全部替补，池大小=%d", len(mains), need, len(pool))
-        return pool
-    return mains or subs
+    return active_pool(cfg)
 
 
 def round_label(index: int, total: int) -> str:
@@ -601,7 +593,7 @@ def _empty_stat(player_id: str) -> dict[str, Any]:
         "scored": 0,
         "conceded": 0,
         "diff": 0,
-        # 用时制的 tiebreak 用：完成场次与总用时（计分制下不参与排序）
+        # 数值低胜的 tiebreak 用：完成场次与总成绩（数值高胜下不参与排序）
         "finished": 0,
         "spent": 0,
         "rest": 0,
@@ -615,16 +607,16 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
     """按积分制统计个人榜（每局独立结算、多局累计积分）。
 
     排名规则：
-    * 场次 ``>= rules.min_rank_played`` 才参与排名，按**均分（总得分 ÷ 场次）**降序；
-      均分相同再比总得分、胜场，最后比「分项」——计分制看净胜分，
-      用时制看完成场次 + 总用时（见 :mod:`app.metrics`）。
+    * 场次 ``>= rules.min_rank_played`` 才参与排名，按**均分（总成绩 ÷ 场次）**降序；
+      均分相同再比总成绩、胜场，最后比「分项」——数值高胜看净胜分，
+      数值低胜看完成场次 + 总成绩（见 :mod:`app.metrics`）。
     * 场次不足者 ``rank`` 为 ``None``、``qualified`` 为 ``False``，统一排在榜尾。
     * 榜内只统计**本届参与名单**中的选手；已打过已结算对局的选手即便被移出名单，
       其成绩仍保留，避免历史记录凭空消失。
     """
     rules = cfg.rules
-    metric = metrics.norm(rules.metric)
-    time_based = metrics.lower_is_better(metric)
+    sc = rules.scoring
+    low_wins = sc.low_wins
     played_ids = {
         pid
         for rnd in cfg.rounds
@@ -637,9 +629,7 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
 
     completed = [r for r in cfg.rounds if r.status == "done" and r.winner]
     for rnd in sorted(completed, key=lambda r: r.index):
-        _apply_round(
-            stats, rnd, rules.points_win, rules.points_lose, rules.points_draw, metric
-        )
+        _apply_round(stats, rnd, rules.points_win, rules.points_lose, rules.points_draw, sc)
 
     # 轮空统计：未完成的局不计入
     for rnd in cfg.rounds:
@@ -660,10 +650,10 @@ def compute_standings(cfg: Config) -> dict[str, Any]:
     def rank_key(row: dict[str, Any]) -> tuple[Any, ...]:
         """名次依据：均分 → 总积分 → 胜场 → 分项 → 姓名（完全确定，无随机）。
 
-        分项随比法变化：计分制看净胜分（分多者优）；用时制看完成场次 + 总用时——
-        未完赛的人不能因为「没跑完所以时间短」占到便宜。
+        分项随判断标准变化：数值高胜看净胜分（分多者优）；数值低胜看完成场次 +
+        总成绩——未完赛的人不能因为「没跑完所以成绩小」占到便宜。
         """
-        tail: tuple[Any, ...] = (-row["finished"], row["spent"]) if time_based else (-row["diff"],)
+        tail: tuple[Any, ...] = (-row["finished"], row["spent"]) if low_wins else (-row["diff"],)
         return (
             -row["average"],
             -row["points"],
@@ -713,11 +703,12 @@ def _apply_round(
     points_win: int,
     points_lose: int,
     points_draw: int,
-    metric: str = metrics.SCORE,
+    scoring: object = metrics.INTEGER,
 ) -> None:
     winner = rnd.winner
     if winner not in ("A", "B", "DRAW"):
         return
+    sc = metrics.as_scoring(scoring)
     outcome: dict[SideKey, str] = {"A": "", "B": ""}
     if winner == "DRAW":
         outcome = {"A": "draw", "B": "draw"}
@@ -731,17 +722,20 @@ def _apply_round(
         other: Side = rnd.side_b if key == "A" else rnd.side_a
         result = outcome[key]
         gain = {"win": points_win, "lose": points_lose, "draw": points_draw}.get(result, 0)
+        # 没有成绩（MISSING / 时间型的 0）按 0 计入累计：负数会把总分与净胜分算歪
+        mine = max(0, side.score)
+        theirs = max(0, other.score)
         for pid in [pid for pid in side.player_ids if pid in stats]:
             row = stats[pid]
             row["played"] += 1
             row[result] += 1
             row["points"] += gain
-            row["scored"] += side.score
-            row["conceded"] += other.score
-            row["diff"] += side.score - other.score
-            # 该场的总成绩（填了各局就是各局合计）：用时制用它排 tiebreak
-            total = metrics.round_total(side.score, side.points, bool(rnd.sets))
-            if total > 0:
+            row["scored"] += mine
+            row["conceded"] += theirs
+            row["diff"] += mine - theirs
+            # 该场的总成绩（填了轮次就是各轮合计）：数值低胜时用它排 tiebreak
+            total = sc.round_total(side.score, side.points, bool(rnd.sets))
+            if sc.has_total(side.score, side.points, has_rounds=bool(rnd.sets)):
                 row["finished"] += 1
                 row["spent"] += total
             if result == "win":

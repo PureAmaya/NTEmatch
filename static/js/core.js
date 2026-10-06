@@ -31,8 +31,10 @@ export const API = '/api';
 export const DEFAULT_SITE_NAME = 'NTE 比赛';
 export const DEFAULT_TAGLINE = 'NEVERNESS TO EVERNESS · MATCH';
 
-export const qs = (sel, root = document) => root.querySelector(sel);
-export const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+// 根节点写成 `root || document`：显式传 null 时（例如「这一段界面这次没渲染」）
+// 也要能安全地查，而不是在 null 上炸掉整个渲染流程。
+export const qs = (sel, root) => (root || document).querySelector(sel);
+export const qsa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 export const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ESC_MAP[c]);
@@ -100,18 +102,64 @@ export function fmtDuration(minutes) {
   return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
 }
 
-/* ---------------------------- 比法（metric） ----------------------------
- * 与后端 app/metrics.py 一一对应：score = 计分制（分高者胜）、
- * time = 用时制（用时短者胜）。方向、0 的含义、显示格式三件事必须与后端一致，
- * 否则「预览说 A 胜、结算说 B 胜」——观众只会看到自相矛盾。
+/* ---------------------------- 计分口径（scoring） ----------------------------
+ * 与后端 app/metrics.py 一一对应，三件事各自独立：
+ *   类型（自然数 / 小数 / 时间）—— 决定怎么解析与怎么显示；
+ *   判断标准（数值高胜 / 数值低胜）—— 决定谁赢；
+ *   标签（得分 / 评分 / 用时 / 自定义）—— 只影响文案。
+ * 三者必须与后端一致，否则「预览说 A 胜、结算说 B 胜」——观众只会看到自相矛盾。
  *
- * 用时制的数值一律是**毫秒**（整数）：要和后端一样能可靠地求和、比并列。
+ * 存储一律是**整数**：自然数原值、小数**千分之一**、时间**毫秒**。
  */
-const DNF_WORDS = /^(dnf|dns|dnq|退赛|未完赛|未完成|-|—|\/|无)$/i;
+const VALUE_TYPES = ['integer', 'decimal', 'time'];
+const BETTERS = ['high', 'low'];
+const TYPE_LABELS = { integer: '自然数', decimal: '小数', time: '时间' };
+const DEFAULT_LABELS = { integer: '得分', decimal: '评分', time: '用时' };
+const DECIMAL_UNIT = 1000;
 
-/** 当前比法；认不出来按计分制（老数据没有这个字段）。 */
-export const metricOf = (s) => (s?.rules?.metric === 'time' ? 'time' : 'score');
-export const isTimeMetric = (s) => metricOf(s) === 'time';
+/** 计分类型选项（管理端表单与规则文案共用一份）。 */
+export const VALUE_TYPE_OPTIONS = [
+  ['integer', '自然数（比分 / 次数）'],
+  ['decimal', '小数（评委打分 / 测量值）'],
+  ['time', '时间（用时 / 赛段）'],
+];
+/** 判断标准选项。 */
+export const BETTER_OPTIONS = [
+  ['high', '数值高胜（分高者赢）'],
+  ['low', '数值低胜（用时短者赢）'],
+];
+/** 计分标签预设；填别的就是自定义。 */
+export const LABEL_PRESETS = ['得分', '评分', '用时'];
+
+/**
+ * 把一份 rules（或只有几个字段的对象）规整成完整的计分口径。
+ *
+ * 认不出来的一律按「自然数 + 数值高胜」——老数据没有这些字段，而那正是它当年的行为。
+ * 返回普通对象（不是类）：视图层要拿它算、要拼文案，保持纯数据最省事。
+ */
+export function normScoring(rules) {
+  const src = rules || {};
+  const valueType = VALUE_TYPES.includes(src.valueType) ? src.valueType : 'integer';
+  const better = BETTERS.includes(src.better)
+    ? src.better
+    : valueType === 'time'
+      ? 'low'
+      : 'high';
+  const label = String(src.valueLabel || '').trim() || DEFAULT_LABELS[valueType];
+  return {
+    valueType,
+    better,
+    label,
+    lowWins: better === 'low',
+    timeBased: valueType === 'time',
+    typeLabel: TYPE_LABELS[valueType],
+  };
+}
+
+/** 当前届的计分口径。 */
+export function scoringOf(s) {
+  return normScoring(s?.rules || {});
+}
 
 /** 毫秒 → 1:23.456 / 83.45（规则与后端 metrics.format_time 完全一致）。 */
 export function fmtMilli(ms) {
@@ -121,7 +169,7 @@ export function fmtMilli(ms) {
   const unit = 1000;
   const p2 = (v) => String(v).padStart(2, '0');
   const hours = Math.floor(n / (3600 * unit));
-  const minutes = Math.floor(n / (60 * unit)) % 60;
+  const minutes = Math.floor((n / (60 * unit)) % 60);
   const secs = Math.floor(n / unit) % 60;
   const millis = String(n % unit).padStart(3, '0').slice(0, dec);
   if (hours) return `${hours}:${p2(minutes)}:${p2(secs)}.${millis}`;
@@ -129,22 +177,103 @@ export function fmtMilli(ms) {
   return `${secs}.${millis}`;
 }
 
-/** 按比法显示一个成绩：time → 时间，score → 数字。 */
-export function fmtVal(value, metric = metricOf()) {
-  return metric === 'time' ? fmtMilli(value) : String(num(value));
+/** 毫秒 → 「时 / 分 / 秒」三个输入框的回填值（与后端 hours_minutes_seconds 一致）。 */
+export function splitMilli(ms) {
+  const n = Math.max(0, Math.round(Number(ms) || 0));
+  const text = (value) => (value ? String(Math.round(value * 1000) / 1000) : '');
+  return [
+    text(Math.floor(n / 3_600_000)),
+    text(Math.floor((n % 3_600_000) / 60_000)),
+    text((n % 60_000) / 1000),
+  ];
 }
 
-/** 按比法解析输入；解析不了抛错（静默当 0 会把人记成「未完赛」）。 */
-export function parseVal(text, metric = metricOf()) {
-  const raw = String(text ?? '').trim();
-  if (!raw) return 0;
-  if (metric !== 'time') {
-    const n = Number(raw);
-    if (!Number.isFinite(n)) throw new Error(`「${raw}」不是合法的分数`);
-    return Math.max(0, Math.trunc(n)); // 与后端 int() 一致
+/** 千分之一 → 8.75 / 8（去掉末尾多余的 0；0 显示成 0，与自然数一致）。 */
+export function fmtDec(value) {
+  const n = Math.round(Number(value) || 0);
+  if (n <= 0) return '0';
+  let text = (n / DECIMAL_UNIT).toFixed(3);
+  if (text.includes('.')) text = text.replace(/0+$/, '').replace(/\.$/, '');
+  return text;
+}
+
+/**
+ * 「没有成绩」的哨兵（数值型）。
+ *
+ * 数值型的 0 是合法读数（评委真的会打 0 分），所以「没填 / 退赛」不能用 0 兼职；
+ * 时间型的合法值必然 > 0，它的哨兵就是 0（老数据也这么存）。见后端 app/metrics.py。
+ */
+export const MISSING = -1;
+
+/** 本口径下「没有成绩」的写法：时间型是 0，其余是 -1。 */
+export const missingValue = (sc = scoringOf(App.state)) => (sc.timeBased ? 0 : MISSING);
+
+/** 这个成绩算「有效」吗（判定胜负、排名与「完成场次」都问它）。 */
+export function hasResult(value, sc = scoringOf(App.state)) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n) || n < 0) return false;
+  return n > 0 || !sc.timeBased;
+}
+
+/**
+ * 有没有**明确录入过**（不是「没有成绩」，也不是数值型的 0）。
+ *
+ * 只用来回答「这场比赛动过没有」：数值型的 0 是合法读数，但它和旧库里从没打过的 0
+ * 长得一模一样，所以不能算录入痕迹（否则没开打的对局会显示成「已经有比分」）。
+ */
+export function hasEntered(value, sc = scoringOf(App.state)) {
+  return hasResult(value, sc) && Math.trunc(Number(value)) !== 0;
+}
+
+/** 按计分类型显示一个成绩（没有成绩一律「—」）。 */
+export function fmtVal(value, sc = scoringOf(App.state)) {
+  if (!hasResult(value, sc)) return '—';
+  if (sc.timeBased) return fmtMilli(value);
+  if (sc.valueType === 'decimal') return fmtDec(value);
+  return String(num(value));
+}
+
+/**
+ * 一方的 ``score`` 怎么显示：
+ *
+ * ``counted`` = 这场比赛**填了轮次**，于是 ``score`` 是「赢的轮数」——那是计数，
+ * 任何类型下都按整数显示（时间型里把 2 轮写成 2，而不是去格式化）。
+ */
+export function fmtScore(value, counted, sc = scoringOf(App.state)) {
+  if (counted) {
+    const n = Math.trunc(Number(value));
+    return Number.isFinite(n) && n >= 0 ? String(n) : '—';
   }
-  if (DNF_WORDS.test(raw)) return 0;
-  const parts = raw
+  return fmtVal(value, sc);
+}
+
+/**
+ * 按计分类型解析输入；解析不了抛错。
+ *
+ * 空与「退赛」这类写法一律解析成 ``missingValue()``——**不要**当成 0：
+ * 数值型的 0 是一个合法读数，把「没填」记成「0 分」等于凭空造了一个成绩。
+ */
+export function parseVal(text, sc = scoringOf(App.state)) {
+  const raw = String(text ?? '').trim();
+  if (!raw || DNF_WORDS.test(raw)) return missingValue(sc);
+  if (sc.timeBased) return parseMilli(raw);
+  if (sc.valueType === 'decimal') {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) throw new Error(`「${raw}」不是合法的小数`);
+    return Math.max(0, Math.round(n * DECIMAL_UNIT));
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`「${raw}」不是合法的分数`);
+  return Math.max(0, Math.trunc(n)); // 与后端 int() 一致
+}
+
+const DNF_WORDS = /^(dnf|dns|dnq|退赛|未完赛|未完成|-|—|\/|无)$/i;
+
+/** 时间文本 → 毫秒（``1:23.456`` / ``1'23"45`` / ``83.45`` 都认）。 */
+export function parseMilli(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text || DNF_WORDS.test(text)) return 0;
+  const parts = text
     .replace(/["”″]/g, '.')
     .replace(/[:：'’′]/g, ':')
     .split(':')
@@ -153,7 +282,7 @@ export function parseVal(text, metric = metricOf()) {
   const step = (part) => {
     const n = Number(part);
     if (!Number.isFinite(n)) {
-      throw new Error(`「${raw}」不是合法的用时（可写 1:23.456 或 83.45）`);
+      throw new Error(`「${text}」不是合法的用时（可写 1:23.456 或 83.45）`);
     }
     return n;
   };
@@ -167,18 +296,34 @@ export function parseVal(text, metric = metricOf()) {
   return Math.max(0, Math.round(total));
 }
 
+/** 「时 / 分 / 秒」三个输入框 → 毫秒（空 = 0，全空 = 没有成绩）。 */
+export function parseHms(hours, minutes, seconds) {
+  const step = (raw, what) => {
+    const text = String(raw ?? '').trim();
+    if (!text) return 0;
+    const n = Number(text);
+    if (!Number.isFinite(n)) throw new Error(`「${text}」不是合法的${what}`);
+    if (n < 0) throw new Error(`${what}不能是负数`);
+    return n;
+  };
+  const total =
+    step(hours, '小时') * 3600 + step(minutes, '分钟') * 60 + step(seconds, '秒');
+  return Math.max(0, Math.round(total * 1000));
+}
+
 /**
  * 成绩比较器（Array#sort 用）：负数 = a 在前。
  *
- * **0 / 空 = 没有成绩，永远排在有成绩的后面**——否则用时制里
- * 「0 秒」会被当成最快的人（与后端 metrics.value_key 同一条约定）。
+ * **没有成绩的一方永远排在有成绩的后面**——否则数值低胜里「0 毫秒」会被当成最快的人。
+ * 数值型的 0 是合法读数（0 分照样参与比较），时间型的 0 才是「没有成绩」
+ * （与后端 metrics.Scoring.sort_key 同一条约定）。
  */
-export function cmpVal(a, b, metric = metricOf()) {
-  const noA = !(Number(a) > 0);
-  const noB = !(Number(b) > 0);
+export function cmpVal(a, b, sc = scoringOf(App.state)) {
+  const noA = !hasResult(a, sc);
+  const noB = !hasResult(b, sc);
   if (noA !== noB) return noA ? 1 : -1;
   if (noA) return 0;
-  return metric === 'time' ? Number(a) - Number(b) : Number(b) - Number(a);
+  return sc.lowWins ? Number(a) - Number(b) : Number(b) - Number(a);
 }
 
 /** 当前本地时间，格式化为 <input type="datetime-local"> 需要的值。 */
@@ -503,6 +648,67 @@ export async function api(path, { method = 'GET', body, auth = false } = {}) {
   return data;
 }
 
+/** 从 Content-Disposition 里抠出服务端给的文件名。 */
+function filenameFrom(headers, fallback) {
+  const raw = headers.get('content-disposition') || '';
+  const match = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(raw);
+  if (!match) return fallback;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1] || fallback;
+  }
+}
+
+/**
+ * 带会话下载一个文件（导出、备份、旧数据快照都走它）。
+ *
+ * 刻意**不用** `window.open('…?token=…')`：查询串里的会话令牌会原样进反向代理 /
+ * CDN 的访问日志，而且那等于「一个链接就能下载」。这里改成带 ``X-NTE-Token``
+ * 取回 blob 再本地另存——服务端也据此**只认请求头**（见 app/security.py）。
+ */
+export async function downloadFile(path, fallbackName = 'download') {
+  let res;
+  try {
+    res = await fetch(API + path, {
+      headers: App.token ? { 'X-NTE-Token': App.token } : {},
+      cache: 'no-store',
+    });
+  } catch (err) {
+    log.error('下载失败（网络）', path, err);
+    throw new Error('网络不可达，请检查服务是否在线');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const data = await res.json();
+      detail = typeof data?.detail === 'string' ? data.detail : '';
+    } catch {
+      detail = '';
+    }
+    if (res.status === 401) {
+      App.token = '';
+      localStorage.removeItem(TOKEN_KEY);
+      if (hooks.onAuthLost) hooks.onAuthLost();
+    }
+    throw new Error(detail || `下载失败（HTTP ${res.status}）`);
+  }
+  const blob = await res.blob();
+  const name = filenameFrom(res.headers, fallbackName);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // 立刻 revoke 在部分浏览器会把下载取消掉，等一拍再回收
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  log.info('已下载', name, blob.size, '字节');
+  return name;
+}
+
 /**
  * 拉取管理端私有数据（选手隐私字段 + 推流地址）。
  *
@@ -545,18 +751,49 @@ export async function refreshMe() {
 }
 
 /* -------------------------------- Toast -------------------------------- */
-export function toast(message, kind = 'info', ms = 3600) {
+/**
+ * 一条提示。
+ *
+ * ``action`` （可选，``{label, onClick}``）会在提示里放一个按钮——用在「有件事需要你决定」的
+ * 场合（例如热更新换代后提示「点此刷新」）。**带按钮的提示不会自动消失**：会自己跑掉的
+ * 按钮等于没提。``ms = 0`` 也表示不自动关闭。
+ */
+export function toast(message, kind = 'info', ms = 3600, action = null) {
   const box = qs('#toasts');
   if (!box) return;
   const el = document.createElement('div');
   el.className = `toast toast--${kind}`;
-  el.textContent = message;
-  box.appendChild(el);
-  setTimeout(() => {
+  const text = document.createElement('span');
+  text.className = 'toast__text';
+  text.textContent = message;
+  el.appendChild(text);
+
+  let timer = 0;
+  const dismiss = () => {
+    if (!el.isConnected || el.classList.contains('out')) return;
+    clearTimeout(timer);
     el.classList.add('out');
     setTimeout(() => el.remove(), 220);
-  }, ms);
+  };
+  if (action && action.label) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast__act';
+    btn.textContent = action.label;
+    btn.onclick = () => {
+      dismiss();
+      try {
+        action.onClick?.();
+      } catch (err) {
+        log.warn('提示上的动作失败', err);
+      }
+    };
+    el.appendChild(btn);
+  }
+  box.appendChild(el);
+  if (ms > 0) timer = setTimeout(dismiss, ms);
   log.debug('提示', kind, message);
+  return dismiss;
 }
 
 /* -------------------------------- Modal -------------------------------- */
@@ -582,7 +819,15 @@ export const Modal = {
       if (e.key === 'Escape' && !Modal.el.hidden) Modal.close();
     });
   },
-  open({ title = '', body = '', footer = '', onMount, className = '' } = {}) {
+  /**
+   * 关闭前的拦截钩子（``onBeforeClose``）。
+   *
+   * 返回 ``false`` 表示「先别关」——用于「有没保存的改动，问一句」这类场景
+   * （见小组赛对阵调整）。钩子只会被问一次：它自己再调 ``close()`` 时不再递归。
+   */
+  _beforeClose: null,
+  open({ title = '', body = '', footer = '', onMount, onBeforeClose, className = '' } = {}) {
+    this._beforeClose = typeof onBeforeClose === 'function' ? onBeforeClose : null;
     const alreadyOpen = this.el && !this.el.hidden;
     // 上一次的淡出还没结束就又要开（比如「保存 → 关掉 → 立刻开下一个」）：取消它，
     // 否则那个定时器会在新弹窗上补一刀，把刚打开的面板又藏起来。
@@ -622,6 +867,15 @@ export const Modal = {
       this._reset();
       return;
     }
+    if (this._beforeClose) {
+      const hook = this._beforeClose;
+      // 只问一次：钩子里（或用户点「保存」之后）再调 close() 时直接放行
+      this._beforeClose = null;
+      if (hook() === false) {
+        this._beforeClose = hook; // 用户选择「先别关」
+        return;
+      }
+    }
     // 移除终态 → 面板与背板一起淡出；淡出播完再 hidden，否则会「啪」地消失
     this.el.classList.remove('is-open');
     this.el.classList.add('is-closing');
@@ -642,5 +896,6 @@ export const Modal = {
     if (body) body.innerHTML = '';
     if (foot) foot.innerHTML = '';
     this._onPick = null;
+    this._beforeClose = null;
   },
 };

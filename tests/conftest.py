@@ -11,6 +11,10 @@ import os
 import tempfile
 
 os.environ.setdefault("NTE_DATA_DIR", tempfile.mkdtemp(prefix="nte-test-"))
+# 命令行输出的彩色一律关掉：断言要读的是文字，转义码混进去只会让
+# 正则（例如从 ``--transfer-admin`` 的输出里抠密钥）把颜色码一起吞掉。
+# 用 setdefault：谁真想看彩色（`NO_COLOR= pytest`）也能自己开。
+os.environ.setdefault("NO_COLOR", "1")
 
 import httpx
 import pytest
@@ -27,22 +31,34 @@ from app.store import store
 def make_config():
     """造一份「两队 / 一场」的最小配置，赛制参数逐项可覆盖。
 
-    默认是锦标赛制、一局定胜负、单场小组赛——这样单个测试只声明它关心的那一项，
-    其余保持出厂值，改动影响面一眼可见。
+    默认是锦标赛制、自然数 + 数值高胜、单场小组赛——这样单个测试只声明它关心的
+    那一项，其余保持出厂值，改动影响面一眼可见。
     """
 
     def build(
         *,
-        best_of: int = 1,
+        value_type: str = "integer",
+        value_label: str = "",
+        better: str = "high",
         sets=(),
         fmt: str = "tournament",
         teams: int = 2,
-        metric: str = "score",
     ) -> Config:
-        cfg = Config.model_validate(default_config())
-        cfg.rules.format = fmt
-        cfg.rules.best_of = best_of
-        cfg.rules.metric = metric
+        base = default_config()
+        cfg = Config.model_validate(
+            {
+                **base,
+                "rules": {
+                    **base["rules"],
+                    "format": fmt,
+                    # 走一遍校验器：三件套与旧口径 metric 会一起规整成一致状态
+                    "valueType": value_type,
+                    "valueLabel": value_label,
+                    "better": better,
+                    "metric": "time" if value_type == "time" else "score",
+                },
+            }
+        )
         cfg.teams = [Team(id=f"t{i}", label=f"{i} 队", group="A") for i in range(1, teams + 1)]
         sides = [
             Side(key=chr(64 + i), label=f"{i} 队", team_id=f"t{i}") for i in range(1, teams + 1)

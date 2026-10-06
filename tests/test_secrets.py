@@ -50,7 +50,9 @@ def test_public_stream_config_is_a_whitelist():
     for field in ("pushToken", "apiPass", "apiUser", "apiBase", "hlsBase"):
         assert field not in public, f"{field} 不该出现在对外直播配置里"
     # `baseUrl`（WebRTC 根地址）是**有意**公开的：观众要靠它拼出观看地址
-    assert public.get("enabled") is True and public.get("baseUrl") is not None
+    assert public.get("baseUrl") is not None
+    # 直播没有总开关了（只要有赛事就允许直播），这个键不该再出现在对外配置里
+    assert "enabled" not in public
 
 
 def test_main_room_stream_key_is_public_by_design():

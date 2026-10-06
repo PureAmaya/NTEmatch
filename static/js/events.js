@@ -256,8 +256,8 @@ function setupGuideHtml(s) {
       cta: '去设置',
     });
   }
-  // 「直播」关掉了就不催（有的社区只办比赛不直播）
-  if (s?.stream?.enabled !== false && !String(s?.stream?.baseUrl || '').trim()) {
+  // 直播没有总开关（有赛事就能播），只要没填源站地址就提醒一次
+  if (!String(s?.stream?.baseUrl || '').trim()) {
     steps.push({
       title: '填直播服务器地址',
       desc: '没填的话「直播」页只能给出推流地址，观众那边点不开播放器。',

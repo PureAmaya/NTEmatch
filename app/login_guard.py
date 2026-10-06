@@ -150,12 +150,22 @@ def client_ip(request: Request, settings: dict[str, Any]) -> str:
     return chain[0] if chain else peer
 
 
+#: 永久封禁（``seconds=0``）：用 ``inf`` 表示「没有到期时间」
+PERMANENT = float("inf")
+#: 永久封禁回给客户端的 ``Retry-After``：HTTP 头只能放秒数，
+#: 这里给一年（足够表达「别等了」），列表里仍显示「永久」。
+PERMANENT_RETRY_AFTER = 365 * 24 * 3600
+#: 封禁原因：自动（登录失败过多）/ 手动（管理员加的）
+REASON_AUTO = "登录失败过多"
+
+
 # --------------------------------------------------------------------------- #
 # 计数与封禁
 # --------------------------------------------------------------------------- #
 def _prune(now: float) -> None:
-    for ip, until in list(_bans.items()):
-        if until <= now:
+    for ip, row in list(_bans.items()):
+        until = float(row.get("until") or 0)
+        if until != PERMANENT and until <= now:
             _bans.pop(ip, None)
     if len(_failures) > _MAX_TRACKED:
         oldest = sorted(_failures, key=lambda k: max(_failures[k] or [0]))[: len(_failures) // 2]
@@ -163,26 +173,93 @@ def _prune(now: float) -> None:
             _failures.pop(ip, None)
 
 
+def is_whitelisted(ip: str, settings: dict[str, Any]) -> bool:
+    """该 IP 是否在「永不封禁」名单里。"""
+    return _in_nets(ip, _nets(settings.get("whitelist", "")))
+
+
+def _whitelist_bypasses(ip: str, settings: dict[str, Any]) -> bool:
+    """白名单能不能放过这个 IP。
+
+    **自动**封禁会被白名单挡下（那是「别误伤自己人」）；但管理员**手动**加的封禁
+    必须生效——不然他点了封禁、界面写着已封禁，实际却拦不住，这种「看着有、其实没有」
+    比不加这个功能更糟。
+    """
+    if not is_whitelisted(ip, settings):
+        return False
+    with _lock:
+        row = _bans.get(ip)
+    return not (row and not row.get("auto"))
+
+
 def blocked_seconds(ip: str, settings: dict[str, Any]) -> int:
-    """该 IP 当前是否被封禁；返回剩余秒数（0 = 未被封禁）。"""
+    """该 IP 当前是否被封禁；返回剩余秒数（0 = 未被封禁，永久封禁回一年）。"""
     if not settings.get("enabled", True) or not ip:
         return 0
-    if _in_nets(ip, _nets(settings.get("whitelist", ""))):
+    if _whitelist_bypasses(ip, settings):
         return 0
     now = time.time()
     with _lock:
-        until = _bans.get(ip, 0.0)
+        row = _bans.get(ip)
+        if row is None:
+            return 0
+        until = float(row.get("until") or 0)
+        if until == PERMANENT:
+            return PERMANENT_RETRY_AFTER
         if until <= now:
             _bans.pop(ip, None)
             return 0
         return int(until - now) + 1
 
 
+def ban(
+    ip: str,
+    seconds: int,
+    *,
+    reason: str = "手动封禁",
+    auto: bool = False,
+) -> bool:
+    """封禁一个 IP；``seconds=0`` = **永久**。返回是否是新增（``False`` = 覆盖了原记录）。
+
+    只接受单个 IP（不是网段）：这条路径在每个登录请求上跑，必须是 O(1) 的字典查；
+    网段是「可信代理 / 白名单」那种小众且不频繁的判断，那里才用 CIDR。
+    """
+    clean = _clean_ip(ip)
+    if not clean:
+        raise ValueError("要封禁的得是一个 IP（例如 203.0.113.7）")
+    now = time.time()
+    length = int(seconds or 0)
+    until = PERMANENT if length <= 0 else now + length
+    with _lock:
+        fresh = clean not in _bans
+        _bans[clean] = {"until": until, "at": now, "reason": str(reason or "")[:60], "auto": bool(auto)}
+        if not auto:
+            _failures.pop(clean, None)  # 手动封禁：顺带清掉失败计数，别两边都显示
+    log.warning(
+        "已封禁 IP | ip=%s | 时长=%s | 原因=%s | 方式=%s",
+        clean,
+        "永久" if until == PERMANENT else f"{length}s",
+        reason,
+        "自动" if auto else "手动",
+    )
+    return fresh
+
+
+def unban(ip: str) -> bool:
+    clean = _clean_ip(ip) or str(ip or "").strip()
+    with _lock:
+        removed = _bans.pop(clean, None) is not None
+        _failures.pop(clean, None)
+    if removed:
+        log.warning("已解除登录封禁 | ip=%s", clean)
+    return removed
+
+
 def record_failure(ip: str, settings: dict[str, Any]) -> int:
     """记一次登录失败；返回本次触发的封禁秒数（0 = 未封禁）。"""
     if not settings.get("enabled", True) or not ip:
         return 0
-    if _in_nets(ip, _nets(settings.get("whitelist", ""))):
+    if is_whitelisted(ip, settings):
         return 0
     now = time.time()
     window = max(1, int(settings.get("windowSeconds", 300) or 1))
@@ -194,16 +271,10 @@ def record_failure(ip: str, settings: dict[str, Any]) -> int:
         _failures[ip] = hits
         _prune(now)
         if ban_seconds and len(hits) >= max_attempts:
-            _bans[ip] = now + ban_seconds
             _failures.pop(ip, None)
-            log.warning(
-                "登录失败过多，已临时封禁 | ip=%s | %d 次 / %ds | 封禁 %ds",
-                ip,
-                len(hits),
-                window,
-                ban_seconds,
-            )
-            return ban_seconds
+    if ban_seconds and len(hits) >= max_attempts:
+        ban(ip, ban_seconds, reason=f"{REASON_AUTO}（{len(hits)} 次 / {window}s）", auto=True)
+        return ban_seconds
     return 0
 
 
@@ -216,38 +287,127 @@ def record_success(ip: str) -> None:
         _bans.pop(ip, None)
 
 
-def snapshot(window: int = 300) -> dict[str, Any]:
-    """当前封禁与失败计数（供管理端展示）。"""
+def _row_view(ip: str, row: dict[str, Any], now: float, window: int) -> dict[str, Any]:
+    """一条封禁记录 → 管理端要的形态（时间给人看，剩余秒数给倒计时用）。"""
+    until = float(row.get("until") or 0)
+    permanent = until == PERMANENT
+    return {
+        "ip": ip,
+        "permanent": permanent,
+        "until": "" if permanent else _iso(until),
+        "at": _iso(float(row.get("at") or 0)),
+        "remaining": PERMANENT_RETRY_AFTER if permanent else max(0, int(until - now) + 1),
+        "reason": str(row.get("reason") or ""),
+        "auto": bool(row.get("auto")),
+        "failures": len([t for t in _failures.get(ip, []) if now - t <= window]),
+    }
+
+
+def _iso(ts: float) -> str:
+    """时间戳 → 站内统一的 ISO 文本（本地时区，与其它时间字段一致）。"""
+    if ts <= 0:
+        return ""
+    from datetime import datetime
+
+    try:
+        return datetime.fromtimestamp(ts).replace(microsecond=0).isoformat()  # noqa: DTZ006  (本地时间)
+    except (OverflowError, OSError, ValueError):  # pragma: no cover - 极端时间戳
+        return ""
+
+
+def _clean_ip(raw: str) -> str:
+    """校验并规范化一个 IP；不合法回空串。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
+def bans_page(
+    *,
+    page: int = 1,
+    size: int = 20,
+    query: str = "",
+    kind: str = "",
+    window: int = 300,
+) -> dict[str, Any]:
+    """封禁列表（**分页 / 搜索 / 过滤都在服务端做**）。
+
+    列表可能很长（攻击时成百上千条），把全量丢给前端再过滤既费流量、又在最需要
+    它快的时候最慢。参数：
+
+    * ``query``：IP 片段（也匹配原因文字）；
+    * ``kind``：``""`` 全部 / ``permanent`` 永久 / ``temp`` 临时 / ``auto`` 自动 /
+      ``manual`` 手动；
+    * 排序：**永久在前**，其余按到期时间从近到远（最该处理的先看到）。
+    """
     now = time.time()
+    needle = str(query or "").strip().lower()
+    want = str(kind or "").strip().lower()
+    rows: list[dict[str, Any]] = []
     with _lock:
-        bans = [
-            {"ip": ip, "remaining": int(until - now) + 1}
-            for ip, until in _bans.items()
-            if until > now
-        ]
+        _prune(now)
+        for ip, row in _bans.items():
+            view = _row_view(ip, row, now, window)
+            if needle and needle not in ip.lower() and needle not in view["reason"].lower():
+                continue
+            permanent = view["permanent"]
+            auto = view["auto"]
+            if want == "permanent" and not permanent:
+                continue
+            if want == "temp" and permanent:
+                continue
+            if want == "auto" and not auto:
+                continue
+            if want == "manual" and auto:
+                continue
+            rows.append(view)
         failing = {
             ip: len([t for t in hits if now - t <= window])
             for ip, hits in _failures.items()
             if any(now - t <= window for t in hits)
         }
-    bans.sort(key=lambda item: item["remaining"], reverse=True)
+    rows.sort(key=lambda item: (not item["permanent"], item["remaining"]))
+    size = max(1, min(int(size or 20), 200))
+    page = max(1, int(page or 1))
+    total = len(rows)
+    start = (page - 1) * size
+    return {
+        "items": rows[start : start + size],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": max(1, (total + size - 1) // size),
+        "failing": failing,
+        "now": now,
+    }
+
+
+def snapshot(window: int = 300) -> dict[str, Any]:
+    """当前封禁与失败计数（管理端用）。
+
+    保留这个「一次拿全量」的形态（其它地方仍在使用）：
+    ``bans`` 里的每一项与 :func:`bans_page` 的条目结构一致。
+    """
+    now = time.time()
+    with _lock:
+        bans = [_row_view(ip, row, now, window) for ip, row in _bans.items()]
+        failing = {
+            ip: len([t for t in hits if now - t <= window])
+            for ip, hits in _failures.items()
+            if any(now - t <= window for t in hits)
+        }
+    bans.sort(key=lambda item: (not item["permanent"], item["remaining"]))
     return {"bans": bans, "failing": failing}
 
 
-def unban(ip: str) -> bool:
-    with _lock:
-        removed = _bans.pop(ip, None) is not None
-        _failures.pop(ip, None)
-    if removed:
-        log.warning("已解除登录封禁 | ip=%s", ip)
-    return removed
-
-
 def clear() -> int:
-    """清空全部封禁与失败计数；返回被清掉的生效封禁数。"""
-    now = time.time()
+    """清空全部封禁与失败计数；返回被清掉的封禁数。"""
     with _lock:
-        count = sum(1 for until in _bans.values() if until > now)
+        count = len(_bans)
         _bans.clear()
         _failures.clear()
     if count:

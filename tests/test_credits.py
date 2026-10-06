@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -20,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # AGPL-3.0 与它们都兼容：宽松许可 + 弱著佐权（MPL / PSF 属弱或兼容型）。
 ALLOWED = {
     "mit",
+    # Pillow 用的是 MIT-CMU（即 HPND，宽松许可，只是名字不一样）
+    "mit-cmu",
     "bsd-2-clause",
     "bsd-3-clause",
     "apache-2.0",
@@ -35,11 +38,53 @@ def _declared_runtime_deps() -> list[str]:
     return [dep.split(">=")[0].split("[")[0].strip().lower() for dep in deps]
 
 
+def _locked_packages() -> set[str]:
+    """``uv.lock`` 里出现的全部包名（本项目自己除外）。
+
+    锁文件是**实际会装进来**的那一份（含传递依赖、含可选 extra），所以拿它当
+    「到底有哪些第三方代码随本站分发」的准绳——比只对 ``pyproject`` 的顶层声明严得多：
+    换了依赖、传递依赖变了（例如 anyio 4 不再依赖 sniffio），这里都会跟着变。
+    """
+    text = (ROOT / "uv.lock").read_text(encoding="utf-8")
+    names = {name.lower() for name in re.findall(r'^name = "([^"]+)"$', text, re.MULTILINE)}
+    return names - {"nte-match"}
+
+
 def test_every_declared_dependency_is_credited():
     """pyproject 里声明的运行依赖必须都在清单里——漏一个就是漏一份署名。"""
     names = credits.component_names()
     missing = [dep for dep in _declared_runtime_deps() if dep not in names]
     assert not missing, f"这些依赖没写进 app/credits.py：{missing}"
+
+
+def test_every_locked_package_is_credited():
+    """**实际会装的每一个包**都要在清单里（含传递依赖）——AGPL 要求的署名不是可选项。"""
+    names = credits.component_names()
+    missing = sorted(name for name in _locked_packages() if name not in names)
+    assert not missing, f"这些包随本站分发却没写进 app/credits.py：{missing}"
+
+
+def test_runtime_list_has_no_stale_entries():
+    """反过来也要对：清单里别留着已经不装的包（那会让人以为依赖它）。
+
+    真踩过：``sniffio`` 是 anyio 3 时代的依赖，anyio 4 之后早就不装了，
+    而清单里还挂着它。
+    """
+    locked = _locked_packages()
+    stale = [name for name, *_ in credits.RUNTIME if name.lower() not in locked]
+    assert not stale, f"这些包已经不在了，从清单里去掉：{stale}"
+
+
+def test_credit_texts_have_no_markdown_marks():
+    """清单文本是 ``esc()`` 直出的**纯文本**：写上 `**粗体**` 只会原样显示星号。
+
+    （与「帮助图 / --help 里不写 Markdown」同一条原则：哪里不渲染，哪里就别写。）
+    """
+    rows = credits.RUNTIME + credits.FRONTEND + credits.PROGRAM + credits.DEV
+    for name, lic, url, note in rows:
+        for text in (name, lic, note):
+            for mark in ("**", "`", "~~"):
+                assert mark not in text, f"「{name}」的文本里有 Markdown 记号 {mark!r}：{text}"
 
 
 def test_mediamtx_is_credited():

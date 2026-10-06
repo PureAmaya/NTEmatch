@@ -10,7 +10,7 @@
     event_participants 本届手动参与名单（有序；空 = 全员参与）
     teams           队伍
     team_players    队伍成员（有序）
-    rounds          对局（含各局小分 / 用时 / 直播开关）
+    rounds          对局（含各轮成绩 / 时长 / 直播开关）
     round_sides     对局各方（2~4 队同场：队伍、标签、比分、得分、名次）
     round_players   对局出场选手（有序）
     meta            全局键值（当前届 ID 等）
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -68,15 +69,16 @@ CREATE TABLE IF NOT EXISTS event_rules (
   points_lose         INTEGER NOT NULL DEFAULT 0,
   points_draw         INTEGER NOT NULL DEFAULT 1,
   total_rounds        INTEGER NOT NULL DEFAULT 5,
-  include_substitutes INTEGER NOT NULL DEFAULT 1,
   fair_rotation       INTEGER NOT NULL DEFAULT 1,
   min_rank_played     INTEGER NOT NULL DEFAULT 5,
   group_count         INTEGER NOT NULL DEFAULT 0,
   knockout_size       INTEGER NOT NULL DEFAULT 0,
   teams_per_match     INTEGER NOT NULL DEFAULT 2,
   loser_bracket       INTEGER NOT NULL DEFAULT 1,
-  best_of             INTEGER NOT NULL DEFAULT 1,
-  metric              TEXT NOT NULL DEFAULT 'score'
+  metric              TEXT NOT NULL DEFAULT 'score',
+  value_type          TEXT NOT NULL DEFAULT '',
+  value_label         TEXT NOT NULL DEFAULT '',
+  better              TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS event_ui (
@@ -261,6 +263,7 @@ CREATE TABLE IF NOT EXISTS members (
   game_uuid     TEXT NOT NULL DEFAULT '',
   stream_id     TEXT NOT NULL DEFAULT '',
   room_title    TEXT NOT NULL DEFAULT '',
+  bili_room     TEXT NOT NULL DEFAULT '',
   note          TEXT NOT NULL DEFAULT '',
   permission    TEXT NOT NULL DEFAULT 'member',
   active        INTEGER NOT NULL DEFAULT 1,
@@ -298,6 +301,22 @@ CREATE TABLE IF NOT EXISTS activity (
   path        TEXT NOT NULL DEFAULT '',
   status      INTEGER NOT NULL DEFAULT 0
 );
+
+-- 登录会话：**落库**，因为热更新会换掉进程（见 app/hot.py）。
+-- 存的是 token 的 sha256 而**不是明文**：token 是 32 字节随机串，读库的人反推不出它，
+-- 也就没法拿这份数据去冒充登录；明文一旦落库，读库就等于拿到了所有人的登录态。
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  uid        TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL DEFAULT '',
+  permission TEXT NOT NULL DEFAULT '',
+  label      TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL DEFAULT 0,
+  expires_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid);
+CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_players_event ON players(event_id, position);
 CREATE INDEX IF NOT EXISTS idx_members_stream ON members(stream_id);
@@ -374,10 +393,13 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
       "knockout_size": "INTEGER NOT NULL DEFAULT 0",
       "teams_per_match": "INTEGER NOT NULL DEFAULT 2",
       "loser_bracket": "INTEGER NOT NULL DEFAULT 1",
-      # 系列赛（BO1 / BO3 / BO5 / BO7）：见 models.Rules.best_of
-      "best_of": "INTEGER NOT NULL DEFAULT 1",
-      # 比法（score 计分制 / time 用时制）：见 app/metrics.py
+      # 旧口径比法名（score / time）：只为老版本兼容保留，见 models.Rules.metric
       "metric": "TEXT NOT NULL DEFAULT 'score'",
+      # 计分口径三件套（类型 / 标签 / 判断标准）：见 app/metrics.py
+      # 空串 = 老库刚补上的列，由 models.Rules 按 metric 推导后落值
+      "value_type": "TEXT NOT NULL DEFAULT ''",
+      "value_label": "TEXT NOT NULL DEFAULT ''",
+      "better": "TEXT NOT NULL DEFAULT ''",
       },
     "event_ui": {
         # 自定义主题色与分享图（见 models.UiConfig）
@@ -402,6 +424,8 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         # 加盐哈希（新格式）；同表的 *_sha256 是历史无盐格式，仅为兼容旧库保留
         "key_hash": "TEXT NOT NULL DEFAULT ''",
         "bearer_hash": "TEXT NOT NULL DEFAULT ''",
+        # B站直播间号（见 models.Member.bili_room）
+        "bili_room": "TEXT NOT NULL DEFAULT ''",
     },
     "teams": {"group_name": "TEXT NOT NULL DEFAULT ''"},
     "rounds": {
@@ -439,7 +463,19 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
 # SQLite 的 DROP COLUMN 需要 3.35+（Python 3.11 自带的通常满足）；不支持时
 # 静默跳过——留着这几列不影响功能，模型已经不认它们了。
 _OBSOLETE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "event_stream": ("rtmp_base", "rtsp_base", "rtmp_push", "rtsp_url", "hls_url", "flv_url"),
+    # 「启用直播」开关已移除（只要有赛事就允许直播，见 models.StreamConfig.enabled）
+    "event_stream": (
+        "rtmp_base",
+        "rtsp_base",
+        "rtmp_push",
+        "rtsp_url",
+        "hls_url",
+        "flv_url",
+        "enabled",
+    ),
+    # 「替补选手」类别与「系列赛（BO）」都已移除：轮次改成自由增删（见 models.SetScore），
+    # 这两列不再被任何代码读取。旧数据在升级时会先落一份只读快照（见 app/legacy.py）。
+    "event_rules": ("include_substitutes", "best_of"),
 }
 
 # 已退休的表：`event_admin` 存的是「主管理 KEY」——那套凭据已经去掉了（登录只认成员密钥），
@@ -536,6 +572,98 @@ def event_exists(conn: sqlite3.Connection, event_id: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 登录会话（跨进程存活）
+#
+# 为什么要有这张表：热更新会**换掉进程**（见 app/hot.py）。会话只在内存里的话，
+# 每次更新都等于把所有人踢下线——「不中断业务」也就成了空话。
+# 读写都走**短连接 + 主键点查**：热路径（鉴权）只在**内存里没有该 token 时**才来一次，
+# 命中一次之后就在内存里了（见 app/auth.py 的 resolve）。
+# --------------------------------------------------------------------------- #
+def load_session(path: Path, token_hash: str) -> dict[str, Any] | None:
+    """按 token 的散列取一条会话（没有 / 已过期都回 ``None``）。"""
+    if not token_hash:
+        return None
+    with connect(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE token_hash = ?", (token_hash,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        if float(data.get("expires_at") or 0) <= time.time():
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+            return None
+        return data
+
+
+def save_sessions(path: Path, rows: list[dict[str, Any]]) -> None:
+    """批量写入 / 刷新会话（一次事务，避免逐条开关连接）。"""
+    if not rows:
+        return
+    with connect(path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO sessions (token_hash, uid, name, permission, label, created_at, expires_at)
+            VALUES (:token_hash, :uid, :name, :permission, :label, :created_at, :expires_at)
+            ON CONFLICT(token_hash) DO UPDATE SET
+                uid = excluded.uid,
+                name = excluded.name,
+                permission = excluded.permission,
+                label = excluded.label,
+                expires_at = excluded.expires_at
+            """,
+            rows,
+        )
+
+
+def delete_sessions(path: Path, token_hashes: list[str]) -> int:
+    """按 token 散列删（登出 / 单点失效）。"""
+    clean = [str(item) for item in token_hashes if item]
+    if not clean:
+        return 0
+    with connect(path) as conn:
+        removed = 0
+        # 分批删：SQLite 的变量上限（旧版本 999）不是我们能假定的事
+        for start in range(0, len(clean), 400):
+            chunk = clean[start : start + 400]
+            marks = ",".join("?" for _ in chunk)
+            cur = conn.execute(f"DELETE FROM sessions WHERE token_hash IN ({marks})", chunk)
+            removed += int(cur.rowcount or 0)
+        return removed
+
+
+def delete_sessions_of(path: Path, uid: str) -> int:
+    """删掉某成员的全部会话（成员被停用 / 改权限 / 轮换密钥时）。"""
+    if not uid:
+        return 0
+    with connect(path) as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE uid = ?", (uid,))
+        return int(cur.rowcount or 0)
+
+
+def delete_all_sessions(path: Path) -> int:
+    """清空所有会话（还原备份 / 全站强制重登）。"""
+    with connect(path) as conn:
+        cur = conn.execute("DELETE FROM sessions")
+        return int(cur.rowcount or 0)
+
+
+def prune_sessions(path: Path, now: float | None = None) -> int:
+    """清掉过期会话（顺手做，免得表随时间无限长）。"""
+    moment = time.time() if now is None else float(now)
+    with connect(path) as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (moment,))
+        return int(cur.rowcount or 0)
+
+
+def count_sessions(path: Path) -> int:
+    """当前库里的会话数（诊断 / 测试用）。"""
+    with connect(path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()
+        return int(row["n"] if row else 0)
+
+
+# --------------------------------------------------------------------------- #
 # 写入
 # --------------------------------------------------------------------------- #
 def save_event(
@@ -623,15 +751,16 @@ def save_event(
             "points_lose": rules.get("pointsLose", 0),
             "points_draw": rules.get("pointsDraw", 1),
             "total_rounds": rules.get("totalRounds", 5),
-            "include_substitutes": int(bool(rules.get("includeSubstitutes", True))),
             "fair_rotation": int(bool(rules.get("fairRotation", True))),
             "min_rank_played": rules.get("minRankPlayed", 5),
             "group_count": rules.get("groupCount", 0),
             "knockout_size": rules.get("knockoutSize", 0),
             "teams_per_match": rules.get("teamsPerMatch", 2),
             "loser_bracket": int(bool(rules.get("loserBracket", True))),
-            "best_of": rules.get("bestOf", 1),
             "metric": rules.get("metric", "score"),
+            "value_type": rules.get("valueType", ""),
+            "value_label": rules.get("valueLabel", ""),
+            "better": rules.get("better", ""),
         },
     )
     _upsert(
@@ -655,7 +784,6 @@ def save_event(
         ("event_id",),
         {
             "event_id": event_id,
-            "enabled": int(bool(stream.get("enabled", True))),
             "provider": stream.get("provider", "mediamtx"),
             "base_url": stream.get("baseUrl", ""),
             "api_base": stream.get("apiBase", ""),
@@ -1059,15 +1187,16 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             "pointsLose": rules["points_lose"] if rules else 0,
             "pointsDraw": rules["points_draw"] if rules else 1,
             "totalRounds": rules["total_rounds"] if rules else 5,
-            "includeSubstitutes": bool(rules["include_substitutes"]) if rules else True,
             "fairRotation": bool(rules["fair_rotation"]) if rules else True,
             "minRankPlayed": rules["min_rank_played"] if rules else 5,
             "groupCount": rules["group_count"] if rules else 0,
             "knockoutSize": rules["knockout_size"] if rules else 0,
             "teamsPerMatch": rules["teams_per_match"] if rules else 2,
             "loserBracket": bool(rules["loser_bracket"]) if rules else True,
-            "bestOf": rules["best_of"] if rules else 1,
             "metric": rules["metric"] if rules else "score",
+            "valueType": rules["value_type"] if rules else "",
+            "valueLabel": rules["value_label"] if rules else "",
+            "better": rules["better"] if rules else "",
         },
         "ui": {
             "accent": ui["accent"] if ui else "cyan",
@@ -1082,7 +1211,6 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
         # 有记录时把仍是旧默认 http:// 的地址升到 https（见 _upgrade_stream_https）。
         "stream": _upgrade_stream_https(
             {
-                "enabled": bool(stream["enabled"]),
                 "provider": stream["provider"],
                 "baseUrl": stream["base_url"],
                 "apiBase": stream["api_base"],
@@ -1215,6 +1343,7 @@ def _member_row(row: sqlite3.Row) -> dict[str, Any]:
         "gameUuid": row["game_uuid"],
         "streamId": row["stream_id"],
         "roomTitle": row["room_title"],
+        "biliRoom": row["bili_room"],
         "note": row["note"],
         "permission": row["permission"],
         "active": bool(row["active"]),
@@ -1247,6 +1376,7 @@ def upsert_member(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
             "game_uuid": row.get("gameUuid", ""),
             "stream_id": row.get("streamId", ""),
             "room_title": row.get("roomTitle", ""),
+            "bili_room": row.get("biliRoom", ""),
             "note": row.get("note", ""),
             "permission": row.get("permission", "member"),
             "active": int(bool(row.get("active", True))),

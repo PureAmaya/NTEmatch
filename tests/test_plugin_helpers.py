@@ -203,6 +203,133 @@ class _Msg:
         self.message = list(segs)
 
 
+def test_stream_key_arg_ignores_qq_like_args(plugin_module):
+    """@ 人时混进来的纯数字不是流名；其余原样交给站点校验（错字要当场报错）。"""
+    parse = plugin_module._stream_key_arg
+    assert parse("tom") == "tom"
+    assert parse("", "") == ""
+    assert parse("10001") == "", "纯数字是 QQ（@ 某人时平台会把它当参数传进来）"
+    assert parse("10001", "tom") == "tom"
+    assert parse("tom-1_2") == "tom-1_2"
+    assert parse("中文流名") == "中文流名", "不在这里挑字符——让站点给一句清楚的报错"
+
+
+async def test_stream_setup_points_to_private_chat(plugin_module):
+    """「比赛直播注册」：把流名与 @ 目标交给站点，群里只说「去私聊查收」。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    calls: list[tuple] = []
+
+    async def fake_post(path, payload=None):
+        calls.append((path, payload))
+        return {
+            "ok": True,
+            "sent": True,
+            "streamId": "tom",
+            "created": ["推流码 tom", "一把新的直播令牌"],
+            "note": "直播注册完成：推流码 tom、一把新的直播令牌",
+        }
+
+    plugin._post = fake_post
+    out = await _collect(
+        plugin.cmd_stream_setup(_FakeEvent(sender="10001", group="g1"), "tom", "")
+    )
+    assert calls == [("stream-setup", {"qq": "10001", "targetQq": "", "streamKey": "tom"})]
+    assert "私聊" in out[0]["text"]
+
+
+async def test_stream_setup_admin_mentions_the_target(plugin_module):
+    """管理员 @ 某人代办：群里点名说「发给他本人了」，绝不带任何明文。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    seen: dict = {}
+
+    async def fake_post(path, payload=None):
+        seen.update(payload)
+        return {"ok": True, "sent": True, "forOther": True, "name": "张三", "note": "直播注册完成"}
+
+    plugin._post = fake_post
+    event = _FakeEvent(sender="10001", group="g1", message_obj=_Msg(_At("10002")))
+    out = await _collect(plugin.cmd_stream_setup(event, "", ""))
+    assert seen["targetQq"] == "10002"
+    assert seen["streamKey"] == ""
+    assert "TA" in out[0]["text"]
+
+
+async def test_uid_answers_in_the_group(plugin_module):
+    """游戏 UUID：群内直接回（与命令说明、推流地址不同，它不用私聊）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    seen: dict = {}
+
+    async def fake_get(path, **params):
+        seen["path"] = path
+        seen.update(params)
+        return {"ok": True, "parts": ["【NTE 比赛】张三 的游戏 UUID\nUUID-1"]}
+
+    plugin._get = fake_get
+    event = _FakeEvent(sender="10001", group="g1", message_obj=_Msg(_At("10002")))
+    out = await _collect(plugin.cmd_uid(event))
+    assert seen["path"] == "uid" and seen["qq"] == "10001" and seen["targetQq"] == "10002"
+    assert out[0]["type"] == "plain" and "UUID-1" in out[0]["text"]
+
+
+async def test_profile_view_goes_private_to_the_right_person(plugin_module):
+    """资料查看：私聊发给**站点指认的那个人**（管理员代办时不是自己）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    private: list[tuple] = []
+
+    async def fake_get(path, **params):
+        return {"ok": True, "parts": ["资料全文"], "toQq": "10002", "forOther": True}
+
+    async def fake_notify(qq, text):
+        private.append((qq, text))
+        return {"ok": True}
+
+    plugin._get = fake_get
+    plugin._notify = fake_notify
+    event = _FakeEvent(sender="10001", group="g1", message_obj=_Msg(_At("10002")))
+    out = await _collect(plugin.cmd_profile(event))
+    assert private == [("10002", "资料全文")]
+    assert "TA" in out[0]["text"]
+    assert "资料全文" not in out[0]["text"], "群里只留一句指引"
+
+
+async def test_profile_edit_sends_field_and_value(plugin_module):
+    """改资料：字段与值原样交给站点（容错表在站点那一侧，插件不自己认）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    seen: dict = {}
+
+    async def fake_post(path, payload=None):
+        seen["path"] = path
+        seen.update(payload or {})
+        return {"ok": True, "parts": ["新的资料"], "toQq": "10001", "changed": ["名字 → 新名字"]}
+
+    async def fake_notify(qq, text):
+        return {"ok": True}
+
+    plugin._post = fake_post
+    plugin._notify = fake_notify
+    out = await _collect(plugin.cmd_profile(_FakeEvent(sender="10001", group="g1"), "名字", "新名字"))
+    assert seen["path"] == "profile"
+    assert seen["field"] == "名字" and seen["value"] == "新名字"
+    assert "已改" in out[0]["text"]
+
+
+async def test_profile_falls_back_to_the_group_for_yourself(plugin_module):
+    """私聊发不出去时：**自己**的资料可以回群里（里面没有敏感内容），别人的不行。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_get(path, **params):
+        return {"ok": True, "parts": ["我的资料全文"], "toQq": "10001"}
+
+    async def fail_notify(qq, text):
+        return {"ok": False, "error": "未加机器人好友"}
+
+    plugin._get = fake_get
+    plugin._notify = fail_notify
+    out = await _collect(plugin.cmd_profile(_FakeEvent(sender="10001", group="g1")))
+    assert "我的资料全文" in out[0]["text"]
+    assert "私聊没发出去" in out[0]["text"]
+
+
 async def test_credential_commands_send_you_to_private_chat(plugin_module):
     """三条自助命令都只调站点的 ``/credential``，群里只说「去私聊查收」。
 
@@ -448,7 +575,7 @@ def test_help_doc_lists_every_command(plugin_module):
     """
     source = PLUGIN.read_text(encoding="utf-8")
     commands = re.findall(r'@filter\.command\(\s*"([^"]+)"', source)
-    assert len(commands) == 19, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
+    assert len(commands) == 22, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
     doc = (PLUGIN.parent / "HELP.md").read_text(encoding="utf-8")
     for name in commands:
         assert name in plugin_module.HELP_TEXT, f"HELP_TEXT 里缺命令：{name}"
@@ -456,38 +583,57 @@ def test_help_doc_lists_every_command(plugin_module):
 
 
 def _load_help_card_content():
-    """读帮助图的内容模块（**零依赖**，不装 Pillow 也能核对文案）。"""
-    path = Path(__file__).resolve().parent.parent / "tools" / "help_card_content.py"
-    spec = importlib.util.spec_from_file_location("help_card_content", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    """读帮助图的内容模块（在 ``app/`` 里：**服务启动时会用它自动出图**）。"""
+    from app import helpcard_content
+
+    return helpcard_content
 
 
-def test_help_card_is_not_older_than_its_text():
-    """帮助图不能比文案旧：``static/help.jpg.src.sha256`` 要与当前文案的指纹一致。
+def test_help_card_content_has_no_markdown():
+    """图只会画字：文案里出现 ``**加粗**`` 就会原样印出星号（踩过这个坑）。"""
+    assert _load_help_card_content().markdown_leaks() == []
+
+
+def test_help_card_artifact_matches_when_present():
+    """帮助图**不入库**（服务启动时自动重画）；本地若有一份，它必须与文案同步。
 
     图上的命令群友会照着打（精确匹配，错一个字就是**毫无反应**），所以「改了文案忘了
-    重画」必须有人喊出来——出图脚本把源文件指纹写进那个小文件，这里比对
-    （``tools/check_assets.py`` 查的是同一条）。
+    重画」必须有人喊出来——出图时把源文件指纹写进 ``static/help.jpg.src.sha256``，
+    这里比对（``tools/check_assets.py`` 查的是同一条）。干净检出（没有图）是**正常状态**。
     """
     card = _load_help_card_content()
-    art = Path(__file__).resolve().parent.parent / "static" / "help.jpg"
+    root = Path(__file__).resolve().parent.parent
+    art = root / "static" / "help.jpg"
+    if not art.exists():
+        pytest.skip("帮助图不入库：服务启动时会自动生成一份")
     stamp = art.with_name(art.name + ".src.sha256")
-    assert art.exists(), "static/help.jpg 不见了（群里「比赛帮助」发的那张）"
-    assert stamp.exists(), (
-        f"缺指纹文件 {stamp.name}：跑 uv run --with pillow python tools/make_help_card.py"
-    )
+    assert stamp.exists(), "图在、指纹不在：重启一次服务，或跑 tools/make_help_card.py 重画"
     assert stamp.read_text(encoding="utf-8").strip() == card.source_digest(), (
-        "帮助图比文案旧：跑 uv run --with pillow python tools/make_help_card.py 重画"
+        "帮助图比文案旧：重启一次服务会自动重画，或跑 tools/make_help_card.py"
     )
+
+
+def test_help_card_renderer_builds_a_real_jpeg():
+    """出图这条路径本身要能跑——图不再入库之后，它是产物的**唯一**来源。"""
+    import io
+
+    from PIL import Image
+
+    from app import helpcard
+
+    if not helpcard.available():
+        pytest.skip("没装 Pillow（可选依赖）：站点会退回文字说明，不影响功能")
+    data = helpcard.build()
+    assert data[:2] == b"\xff\xd8", "JPEG 的 SOI 记号（画出来得是一张真图）"
+    with Image.open(io.BytesIO(data)) as img:
+        assert img.width == helpcard.W
+        assert 1200 < img.height < helpcard.CANVAS_H
 
 
 def test_help_card_lists_exactly_the_same_commands(plugin_module):
     """帮助图上的命令必须与 `HELP_TEXT` **完全一致**。
 
-    图是代码渲染的（`tools/make_help_card.py`，文字在 `tools/help_card_content.py`），
+    图是代码渲染的（`app/helpcard.py`，文字在 `app/helpcard_content.py`），
     所以两边能对得上；这条用例盯住「插件加了命令忘了画」或「图上写错一条」——
     图上的命令错一个字，群友照着打就是**毫无反应**（命令是精确匹配的，没有兜底）。
     """

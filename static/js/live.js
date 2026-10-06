@@ -286,9 +286,24 @@ function makePlayer(ids) {
     log.info('直播使用 WebRTC', url);
   },
 
-  /** 播放一个机位；room 为 key_endpoints 结果。 */
+  /** 播放一个机位；room 为 key_endpoints 结果（B站 机位是 ``{bili: true, embed, jump}``）。 */
   async playRoom(room) {
     const target = room && room.key ? room : null;
+    if (target?.bili) {
+      // B站 直播：画面由舞台里的 <iframe> 直嵌 B站 官方播放器（见 views.stageHtml），
+      // 这里**不连任何地址**，只维护状态并把 MediaMTX 那套停干净（免得切回普通机位时
+      // 两路画面打架）。每次重绘都会调进来，所以同一路已经在播就直接返回。
+      this.room = target;
+      if (this.playing.key === target.key && this.playing.mode === 'bili') {
+        this.setState('B站直播中');
+        return;
+      }
+      await this.stop(false);
+      this.room = target;
+      this.playing = { key: target.key, mode: 'bili' };
+      this.setState('B站直播中');
+      return;
+    }
     const st = App.state?.stream || {};
     // 观众手动选的线路优先（WebRTC 延迟低但 UDP 怕抖动；HLS 走 TCP 更稳）
     const mode = App.liveProto || st.mode || 'auto';
@@ -323,11 +338,6 @@ function makePlayer(ids) {
       }
       this.setCover('当前没有直播', '有人开播后，机位会自动出现在这里，点击即可观看。');
       this.setState('无人直播');
-      return;
-    }
-    if (st.enabled === false) {
-      this.setCover('直播已关闭', '管理员可在后台开启直播功能');
-      this.setState('已关闭');
       return;
     }
     this.setState(mode === 'hls' ? '切换到 HLS…' : '连接中…');
@@ -410,21 +420,27 @@ export const ChannelLive = makePlayer(CHANNEL_IDS);
 
 /* --------------------------- 直播信号检测 ---------------------------
  *
- * **只在直播 / 频道页运行**：进入这两个页面才开始检测，离开就停。
- * 没人看直播时既不轮询、后端也不做任何探测。
+ * **服务端常驻探测，前端只管显示**（见后端 ``live.watch_loop``）。数据有两个来源，
+ * 但都走**同一段逻辑**（:func:`applyLiveHealth`）：
+ *
+ * * **WebSocket 推送**（``{"type": "live"}``）：探测结果一变，服务端立刻推过来。
+ *   这是「及时更新」的主要通道——开播 / 下播几乎当场可见，也不占额外请求；
+ * * **HTTP 轮询**（``/api/live/health``）：兜底（推送断了、或刚打开页面）。
+ *   服务端只读缓存、毫秒级返回，永远不会把界面卡住。
+ *
+ * 两边共用一段解析，就不会出现「推送说在播、轮询说没播」这种抖动。
  *
  * 检测结果分四种状态（``App.liveHealthState``）：
  *   idle    → 还没检测过
  *   loading → 正在检测（界面显示加载动画）
  *   ok      → 拿到了推流状态
  *   error   → 连续失败达到上限，界面显示「获取失败」，不再自动重试
- *
- * 关键：每次请求都是「服务端只读缓存、毫秒级返回」，探测本身在服务端后台做，
- * 所以这里永远不会把界面卡住。
  */
 export const LIVE_HEALTH_MAX_FAILS = 3;
-const LIVE_HEALTH_INTERVAL = 15000;   // 有人在播：勤一点，观众不必等太久才看到新机位
-const LIVE_HEALTH_IDLE = 60000;       // 没人在播：慢一点，别一直敲媒体服务器
+// 推送已经把「即时」这件事做到了，轮询只做兜底，所以间隔比从前放宽，
+// 少一份无谓的请求（尤其是没人在播的时候）。
+const LIVE_HEALTH_INTERVAL = 20000;   // 有人在播：轮询兜底，别和推送抢活
+const LIVE_HEALTH_IDLE = 60000;       // 没人在播：更慢（服务端仍在常驻探测）
 const LIVE_HEALTH_RETRY = 3000;       // 失败后 / 等待后台探测结果时的重试间隔
 
 let healthRunning = false;
@@ -489,10 +505,63 @@ async function healthTick(probe = false) {
   return ok;
 }
 
+/** 集合是否与上一轮不同（与顺序无关）。 */
+function setDiff(prev, next) {
+  return !(prev instanceof Set) || prev.size !== next.size || [...next].some((x) => !prev.has(x));
+}
+
+/**
+ * 把一份直播健康视图（``/api/live/health`` 的响应，或 WebSocket 推来的同一份）
+ * 应用到 ``App``；返回**有没有真的变化**。
+ *
+ * 判定的那几项与服务端的 ``live.live_fingerprint``（决定「要不要推」用的就是它）
+ * 刻意对齐：主直播间、选手机位、成员频道、成员直播间、B站 机位。
+ *
+ * 「只有变了才重绘」是**保护正在播的画面**的关键：重绘由 ``hooks.onLiveHealth``
+ * 落地，而它按视图签名决定要不要重建播放器元素（签名没变就只更新机位条与面板）。
+ */
+export function applyLiveHealth(data) {
+  const before = App.liveHealthState;
+  App.liveHealth = data || {};
+  // 「谁真的在推流」由媒体服务器上报；只有这里报出来的才显示「直播中」
+  const next = new Set(Array.isArray(App.liveHealth.streaming) ? App.liveHealth.streaming : []);
+  // 成员频道（日常直播）：同一次探测里也回报哪些频道在推流
+  const nextChannels = new Set(
+    Array.isArray(App.liveHealth.streamingChannels) ? App.liveHealth.streamingChannels : []
+  );
+  // 成员直播间：回报哪些成员（按 uid）在推流
+  const nextMembers = new Set(
+    Array.isArray(App.liveHealth.streamingMembers) ? App.liveHealth.streamingMembers : []
+  );
+  // 主直播间（默认流名）：探测不到就是 null（未知），此时一律不给这一路信号
+  const main = App.liveHealth.streamingKnown ? Boolean(App.liveHealth.mainStreaming) : null;
+  // B站 直播（另一条链路）：谁在播由服务端的 bili 视图给出（只读缓存）
+  const nextBili = new Set(
+    ((App.liveHealth.bili && App.liveHealth.bili.items) || []).map((item) => item.uid)
+  );
+  let changed =
+    main !== App.liveMain ||
+    setDiff(App.liveNow, next) ||
+    setDiff(App.liveChannelsNow, nextChannels) ||
+    setDiff(App.liveMembersNow, nextMembers) ||
+    setDiff(App.liveBiliNow, nextBili);
+  App.liveNow = next;
+  App.liveChannelsNow = nextChannels;
+  App.liveMembersNow = nextMembers;
+  App.liveBiliNow = nextBili;
+  App.liveMain = main;
+  App.liveHealthFails = 0;
+  App.liveHealthState = 'ok';
+  // 「检测中 → 已获取」本身也要重绘，提示文案才会跟着换
+  if (before !== 'ok') changed = true;
+  log.info('直播信号状态', App.liveHealth);
+  return changed;
+}
+
 /**
  * 拉一次直播链路健康视图；返回本次是否成功。
  *
- * 服务端默认**只读缓存**（毫秒级返回，探测在服务端后台跑，不会挂住界面）；
+ * 服务端**只读缓存**（毫秒级返回，常驻探测在服务端跑，不会挂住界面）；
  * 只有用户显式点「刷新信号」时才传 ``probe`` 让服务端现场重新探测一次。
  */
 export async function refreshLiveHealth({ probe = false } = {}) {
@@ -509,36 +578,9 @@ export async function refreshLiveHealth({ probe = false } = {}) {
   }
   let changed = false;
   let ok = false;
-  // 集合是否与上一轮不同（与顺序无关）
-  const setDiff = (prev, next) =>
-    !(prev instanceof Set) || prev.size !== next.size || [...next].some((x) => !prev.has(x));
   try {
-    App.liveHealth = await api(`/live/health${probe ? '?probe=1' : ''}`);
-    // 「谁真的在推流」由媒体服务器上报；只有这里报出来的才显示「直播中」
-    const next = new Set(Array.isArray(App.liveHealth.streaming) ? App.liveHealth.streaming : []);
-    // 成员频道（日常直播）：同一次探测里也回报哪些频道在推流
-    const nextChannels = new Set(
-      Array.isArray(App.liveHealth.streamingChannels) ? App.liveHealth.streamingChannels : []
-    );
-    // 成员直播间：回报哪些成员（按 uid）在推流
-    const nextMembers = new Set(
-      Array.isArray(App.liveHealth.streamingMembers) ? App.liveHealth.streamingMembers : []
-    );
-    // 主直播间（默认流名）：探测不到就是 null（未知），此时一律不给这一路信号
-    const main = App.liveHealth.streamingKnown ? Boolean(App.liveHealth.mainStreaming) : null;
-    changed =
-      main !== App.liveMain ||
-      setDiff(App.liveNow, next) ||
-      setDiff(App.liveChannelsNow, nextChannels) ||
-      setDiff(App.liveMembersNow, nextMembers);
-    App.liveNow = next;
-    App.liveChannelsNow = nextChannels;
-    App.liveMembersNow = nextMembers;
-    App.liveMain = main;
-    App.liveHealthFails = 0;
-    App.liveHealthState = 'ok';
+    changed = applyLiveHealth(await api(`/live/health${probe ? '?probe=1' : ''}`));
     ok = true;
-    log.info('直播信号状态', App.liveHealth);
   } catch (err) {
     log.warn('直播信号探测失败', err);
     App.liveHealthFails += 1;
@@ -551,13 +593,16 @@ export async function refreshLiveHealth({ probe = false } = {}) {
       reason: err.message,
       streaming: [],
       streamingChannels: [],
+      bili: { known: false, items: [] },
     };
     changed =
       App.liveMain !== null ||
       (App.liveNow instanceof Set && App.liveNow.size > 0) ||
-      (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0);
+      (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0) ||
+      (App.liveBiliNow instanceof Set && App.liveBiliNow.size > 0);
     App.liveNow = new Set();
     App.liveChannelsNow = new Set();
+    App.liveBiliNow = new Set();
     App.liveMain = null;
   } finally {
     healthInFlight = false;
@@ -603,7 +648,8 @@ export function installStageDelegation() {
       Live.playSelected(App.state);
     } else if (act === 'live-stop') Live.stop(true);
     else if (act === 'live-open') {
-      const url = watchUrlOf(Live.room);
+      // B站 机位没有本站的观看地址：它的「源页」就是 B站 直播间
+      const url = Live.room?.jump || watchUrlOf(Live.room);
       if (url) window.open(url, '_blank', 'noopener');
     } else if (act === 'live-copy') {
       // 复制观看地址：跟随当前线路给 8888 或 8889 那一条

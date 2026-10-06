@@ -5,7 +5,7 @@
 | `GET    /api/backups` | 备份列表 + 自动备份设置 + 下次执行时间 |
 | `POST   /api/backups` | 立刻打一份备份 |
 | `PUT    /api/backups/settings` | 改自动备份设置（开关 / 间隔 / 保留份数） |
-| `GET    /api/backups/{name}/download` | 下载某一份（`?token=` 可带会话） |
+| `GET    /api/backups/{name}/download` | 下载某一份（**只认请求头**：前端取回 blob 再另存） |
 | `DELETE /api/backups/{name}` | 删除某一份 |
 | `POST   /api/backups/upload` | **上传备份并还原**（请求体就是原始 zip 字节） |
 
@@ -70,7 +70,12 @@ async def api_backup_settings(
 
 @router.get("/backups/{name}/download")
 async def api_backup_download(name: str, _: Session = Depends(require_server)) -> FileResponse:
-    """下载一份备份（走 `?token=` 也可以，方便直接用链接下载）。"""
+    """下载一份备份。
+
+    会话**只认请求头**（见 :mod:`app.security`）：下载由前端带 ``X-NTE-Token``
+    取回 blob 后本地另存（``core.downloadFile``），链接里不出现会话令牌——
+    查询串会进反向代理 / CDN 的访问日志，等于「一个链接就能把整库拖走」。
+    """
     try:
         path = await asyncio.to_thread(backup.resolve, name)
     except ValueError as exc:
@@ -112,7 +117,7 @@ async def api_backup_restore(name: str, _: Session = Depends(require_server)) ->
         "ok": True,
         "restored": result.get("manifest") or {},
         "safety": result.get("safety"),
-        "avatars": result.get("avatars") or 0,
+        "media": result.get("media") or 0,
         "revoked": revoked,
         "reauth": True,
         "backups": await asyncio.to_thread(backup.list_backups),
@@ -164,7 +169,7 @@ async def api_backup_upload(
         "restored": result.get("manifest") or {},
         "safety": result.get("safety"),
         "uploaded": result.get("uploaded") or "",
-        "avatars": result.get("avatars") or 0,
+        "media": result.get("media") or 0,
         "revoked": revoked,
         # 凭据换了，前端据此清掉本地会话并重新登录
         "reauth": True,

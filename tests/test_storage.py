@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from app import db
 from app.models import UiConfig
 from app.store import store
@@ -22,10 +24,10 @@ def test_data_dir_is_isolated():
 
 
 def test_rules_and_ui_columns_round_trip(tmp_path, make_config):
-    """best_of / metric / accent_custom / og_image 存进去要能原样读出来。"""
+    """计分三件套 / metric / accent_custom / og_image 存进去要能原样读出来。"""
     path = tmp_path / "round.sqlite"
     db.init_db(path)
-    cfg = make_config(best_of=3, metric="time")
+    cfg = make_config(value_type="time", value_label="用时", better="low")
     cfg.ui = UiConfig(accent="violet", accent_custom="#FF6A00", og_image="/static/share.png")
 
     with db.connect(path) as conn:
@@ -33,8 +35,10 @@ def test_rules_and_ui_columns_round_trip(tmp_path, make_config):
         conn.commit()
         back = db.load_event(conn, "e001")
 
-    assert back["rules"]["bestOf"] == 3
-    assert back["rules"]["metric"] == "time"
+    assert back["rules"]["valueType"] == "time"
+    assert back["rules"]["valueLabel"] == "用时"
+    assert back["rules"]["better"] == "low"
+    assert back["rules"]["metric"] == "time", "旧口径名跟着同步，老版本读得回来"
     assert back["ui"]["accentCustom"] == "#ff6a00"  # 统一小写
     assert back["ui"]["ogImage"] == "/static/share.png"
 
@@ -44,8 +48,9 @@ def test_old_database_gets_new_columns(tmp_path):
     path = tmp_path / "old.sqlite"
     db.init_db(path)
     with db.connect(path) as conn:
-        conn.execute("ALTER TABLE event_rules DROP COLUMN best_of")
-        conn.execute("ALTER TABLE event_rules DROP COLUMN metric")
+        conn.execute("ALTER TABLE event_rules DROP COLUMN value_type")
+        conn.execute("ALTER TABLE event_rules DROP COLUMN value_label")
+        conn.execute("ALTER TABLE event_rules DROP COLUMN better")
         conn.execute("ALTER TABLE event_ui DROP COLUMN accent_custom")
         conn.execute("ALTER TABLE event_ui DROP COLUMN og_image")
         conn.commit()
@@ -55,22 +60,53 @@ def test_old_database_gets_new_columns(tmp_path):
     with db.connect(path) as conn:
         rules_cols = {row["name"] for row in conn.execute("PRAGMA table_info(event_rules)")}
         ui_cols = {row["name"] for row in conn.execute("PRAGMA table_info(event_ui)")}
-    assert {"best_of", "metric"} <= rules_cols
+    assert {"value_type", "value_label", "better", "metric"} <= rules_cols
     assert {"accent_custom", "og_image"} <= ui_cols
 
 
-def test_old_event_without_metric_reads_as_score(tmp_path, make_config):
-    """老比赛读回来必须是「计分制」：补列默认值若不是历史行为，名次会集体翻转。"""
-    path = tmp_path / "legacy.sqlite"
+def test_retired_columns_are_dropped(tmp_path):
+    """已移除的概念（替补类别 / 系列赛 BO）对应的列会被清掉，不留死列。"""
+    path = tmp_path / "retired.sqlite"
+    db.init_db(path)
+    with db.connect(path) as conn:
+        conn.execute("ALTER TABLE event_rules ADD COLUMN include_substitutes INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE event_rules ADD COLUMN best_of INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
+
+    db.init_db(path)
+
+    with db.connect(path) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(event_rules)")}
+    assert "include_substitutes" not in cols
+    assert "best_of" not in cols
+
+
+@pytest.mark.parametrize(
+    ("legacy_metric", "expected"),
+    [
+        # 老数据的两种取值必须各自映射回历史行为：映射错了，名次会集体翻转
+        ("score", ("integer", "得分", "high")),
+        ("time", ("time", "用时", "low")),
+    ],
+)
+def test_old_event_with_only_metric_is_derived(tmp_path, make_config, legacy_metric, expected):
+    """只有旧口径 ``metric`` 的库：读回来要自动拆成三件套，且数值一个字节不动。"""
+    from app.models import Config
+
+    path = tmp_path / f"legacy-{legacy_metric}.sqlite"
     db.init_db(path)
     cfg = make_config()
     with db.connect(path) as conn:
         db.save_event(conn, "legacy", cfg.dump())
-        # 模拟「这个字段出现之前的库」：值退回默认
-        conn.execute("UPDATE event_rules SET metric = 'score'")
+        # 模拟「这三个字段出现之前的库」：值退回默认，只剩旧口径 metric
+        conn.execute("UPDATE event_rules SET value_type = '', value_label = '', better = ''")
+        conn.execute("UPDATE event_rules SET metric = ?", (legacy_metric,))
         conn.commit()
         back = db.load_event(conn, "legacy")
-    assert back["rules"]["metric"] == "score"
+
+    rules = Config.model_validate(back).rules
+    assert (rules.value_type, rules.value_label, rules.better) == expected
+    assert rules.metric == legacy_metric
 
 
 def test_notices_table_survives_old_databases(tmp_path):

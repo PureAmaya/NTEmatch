@@ -16,9 +16,9 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from . import league, markdown, metrics
+from . import league, markdown
 from . import tournament as T
-from .defaults import SPORT_PRESETS, sport_meta
+from .defaults import SPORT_WORDS
 from .logging_conf import get_logger
 from .models import (
     MAX_SIDES,
@@ -30,6 +30,7 @@ from .models import (
     Round,
     Side,
     StreamConfig,
+    Substitution,
     Team,
 )
 
@@ -44,20 +45,32 @@ log = get_logger("logic")
 # 名单为空表示未指定，视为全员参与——旧数据无需迁移即可继续使用。
 # --------------------------------------------------------------------------- #
 def selection_ids(cfg: Config) -> set[str]:
-    """本届手动选定的参与选手 ID 集合（空集 = 未指定）。"""
+    """本届手动选定的参与选手 ID 集合（空集 = 一个人都没选）。"""
     return {pid for pid in cfg.participants if pid}
+
+
+def has_custom_roster(cfg: Config) -> bool:
+    """本届是否**显式指定**过参与名单。
+
+    名单非空算显式，保存过（``participants_set``）也算——后者让「空名单」成为一份
+    真正的名单。否则「全不选后保存」会被当成「没指定」而变回全员参与，永远清不空。
+    """
+    return cfg.participants_set or bool(selection_ids(cfg))
 
 
 def is_selected(cfg: Config, player_id: str) -> bool:
     """该选手是否参与本届（未指定名单时视为全员参与）。"""
-    chosen = selection_ids(cfg)
-    return not chosen or player_id in chosen
+    if not has_custom_roster(cfg):
+        return True
+    return player_id in selection_ids(cfg)
 
 
 def joined_players(cfg: Config) -> list[Player]:
     """本届实际参与的选手，保持报名池顺序。"""
+    if not has_custom_roster(cfg):
+        return list(cfg.players)
     chosen = selection_ids(cfg)
-    return [p for p in cfg.players if not chosen or p.id in chosen]
+    return [p for p in cfg.players if p.id in chosen]
 
 
 def selectable_players(cfg: Config) -> list[Player]:
@@ -318,7 +331,6 @@ PLAY_ENDPOINT_KEYS = ("key", "webrtc", "hls")
 # ``verifyTls`` 不是凭据（只是一个证书校验开关），管理端表单要读它，因此也在白名单里；
 # ``apiUser`` / ``apiPass``（控制 API 的 Basic 认证）是凭据，绝不在此列。
 PUBLIC_STREAM_FIELDS = (
-    "enabled",
     "mode",
     "provider",
     "title",
@@ -423,6 +435,73 @@ def play_endpoints(stream: StreamConfig, key: str) -> dict[str, str]:
     return {name: full[name] for name in PLAY_ENDPOINT_KEYS if full.get(name)}
 
 
+# --------------------------------------------------------------------------- #
+# 替补（对局级，仅积分制）
+# --------------------------------------------------------------------------- #
+# 生效范围的中文说法：与 app/subs.py 的判定一一对应
+SUB_SCOPE_LABEL = {
+    "round": "仅当前比赛",
+    "rest": "本场及之后",
+    "event": "全场",
+}
+
+
+def substitution_view(cfg: Config, sub: Substitution) -> dict[str, Any]:
+    """一条替补的对外结构：原谁 → 现在谁 + 生效范围（带双方展示信息，便于直接渲染头像）。"""
+    players = {p.id: p for p in cfg.players}
+    data = sub.dump()
+    data["scopeLabel"] = SUB_SCOPE_LABEL.get(sub.scope, sub.scope)
+    data["fromPlayer"] = public_player(players[sub.from_id]) if sub.from_id in players else None
+    data["toPlayer"] = public_player(players[sub.to_id]) if sub.to_id in players else None
+    data["fromName"] = players[sub.from_id].display_name if sub.from_id in players else sub.from_id
+    data["toName"] = players[sub.to_id].display_name if sub.to_id in players else sub.to_id
+    return data
+
+
+def _anchor_index_of(cfg: Config, anchor: str) -> int | None:
+    """把起点 ``code`` 换成对局序号；找不到返回 ``None``。"""
+    want = str(anchor or "").strip()
+    if not want:
+        return None
+    for rnd in cfg.rounds:
+        if (rnd.code or str(rnd.index)) == want:
+            return rnd.index
+    return None
+
+
+def round_substitutions(cfg: Config, rnd: Round) -> list[dict[str, Any]]:
+    """本场生效的替补登记（赛程里显示「原谁 → 现在谁」，阵容里已经是替补本人）。
+
+    范围判定与 :mod:`app.subs` 完全一致：``event`` 覆盖全场，``rest`` 覆盖起点及
+    其后，``round`` 只覆盖起点那一场。
+    """
+    if not cfg.substitutions:
+        return []
+    out: list[dict[str, Any]] = []
+    for sub in cfg.substitutions:
+        if sub.scope == "event":
+            out.append(substitution_view(cfg, sub))
+            continue
+        start = _anchor_index_of(cfg, sub.anchor)
+        if start is None:
+            continue
+        # round 只管起点那一场；rest 管起点及其之后
+        if (sub.scope == "round" and rnd.index == start) or (
+            sub.scope == "rest" and rnd.index >= start
+        ):
+            out.append(substitution_view(cfg, sub))
+    return out
+
+
+def substitution_views(cfg: Config) -> list[dict[str, Any]]:
+    """本届全部替补登记（总览用），按生效起点排成与赛程一致的顺序。"""
+    items = [substitution_view(cfg, sub) for sub in cfg.substitutions]
+    return sorted(
+        items,
+        key=lambda item: (_anchor_index_of(cfg, str(item.get("anchor") or "")) or 0, str(item.get("id") or "")),
+    )
+
+
 def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str, Any]:
     """把一场比赛渲染成前端直接可用的结构。
 
@@ -431,6 +510,9 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
 
     直播：``live`` 表示本场**当前有效**的直播状态——已结束的比赛一律视为
     未直播；查看过往届次（``historical``）时也按关闭处理。
+
+    ``substitutions`` 是本场生效的替补登记（原谁 → 现在谁、范围多长）：
+    阵容里已经是替补本人，这里额外给出「换下的是谁」，让页面能两样都显示。
     """
     players = {p.id: p for p in cfg.players}
     teams = {t.id: t for t in cfg.teams}
@@ -493,7 +575,7 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
         "pendingSettlement": times["pendingSettlement"],
         # 用时：优先用手填值，否则回退到起止时间差
         "duration": rnd.duration_minutes or times["durationMinutes"] or 0,
-        # 各局小分与直播
+        # 各轮成绩与直播
         "sets": [item.dump() for item in rnd.sets],
         "live": live_on,
         "livePlaying": live_on and rnd.status == "live",
@@ -508,6 +590,8 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
         "sides": sides,
         "sideA": sides[0],
         "sideB": sides[1],
+        # 本场生效的替补（原谁 → 现在谁）：阵容里已经是替补本人，这里补上「换下的是谁」
+        "substitutions": round_substitutions(cfg, rnd),
     }
 
 
@@ -530,63 +614,158 @@ def knockout_round_names(size: int, loser_bracket: bool) -> list[str]:
     return names
 
 
-# 系列赛的中文说法（BO1 不是「系列赛」）
-_SERIES_NAME = {3: "三局两胜", 5: "五局三胜", 7: "七局四胜"}
+def _rule_plain(text: str) -> str:
+    """纯文本版：把行内标记摘掉。
+
+    群消息摘要与**卡片渲染**都不认 Markdown（卡片是往图上画字，``**全程固定**``
+    会原样印出两个星号）。所以「网页看 HTML、别处看纯文本」这两份都得在服务端出，
+    而不是把带标记的那份丢给下游各自处理。
+    """
+    out = markdown.to_text(text)
+    for token in ("**", "*", "`"):
+        out = out.replace(token, "")
+    return out
 
 
-def series_label(best_of: int) -> str:
-    """把 ``best_of`` 说成人话；1（一局定胜负）返回空串。"""
-    n = int(best_of or 1)
-    if n <= 1:
-        return ""
-    return _SERIES_NAME.get(n, f"{n} 局 {n // 2 + 1} 胜")
+def _rule_section(title: str, items: list[str]) -> dict[str, Any]:
+    """一个规则分区。
+
+    ``items`` 是**纯文本**（群消息摘要、卡片渲染用，标记已摘掉），``itemsHtml`` 是
+    同一批文本的**行内 Markdown 渲染**（网页用）。两份都由服务端出：网页那份走
+    :mod:`app.markdown` 的白名单（先转义再渲染），前端不需要、也不该自己拼 ``<b>``。
+    """
+    return {
+        "title": title,
+        "items": [_rule_plain(item) for item in items],
+        "itemsHtml": [markdown.inline(item) for item in items],
+    }
 
 
 def rulebook(cfg: Config) -> dict[str, Any]:
-    """把当前赛制与参数翻译成用户端可读的规则条目。"""
+    """把当前赛制与参数翻译成用户端可读的规则条目。
+
+    两条原则：
+
+    * **全部由参数推导**（一个字的文案都不入库）：改了赛制 / 人数 / 同场队伍数 /
+      计分口径，这里立刻跟着变，不会出现「规则说的和实际打的不一样」；
+    * **能算出具体数字就算出来**：每队打几场、几个组、每组几队、每场几队同场、
+      淘汰赛几轮，全部按**当前实际的队伍与赛程**推导（还没生成赛程时给规则说明）。
+    """
     rules = cfg.rules
     league = rules.format == "league"
     teams = cfg.teams
     rounds = cfg.rounds
     players = joined_players(cfg)
-    meta = sport_meta(cfg.event.sport)
+    # 用词固定这一套就够了：以前的「比赛类型」只是换称呼（车手 / 作者…），
+    # 组织者要的是「规则跟着赛制走」——称呼不该是另一层需要维护的东西。
+    meta = SPORT_WORDS
     per_match = max(2, min(MAX_SIDES, rules.teams_per_match or 2))
-    shape = "组 vs 组" if per_match == 2 else f"{per_match} 队同场"
     loser = bool(rules.loser_bracket)
     sections: list[dict[str, Any]] = []
 
-    # ---- 比法（app/metrics.py）：方向只有一处定义，这里翻译成人话 ----
-    time_based = metrics.lower_is_better(rules.metric)
-    # 「同分再比什么」在两种比法下不是同一个东西
-    tie_break = "完成场次、总用时" if time_based else "净胜分、总得分"
-    if time_based:
-        verdict = "每局用时短者胜；用时相同视为并列，需人工指定胜方或记平局。"
+    # ---- 计分口径（app/metrics.py）：类型 / 标签 / 判断标准，这里翻译成人话 ----
+    sc = rules.scoring
+    value_word = sc.label_text
+    # 「同分再比什么」随判断标准变化
+    tie_break = "完成场次、总成绩" if sc.low_wins else "净胜分、总成绩"
+    if sc.low_wins:
+        verdict = f"每轮{value_word}少者胜；相同视为并列，需人工指定胜方或记平局。"
     elif rules.target_score:
-        verdict = f"单局目标分 {rules.target_score} 分，先到者胜。"
+        verdict = f"单轮目标 {rules.target_score} 分，先到者胜。"
     else:
-        verdict = "单局不设目标分，按录入比分判定胜负。"
+        verdict = "单轮不设目标分，按录入的成绩判定胜负。"
 
-    # ---- 赛制概览 ----
+    # ---- 现场推导：分组、每队场次、同场队数、轮数（全部来自实际数据）----
+    group_sizes: dict[str, int] = {}
+    for team in teams:
+        key = team.group or "A"
+        group_sizes[key] = group_sizes.get(key, 0) + 1
+    groups = sorted(group_sizes)
+    group_rounds = [r for r in rounds if r.stage == "group"]
+    knockout_rounds = [r for r in rounds if r.stage != "group"]
+    group_round_count = max((r.bracket_round or 0) for r in group_rounds) if group_rounds else 0
+    appear: dict[str, int] = {}
+    for rnd in group_rounds:
+        for side in rnd.sides:
+            if side.team_id:
+                appear[side.team_id] = appear.get(side.team_id, 0) + 1
+    heat_sizes = sorted({len(r.sides) for r in group_rounds})
+    # 小组数：手动设了就照手动说，没设就说「按队伍数自动推算」——
+    # 两者别混着讲，否则又是一句自相矛盾的话。
+    manual_groups = int(rules.group_count or 0) > 0
+    planned_groups = (
+        max(1, min(int(rules.group_count), len(teams)))
+        if manual_groups and teams
+        else (T.group_count_for(len(teams), per_match) if teams else 0)
+    )
+    # 小组赛每队出场次数：按实际排出来的赛程说，没排出来时按单循环公式给个数
+    if appear:
+        counts = sorted(set(appear.values()))
+        per_team_text = (
+            f"每队 {counts[0]} 场" if len(counts) == 1 else f"每队 {counts[0]}~{counts[-1]} 场"
+        )
+    elif per_match == 2 and teams:
+        per_team_text = f"每队 {max(0, len(teams) - 1)} 场（单循环）"
+    else:
+        per_team_text = ""
+    # 「每场几队同场」只说**一个**说法，而且优先说**实际排出来的**：
+    # 以前会写「4 队同场（每场 3 队同场）」——前者是配置上限、后者是实际场次，
+    # 两个数并排摆着，看的人只会觉得规则自己都没想清楚。
+    if heat_sizes == [2]:
+        shape = "组 vs 组"
+    elif heat_sizes:
+        shape = " / ".join(f"{n} 队同场" for n in heat_sizes)
+    elif per_match == 2:
+        shape = "组 vs 组"
+    else:
+        shape = f"最多 {per_match} 队同场"
+    # 「怎么打」有几队同场：**以实际排出来的场次为准**（有赛程时）。
+    # 只按配置讲，就会出现「配置说 4 队同场、赛程里全是 3 队同场」这种自相矛盾的规则。
+    heat_max = max(heat_sizes) if heat_sizes else per_match
+    actual_multi = bool(heat_sizes) and heat_sizes != [2]
+    placement_table = "、".join(
+        f"第 {i} 名 {T.placement_points(heat_max, i)} 分" for i in range(1, heat_max + 1)
+    )
+    size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
+
+    # ---- 赛制概览（只说这套赛制**是什么样**，不谈「怎么改、谁说了算」）----
     if league:
         headline = f"积分制 · {rules.team_size}v{rules.team_size} · 共 {rules.total_rounds} 局"
         overview = [
-            f"赛制：积分制（不淘汰），每局 {rules.team_size} 人对 {rules.team_size} 人。",
-            f"参赛：{len(players)} 名选手，共 {rules.total_rounds} 局。",
+            (
+                f"赛制：积分制（不淘汰）——每局 {rules.team_size} 人对 {rules.team_size} 人，"
+                f"共 {rules.total_rounds} 局。"
+            ),
+            f"参赛：{len(players)} 名选手；每局上场 {rules.team_size * 2} 人，其余轮空。",
         ]
-        if rules.include_substitutes:
-            overview.append("正式选手不足时启用替补；替补上场同样计入本人成绩。")
         if rules.fair_rotation:
-            overview.append("自动排阵：均衡出场，尽量不重复搭档、不重复对手。")
+            overview.append("排阵：自动轮换——均衡出场与轮空，尽量不重复搭档、不重复对手。")
+        else:
+            overview.append("排阵：按参与名单顺序轮换搭档与对手。")
+        overview.append("替补：某场缺人时可在赛程里换人，替补的成绩计入替补本人。")
     else:
         headline = (
-            f"锦标赛制 · 每队 {rules.team_size} 人 · 小组赛每场 {shape} · "
+            f"锦标赛制 · 每队 {rules.team_size} 人 · 小组赛 {shape} · "
             f"{'双败' if loser else '单败'}淘汰"
         )
+        if teams:
+            flow = f"小组赛（{len(groups) or planned_groups} 组）"
+            flow += (
+                f" → 淘汰赛（{size} 强，{'双败' if loser else '单败'}）→ 冠军"
+                if size
+                else " → 淘汰赛 → 冠军"
+            )
+        else:
+            flow = "小组赛 → 淘汰赛 → 冠军"
         overview = [
-            f"赛制：固定队伍 —— 随机分配队友后全程固定、不换人，每个组 {rules.team_size} 人。",
+            (
+                f"赛制：锦标赛制——每队 {rules.team_size} 人，队友在组队时随机分配、"
+                "**全程固定**（不换队、不换队友）。"
+            ),
             f"参赛：{len(players)} 名选手 / {len(teams)} 支队伍。",
+            f"流程：{flow}。",
         ]
-    sections.append({"title": "赛制概览", "items": overview})
+    sections.append(_rule_section("赛制概览", overview))
 
     if not cfg.event.ranked:
         # 娱乐模式：规则面板直说「不排名」，避免用户找积分榜
@@ -594,112 +773,160 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             {
                 "title": "娱乐模式（不排名）",
                 "items": [
-                    f"本场是娱乐性质的{meta['label']}：只记录{meta['round']}与{meta['score']}。",
+                    f"本场为娱乐性质：只记录每场{meta['round']}与{meta['score']}。",
                     "不计算名次与积分、不判晋级、不产生冠军。",
-                    f"{meta['score']}相同时直接记为平局，不必指定胜方。",
+                    f"{meta['score']}相同时记平局。",
                 ],
             }
         )
-
-    groups = sorted({t.group or "A" for t in teams}) if teams else []
-    size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
 
     if league:
         # ---- 积分与排名 ----
         points = [f"胜 +{rules.points_win}", f"负 +{rules.points_lose}"]
-        points.append(f"平 +{rules.points_draw}" if rules.allow_draw else "不允许平局")
+        points.append(f"平 +{rules.points_draw}" if rules.allow_draw else "不设平局")
         sections.append(
             {
                 "title": "积分与排名",
                 "items": [
-                    "每局积分：" + "、".join(points) + "。",
                     (
-                        f"排名依据：总得分 ÷ 出场次数（均分）降序，同分再比{tie_break}；"
+                        f"怎么打：{rules.total_rounds} 局，每局 {rules.team_size}v{rules.team_size}；"
+                        "每局独立结算，不影响其它局。"
+                    ),
+                    "积分：" + "、".join(points) + "。",
+                    (
+                        f"排名依据：总{value_word} ÷ 出场次数（均分）降序，同分再比{tie_break}；"
                         f"出场不足 {rules.min_rank_played} 局不参与名次。"
                     ),
                     verdict,
+                    "没有淘汰与晋级：打完所有局，按均分排名。",
                 ],
             }
         )
     else:
-        # ---- 小组赛 ----
-        group_items = [
-            (
-                f"小组赛：{'分 ' + str(len(groups)) + ' 组' if groups else '按队伍数分组'}"
-                f"轮转，每场 {shape}；每队每轮最多出场一次，出场次数保持均衡。"
-            ),
-            (
-                f"排名依据：名次分 —— 同场 {per_match} 队时第 1 名得 {per_match} 分，"
-                f"依次递减，最低 1 分；同分再比{tie_break}。"
-                if per_match > 2
-                else f"排名依据：名次分 —— 胜 2 分、负 1 分；同分再比{tie_break}。"
-            ),
-            (
-                "小组赛允许平局。"
-                if rules.allow_draw
-                else "小组赛必须分出胜负（不设平局）。"
-            ),
-            # 「怎么算赢」：比法决定方向，必须写在最显眼的地方
-            verdict,
-        ]
+        # ---- 分组与小组赛 ----
+        group_items: list[str] = []
+        if groups:
+            detail = "、".join(f"{key} 组 {group_sizes[key]} 队" for key in groups)
+            group_items.append(
+                f"分组：{len(groups)} 组（{detail}）"
+                + ("（手动设定）" if manual_groups else "（按队伍数自动划分）")
+                + "；队伍随机分配，分组只决定小组赛跟谁打。"
+            )
+        elif teams:
+            group_items.append(
+                f"分组：按 {len(teams)} 支队伍"
+                + (f"手动分为 {planned_groups} 组" if manual_groups else f"自动分为 {planned_groups} 组")
+                + "（生成赛程时落定）。"
+            )
+        else:
+            group_items.append("分组：还没有队伍——先在组队台生成队伍，再生成赛程。")
+        # 「怎么打」：2 队对 2 队是单循环，多队同场是「每轮尽量排满 + 轮转」。
+        # 判据是**实际排出来的场次**（有赛程时），而不是配置里的上限——配置说 4 队、
+        # 实际全是 3 队同场时，规则得说实话。
+        if per_match == 2 and not actual_multi:
+            group_items.append(
+                "打法：**组 vs 组**，组内单循环——同组每两支队伍相遇一次"
+                + (f"，共 {group_round_count} 轮" if group_round_count else "")
+                + (f"，{per_team_text}" if per_team_text else "")
+                + "。"
+            )
+        else:
+            group_items.append(
+                f"打法：每场 **{shape}**——每轮把组内队伍尽量凑满一场，每支队每轮最多出场一次；"
+                "凑不满的场次少一队，仍排不下的队这一轮轮休"
+                + (f"。共 {group_round_count} 轮，{per_team_text}。" if group_round_count else "。")
+            )
+        group_items.append(
+            f"每场名次分：{placement_table}"
+            + ("（2 队即胜者 2 分、负者 1 分；平局双方同分）。" if per_match == 2 else "。")
+        )
+        group_items.append(
+            f"小组排名：名次分 → {tie_break} → 队名；"
+            "各组第 1 名优先、再各组第 2 名……依次排出总排名。"
+        )
+        group_items.append(
+            "小组赛允许平局。" if rules.allow_draw else "小组赛必须分出胜负（不设平局）。"
+        )
+        # 「怎么算赢」：口径决定方向，必须写在最显眼的地方
+        group_items.append(verdict)
         if size:
             left = len(teams) - size
             group_items.append(
-                f"晋级：各组名次靠前者优先，取总排名前 {size} 名进入淘汰赛"
-                + (f"，其余 {left} 支队淘汰。" if left > 0 else "（全部队伍晋级，小组赛决定种子）。")
+                f"出线（小组赛淘汰）：取总排名前 {size} 名进入淘汰赛"
+                + (
+                    f"，其余 {left} 支队在小组赛被淘汰。"
+                    if left > 0
+                    else "（队伍数不多，全部晋级，小组赛只决定淘汰赛的种子位置）。"
+                )
             )
         else:
-            group_items.append("晋级：小组赛结束后按总排名确定晋级名额。")
-        sections.append({"title": "小组赛", "items": group_items})
+            group_items.append("出线：小组赛结束后按总排名确定晋级名额。")
+        sections.append(_rule_section("小组赛", group_items))
 
         # ---- 淘汰赛 ----
-        knockout_items = []
+        # 单败 / 双败必须**跟着配置走**：一段写死「默认双败」的说明，遇到单败的届
+        # 就是一句假话（用户看不到自己那一届的真实规则）。
+        knockout_items: list[str] = []
         if size:
-            names = knockout_round_names(size, loser)
-            branch = "胜者组逐轮为 " if loser else "逐轮为 "
+            tree = " → ".join(knockout_round_names(size, loser))
             knockout_items.append(
-                f"淘汰赛：{size} 强{'双败' if loser else '单败'}，{branch}"
-                + " → ".join(names)
-                + "；对阵恒为 2 队一组。"
+                f"规模：{size} 强（首轮 {size // 2} 场），每场固定 2 队对阵，逐轮 {tree}。"
             )
+            knockout_items.append(
+                "晋级：每场胜者进入下一轮"
+                + (
+                    f"；种子按小组总排名排入 {size} 强签位（第 1 名与第 2 名只可能在决赛相遇）。"
+                    if loser
+                    else "；对阵按小组总排名排入签位。"
+                )
+            )
+        else:
+            knockout_items.append("规模：队伍确定后自动取不超过队伍数的最大 2 的幂作为规模。")
         if loser:
-            rounds_word = f"（共 {2 * (size.bit_length() - 1) - 2} 轮）" if size >= 4 else ""
             knockout_items.append(
-                f"双败淘汰：胜者组落败者进入败者组{rounds_word}，输两场才被淘汰；"
-                "败者组比赛成员随比赛进程自动生成。"
+                "淘汰方式（**双败**）：胜者组输一场掉进败者组（还有一次机会），"
+                "在败者组再输一场才真正淘汰"
+                + (f"；败者组共 {max(0, 2 * (size.bit_length() - 1) - 2)} 轮。" if size >= 4 else "。")
             )
-            knockout_items.append("总决赛：胜者组冠军 对 败者组冠军，单场定胜负。")
+            knockout_items.append(
+                "冠军：胜者组冠军与败者组冠军打**总决赛**（单场定胜负），"
+                "胜者为总冠军、负者为亚军。"
+            )
         else:
             knockout_items.append(
-                "单败淘汰：输一场即被淘汰（没有败者组），最后一轮直接决出冠军。"
+                "淘汰方式（**单败**）：输一场直接淘汰；没有败者组，最后一轮就是决赛。"
             )
-        sections.append({"title": "淘汰赛", "items": knockout_items})
+            knockout_items.append("冠军：决赛胜者为总冠军、负者为亚军。")
+        if knockout_rounds:
+            knockout_items.append(f"当前赛程共 {len(knockout_rounds)} 场淘汰赛。")
+        sections.append(_rule_section("淘汰赛", knockout_items))
+
+    # ---- 排期与录入 ----
+    play_items = [
+        f"录分：按录入的{value_word}自动判定胜负与名次；填了多轮时自动汇总大比分与总成绩。",
+        "轮次：一场可以记多轮（默认一轮），赢的轮数就是大比分，各轮成绩合计就是总成绩。",
+    ]
+    if league:
+        play_items.append("弃权：某方弃权则该方名次垫底、对手直接获胜，该局照常计入双方积分。")
+    else:
+        play_items.append("弃权：某方弃权则该方名次垫底、对手直接晋级（后续对阵会自动往下推进）。")
+        play_items.append("改期：生成赛程后可以逐场登记时间；重置一场会作废依赖它的后续对阵。")
+    sections.append(_rule_section("排期与录入", play_items))
 
     # ---- 其他 ----
-    if league:
-        result_note = "比赛结果按录入的成绩自动结算积分；每局独立结算，不影响其它局。"
-    elif time_based:
-        result_note = "比赛结果按录入的用时自动判定胜负与名次，录入各局用时还能自动汇总局分与总用时。"
-    else:
-        result_note = "比赛结果按录入的比分自动判定胜负与名次，录入各局小分还能自动汇总局分与总得分。"
-    others = [result_note]
-    if time_based:
-        others.append(
-            "用时制：成绩按毫秒存储与比较（界面写 1:23.456 这样的时间）；"
+    others = [
+        f"计分：{sc.type_label}（{value_word}），{sc.better_label}。"
+        + (
+            "界面按时间录入（如 1:23.456），底层按毫秒存储比较；"
             "没填或填 0 视为「未完赛」，名次垫底。"
-        )
-    series = series_label(rules.best_of)
-    if series:
-        others.append(
-            f"系列赛：每场 {rules.best_of} 局小局（{series}），"
-            f"先赢 {(rules.best_of + 1) // 2} 局小局者赢下整场；"
-            "局数与胜负由「各局小分」自动汇总，不需要另外填大比分。"
-        )
-    if cfg.stream.enabled:
-        others.append("直播：每场比赛可单独开启推流，并标注直播选手提示。")
-    if cfg.rules.target_score and not league and not time_based:
-        others.append(f"单局目标分：{cfg.rules.target_score} 分。")
-    sections.append({"title": "其他", "items": others})
+            if sc.time_based
+            else "0 是一个合法成绩（0 分照样参与排名）；只有「没填 / 退赛」才名次垫底。"
+        ),
+        "直播：每场比赛可单独开启推流，并标注直播选手提示。",
+    ]
+    if rules.target_score and not league and not sc.low_wins:
+        others.append(f"单轮目标：{rules.target_score} 分。")
+    sections.append(_rule_section("其他", others))
 
     return {
         "headline": headline,
@@ -709,21 +936,23 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             "formatLabel": "积分制" if league else "锦标赛制",
             "teamSize": rules.team_size,
             "teamsPerMatch": per_match,
+            "shape": shape,
             "loserBracket": loser,
             "allowDraw": rules.allow_draw,
             "teams": len(teams),
             "players": len(players),
-            "groups": len(groups),
+            "groups": len(groups) or planned_groups,
+            "groupsManual": manual_groups,
+            "groupSizes": "、".join(f"{key} 组 {group_sizes[key]} 队" for key in groups),
+            "perTeamMatches": per_team_text,
+            "groupRounds": group_round_count,
+            "knockoutRounds": len(knockout_rounds),
             "size": size,
             "targetScore": rules.target_score,
-            "metric": metrics.norm(rules.metric),
-            "metricLabel": metrics.LABELS[metrics.norm(rules.metric)],
-            "metricNote": metrics.DESCRIPTIONS[metrics.norm(rules.metric)],
-            "timeBased": time_based,
-            "bestOf": rules.best_of,
-            "series": series_label(rules.best_of),
-            "groupMatches": sum(1 for r in rounds if r.stage == "group"),
-            "knockoutMatches": sum(1 for r in rounds if r.stage != "group"),
+            # 计分口径：类型 / 标签 / 判断标准 + 中文名（前端只读这一份）
+            **sc.dump(),
+            "groupMatches": len(group_rounds),
+            "knockoutMatches": len(knockout_rounds),
             "totalRounds": rules.total_rounds,
             "minRankPlayed": rules.min_rank_played,
         },
@@ -747,13 +976,16 @@ def build_state(cfg: Config, *, historical: bool = False) -> dict[str, Any]:
         "revision": cfg.revision,
         "updatedAt": cfg.updated_at,
         "event": cfg.event.dump(),
-        # 比赛类型（文案）与排名开关：前端据此换称呼、并决定是否展示排名 / 晋级相关内容
-        "sport": sport_meta(cfg.event.sport),
-        "sportPresets": [{"key": key, **meta} for key, meta in SPORT_PRESETS.items()],
+        # 界面用词（固定一套，见 defaults.SPORT_WORDS）与排名开关。
+        # 「比赛类型」已退休：以前它按类型换称呼，现在一律同一套词——多一层可选择的东西，
+        # 就多一处会与实际赛制对不上的地方。
+        "sport": dict(SPORT_WORDS),
         "ranked": bool(cfg.event.ranked),
         # 整届的时间状态（是否结束 / 起止时间 / 用时）
         "eventTime": event_time_view(cfg, progress),
         "rules": cfg.rules.dump(),
+        # 计分口径：类型 / 标签 / 判断标准 + 中文名（前端所有比分显示与录入都按它走）
+        "scoring": cfg.rules.scoring.dump(),
         # 用户端展示的「比赛规则」：完全由当前赛制与参数推导
         "rulebook": rulebook(cfg),
         # 直播配置：剥掉推流凭据后再下发
@@ -762,7 +994,9 @@ def build_state(cfg: Config, *, historical: bool = False) -> dict[str, Any]:
         # 选手：脱敏下发（UUID / QQ / 推流流名不下发用户端）
         "players": [public_player(p) for p in cfg.players],
         "participants": [p.id for p in joined_players(cfg)],
-        "participantsSet": bool(selection_ids(cfg)),
+        "participantsSet": has_custom_roster(cfg),
+        # 本届替补登记（仅积分制有意义）：总览据此列出「谁换了谁」并可取消
+        "substitutions": substitution_views(cfg),
         "teams": [t.dump() for t in cfg.teams],
         "rounds": [round_view(cfg, r, historical=historical) for r in cfg.rounds],
         "progress": progress,
@@ -807,8 +1041,8 @@ def _tournament_state(cfg: Config) -> dict[str, Any]:
     teams = cfg.teams
     rounds = cfg.rounds
     by_id = {t.id: t for t in teams}
-    tables = T.group_tables(teams, rounds, cfg.rules.metric)
-    ranking = T.overall_ranking(tables, cfg.rules.metric)
+    tables = T.group_tables(teams, rounds, cfg.rules.scoring)
+    ranking = T.overall_ranking(tables, cfg.rules.scoring)
     size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
     champion = T.champion_of(teams, rounds)
     return {
@@ -917,7 +1151,7 @@ def validate_config(cfg: Config) -> list[str]:
     per_team = max(1, cfg.rules.team_size or 2)
     need = per_team * 2
     joined = joined_players(cfg)
-    meta = sport_meta(cfg.event.sport)
+    meta = SPORT_WORDS
 
     if not cfg.event.ranked:
         # 娱乐模式：只记录，不排名 / 不晋级
@@ -938,7 +1172,8 @@ def validate_config(cfg: Config) -> list[str]:
             "再勾选本届参与名单。"
         )
     elif len(joined) < need:
-        # 注意：参与名单留空 = 全员参与（见 joined_players），所以这里只可能是真的不够人
+        # 「从未指定名单」= 全员参与（见 joined_players），所以这里的人数是真实上场人数：
+        # 要么勾得太少，要么名单被显式清空了（那时就是 0 人）。
         issues.append(f"参与选手 {len(joined)} 人，不足 {need} 人（{per_team} 人一队至少需要 2 队）。")
 
     chosen = selection_ids(cfg)
@@ -990,18 +1225,13 @@ def validate_config(cfg: Config) -> list[str]:
                 stale.update(pid for pid in (rnd.side_a.player_ids + rnd.side_b.player_ids) if not is_selected(cfg, pid))
             if stale:
                 issues.append(
-                    f"未开赛对局中仍有 {len(stale)} 名非参与选手，重新保存参与名单时会自动移出。"
+                    f"未开赛对局中仍有 {len(stale)} 名非参与选手：重新保存参与名单会自动移出，"
+                    "名单为空则保持现状（可重新生成或清空赛程）。"
                 )
         return issues
 
-    # ---- 锦标赛制：必须有固定队伍（且不接受替补）----
-    substitutes = [p for p in joined if p.substitute]
-    if substitutes:
-        names = "、".join(p.display_name for p in substitutes[:5])
-        issues.append(
-            f"锦标赛制不支持替补：{names} 不会进入队伍（固定队伍全程不换人；只有积分制才需要替补）。"
-        )
-    eligible = [p for p in joined if not p.substitute]
+    # ---- 锦标赛制：必须有固定队伍（全程不换人，替补只属于积分制）----
+    eligible = list(joined)
     if eligible and len(eligible) % per_team:
         issues.append(
             f"可组队选手 {len(eligible)} 人不是 {per_team} 的整数倍，"
@@ -1041,70 +1271,41 @@ def validate_config(cfg: Config) -> list[str]:
     if size and len(cfg.teams) < size:
         issues.append(f"淘汰赛规模为 {size} 强，但只有 {len(cfg.teams)} 支队伍，请重新生成赛程。")
 
-    # ---- 系列赛（BO）与录入是否对得上 ----
-    # 判定本身不需要额外规则（填了各局小分就是「谁赢的局多谁赢」，见 judge_round），
-    # 这里只负责把「对不上」的情况说出来：局数超了、或者赛制没设 BO 却记了多局。
-    best_of = int(cfg.rules.best_of or 1)
-    if best_of > 1:
-        over = [
-            r for r in cfg.rounds if len(r.sets) > best_of and len(r.sides) == 2
-        ]
-        if over:
-            names = "、".join((r.label or r.code) for r in over[:4])
-            issues.append(
-                f"{names} 记录的小局数超过 BO{best_of}（一场最多 {best_of} 局），"
-                "多出来的局不会被计入胜负，建议核对后删掉。"
-            )
-        # 「已经分出胜负、后面还接着记」的场次：小局的顺序是有意义的，
-        # 所以从前往后数，谁先到 ⌈n/2⌉ 局就是终结点，之后的记录都不该存在。
-        half = (best_of + 1) // 2
-        trailing: list[Round] = []
-        for rnd in cfg.rounds:
-            if len(rnd.sides) != 2:
-                continue
-            wins = [0, 0]
-            for i, item in enumerate(rnd.sets):
-                # 每局谁赢由比法决定（计分制比大、用时制比小，见 app/metrics.py）
-                left = metrics.value_key(item.a, cfg.rules.metric)
-                right = metrics.value_key(item.b, cfg.rules.metric)
-                if left < right:
-                    wins[0] += 1
-                elif right < left:
-                    wins[1] += 1
-                if max(wins) >= half and i < len(rnd.sets) - 1:
-                    trailing.append(rnd)
-                    break
-        if trailing:
-            names = "、".join((r.label or r.code) for r in trailing[:4])
-            issues.append(
-                f"{names} 已经先到 {half} 局（胜负已定），后面还记了小局，请核对。"
-            )
-    elif any(len(r.sets) > 1 for r in cfg.rounds):
+    # ---- 轮次：每一轮的记录都算数，这里只把「明显对不上」的情况说出来 ----
+    # 判定本身不需要额外规则（填了轮次就是「谁赢的轮多谁赢」，见 judge_round）。
+    sc = cfg.rules.scoring
+    half_bad = [
+        r
+        for r in cfg.rounds
+        if len(r.sides) == 2
+        and len(r.sets) > 1
+        and any(not item.a or not item.b for item in r.sets)
+    ]
+    if half_bad:
+        names = "、".join((r.label or r.code) for r in half_bad[:4])
         issues.append(
-            "有场次记了多局小分，但赛制是「一局定胜负（BO1）」："
-            "按现有规则会以「赢的局数」作为局分。若本来就想打三局两胜，"
-            "请到「赛制」里把系列赛改成 BO3。"
+            f"{names} 有轮次只填了一方的{sc.label_text}：那一轮不会有胜负，核对一下。"
         )
 
-    if metrics.lower_is_better(cfg.rules.metric):
-        # 用时制下 0 = 未完赛 / 退赛：已分出胜负却有一方没成绩，多半是漏填。
-        # 弃权方本来就记 0，要排除掉，否则每次弃权都会冒一条无意义的提示。
-        blank = [
-            r
-            for r in cfg.rounds
-            if r.status == "done"
-            and r.winner not in ("", "DRAW")
-            and any(
-                not side.forfeit
-                and metrics.round_total(side.score, side.points, bool(r.sets)) <= 0
-                for side in r.sides
-            )
-        ]
-        if blank:
-            names = "、".join((r.label or r.code) for r in blank[:4])
-            issues.append(
-                f"{names} 有一方没有用时（0 = 未完赛）：确认是退赛，还是漏填了。"
-            )
+    # 已经分出胜负、却有一方「没有成绩」：多半是漏填。注意数值型的 0 是合法读数
+    # （0 分照样算成绩），只有时间型的 0 与数值型的 MISSING 才叫没有成绩。
+    # 弃权方本来就记「—」，要排除掉，否则每次弃权都会冒一条无意义的提示。
+    blank = [
+        r
+        for r in cfg.rounds
+        if r.status == "done"
+        and r.winner not in ("", "DRAW")
+        and any(
+            not side.forfeit
+            and not sc.has_total(side.score, side.points, has_rounds=bool(r.sets))
+            for side in r.sides
+        )
+    ]
+    if blank:
+        names = "、".join((r.label or r.code) for r in blank[:4])
+        issues.append(
+            f"{names} 有一方没有{sc.label_text}（没有成绩 = 退赛）：确认是退赛，还是漏填了。"
+        )
     return issues
 
 

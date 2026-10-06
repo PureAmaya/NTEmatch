@@ -13,6 +13,7 @@ import mimetypes
 import os
 import random
 import re
+import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from html import escape
@@ -31,12 +32,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
 from . import (
+    __version__,
     avatars,
     backup,
     backup_api,
     bot_api,
+    card,
     credits,
+    helpcard,
+    hot,
+    hot_api,
     league,
+    legacy_api,
     live,
     logic,
     login_guard,
@@ -45,13 +52,25 @@ from . import (
     notices_api,
     qqbot_api,
     remind,
+    subs,
     tournament,
 )
 from . import members as members_api
 from .auth import Session, auth
 from .logging_conf import get_logger, setup_logging
 from .logic import build_state, joined_players, validate_config
-from .models import MAX_SIDES, Channel, Config, NTEModel, Player, Round, SetScore, Team
+from .models import (
+    MAX_SIDES,
+    Channel,
+    Config,
+    NTEModel,
+    Player,
+    Round,
+    SetScore,
+    SubScope,
+    Substitution,
+    Team,
+)
 from .security import (
     optional_session,
     require_admin,
@@ -60,7 +79,7 @@ from .security import (
     require_event_owned,
     require_server,
 )
-from .store import PROJECT_ROOT, store
+from .store import PROJECT_ROOT, now_iso, store
 from .ws import hub
 
 setup_logging()
@@ -103,7 +122,14 @@ _HTML_CACHE_HEADERS = {
 }
 
 
-def _compute_asset_version() -> str:
+#: 资源版本号的缓存时长：目录里文件一多，**每个**首页请求都 stat 一遍就太浪费了；
+#: 一秒足够让「改完刷新页面就生效」，也远小于任何人手速（见 :func:`asset_version`）。
+ASSET_TTL = 1.0
+#: 最近一次算出来的 ``(算的时刻, 版本号)``
+_asset_cache: tuple[float, str] | None = None
+
+
+def _compute_asset_version_uncached() -> str:
     """按静态资源的相对路径 / 大小 / mtime 计算版本号。"""
     digest = hashlib.sha1()
     if STATIC_DIR.exists():
@@ -116,15 +142,20 @@ def _compute_asset_version() -> str:
     return digest.hexdigest()[:10]
 
 
-def asset_version() -> str:
-    """每次都按当前静态文件重算版本号。
+def asset_version(ttl: float = ASSET_TTL) -> str:
+    """静态资源版本号（**带 TTL 的缓存**，见 :data:`ASSET_TTL`）。
 
-    静态文件就十来个，stat 一遍的代价可以忽略，换来的是「改完前端刷新页面
-    就生效」：版本变了 → 首页里注入的 ``/static/v/<版本>/…`` 跟着变 → 浏览器
-    自然去取新包，**进程不重启也不会再继续发旧的 JS / CSS**。
-    （以前只在 NTE_RELOAD=1 时才重算，开发时极易踩到「代码改了但页面还跑旧包」。）
+    版本变了 → 首页里注入的 ``/static/v/<版本>/…`` 跟着变 → 浏览器自然去取新包，
+    **进程不重启也不会再继续发旧的 JS / CSS**（热更新就靠它把前端一起换掉）。
+    把「reload 才重算」改成「一直重算」是为了开发时不再踩「代码改了页面还跑旧包」。
     """
-    return _compute_asset_version()
+    global _asset_cache
+    now = time.monotonic()
+    if _asset_cache is not None and now - _asset_cache[0] < ttl:
+        return _asset_cache[1]
+    version = _compute_asset_version_uncached()
+    _asset_cache = (now, version)
+    return version
 
 
 class EdgeCacheMiddleware:
@@ -188,11 +219,13 @@ class SecurityHeadersMiddleware:
     刻意只加「不会与站内自定义 HTML / 头像 / 直播流打架」的那几条：
 
     * ``X-Content-Type-Options: nosniff``：上传物与静态文件不按内容被猜成脚本；
-    * ``Referrer-Policy: no-referrer``：会话令牌会出现在 ``?token=`` 里
-      （导出与备份下载必须走它），别让它随 Referer 漏给第三方；
+    * ``Referrer-Policy: no-referrer``：站内链接不带会话令牌了（下载走请求头，
+      见 ``core.downloadFile``），但同源页面里仍可能有别的敏感 URL，一律不外带；
     * ``Content-Security-Policy: frame-ancestors 'self'``：防点击劫持。
       **只写这一条指令**——全量 CSP 会跟「自定义 HTML、QQ 头像、HLS/m3u8」
-      互相打架，而 frame-ancestors 只管「谁能用 iframe 嵌我们」；
+      互相打架，而 frame-ancestors 只管「谁能用 iframe 嵌我们」。
+      另外**不要**顺手加 ``frame-src 'self'``：那只管我们嵌谁，而 B站 直播正是靠
+      ``<iframe>`` 直嵌官方播放器（见 live.bili_embed_url），加了它直播页会白屏；
     * ``X-Frame-Options: SAMEORIGIN``：给不认 CSP 的老浏览器兜底。
 
     不加 ``Strict-Transport-Security``：它只在 HTTPS 下有意义，而且一旦浏览器
@@ -274,7 +307,8 @@ class AuditMiddleware:
                 if raw_key.decode("latin-1").lower() == SESSION_HEADER.lower():
                     token = raw_value.decode("latin-1")
                     break
-            session = auth.get(token) if token else None
+            # resolve 而不是 get：审计日志里的「谁做的」也要认得换代之前签发的会话
+            session = await auth.resolve(token) if token else None
             await store.log_activity(
                 actor=(session.name or session.label) if session else "未登录",
                 actor_uid=session.uid if session else "",
@@ -473,11 +507,6 @@ class ScheduleAppendPayload(NTEModel):
     seed: int | None = None
 
 
-class RoundSwapPayload(NTEModel):
-    from_id: str
-    to_id: str
-
-
 class RoundLineupPayload(NTEModel):
     side: str
     player_ids: list[str] = Field(default_factory=list)
@@ -504,8 +533,8 @@ class SideResultPayload(NTEModel):
 class RoundResultPayload(NTEModel):
     """录入比赛结果——三种填法都支持，服务端「能填就自动判定」：
 
-    * ``sets``：各局小分（最自然，自动推出局分与总得分），仅 2 队有意义；
-    * ``sides``：各方比分 / 得分（多队同场用这个）；
+    * ``sets``：各轮成绩（最自然，自动推出大比分与总成绩），仅 2 队有意义；
+    * ``sides``：各方成绩（多队同场用这个）；
     * ``scoreA`` / ``scoreB``：早期字段，仍兼容。
 
     ``winner`` 留空即自动判定；显式指定则以其为准。
@@ -564,7 +593,11 @@ class EventMetaPayload(NTEModel):
 
 
 class ParticipantsPayload(NTEModel):
-    """本届参与名单。``player_ids`` 为空表示未指定（视为全员参与）。"""
+    """本届参与名单。
+
+    ``player_ids`` 传空数组表示「本届一个人都不参与」——一旦保存过，名单就是显式的，
+    不会回落成「未指定 = 全员参与」（那正是「全不选后保存又变回全选」的根源）。
+    """
 
     player_ids: list[str] = Field(default_factory=list)
 
@@ -625,6 +658,9 @@ def build_public_state(cfg: Config) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.start()
+    # 登录会话落库并起一个「写回」巡检：热更新会换掉进程，会话必须活过换代，
+    # 否则每更新一次就把所有人踢下线（见 app/auth.py 与 app/hot.py 的说明）。
+    await auth.attach(store.path)
 
     async def on_config_change(cfg: Config, source: str) -> None:
         await hub.broadcast_state(build_public_state(cfg))
@@ -639,8 +675,25 @@ async def lifespan(app: FastAPI):
     # 赛前提醒：开赛前一天 / 前两小时在群里 @ 举办者（见 app/remind.py）。
     # 只在「聊天机器人推送开着」且举办者登记了 QQ 时才真的发得出去。
     remind_task = asyncio.create_task(remind.loop())
-    # 直播探测按需触发（前端在直播 / 频道页请求 /api/live/health 时才探一次），
-    # 因此这里不启动任何常驻任务，没人看直播时后端不做任何探测。
+    # 直播常驻探测：**没人访问也一直在探**（间隔见 live.WATCH_INTERVAL），
+    # 状态变了就通过 WebSocket 推给在线客户端；请求路径始终只读缓存、一秒都不等它。
+    # 关停时由 live.stop_refresher() 统一收掉（见下面的 finally）。
+    live.start_watcher()
+    # QQ 机器人帮助图：启动时重画一份（产物不入库，见 app/helpcard.py）。
+    # 放线程里做（画图 + 存盘约半秒），不拖慢启动；没装 Pillow 就只记一行日志。
+    help_task = asyncio.create_task(asyncio.to_thread(helpcard.refresh))
+    # 图片仓库收拢：把「旧布局」里单独存放的本地上传头像并进统一仓库，
+    # 顺手删掉历史重复（同一张图以前会在头像 / 公告两个目录各存一份）。
+    # **等它跑完**再往下走（放线程里做，不阻塞事件循环）：搬移过程中文件会有一瞬
+    # 「两边都不在」，这时候若正好有备份在打包，就会漏掉那些图。收拢完就再也不会
+    # 有可收的东西了（旧目录空了），所以这点等待只有升级后的第一次启动才有。
+    try:
+        await asyncio.to_thread(media.merge_legacy)
+    except Exception:  # 图片读得到就行，收拢失败不该拦着服务起来
+        log.warning("图片仓库收拢失败（不影响读取，下次启动再试）", exc_info=True)
+    # 守护没了就跟着收摊：被硬杀（kill -9 / Windows terminate）的父进程没机会做清理，
+    # 子进程不能变成「占着端口的孤儿」——那会让下一次启动绑不上（见 hot.watch_parent）。
+    parent_task = asyncio.create_task(hot.watch_parent())
     cfg = store.snapshot()
     log.info("=" * 68)
     log.info("NTE 比赛平台已启动 | 当前届: %s (%s)", cfg.event.name, store.current_id)
@@ -648,6 +701,30 @@ async def lifespan(app: FastAPI):
     log.info("本机访问: http://127.0.0.1:%s", os.getenv("NTE_PORT", "8000"))
     log.info("登录方式：成员密钥（服务器管理员忘记密钥可执行 `uv run python -m app --reset-key`）")
     log.info("=" * 68)
+    # 一切就绪（数据库、后台任务、广播中心）——告诉热更新守护「可以停掉旧进程了」。
+    # 这一行的位置就是「零中断」的关键：**调它之前**父进程绝不会动旧进程。
+    if hot.supervised():
+        # 应用侧的事实写一份给管理端（父进程那份自检看不到进程内部的事，见 app/hot.py）
+        report = {
+            "pid": os.getpid(),
+            "loop": type(asyncio.get_running_loop()).__name__,
+            "python": sys.version.split()[0],
+            "sessions": auth.persisted,
+            "online": auth.online,
+            "cards": card.available(),
+            "database": str(store.path),
+            "at": time.time(),
+        }
+        hot.write_app_report(report)
+        log.info(
+            "热更新模式 | 事件循环=%s | 会话落库=%s | 卡片渲染=%s | Python=%s",
+            report["loop"],
+            "开" if report["sessions"] else "关",
+            "开" if report["cards"] else "关（没装 Pillow，推送走纯文本）",
+            report["python"],
+        )
+    if hot.notify_ready():
+        log.info("已通知热更新守护：本进程可以开始服务（旧进程将被优雅停掉）")
     try:
         yield
     finally:
@@ -657,6 +734,14 @@ async def lifespan(app: FastAPI):
         remind_task.cancel()
         with suppress(asyncio.CancelledError):
             await remind_task
+        # 帮助图那次渲染跑在线程里（线程没法取消）：等它收尾，别留下「任务未结束」的噪音
+        with suppress(asyncio.CancelledError):
+            await help_task
+        parent_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await parent_task
+        # 会话落库的最后一笔：**在做完这件事之后**才停 store，免得写不进去
+        await auth.detach()
         await store.stop()
         await avatars.aclose()
         # 先收掉还没跑完的探测任务，再关连接池：否则它可能在关池的瞬间发起请求
@@ -673,7 +758,7 @@ _DOCS_ON = os.getenv("NTE_DOCS", "").strip().lower() in ("1", "true", "yes", "on
 app = FastAPI(
     title="NTE 比赛",
     description="NTE 比赛（异环）通用赛事平台：自动分组 / 积分结算 / 实时排行 / 直播推流",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
     docs_url="/api/docs" if _DOCS_ON else None,
     redoc_url="/redoc" if _DOCS_ON else None,
@@ -708,9 +793,11 @@ app.add_middleware(AuditMiddleware)
 app.include_router(live.router)
 app.include_router(members_api.router)
 app.include_router(backup_api.router)
+app.include_router(legacy_api.router)
 app.include_router(qqbot_api.router)
 app.include_router(bot_api.router)
 app.include_router(notices_api.router)
+app.include_router(hot_api.router)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -778,7 +865,7 @@ async def api_state() -> dict[str, Any]:
     cfg = store.snapshot()
     state = build_public_state(cfg)
     state["live"] = live.stream_endpoints()
-    # 以下几项**只读缓存**（探测由直播 / 频道页按需触发，见 live.kick_refresh）：
+    # 以下几项**只读缓存**（探测由常驻任务一直刷，见 live.watch_loop）：
     # 本接口是页面首屏的必经之路，绝不能因为媒体服务器不可达而卡住。
     #
     # 主直播间（默认流名）有没有人在推流；None = 查不到（API 未配置 / 不可达）
@@ -804,18 +891,30 @@ async def api_state() -> dict[str, Any]:
 
 
 @app.get("/api/health")
-async def api_health() -> dict[str, Any]:
+async def api_health(session: Session | None = Depends(optional_session)) -> dict[str, Any]:
+    """存活探针（容器 HEALTHCHECK 要打，所以**必须公开**）。
+
+    配置自检（``validate_config``）会说到具体选手名（「参与名单中的 X 未启用」），
+    那是名单信息，只在管理端会话下才回——公开探针只给数量与计数。
+    """
     cfg = store.snapshot()
+    admin = bool(session and session.can_manage_events)
     return {
         "ok": True,
         "revision": cfg.revision,
         "players": len(cfg.players),
         "participants": len(joined_players(cfg)),
-        "participantsSet": bool(cfg.participants),
+        "participantsSet": logic.has_custom_roster(cfg),
         "rounds": len(cfg.rounds),
         "ws": hub.stats(),
         "avatarCache": avatars.cache_stats(),
-        "issues": validate_config(cfg),
+        "issues": validate_config(cfg) if admin else [],
+        # 前端据此判断「我这一页跑的是不是最新的一版」：热更新换代后 WebSocket 会重连，
+        # 前端在重连时比一次这个值，不一致就提示「点此刷新」（见 static/js/app.js）。
+        # 它就是静态资源地址里那个版本号，本来就随每个页面发给所有访客，不算泄密。
+        "assets": asset_version(),
+        "app": __version__,
+        "hot": hot.supervised(),
     }
 
 
@@ -1254,10 +1353,10 @@ _PROTECTED_PATCH_KEYS = {"revision", "updatedAt", "version"}
 
 #: 直播配置里**只有服务器管理员能改**的键。
 #:
-#: 除「启用直播」这个开关外，其余全是**站点级**的媒体服务器设置（根地址 / API 地址与账号 /
-#: 凭据 / 默认流名 / 推流令牌 / 封面 / 备注）。这些只在「服务器 → 直播配置」里出现：
-#: 赛事管理员能决定「这一届要不要直播」，但看不到也改不了媒体服务器本身
-#: （一处媒体服务器给整站所有届共用，本来就该由服务器管理员维护）。
+#: 全是**站点级**的媒体服务器设置（根地址 / API 地址与账号 / 凭据 / 默认流名 /
+#: 推流令牌 / 封面 / 备注），只在「服务器 → 直播配置」里出现。直播没有「总开关」
+#: （只要有赛事就允许直播，见 :class:`app.models.StreamConfig`），所以这里没有例外——
+#: 任何 ``stream`` 补丁都只有服务器管理员能提交。
 _STREAM_SERVER_KEYS = frozenset(
     {
         "provider",
@@ -1296,22 +1395,21 @@ def _apply_ui_patch(patch: dict[str, Any], session: Session) -> None:
 def _apply_stream_patch(patch: dict[str, Any], session: Session) -> None:
     """直播配置补丁的两条规矩（**就地**改 ``patch``）。
 
-    * **权限**：媒体服务器设置只有服务器管理员能碰，赛事管理员至多开关「启用直播」；
+    * **权限**：直播配置**整块**只有服务器管理员能改。它全是站点级的媒体服务器设置
+      （根地址 / API 账号 / 凭据 / 推流令牌…），一处媒体服务器给整站所有届共用；
+      而且直播没有总开关（只要有赛事就允许直播），所以赛事管理员这边没有任何
+      可改的直播字段——别只靠前端藏表单；
     * **凭据**：API 密码的明文只留服务端——接口回给浏览器的是 ``hasApiPass`` 布尔
       （见 :func:`db.private_config`），所以这里「**留空 = 保持原值**」，
       要清空必须显式传 ``apiPassClear``。否则管理端一次无关的保存就把密码抹掉了，
-      与 qqbot 的 API Key 是同一套规矩（那边叫 ``SECRET_KEYS``）；
-    * **局部补丁**：表单只发自己那几个字段（赛事页只发 ``enabled``），没提到的键由
-      ``store.update`` 的深合并保留——所以「只改一个开关」不会顺手把地址清空。
+      与 qqbot 的 API Key 是同一套规矩（那边叫 ``SECRET_KEYS``）。
     """
     if not session.is_server:
-        touched = sorted(set(patch) & _STREAM_SERVER_KEYS)
-        if touched:
-            raise HTTPException(
-                status_code=403,
-                detail="直播的媒体服务器设置（根地址 / API 账号 / 推流令牌…）只有服务器管理员能改；"
-                "这里只能开关「启用直播」。",
-            )
+        raise HTTPException(
+            status_code=403,
+            detail="直播配置（媒体服务器地址 / API 账号 / 推流令牌…）是站点级设置，"
+            "只有服务器管理员能改。",
+        )
     # 凭据：明文只留服务端（浏览器拿到的是 hasApiPass），所以「留空 = 保持原值」——
     # 把键去掉就行：store.update 是**深合并**，没提到的键（含已存的密码）原样保留。
     # 要清空必须显式传 ``apiPassClear``。
@@ -1329,7 +1427,7 @@ def event_locked() -> bool:
 def _require_unlocked(what: str = "赛制与参赛名单") -> None:
     """比赛开始后拒绝改动赛制 / 名单 / 组队 / 赛程重建。
 
-    直播开关、替补换人、录分与时间登记都不走这里——它们随时可用。
+    直播开关、对局替补、录分与时间登记都不走这里——它们随时可用。
     """
     if event_locked():
         raise HTTPException(
@@ -1638,7 +1736,7 @@ async def api_upsert_player(payload: Player, _: Session = Depends(require_curren
 
 @app.delete("/api/players/{player_id}")
 async def api_delete_player(player_id: str, _: Session = Depends(require_current_event)) -> dict[str, Any]:
-    """删除选手（比赛开始后禁止，改由替补换人调整）。
+    """删除选手（比赛开始后禁止，改由替补调整阵容）。
 
     新增 / 编辑选手**不受锁定限制**——替补可能是一位全新的人，
     需要先建好档案才能换上。
@@ -1668,11 +1766,10 @@ async def api_set_participants(
 ) -> dict[str, Any]:
     """保存本届参与选手，并按新名单自动重排未开赛对局。
 
-    * ``playerIds`` 传空数组表示「未指定」，视为全员参与；
-    * ``reconcile`` 为 ``false`` 时只改名单、不动赛程；
+    * ``playerIds`` 传空数组 = 保存一份**空名单**（本届无人参与），不是「未指定」；
     * 已完成 / 已锁定的对局永远不会被改动。
 
-    比赛开始后名单冻结（替补由换人接口自动加入，不走这里）。
+    比赛开始后名单冻结（替补由对局替补接口自动加入，不走这里）。
     """
     _require_unlocked("参赛名单")
     try:
@@ -1686,7 +1783,7 @@ async def api_set_participants(
         "revision": cfg.revision,
         "participants": chosen,
         "count": len(chosen),
-        "explicit": bool(cfg.participants),
+        "explicit": logic.has_custom_roster(cfg),
         "warnings": warnings,
         "state": build_public_state(cfg),
     }
@@ -1828,17 +1925,23 @@ async def api_teams_auto(payload: TeamsFormPayload, _: Session = Depends(require
 
 @app.put("/api/teams")
 async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
-    """手动调整固定队伍成员；队伍结构变化时清空赛程以免对阵失效。
+    """手动调整队伍（成员 / 队名 / 缩写 / 主题色 / 分组）；队伍增删时清空赛程。
+
+    两条约定：
+
+    * **没有成员的分组自动删除**：组队台保存时就会滤掉，接口这边同样兜一层
+      （调用方不守规矩也不该留下一支空队伍——空队伍在赛程里是个永远打不了的席位）；
+    * 队伍被增删（id 集合变化）会清空赛程与比分：旧对阵引用的是已经不在的队伍。
 
     比赛开始后禁止整体重排队伍（单个替补请用 ``/api/teams/{id}/substitute``）。
     """
     _require_unlocked("队伍成员")
-    teams = [Team.model_validate(t) for t in payload.teams]
+    incoming = [Team.model_validate(t) for t in payload.teams]
+    teams = [t for t in incoming if t.player_ids]
+    dropped_empty = len(incoming) - len(teams)
     known = {p.id for p in store.snapshot().players}
     seen: set[str] = set()
     for team in teams:
-        if not team.player_ids:
-            raise HTTPException(status_code=400, detail=f"{team.label or team.id} 还没有队员")
         unknown = [pid for pid in team.player_ids if pid not in known]
         if unknown:
             raise HTTPException(status_code=400, detail=f"{team.label} 含未知选手: {', '.join(unknown)}")
@@ -1848,7 +1951,15 @@ async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_c
         seen.update(team.player_ids)
 
     before_ids = {t.id for t in store.snapshot().teams}
-    dropped = before_ids != {t.id for t in teams}
+    after_ids = {t.id for t in teams}
+    dropped = before_ids != after_ids
+    if dropped_empty:
+        log.info(
+            "保存队伍时丢弃 %d 个空分组 | 届=%s | 保留=%d",
+            dropped_empty,
+            store.current_id,
+            len(teams),
+        )
 
     def _mutate(data: dict[str, Any]) -> dict[str, Any]:
         merged = {**data, "teams": [t.dump() for t in teams]}
@@ -1857,38 +1968,38 @@ async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_c
         return merged
 
     cfg = await store.mutate(_mutate, actor="web:teams-update")
-    warnings = ["队伍结构已变化，原赛程已清空，请重新生成赛程。"] if dropped else []
+    warnings = ["队伍有增删，原赛程与比分已清空，请重新生成赛程。"] if dropped else []
     return {
         "ok": True,
         "revision": cfg.revision,
         "teams": [t.dump() for t in cfg.teams],
         "count": len(cfg.teams),
+        "droppedEmpty": dropped_empty,
         "warnings": warnings,
         "state": build_public_state(cfg),
     }
 
 
 class TeamSubstitutePayload(NTEModel):
-    """队伍内替补换人：把 ``from_id`` 换成 ``to_id``（1:1，队伍规模不变）。"""
+    """队伍换人：把 ``from_id`` 换成 ``to_id``（1:1，队伍规模不变）。"""
 
     from_id: str
     to_id: str
-    mark_substitute: bool = False    # 把换上的人标记为「替补」
 
 
 @app.post("/api/teams/{team_id}/substitute")
 async def api_team_substitute(
     team_id: str, payload: TeamSubstitutePayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
-    """替补换人（锦标赛制）：**不重建赛程**，只换掉队伍里的一个人。
+    """队伍换人（固定队伍）：**不重建赛程**，只换掉队伍里的一个人。
 
-    与「组队台」的区别：
+    用于「到不齐人」：换上的人若不在本届参与名单中会**自动加入**，比赛开始后也能用。
 
-    * 队伍规模不变，因此既有的对阵结构依然有效，赛程不会被清空；
-    * 该队**未结算**对局里的出场阵容会同步更新；
-      已结算的对局保留当时实际出场的阵容与比分（只在返回里提示）；
-    * 换上的人若不在本届参与名单中，会**自动加入**（这正是替补的用法）；
-    * 比赛开始后依然可用（替补不受锁定限制）。
+    与「组队台」的区别：队伍规模不变，因此既有的对阵结构依然有效，赛程不会被清空；
+    该队**未结算**对局里的出场阵容会同步更新，已结算的对局保留当时阵容与比分。
+
+    注意：这是**整队换人**（往后所有比赛都用新阵容）。只换某一场、或从某一场起换人，
+    请用积分制的对局替补（``POST /api/rounds/{ref}/substitute``）。
     """
     cfg_now = store.snapshot()
     team = next((t for t in cfg_now.teams if t.id == team_id), None)
@@ -1934,17 +2045,13 @@ async def api_team_substitute(
                     continue
                 side["playerIds"] = list(roster)
         added.extend(_ensure_participants(data, [payload.to_id]))
-        if payload.mark_substitute:
-            for item in data.get("players", []):
-                if item.get("id") == payload.to_id:
-                    item["substitute"] = True
         return data
 
     cfg = await store.mutate(_mutate, actor="web:team-substitute")
     out_name = players[payload.from_id].display_name
     in_name = players[payload.to_id].display_name
     log.warning(
-        "替补换人 | 届=%s | 队伍=%s | %s → %s | 自动加入名单=%s | 已结算对局保留=%d",
+        "队伍换人 | 届=%s | 队伍=%s | %s → %s | 自动加入名单=%s | 已结算对局保留=%d",
         store.current_id,
         team.label or team.id,
         out_name,
@@ -1957,7 +2064,7 @@ async def api_team_substitute(
         "revision": cfg.revision,
         "teamId": team_id,
         "from": {"id": payload.from_id, "name": out_name},
-        "to": {"id": payload.to_id, "name": in_name, "substitute": payload.mark_substitute},
+        "to": {"id": payload.to_id, "name": in_name},
         "addedToParticipants": _names_of(added),
         "keptRounds": kept,
         "state": build_public_state(cfg),
@@ -2269,8 +2376,8 @@ async def api_round_append(_: Session = Depends(require_current_event)) -> dict[
                 "slot": idx,
                 "status": "pending",
                 "sides": [
-                    {"playerIds": [], "score": 0, "points": 0, "rank": 0},
-                    {"playerIds": [], "score": 0, "points": 0, "rank": 0},
+                    {"playerIds": [], "score": metrics.MISSING, "points": 0, "rank": 0},
+                    {"playerIds": [], "score": metrics.MISSING, "points": 0, "rank": 0},
                 ],
             }
         )
@@ -2327,58 +2434,179 @@ async def api_round_delete(ref: str, _: Session = Depends(require_current_event)
     return {"ok": True, "revision": cfg.revision, "count": len(cfg.rounds)}
 
 
-@app.post("/api/rounds/{ref}/swap")
-async def api_round_swap(
-    ref: str, payload: RoundSwapPayload, _: Session = Depends(require_current_event)
+class RoundSubstitutionPayload(NTEModel):
+    """对局替补：把 ``from_id`` 换成 ``to_id``，``scope`` 决定影响哪些比赛。"""
+
+    from_id: str
+    to_id: str
+    scope: SubScope = "round"
+
+
+@app.post("/api/rounds/{ref}/substitute")
+async def api_round_substitute(
+    ref: str, payload: RoundSubstitutionPayload, session: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
-    """积分制换人：把在场的 fromId 换成 toId。
+    """积分制替补：把某一场的 ``fromId`` 换成 ``toId``，按范围生效。
 
-    若 toId 在对面阵容中则两人互换，若不在本局则直接替换，
-    因此「主替互换」与「跨队调换」都只用这一个接口。
-
-    换上的人若不在本届参与名单里会**自动加入**（替补的常规用法）；
-    比赛开始后依然可用（替补不受锁定限制）。
+    * ``round`` 仅这场比赛；``rest`` 这场比赛**及其之后**；``event`` 全场；
+    * **已结算的对局不改写**：打完的比赛保留当时实际出场的阵容与比分（在 ``lockedRounds`` 里列出）；
+    * 替补在该场已经上场时跳过那一场（``conflictRounds``），免得同一个人两边都是他；
+    * 同一位选手在同一范围**只会有一处替补**：再次指定即为改人，最终只保留最后一次；
+    * 换上的人若不在本届参与名单里会**自动加入**；比赛开始后依然可用。
     """
     _require_league()
     cfg_now = store.snapshot()
-    if payload.to_id not in {p.id for p in cfg_now.players}:
-        raise HTTPException(status_code=404, detail="目标选手不存在")
-    added: list[str] = []
+    players = {p.id: p for p in cfg_now.players}
+    from_id = (payload.from_id or "").strip()
+    to_id = (payload.to_id or "").strip()
+    scope: SubScope = payload.scope if payload.scope in ("round", "rest", "event") else "round"
+    if from_id not in players:
+        raise HTTPException(status_code=404, detail="被换下的选手不存在")
+    if to_id not in players:
+        raise HTTPException(status_code=404, detail="替补选手不存在，请先在「选手名单」里新增")
+    if from_id == to_id:
+        raise HTTPException(status_code=400, detail="被换下的选手与替补不能是同一位")
+    from_name = players[from_id].display_name
+    to_name = players[to_id].display_name
 
-    def apply(rnd: dict[str, Any]) -> None:
-        sides = _raw_sides(rnd)
-        from_side = next((s for s in sides if payload.from_id in s["playerIds"]), None)
-        if from_side is None:
-            raise HTTPException(status_code=400, detail="原选手不在本局阵容中")
-        to_side = next((s for s in sides if payload.to_id in s["playerIds"]), None)
-        if to_side is from_side:
-            return
-        if to_side is None:
-            ids = from_side["playerIds"]
-            ids[ids.index(payload.from_id)] = payload.to_id
-        else:
-            a_ids, b_ids = from_side["playerIds"], to_side["playerIds"]
-            a_ids[a_ids.index(payload.from_id)] = payload.to_id
-            b_ids[b_ids.index(payload.to_id)] = payload.from_id
+    anchor = ""
+    if scope != "event":
+        target = _find_round(cfg_now, ref)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"对局 {ref} 不存在")
+        anchor = target.code or str(target.index)
+    probe = Substitution(from_id=from_id, to_id=to_id, scope=scope, anchor=anchor)
+    # 「在不在场上」按**原始阵容**判断（见 subs.original_lineup）：替补已经改写过了阵容，
+    # 改人时原来的选手早就不在场上了，只看当前阵容会把他自己判成「不在阵容里」。
+    if not subs.appears_in(cfg_now.dump(), probe):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{from_name} 不在所选范围的任何阵容里，安排替补没有意义",
+        )
+
+    actor = session.name or session.uid or "admin"
+    added: list[str] = []
+    info: dict[str, list[str]] = {}
+    saved_id = ""
 
     def _mutate(data: dict[str, Any]) -> dict[str, Any]:
-        _round_mutator(ref, apply)(data)
-        # 替补不在参与名单里时自动加入（否则榜表与用户端名单会漏掉他）
-        added.extend(_ensure_participants(data, [payload.to_id]))
+        nonlocal info, saved_id
+        existing = subs.load(data)
+        # 同一选手 + 同一范围：先把上一处换回去，再应用新的（最终只留最后一次）
+        old = next(
+            (s for s in existing if subs.same_slot(s, from_id=from_id, scope=scope, anchor=anchor)),
+            None,
+        )
+        if old is not None:
+            subs.revert(data, old)
+        fresh = Substitution(
+            id=old.id if old is not None else subs.new_id(existing),
+            from_id=from_id,
+            to_id=to_id,
+            scope=scope,
+            anchor=anchor,
+            created_at=now_iso(),
+            created_by=actor,
+        )
+        info = subs.apply(data, fresh)
+        if not info["changed"]:
+            if info["locked"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"所选范围内的比赛都已结算（{'、'.join(info['locked'])}），"
+                        "按约定不改写已打完的阵容"
+                    ),
+                )
+            if info["conflict"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{to_name} 已经在本场阵容里，换了会出现同一个人两边都是他；"
+                        "请先把他移出，或换一位替补"
+                    ),
+                )
+            raise HTTPException(
+                status_code=400,
+                detail=f"{from_name} 在未结算的比赛里都没有上场，没有可替换的位置",
+            )
+        # 记录只保留有效项 + 新的这一条；旧记录若换了人则原 id 复用（列表里不会出现两条）
+        data["substitutions"] = [
+            s.dump() for s in existing if s.id != fresh.id
+        ] + [fresh.dump()]
+        added.extend(_ensure_participants(data, [to_id]))
+        saved_id = fresh.id
         return data
 
-    cfg = await store.mutate(_mutate, actor="web:round-swap")
-    log.info(
-        "对局 %s 换人 | %s -> %s | 自动加入名单=%s",
-        ref,
-        payload.from_id,
-        payload.to_id,
-        _names_of(added),
+    cfg = await store.mutate(_mutate, actor="web:round-substitute")
+    log.warning(
+        "已安排替补 | 届=%s | %s → %s | 范围=%s | 起点=%s | 改动对局=%s | 保留已结算=%s | 冲突跳过=%s",
+        store.current_id,
+        from_name,
+        to_name,
+        scope,
+        anchor or "(全场)",
+        "、".join(info["changed"]),
+        "、".join(info["locked"]) or "无",
+        "、".join(info["conflict"]) or "无",
     )
     return {
         "ok": True,
         "revision": cfg.revision,
+        "id": saved_id,
+        "from": {"id": from_id, "name": from_name},
+        "to": {"id": to_id, "name": to_name},
+        "scope": scope,
+        "scopeLabel": logic.SUB_SCOPE_LABEL.get(scope, scope),
+        "changedRounds": info["changed"],
+        "lockedRounds": info["locked"],
+        "conflictRounds": info["conflict"],
         "addedToParticipants": _names_of(added),
+        "state": build_public_state(cfg),
+    }
+
+
+@app.post("/api/substitutions/{sub_id}/cancel")
+async def api_substitution_cancel(
+    sub_id: str, _: Session = Depends(require_current_event)
+) -> dict[str, Any]:
+    """取消一处替补：把换上的选手换回原来那位（只动**未结算**的对局）。
+
+    已结算的对局保留当时实际出场的阵容与比分，不做回溯改写。
+    """
+    _require_league()
+    info: dict[str, list[str]] = {}
+    names: dict[str, str] = {}
+
+    def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal info
+        existing = subs.load(data)
+        target = next((s for s in existing if s.id == sub_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="这处替补不存在（可能已经被取消）")
+        info = subs.revert(data, target)
+        players = {str(item.get("id")): item for item in (data.get("players") or [])}
+        names["from"] = str((players.get(target.from_id) or {}).get("name") or target.from_id)
+        names["to"] = str((players.get(target.to_id) or {}).get("name") or target.to_id)
+        data["substitutions"] = [s.dump() for s in existing if s.id != sub_id]
+        return data
+
+    cfg = await store.mutate(_mutate, actor="web:substitution-cancel")
+    log.warning(
+        "已取消替补 | 届=%s | id=%s | %s ← %s | 还原对局=%s | 保留已结算=%s",
+        store.current_id,
+        sub_id,
+        names.get("from", ""),
+        names.get("to", ""),
+        "、".join(info["changed"]),
+        "、".join(info["locked"]) or "无",
+    )
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "id": sub_id,
+        "revertedRounds": info["changed"],
+        "lockedRounds": info["locked"],
         "state": build_public_state(cfg),
     }
 
@@ -2456,11 +2684,11 @@ def _raw_sides(rnd: dict[str, Any]) -> list[dict[str, Any]]:
 def _ensure_participants(data: dict[str, Any], ids: list[str]) -> list[str]:
     """把上场的替补**自动补进本届参与名单**，返回真正被加入的选手 ID。
 
-    名单为空表示「未指定 = 全员参与」，此时无需补；补进去的选手从下一局起
-    就算作本届参与者（会出现在排名榜与用户端名单里）。
+    **未指定名单**（无 ``participantsSet`` 且名单为空 = 全员参与）时无需补；
+    补进去的选手从下一局起就算作本届参与者（会出现在排名榜与用户端名单里）。
     """
     current = list(data.get("participants") or [])
-    if not current:
+    if not (data.get("participantsSet") or current):
         return []
     added = [pid for pid in dict.fromkeys(ids) if pid and pid not in current]
     if added:
@@ -2512,7 +2740,8 @@ async def api_round_status(
             rnd["winner"] = ""
             rnd["sets"] = []
             for side in _raw_sides(rnd):
-                side["score"] = 0
+                # 重置回「没有成绩」——0 是合法读数，不能用它表示「清空」
+                side["score"] = metrics.MISSING
                 side["points"] = 0
                 side["rank"] = 0
                 side["forfeit"] = False
@@ -2557,7 +2786,8 @@ async def api_round_walkover(
         if not others:
             raise HTTPException(status_code=400, detail="本场只有一方，无法判定弃权")
         raw[index]["forfeit"] = True
-        raw[index]["score"] = 0
+        # 弃权 = 没有成绩（而不是「0 分」：数值型的 0 是合法读数）
+        raw[index]["score"] = metrics.MISSING
         raw[index]["points"] = 0
         label = raw[index].get("label") or f"{key} 方"
         stamp = f"[弃权] {label} {reason}"
@@ -2694,9 +2924,8 @@ async def api_round_result(
     allow_draw = (not ranked) or (
         cfg_now.rules.allow_draw and target.stage in ("group", "league")
     )
-    # 比法决定「谁赢」：计分制比分高者胜，用时制用时短者胜（见 app/metrics.py）
-    metric = metrics.norm(cfg_now.rules.metric)
-    time_based = metrics.lower_is_better(metric)
+    # 计分口径决定「谁赢」：数值高胜还是数值低胜（见 app/metrics.py）
+    scoring = cfg_now.rules.scoring
 
     side_count = len(target.sides)
     valid_keys = [chr(ord("A") + i) for i in range(side_count)]
@@ -2705,11 +2934,14 @@ async def api_round_result(
         raise HTTPException(
             status_code=400, detail=f"winner 只能是 {' / '.join(valid_keys)} 或 DRAW"
         )
+    # 负数只有两个来源：真填错了，或者 metrics.MISSING（「没有成绩」的哨兵）。
+    # 数值型的 0 是合法读数，所以「没填」必须走哨兵这条路，不能靠 0 兼职。
     for item in payload.sides:
-        if item.score < 0 or item.points < 0:
+        if (item.score < 0 and item.score != metrics.MISSING) or item.points < 0:
             raise HTTPException(status_code=400, detail="比分与得分不能为负数")
-    if (payload.score_a or 0) < 0 or (payload.score_b or 0) < 0:
-        raise HTTPException(status_code=400, detail="比分不能为负数")
+    for legacy in (payload.score_a, payload.score_b):
+        if legacy is not None and legacy < 0 and legacy != metrics.MISSING:
+            raise HTTPException(status_code=400, detail="比分不能为负数")
     if payload.duration_minutes is not None and payload.duration_minutes < 0:
         raise HTTPException(status_code=400, detail="用时不合法")
 
@@ -2746,14 +2978,20 @@ async def api_round_result(
             raw[0]["score"] = int(payload.score_a)
         if payload.score_b is not None and len(raw) > 1:
             raw[1]["score"] = int(payload.score_b)
-        rnd["sets"] = [item.dump() for item in payload.sets]
+        # 整轮都没填的行丢掉（前端也会滤，但接口不能指望调用方守规矩）：
+        # 留下 (-1, -1) 会让合计出现负数
+        rnd["sets"] = [
+            item.dump()
+            for item in payload.sets
+            if scoring.has_result(item.a) or scoring.has_result(item.b)
+        ]
 
     def apply(rnd: dict[str, Any]) -> None:
         from .store import now_iso
 
         _write_entered(rnd)
         model = Round.model_validate(rnd)
-        auto = tournament.judge_round(model, allow_draw=allow_draw, metric=metric)
+        auto = tournament.judge_round(model, allow_draw=allow_draw, scoring=scoring)
         winner = explicit or auto
         if explicit and explicit != "DRAW" and explicit != auto:
             # 人工指定第 1 名：把指定方钉在 1，其余按得分顺序依次排 2、3、4
@@ -2763,8 +3001,8 @@ async def api_round_result(
                 counted = len(model.sides) == 2 and bool(model.sets)
                 others = sorted(
                     (i for i in range(len(model.sides)) if i != winner_index),
-                    key=lambda i: metrics.judge_key(
-                        model.sides[i].score, model.sides[i].points, metric, counted=counted
+                    key=lambda i: scoring.judge_key(
+                        model.sides[i].score, model.sides[i].points, counted=counted
                     ),
                 )
                 model.sides[winner_index].rank = 1
@@ -2773,7 +3011,7 @@ async def api_round_result(
             model.winner = winner
         if not winner:
             if ranked:
-                tied_text = "用时相同" if time_based else "比分相同"
+                tied_text = f"{scoring.label_text}相同"
                 who = "并列第一" if side_count > 2 else tied_text
                 hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
                 raise HTTPException(status_code=400, detail=f"{who}，无法判定晋级：{hint}")
@@ -2889,20 +3127,20 @@ async def api_avatar_upload(
 
 @app.get("/api/avatar/file/{name}")
 async def api_avatar_file(name: str) -> Response:
-    """读取本地上传的头像（文件名白名单 + 内容哈希，天然防穿越）。"""
+    """读取本地上传的头像（文件名白名单 + 内容哈希，天然防穿越）。
+
+    图片现在都放在统一仓库里（见 :mod:`app.media`），但**这个地址保持不变**：
+    升级前的成员资料里存的就是它，改了等于把老头像全弄丢。
+    """
     path = avatars.resolve_local(name)
     if path is None:
         raise HTTPException(status_code=404, detail="头像不存在")
-    mime = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(
         path,
-        media_type=mime,
-        headers={"Cache-Control": "public, max-age=604800, immutable", "X-NTE-Avatar": "upload"},
+        media_type=media.mime_for(path),
+        # 与 /api/media/<哈希> 用同一份缓存头：它们指向的是**同一个仓库里的同一张图**，
+        # 策略不一致只会造成「换个地址访问就换了行为」这种最难查的问题。
+        headers={**media.IMMUTABLE_HEADERS, "X-NTE-Avatar": "upload"},
     )
 
 

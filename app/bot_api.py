@@ -17,7 +17,11 @@
 | `POST /api/bot/members` | 群里授权 / 添加成员（**仅服务器管理员**；新建成员时**站点直接把密钥私聊给本人**） |
 | `GET /api/bot/my-links` | 本人的推流地址 + **站内**直播间地址 |
 | `POST /api/bot/credential` | 凭据重置：重置登录密钥 / 重置直播令牌 / 改推流码（默认改自己；服务器管理员可代改，**新值只私聊给被改的那个人**） |
-| `POST /api/bot/notify` | 把一条消息**私聊**发给某人（帮助说明 / 推流地址） |
+| `POST /api/bot/stream-setup` | **比赛直播注册**：缺什么补什么（没推流码就给一个、没令牌就发一把），结果只私聊给本人 |
+| `GET /api/bot/uid` | 查游戏 UUID（自己或 @ 到的人）：**群内可见**，不需要权限 |
+| `GET /api/bot/profile` | 资料全文：QQ / 名字 / 游戏 UUID / B站 房间号 / 推流码 / 推流地址 / 密钥与令牌**有没有**（都不是明文） |
+| `POST /api/bot/profile` | 改资料（名字 / 游戏 UUID / B站 房间号 / 推流码 / 直播间标题 / QQ），回一份新资料 |
+| `POST /api/bot/notify` | 把一条消息**私聊**发给某人（帮助说明 / 推流地址 / 资料） |
 
 前面几个 ``GET`` 是只读查询；``POST /members``、``POST /credential`` 与 ``POST /notify`` 会
 **写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，不是用户手输），权限判定在站点这一侧；
@@ -45,7 +49,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 
-from . import live, logic, qqbot
+from . import card, live, logic, qqbot
 from .auth import verify_secret
 from .logging_conf import get_logger
 from .members import ensure_stream_unique
@@ -186,29 +190,38 @@ def _secret_notice(kind: str, site: str) -> str:
     )
 
 
-def _credential_target(actor: Member, raw_qq: str) -> tuple[Member, bool]:
-    """这次改**谁**的凭据；返回 ``(成员, 是不是在替别人改)``。
+def _target_for(actor: Member, raw_qq: str, *, action: str) -> tuple[Member, bool]:
+    """这次操作**谁**；返回 ``(成员, 是不是在替别人操作)``。
 
-    不填 / 填自己 = 自助。填了别人的 QQ 必须是**服务器管理员**：代改是管理动作，
-    不是「谁都能顺手把别人的登录口令作废」。
+    不填 / 填自己 = 自助。填了别人的 QQ 必须是**服务器管理员**：替别人改凭据 / 看资料
+    都是管理动作，不是「谁都能顺手把别人的登录口令作废、把资料看一遍」。
 
-    新值始终只发给**被改的那个人**（见 ``api_bot_credential`` 末尾），
-    所以服务器管理员代改也拿不到密钥 / 令牌——他要的只是「帮不上线的人重置」。
+    ``action`` 只用来拼提示语（「替别人重置凭据」/「替别人查看资料」…），
+    其它逻辑完全一致——凭据与资料走的是同一条认人闸门。
     """
     target_qq = _clean_qq(raw_qq)
     if not target_qq or target_qq == _clean_qq(actor.qq):
         return actor, False
     if actor.permission != "server_admin":
-        raise HTTPException(status_code=403, detail="只有服务器管理员能替别人重置凭据")
+        raise HTTPException(status_code=403, detail=f"只有服务器管理员能{action}")
     target = store.member_by_qq(target_qq)
     if target is None:
         raise HTTPException(
             status_code=404,
-            detail="这个 QQ 还不是成员：先用「比赛添加 @某人」把 TA 加进来，再重置凭据。",
+            detail=f"这个 QQ 还不是成员：先用「比赛添加 @某人」把 TA 加进来，再{action}。",
         )
     if not target.active:
-        raise HTTPException(status_code=403, detail="TA 的成员账号已被停用，先启用再重置凭据")
+        raise HTTPException(status_code=403, detail=f"TA 的成员账号已被停用，先启用再{action}")
     return target, True
+
+
+def _credential_target(actor: Member, raw_qq: str) -> tuple[Member, bool]:
+    """凭据路径的入口：这次改**谁的**凭据（规则见 :func:`_target_for`）。
+
+    新值始终只发给**被改的那个人**（见 ``api_bot_credential`` 末尾），
+    所以服务器管理员代改也拿不到密钥 / 令牌——他要的只是「帮不上线的人重置」。
+    """
+    return _target_for(actor, raw_qq, action="重置凭据")
 
 
 def _bearer(header: str | None) -> str:
@@ -321,7 +334,34 @@ async def api_bot_manifest(
                 "kind": "—",
                 "args": "—",
                 "alias": ["我的推流", "我的直播间", "推流地址", "我的地址"],
-                "note": "用 /api/bot/my-links：按 QQ 认人，私聊回本人的推流地址 + **站内**直播间地址",
+                "note": "用 /api/bot/my-links：按 QQ 认人，私聊回本人的推流地址 + 站内直播间地址",
+            },
+            {
+                "command": "比赛直播注册",
+                "kind": "—",
+                "args": "「流名」/@某人（都可选）",
+                "alias": ["直播注册", "开播注册", "我的推流码", "注册直播"],
+                "note": (
+                    "用 POST /api/bot/stream-setup：缺什么补什么（没推流码就给一个、没令牌就发一把），"
+                    "已有的一律不动；详情只私聊给本人，服务器管理员可 @ 代办"
+                ),
+            },
+            {
+                "command": "比赛UID",
+                "kind": "—",
+                "args": "@某人（可选）",
+                "alias": ["游戏UID", "游戏uuid", "我的UID", "异环UID", "uid"],
+                "note": "用 GET /api/bot/uid：游戏 UUID，群里直接回，不需要权限",
+            },
+            {
+                "command": "比赛资料",
+                "kind": "—",
+                "args": "「字段 新值」/@某人（都可选）",
+                "alias": ["我的资料", "改资料", "个人资料"],
+                "note": (
+                    "用 GET/POST /api/bot/profile：不填字段 = 私聊发完整资料（含怎么改）；"
+                    "填了 = 改那一项（名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ）"
+                ),
             },
             {
                 "command": "比赛授权",
@@ -509,6 +549,7 @@ async def api_bot_managers(
 
 @router.get("/query")
 async def api_bot_query(
+    request: Request,
     kind: str = Query(default="event"),
     event_id: str = Query(default="", alias="eventId"),
     ref: str = Query(default=""),
@@ -568,6 +609,17 @@ async def api_bot_query(
         live_info=live_info,
         scope=scope_key,
     )
+    # 「比赛信息 / 比赛详情」再多给一张**卡片图**（信息 + 自动生成的比赛规则）：
+    # 插件先发图、再发文本；没有 Pillow 时 card 为 null，文本里也已带规则摘要，
+    # 所以插件那边**不需要**分支判断——照着发就行。
+    site = _site_base(request)
+    card_info = None
+    if cfg is not None and key in ("event", "detail") and not ref:
+        card_info = await card.card_for_event(cfg, target, state, site=site)
+        if card_info:
+            card_info = {k: v for k, v in card_info.items() if k != "bytes"}
+            card_info["url"] = f"{site}{card_info['url']}"
+    parts = qqbot.card_parts(key, card_info, result["parts"])
     return {
         "ok": True,
         "kind": key,
@@ -575,8 +627,9 @@ async def api_bot_query(
         "eventName": (cfg.event.name or cfg.event.title) if cfg else "",
         "page": result["page"],
         "pages": result["pages"],
-        "parts": result["parts"],
-        "text": "\n\n".join(result["parts"]),
+        "parts": parts,
+        "text": "\n\n".join(parts),
+        "card": card_info,
     }
 
 
@@ -910,4 +963,458 @@ async def api_bot_credential(
         "sent": bool(sent.get("ok")),
         "detail": sent.get("detail") or "",
         "note": f"{note}{tail}",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 比赛直播注册：把「开播要用的东西」一次给全（缺什么补什么）
+# --------------------------------------------------------------------------- #
+def _push_checklist() -> list[str]:
+    """推流注意事项（直播注册 / 我的推流共用同一份，不各写一遍）。"""
+    return [
+        "OBS → 设置 → 直播 → 服务选 WHIP（WebRTC），服务器填上面的地址。",
+        "OBS 里把「B 帧 / B-frames」设为 0、关键帧间隔 2 秒：B 帧在 WebRTC 下最容易花屏，甚至推不上去。",
+        "Bearer 令牌填在 OBS 的「Bearer 令牌」字段（不是密码那一栏）。",
+        "令牌别外传：谁拿到都能用你的推流码顶掉你的画面；丢了就再发一次「比赛直播注册」。",
+        "推流码本身是公开的（观看地址里就有它），别拿它当密码——拦住别人的是令牌。",
+    ]
+
+
+def _suggest_stream_key(member: Member) -> str:
+    """给还没设过推流码的人自动生成一个：认得出是谁，又不撞车。
+
+    名字里的 ASCII 部分优先（``tom-3f9a1c`` 一眼看得出是谁），中文名抠不出字符就退回 uid；
+    真的撞上了（同名 + uid 前缀巧合）就加长后缀，最后仍不行就交回调用方（让管理员指定）。
+    """
+    base = logic.clean_key(member.name)
+    uid = member.uid or "000000"
+    for suffix in (uid[:6], uid[:10], uid):
+        key = (f"{base}-{suffix}" if base else f"nte-{suffix}")[:24]
+        try:
+            ensure_stream_unique(key, member.uid)
+        except HTTPException:
+            continue
+        return key
+    return ""
+
+
+class BotStreamSetupPayload(NTEModel):
+    """比赛直播注册：``stream_key`` 可选（他还没有推流码时用这个，不填就自动生成）。"""
+
+    qq: str = ""
+    target_qq: str = ""
+    stream_key: str = ""
+
+
+@router.post("/stream-setup")
+async def api_bot_stream_setup(
+    request: Request,
+    payload: BotStreamSetupPayload,
+    settings: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """**比赛直播注册**：缺什么补什么，结果只私聊给本人。
+
+    三种情况分别给不同的说法（这是用户唯一能自助搞定推流的入口，含糊不起）：
+
+    * **还没有推流码**（第一次注册，最常见）→ 给一个推流码 + 一把新令牌，
+      连推流地址与注意事项一起发给他；
+    * **有推流码、没令牌**（老数据里令牌是空的）→ 推流码照用，补一把新令牌；
+    * **两个都有** → **什么都不改**，只把推流码 / 推流地址 / 直播间地址与注意事项给他，
+      并提醒「令牌是原来那一串；忘了就发「比赛重置令牌」换一把新的」。
+
+    **有推流码的人，令牌绝不会被顺手换掉**：令牌只存哈希、取不回明文，而重置是破坏性动作
+    ——正在推流的人会被当场顶下线。所以「已推流码 + 已令牌」这一路只提醒、不动手
+    （要换得他自己发「比赛重置令牌」）。
+
+    为什么「没有推流码就一定发新令牌」：新建成员时站点会随手生成一把令牌，但**从来没发给过他**
+    （建号那条私聊里只有登录密钥），所以他手上其实一把都没有。而没有推流码的人
+    **不可能正在推流**（``live.authorize_publish`` 是按流名反查成员后校验令牌的），
+    换掉那把没人见过的令牌不会影响任何人——倒是能让「注册」这条命令一次给全。
+
+    管理员可 @ 代办，私聊仍只发本人。
+    """
+    actor = _actor_member(payload.qq)
+    member, for_other = _target_for(actor, payload.target_qq, action="替别人注册直播")
+    cfg = store.snapshot()
+    site = _site_base(request)
+    current = member
+    created: list[str] = []
+    stream_id = (member.stream_id or "").strip()
+    # 「这次注册之前他还没有推流码」——下面发令牌要按**当时**的状态判断（见 docstring）
+    first_time = not stream_id
+
+    if not stream_id:
+        raw = str(payload.stream_key or "").strip()
+        key = ""
+        if raw:
+            try:
+                key = logic.check_stream_key(raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not key:
+                raise HTTPException(
+                    status_code=400,
+                    detail="推流码只能用 ASCII 字母、数字、连字符(-)与下划线(_)；"
+                    "用法：比赛直播注册 你的流名",
+                )
+        else:
+            key = _suggest_stream_key(current)
+        if key:
+            ensure_stream_unique(key, current.uid)
+            current, _key, _bearer = await store.save_member(
+                current.model_copy(update={"stream_id": key})
+            )
+            stream_id = key
+            created.append(f"推流码 {key}")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="没能自动生成推流码（可用的名字都撞车了），请自己指定一个：比赛直播注册 你的流名",
+            )
+
+    bearer_plain = ""
+    # 发新令牌的两种情形：① 一把都没有（老数据）；② 这次是**第一次注册**（原本没有推流码）
+    # ——新建成员那把令牌从没发给过他，而他也不可能正在推流（见 docstring）。
+    # 「原本就有推流码 + 已有令牌」的人**什么都不动**——他可能正开着播。
+    if not current.bearer_stored or first_time:
+        current, _key, bearer_plain = await store.save_member(current, new_bearer=True)
+        created.append("一把新的直播令牌")
+
+    push = logic.push_endpoints(cfg.stream, stream_id).get("whipPush", "")
+    room_url = f"{site}/channels/{quote(stream_id)}" if stream_id else ""
+    by_line = f"（这次由服务器管理员「{actor.display_name}」帮你注册）\n" if for_other else ""
+    lines = [
+        f"【NTE 比赛】{current.display_name} 的直播注册结果\n{by_line}",
+        "—— 你要用的东西 ——",
+        f"推流码（推流 ID）：{stream_id}",
+        f"推流服务器（WHIP）：{push or '（站点还没填媒体服务器地址，请找服务器管理员）'}",
+    ]
+    if bearer_plain:
+        lines.append(f"Bearer 令牌（只显示这一次，请立即保存）：{bearer_plain}")
+    else:
+        lines.append(
+            "Bearer 令牌：你已经有令牌了，这里不重复显示（服务端只存哈希，看不到原文）。\n"
+            "直播继续用原来那一串就行；如果忘了或可能泄露了，发一次「比赛重置令牌」换一把新的"
+            "（旧令牌立即失效，所以别在有人的时候乱试）。"
+        )
+    lines.append(f"你的直播间（本站）：{room_url}")
+    if current.room_title:
+        lines.append(f"直播间标题：{current.room_title}")
+    if current.bili_room:
+        lines.append(
+            f"B站直播间号：{current.bili_room}"
+            "（你在 B站 开播时，赛事直播页会自动多出一路 B站 机位，标题自动同步）"
+        )
+    lines.append("")
+    lines.append("—— 注意事项 ——")
+    lines.extend(f"· {item}" for item in _push_checklist())
+    lines.append("")
+    lines.append(
+        "推流码与推流地址随时可以再要一次（再发一次「比赛直播注册」就行）；"
+        + (
+            "但令牌只显示这一次，请现在就存好——忘了或泄露了就发「比赛重置令牌」换一把新的"
+            "（旧的一把会立即失效）。"
+            if bearer_plain
+            else "令牌本站看不到原文；忘了或泄露了就发「比赛重置令牌」换一把新的。"
+        )
+    )
+    sent = await _send_private(settings, current.qq, "\n".join(lines))
+    tail = (
+        "，详情只私聊发给你本人"
+        if not for_other
+        else f"，详情只私聊发给 {current.display_name} 本人（你这边看不到）"
+    )
+    note = "直播注册完成：" + "、".join(created) if created else "直播注册状态已发给他（无需改动）"
+    return {
+        "ok": True,
+        "name": current.display_name,
+        "forOther": for_other,
+        "toQq": _clean_qq(current.qq),
+        "streamId": stream_id,
+        "created": created,
+        "hasToken": bool(current.bearer_stored),
+        "sent": bool(sent.get("ok")),
+        "detail": sent.get("detail") or "",
+        "note": f"{note}{tail}",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 游戏 UUID：群内就能查（不需要权限、也不走私聊）
+# --------------------------------------------------------------------------- #
+@router.get("/uid")
+async def api_bot_uid(
+    qq: str = Query(default="", description="发命令那个人的 QQ"),
+    target_qq: str = Query(default="", alias="targetQq", description="@ 到的人（留空 = 查自己）"),
+    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """游戏 UUID：**群里直接回**（举办者要拿它把人加进游戏）。
+
+    为什么不做成私聊：它不是凭据，也不敏感——游戏里加好友本来就要互相给 UUID，
+    举办者收名单时也天天在问。**不要求任何权限**：谁都能查自己，也能查 @ 到的人。
+
+    只回**名字 + UUID**，不回 QQ：发话人是谁、被 @ 的是谁，群里本来就看得到。
+    """
+    target = _clean_qq(target_qq) or _clean_qq(qq)
+    member = store.member_by_qq(target)
+    if member is None:
+        who = "你" if target == _clean_qq(qq) else "TA"
+        return {
+            "ok": True,
+            "known": False,
+            "qq": target,
+            "parts": [
+                (
+                    f"没查到 {who} 的成员资料：{who} 的 QQ 还没在站点登记（群里只能靠 QQ 认人）。\n"
+                    f"到站点「我的」页填上自己的 QQ，或让服务器管理员发「比赛添加 @{who}」。"
+                )
+            ],
+        }
+    uuid = (member.game_uuid or "").strip()
+    if uuid:
+        body = (
+            f"【NTE 比赛】{member.display_name} 的游戏 UUID\n"
+            f"{uuid}\n"
+            "（把这一串给举办者，他就能把你加进游戏；改它：私聊「比赛资料 游戏UID 新的UUID」）"
+        )
+    else:
+        body = (
+            f"【NTE 比赛】{member.display_name} 还没登记游戏 UUID。\n"
+            "填上它：私聊「比赛资料 游戏UID 你的UUID」（举办者加人时要用）"
+        )
+    return {
+        "ok": True,
+        "known": True,
+        "qq": target,
+        "name": member.display_name,
+        "uuid": uuid,
+        "parts": [body],
+        "text": body,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 资料：查看与修改（私聊发本人）
+# --------------------------------------------------------------------------- #
+#: 资料字段的写法容错（用户不必记准我们内部叫什么）
+_PROFILE_ALIAS = {
+    "name": "name",
+    "名字": "name",
+    "昵称": "name",
+    "uuid": "gameUuid",
+    "uid": "gameUuid",
+    "游戏uid": "gameUuid",
+    "游戏uuid": "gameUuid",
+    "异环uid": "gameUuid",
+    "游戏id": "gameUuid",
+    "bili": "biliRoom",
+    "bilibili": "biliRoom",
+    "b站": "biliRoom",
+    "b站房间号": "biliRoom",
+    "b站直播间": "biliRoom",
+    "直播间号": "biliRoom",
+    "stream": "streamId",
+    "streamid": "streamId",
+    "推流码": "streamId",
+    "推流id": "streamId",
+    "流名": "streamId",
+    "room": "roomTitle",
+    "直播间": "roomTitle",
+    "直播间标题": "roomTitle",
+    "标题": "roomTitle",
+    "qq": "qq",
+    "qq号": "qq",
+    "手机": "qq",
+}
+
+#: 「清空这一项」的写法（不想再填 B站 房间号 / 游戏 UUID 时）
+_CLEAR_WORDS = frozenset({"清空", "空", "清除", "删除", "去掉", "无", "没有", "-", "—", "clear", "none"})
+
+
+def _is_clear(raw: str) -> bool:
+    return str(raw or "").strip().lower() in _CLEAR_WORDS
+
+
+def _profile_text(member: Member, cfg: Any, site: str) -> str:
+    """本人资料全文（私聊发本人）：**只有「有没有」**，永远不含密钥 / 令牌明文。"""
+    stream_id = (member.stream_id or "").strip()
+    push = logic.push_endpoints(cfg.stream, stream_id).get("whipPush", "") if stream_id else ""
+    room_url = f"{site}/channels/{quote(stream_id)}" if stream_id else ""
+    or_dash = lambda value: value or "（未填）"
+    lines = [
+        f"【NTE 比赛】{member.display_name} 的资料",
+        f"· QQ：{or_dash(member.qq)}（群里靠它认人——写错就等于换了个人）",
+        f"· 名字：{or_dash(member.name)}",
+        f"· 游戏 UUID：{or_dash(member.game_uuid)}",
+        f"· 推流码（推流 ID）：{or_dash(stream_id)}",
+        f"· 推流服务器（WHIP）：{push or '（站点还没填媒体服务器地址）'}",
+        f"· 直播间（本站）：{room_url or '（先有推流码）'}",
+        f"· 直播间标题：{or_dash(member.room_title)}",
+        f"· B站直播间号：{or_dash(member.bili_room)}",
+        f"· 登录密钥：{'已设置（看不到原文，只能换新的）' if member.key_stored else '未设置'}",
+        f"· 直播令牌：{'已设置（看不到原文，只能换新的）' if member.bearer_stored else '未设置'}",
+        "",
+        "—— 怎么改（把下面某一条原样发给我）——",
+        "· 名字          比赛资料 名字 新名字",
+        "· 游戏 UUID     比赛资料 游戏UID 你的UUID",
+        "· B站 房间号    比赛资料 B站 12345",
+        "· 推流码        比赛资料 推流码 新的流名",
+        "· 直播间标题    比赛资料 直播间 今晚开黑",
+        "· QQ 号         比赛资料 QQ 你的QQ号",
+        "· 清空某一项    该命令后面写「清空」（例如：比赛资料 B站 清空）",
+        "",
+        "—— 另外几条 ——",
+        "· 直播怎么推（地址 / 令牌 / 注意事项）：比赛直播注册",
+        "· 换登录密钥：比赛重置密钥　换直播令牌：比赛重置令牌",
+        "· 看推流地址与直播间地址：比赛我的",
+        "",
+        "改完只会私聊给你确认，不会发到群里；令牌与密钥只能换新的，看不了原文。",
+    ]
+    return "\n".join(lines)
+
+
+class BotProfilePayload(NTEModel):
+    """改资料：``field`` 是字段名（见 ``_PROFILE_ALIAS`` 的容错表），``value`` 是新值。"""
+
+    qq: str = ""
+    target_qq: str = ""
+    field: str = ""
+    value: str = ""
+
+
+@router.get("/profile")
+async def api_bot_profile(
+    request: Request,
+    qq: str = Query(default="", description="发命令那个人的 QQ"),
+    target_qq: str = Query(default="", alias="targetQq", description="@ 到的人（留空 = 看自己）"),
+    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """资料全文（私聊发本人）：**改什么、怎么改都写在这一份里**，用户不必记命令。
+
+    不 @ 人 = 自己（按发命令的 QQ 认人）；@ 了人 = 替 TA 看，**只有服务器管理员**能这么做，
+    而且这份答复仍然只发给**被看的那个人**（要发给谁由站点回的 ``toQq`` 决定，
+    插件照它发就不会发错人）。
+    """
+    actor = _actor_member(qq)
+    member, for_other = _target_for(actor, target_qq, action="替别人查看资料")
+    text = _profile_text(member, store.snapshot(), _site_base(request))
+    return {
+        "ok": True,
+        "uid": member.uid,
+        "name": member.display_name,
+        "forOther": for_other,
+        "toQq": _clean_qq(member.qq),
+        "parts": [text],
+        "text": text,
+    }
+
+
+@router.post("/profile")
+async def api_bot_profile_update(
+    request: Request,
+    payload: BotProfilePayload,
+    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """改一项资料，回一份**新的资料全文**（调用方把这一份私聊发给本人）。
+
+    几条刻意的规矩：
+
+    * **一次只改一项**：`field` + `value`。含糊的批量更新更容易误伤
+      （少写一个字段就顺手清空一项），而群里打错字的概率实在不低；
+    * **推流码走唯一性校验**：与成员管理、改推流码共用 ``ensure_stream_unique``；
+    * **QQ 号改动要查重**：两位成员填同一个 QQ 会让「按 QQ 认人」变成歧义，
+      站点那边会直接当作查不到——所以这里先拦住；
+    * **值可以清空**：写「清空」即可（不想再填 B站 房间号时），
+      但空串不算清空（免得一个手滑就把资料抹了）。
+    """
+    actor = _actor_member(payload.qq)
+    member, for_other = _target_for(actor, payload.target_qq, action="替别人改资料")
+    field = _PROFILE_ALIAS.get(str(payload.field or "").strip().lower())
+    if field is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "要改哪一项？可用：名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ。\n"
+                "用法：比赛资料 名字 新名字（私聊「比赛资料」可以看到完整写法）"
+            ),
+        )
+    raw = str(payload.value or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail=f"「{payload.field}」要改成什么？用法：比赛资料 {payload.field} 新值"
+            "（想清空就写「清空」）",
+        )
+    clear = _is_clear(raw)
+    update: dict[str, Any] = {}
+    label = field
+    if field == "name":
+        if clear:
+            raise HTTPException(status_code=400, detail="名字不能清空——总得有个称呼")
+        value = " ".join(raw.split())[:24]
+        update, label = {"name": value}, f"名字 → {value}"
+    elif field == "gameUuid":
+        value = "" if clear else raw[:64]
+        update, label = {"game_uuid": value}, ("游戏 UUID 已清空" if clear else f"游戏 UUID → {value}")
+    elif field == "biliRoom":
+        if clear:
+            update, label = {"bili_room": ""}, "B站直播间号已清空（不再显示 B站 那一路）"
+        else:
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if not digits:
+                raise HTTPException(
+                    status_code=400,
+                    detail="B站直播间号只能填数字（也可以直接粘直播间链接）",
+                )
+            update, label = {"bili_room": digits[:12]}, f"B站直播间号 → {digits[:12]}"
+    elif field == "roomTitle":
+        value = "" if clear else raw[:30]
+        update, label = {"room_title": value}, ("直播间标题已清空" if clear else f"直播间标题 → {value}")
+    elif field == "qq":
+        if clear:
+            raise HTTPException(
+                status_code=400,
+                detail="QQ 号不能清空——群里就是靠它认人的（填错了可以改成对的）",
+            )
+        digits = _clean_qq(raw)
+        if not digits:
+            raise HTTPException(status_code=400, detail="QQ 号只能是数字")
+        clash = store.member_by_qq(digits)
+        if clash is not None and clash.uid != member.uid:
+            raise HTTPException(
+                status_code=400, detail=f"这个 QQ 已经被成员「{clash.display_name}」登记了"
+            )
+        update, label = {"qq": digits}, f"QQ → {digits}"
+    else:  # streamId
+        if clear:
+            update, label = {"stream_id": ""}, "推流码已清空（直播间地址也会一起失效）"
+        else:
+            try:
+                key = logic.check_stream_key(raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if not key:
+                raise HTTPException(status_code=400, detail="推流码不能为空；想清空请写「清空」")
+            ensure_stream_unique(key, member.uid)  # 与成员管理共用同一条唯一性规则
+            update, label = {"stream_id": key}, f"推流码 → {key}"
+
+    saved, _new_key, _new_bearer = await store.save_member(member.model_copy(update=update))
+    log.warning(
+        "QQ 机器人改资料 | qq=%s | 字段=%s | 操作者=%s | 代改=%s",
+        _clean_qq(saved.qq),
+        field,
+        actor.uid,
+        for_other,
+    )
+    text = _profile_text(saved, store.snapshot(), _site_base(request))
+    return {
+        "ok": True,
+        "name": saved.display_name,
+        "field": field,
+        "note": label,
+        "changed": [label],
+        "forOther": for_other,
+        "toQq": _clean_qq(saved.qq),
+        "parts": [text],
+        "text": text,
     }

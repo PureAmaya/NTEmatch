@@ -157,6 +157,19 @@ def _split_row(line: str) -> list[str]:
     return [cell.strip() for cell in body.split("|")]
 
 
+def inline(text: str) -> str:
+    """**行内** Markdown → HTML（``**加粗**`` / ``*斜体*`` / `` `代码` `` / 链接）。
+
+    给「本来就是一句话」的地方用（比赛规则的条目、提示文案）：那边不需要段落、列表、
+    表格，只需要把强调渲染出来。**先转义再渲染**，白名单与 :func:`render` 完全同一套
+    （见 :func:`_inline`），不存在两处各写一份清洗逻辑。
+
+    为什么不干脆在前端 ``replace('**', '<b>')``：那样 HTML 注入就回来了——
+    这些文本里有队名、选手名，都是用户输入。
+    """
+    return _inline(escape(str(text or "")))
+
+
 def render(text: str) -> str:
     """Markdown → HTML。输入为空时返回空串。"""
     source = str(text or "").replace("\r\n", "\n").replace("\r", "\n")

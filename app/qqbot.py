@@ -31,7 +31,7 @@ from typing import Any
 
 import httpx
 
-from . import logic
+from . import logic, metrics
 from .defaults import sport_meta
 from .logging_conf import get_logger
 from .models import Config
@@ -68,6 +68,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "maxPerHour": 30,
     # 单次推送最多分几段（分段之间还会各停 0.5 秒）
     "maxParts": 8,
+    # ---- 图片推送（比赛卡片，见 app/card.py）----
+    # 开：比赛信息先发一张卡片图（信息 + 完整规则），再跟一行说明；
+    # 关：只发文字（文本里本来就带规则摘要，信息一条不少）。
+    # 图发不出去（没装 Pillow / AstrBot 不收图片段）时**自动退回文字**，与这个开关无关。
+    "imageCards": True,
     # ---- 赛前提醒（见 app/remind.py）----
     # 开关：到点自动在群里 @ 举办者。需要「已启用推送」+ 举办者登记了 QQ 才发得出去。
     "remindEnabled": True,
@@ -171,7 +176,7 @@ def normalize_settings(patch: dict[str, Any], current: dict[str, Any]) -> dict[s
             if internal:
                 clean[key] = str(value or "")
             continue
-        if key in ("enabled", "remindEnabled"):
+        if key in ("enabled", "remindEnabled", "imageCards"):
             # 注意：**别让布尔键落到下面的 else**——那里会把 False 存成字符串 "False"，
             # 而字符串恒为真，开关就再也关不掉了。
             clean[key] = bool(value)
@@ -439,6 +444,69 @@ async def send_parts(parts: list[str], *, settings: dict[str, Any], umo: str = "
     return {"ok": True, "status": 200, "detail": "", "sent": sent, "total": len(parts), "umo": umo}
 
 
+#: 图片消息段里「图在哪」的字段名（各版本叫法不一，逐个试，见 send_image）
+_IMAGE_KEYS = ("file", "url", "image")
+
+
+async def send_image(url: str, *, settings: dict[str, Any], umo: str = "") -> dict[str, Any]:
+    """发一张图（就是本站生成的比赛卡片，``url`` 由 :mod:`app.card` 给出）。
+
+    与 :func:`send_text` 同一条规矩：**逐个形态试**，谁被接受就用谁——
+    AstrBot 各版本对图片段的字段名不完全一致（``file`` / ``url`` / ``image``），
+    而这里没法像文本那样「等价替换」（发不出图就是发不出），所以只能试完再说。
+
+    失败**不抛异常**，只回 ``ok=False``：调用方据此退回纯文本推送（信息一条不少）。
+    """
+    target = umo or resolved_umo(settings)
+    result: dict[str, Any] = {"ok": False, "status": 0, "detail": "", "umo": target}
+    if not str(url or "").strip():
+        result["detail"] = "没有图片地址"
+        return result
+    if not settings.get("enabled"):
+        result["detail"] = "未启用 QQ 机器人推送"
+        return result
+    if not settings.get("apiKey"):
+        result["detail"] = "未配置 AstrBot API Key"
+        return result
+    base = str(settings.get("baseUrl") or "").strip()
+    if not base:
+        result["detail"] = "未配置 AstrBot 地址（到「服务器 → QQ 机器人」填写）"
+        return result
+    if not target:
+        result["detail"] = "未配置目标会话（群号 / UMO）"
+        return result
+
+    path = str(settings.get("path") or "/api/v1/im/message")
+    endpoint = f"{base.rstrip('/')}{path}"
+    headers = {
+        "Authorization": f"Bearer {settings['apiKey']}",
+        "X-API-Key": str(settings["apiKey"]),
+        "Content-Type": "application/json",
+    }
+    timeout = float(settings.get("timeout") or 10)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for key in _IMAGE_KEYS:
+            body = {"umo": target, "message": [{"type": "image", key: url}]}
+            try:
+                resp = await client.post(endpoint, headers=headers, json=body)
+            except httpx.HTTPError as exc:
+                result["detail"] = f"请求 AstrBot 失败：{exc}"
+                log.warning("QQ 图片推送失败 | %s | %s", endpoint, exc)
+                return result
+            result["status"] = resp.status_code
+            if resp.status_code < 400:
+                result["ok"] = True
+                result["shape"] = key
+                log.info("QQ 图片推送成功 | umo=%s | 字段=%s", target, key)
+                return result
+            result["detail"] = _error_text(resp)
+            # 只有「请求体格式不对」才值得换个字段名重试
+            if resp.status_code not in (400, 415, 422):
+                break
+    log.warning("QQ 图片推送失败 | umo=%s | HTTP %s | %s", target, result["status"], result["detail"])
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # 文本工具
 # --------------------------------------------------------------------------- #
@@ -507,14 +575,27 @@ def _side_text(side: dict[str, Any]) -> str:
     return _join_names(players)
 
 
-def _round_line(rnd: dict[str, Any], *, with_stage: bool = True) -> str:
-    """`八强赛 · 甲队 2:1 乙队` 这样的一行。"""
+def _round_line(
+    rnd: dict[str, Any], *, with_stage: bool = True, scoring: object = None
+) -> str:
+    """`八强赛 · 甲队 2:1 乙队` 这样的一行。
+
+    比分按计分口径显示：时间型写 ``1:23.456``、小数按小数写；**填了轮次**时
+    ``score`` 是「赢的轮数」（计数），一律按整数显示。
+    """
+    sc = metrics.as_scoring(scoring) if scoring is not None else metrics.Scoring()
     sides = rnd.get("sides") or []
     left = _side_text(sides[0]) if sides else "待定"
     right = _side_text(sides[1]) if len(sides) > 1 else "待定"
+    counted = bool(rnd.get("sets"))
+    # 「有没有比分」要用录入痕迹判断：数值型的 0 是合法读数，不能用真假值糊过去
+    scored = rnd.get("status") == "done" or any(sc.has_entered(s.get("score")) for s in sides)
     scores = ""
-    if rnd.get("status") == "done" or any(s.get("score") for s in sides):
-        scores = f" {sides[0].get('score', 0)}:{sides[1].get('score', 0)}" if len(sides) > 1 else ""
+    if scored and len(sides) > 1:
+        scores = (
+            f" {sc.format_score(sides[0].get('score', 0), counted=counted)}"
+            f":{sc.format_score(sides[1].get('score', 0), counted=counted)}"
+        )
     head = f"{rnd.get('stageName')} · " if with_stage and rnd.get("stageName") else ""
     label = rnd.get("label") or rnd.get("code") or ""
     return f"{head}{label} {left}{scores} vs {right}".replace("  ", " ").strip()
@@ -523,6 +604,59 @@ def _round_line(rnd: dict[str, Any], *, with_stage: bool = True) -> str:
 # --------------------------------------------------------------------------- #
 # 消息构建
 # --------------------------------------------------------------------------- #
+#: 比赛规则里**跟「怎么打、怎么晋级」直接相关**的几节（推送时按这个顺序摘）
+_RULE_SECTIONS = ("赛制概览", "小组赛", "淘汰赛", "积分与排名", "娱乐模式（不排名）")
+
+
+def rules_digest(cfg: Config, limit: int = 14) -> str:
+    """比赛规则的**摘要**（给纯文本推送用）；``limit`` 是行数上限。
+
+    规则本身全部由 :func:`app.logic.rulebook` 按当前赛制现算——**不存文案、不写死**，
+    所以改了人数 / 分组 / 计分口径，这里跟着变，不会出现「规则说的和实际打的不一样」。
+
+    为什么是摘要而不是全文：规则十几条，全塞进群消息会被切成好几段刷屏
+    （推送本身还有单次段数上限）。全文由**推送图片**承载（见 :mod:`app.card`），
+    这里只留「怎么打、怎么晋级、怎么判」这几条，末尾一句指向完整规则。
+    """
+    try:
+        rb = logic.rulebook(cfg)
+    except Exception:
+        log.warning("比赛规则摘要生成失败（跳过这一段）", exc_info=True)
+        return ""
+    lines: list[str] = []
+    for section in rb.get("sections") or []:
+        if str(section.get("title") or "") not in _RULE_SECTIONS:
+            continue
+        for item in section.get("items") or []:
+            text = " ".join(str(item or "").split())
+            # 摘要里不该出现 Markdown 记号（群消息是纯文本，星号只会显得莫名其妙）
+            for token in ("**", "*", "`"):
+                text = text.replace(token, "")
+            if not text:
+                continue
+            lines.append(text)
+            if len(lines) >= limit:
+                break
+        if len(lines) >= limit:
+            break
+    if not lines:
+        return ""
+    return "—— 比赛规则（摘要）——\n" + "\n".join(f"· {line}" for line in lines) + (
+        f"\n（共 {len(lines)} 条要点；完整规则见推送图片与站点「比赛规则」）"
+    )
+
+
+def card_parts(kind: str, card: dict[str, Any] | None, parts: list[str]) -> list[str]:
+    """有卡片时，``比赛信息`` 的正文**只留一行说明**。
+
+    信息与规则全在图里了，再补一屏文字只是刷屏；图没发出去时（不支持图片 / 拉不到图）
+    调用方原样用 ``parts``，信息一条不少——这个判断故意放在调用方（它才知道图发成功了没）。
+    """
+    if card and kind == "event" and card.get("caption"):
+        return [str(card["caption"])]
+    return parts
+
+
 def build_event_message(cfg: Config, state: dict[str, Any]) -> str:
     """比赛信息：名字 / 赛制 / 时间（年月日 + 星期几 + 起止 + 倒计时）/ 人数 / 简介 / 排名。"""
     evt = cfg.event
@@ -567,6 +701,11 @@ def build_event_message(cfg: Config, state: dict[str, Any]) -> str:
         lines.append(f"简介：{evt.brief}")
     if cfg.event.status == "closed":
         lines.append("状态：已结束")
+    # 比赛规则（摘要）：随赛制自动生成，见 rules_digest
+    rules = rules_digest(cfg)
+    if rules:
+        lines.append("")
+        lines.append(rules)
     return "\n".join(lines)
 
 
@@ -586,9 +725,9 @@ def build_progress_message(cfg: Config, state: dict[str, Any]) -> str:
     ]
     if live:
         lines.append("正在打：")
-        lines.extend(f"· {_round_line(r)}" for r in live[:4])
+        lines.extend(f"· {_round_line(r, scoring=cfg.rules.scoring)}" for r in live[:4])
     elif pending:
-        lines.append(f"下一场：{_round_line(pending[0])}")
+        lines.append(f"下一场：{_round_line(pending[0], scoring=cfg.rules.scoring)}")
     else:
         lines.append("赛程已全部结束" if total else "赛程还没生成")
     champion = state.get("champion")
@@ -759,7 +898,7 @@ def build_result_message(cfg: Config, state: dict[str, Any]) -> str:
     if done:
         lines.append("逐场比分：")
         for rnd in done[-12:]:
-            lines.append(f"· {_round_line(rnd)}")
+            lines.append(f"· {_round_line(rnd, scoring=cfg.rules.scoring)}")
         if len(done) > 12:
             lines.append(f"（仅列出最近 12 场，共 {len(done)} 场）")
     return "\n".join(lines)
@@ -774,11 +913,11 @@ def build_next_message(cfg: Config, state: dict[str, Any]) -> str:
     lines = [f"【NTE 比赛】{name} · 下一场"]
     if live:
         lines.append("正在进行：")
-        lines.extend(f"· {_round_line(r)}" for r in live[:4])
+        lines.extend(f"· {_round_line(r, scoring=cfg.rules.scoring)}" for r in live[:4])
         if pending:
-            lines.append(f"接着：{_round_line(pending[0])}")
+            lines.append(f"接着：{_round_line(pending[0], scoring=cfg.rules.scoring)}")
     elif pending:
-        lines.append(_round_line(pending[0]))
+        lines.append(_round_line(pending[0], scoring=cfg.rules.scoring))
         if pending[0].get("scheduledAt"):
             lines.append(
                 f"计划：{_fmt_dt(pending[0]['scheduledAt'])}"
@@ -809,8 +948,7 @@ def build_roster_message(cfg: Config, state: dict[str, Any]) -> str:
     else:
         for player in players[:40]:
             tag = f"（{player.tag}）" if player.tag else ""
-            sub = "·替补" if player.substitute else ""
-            lines.append(f"· {player.display_name}{tag}{sub}")
+            lines.append(f"· {player.display_name}{tag}")
         if len(players) > 40:
             lines.append(f"（仅列出前 40 人，共 {len(players)} 人）")
     if not players and not cfg.teams:
@@ -949,11 +1087,21 @@ def build_detail_message(cfg: Config, state: dict[str, Any], ref: str = "") -> s
             lines.append(f"计划时间：{_fmt_dt(target['scheduledAt'])}")
         if target.get("startedAt"):
             lines.append(f"开始时间：{_fmt_dt(target['startedAt'])}")
+        sc = cfg.rules.scoring
+        counted = bool(target.get("sets"))
         for side in sides:
             who = _side_text(side)
             names = _join_names(side.get("players") or [])
             suffix = f"（{names}）" if names and names != who else ""
-            lines.append(f"· {who}：{side.get('score', 0)} 分{suffix}")
+            text = sc.format_score(side.get("score", 0), counted=counted)
+            label = "大比分" if counted else sc.label_text
+            lines.append(f"· {who}：{label} {text}{suffix}")
+        rounds = target.get("sets") or []
+        if rounds:
+            detail = " / ".join(
+                f"{sc.format(item.get('a', 0))}:{sc.format(item.get('b', 0))}" for item in rounds
+            )
+            lines.append(f"各轮{sc.label_text}：{detail}")
         if target.get("winner") == "DRAW":
             lines.append("结果：平局")
         elif target.get("winner"):
@@ -976,6 +1124,7 @@ LIVE_KIND_LABEL = {
     "player": "选手机位",
     "member": "成员直播间",
     "channel": "成员频道",
+    "bili": "B站直播",
 }
 # 单条消息里最多列几路（跟其它列表消息一样，超了就说明一句）
 LIVE_MAX_ITEMS = 12
@@ -992,7 +1141,10 @@ def build_live_message(live_info: dict[str, Any] | None) -> str:
     """
     info = live_info or {}
     lines = ["【NTE 比赛】当前直播"]
-    if not info.get("known"):
+    items = info.get("items") or []
+    # 媒体服务器查不到**而且**没有任何一路可看时才直说「查不到」：
+    # B站 直播是另一条链路，媒体服务器没配也不影响它
+    if not info.get("known") and not items:
         lines.append("暂时查不到直播状态。")
         reason = str(info.get("reason") or "").strip()
         if reason:
@@ -1002,17 +1154,31 @@ def build_live_message(live_info: dict[str, Any] | None) -> str:
 
     main = info.get("main") or {}
     main_play = main.get("play") or {}
-    if main.get("live"):
+    if not info.get("known"):
+        reason = str(info.get("reason") or "媒体服务器不可达").strip()
+        lines.append(f"媒体服务器状态查不到（{reason}）：下面只有 B站 直播。")
+    elif main.get("live"):
         lines.append("主直播间：直播中")
         if main_play.get("webrtc"):
             lines.append(f"    WebRTC：{main_play['webrtc']}")
     else:
         lines.append("主直播间：未开播")
 
-    items = info.get("items") or []
     if items:
         lines.append(f"正在直播 {len(items)} 路：")
         for item in items[:LIVE_MAX_ITEMS]:
+            bili = item.get("bili") or {}
+            if bili.get("jump"):
+                # B站 这一路没有本站地址：给观众一个能直接点开的直播间链接。
+                # 标题与在线人数都是从 B站 现取的（开播后自动同步），一并写出来。
+                bits = ["B站直播"]
+                if bili.get("title"):
+                    bits.append(f"《{bili['title']}》")
+                if int(bili.get("online") or 0) > 0:
+                    bits.append(f"{bili['online']} 人在看")
+                lines.append(f"· {item.get('name')}（{' · '.join(bits)}）")
+                lines.append(f"    B站：{bili['jump']}")
+                continue
             tag = LIVE_KIND_LABEL.get(str(item.get("kind")), "")
             note = str(item.get("note") or "").strip()
             suffix = " · ".join(part for part in (tag, note) if part)

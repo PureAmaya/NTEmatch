@@ -11,23 +11,24 @@ import asyncio
 import base64
 import binascii
 import hashlib
-import re
 import time
 from pathlib import Path
 
 import httpx
 
+from . import media
 from .logging_conf import get_logger
 from .store import DATA_DIR
 
 log = get_logger("avatar")
 
 CACHE_DIR = DATA_DIR / "avatar_cache"
+#: **旧布局**：本地上传的头像曾经单独放这里。现在统一进 ``media.UPLOAD_DIR``
+#: （同一个内容仓库，同一张图不会存两份），这个目录只为「读旧数据 / 还原旧备份」保留，
+#: 历史文件由 :func:`app.media.merge_legacy` 一次性收拢。
 AVATAR_DIR = DATA_DIR / "avatars"
 
-# 本地上传头像：允许的 MIME、体积上限与文件名白名单
-_UPLOAD_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
-_UPLOAD_NAME_RE = re.compile(r"^[0-9a-f]{16}\.(?:png|jpg|webp|gif)$")
+#: 本地上传头像的体积上限（比公告插图小：头像用不到那么大）
 _UPLOAD_MAX_BYTES = 2 * 1024 * 1024
 _ALLOWED_SIZES = (40, 100, 140, 640)
 _MEM_TTL = 600.0
@@ -267,44 +268,38 @@ def _write_cache(key: str, body: bytes, mime: str) -> None:
 
 
 def save_data_url(data_url: str) -> str:
-    """保存 data:URL 形式的头像，返回同源可访问地址。
+    """保存 data:URL 形式的头像，返回同源可访问地址（校验失败抛 ``ValueError``）。
 
-    以内容哈希命名，天然去重且不支持路径穿越；校验失败抛 ``ValueError``。
+    落盘交给 :func:`app.media.put`（**统一的内容仓库**），所以：
+
+    * 格式按**魔数**判断，不信 data:URL 里声明的 MIME —— 否则可以塞一段 HTML
+      冒充 ``image/png``（公告图片那条路早就防了，头像这条路以前是漏的）；
+    * 同一张图**无论从头像入口还是从公告入口传，都只会有一份**，复用已有文件。
     """
+    raw = _decode(data_url)
+    if len(raw) > _UPLOAD_MAX_BYTES:
+        raise ValueError(f"头像体积超过 {_UPLOAD_MAX_BYTES // 1024} KB")
+    return str(media.put(raw, max_bytes=_UPLOAD_MAX_BYTES)["url"])
+
+
+def _decode(data_url: str) -> bytes:
+    """把 data:URL 解成字节（只做解码，格式交给 :func:`app.media.put` 按魔数判断）。"""
     head, _, payload = (data_url or "").partition(",")
     if not payload or not head.startswith("data:") or ";base64" not in head:
         raise ValueError("头像数据格式不正确")
-    mime = head[5:].split(";", 1)[0].strip().lower()
-    ext = _UPLOAD_TYPES.get(mime)
-    if ext is None:
-        raise ValueError("仅支持 PNG / JPEG / WebP / GIF 格式的头像")
     try:
-        raw = base64.b64decode(payload, validate=True)
+        return base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("头像数据无法解码") from exc
-    if not raw:
-        raise ValueError("头像内容为空")
-    if len(raw) > _UPLOAD_MAX_BYTES:
-        raise ValueError(f"头像体积超过 {_UPLOAD_MAX_BYTES // 1024} KB")
-    name = f"{hashlib.sha256(raw).hexdigest()[:16]}.{ext}"
-    path = AVATAR_DIR / name
-    if not path.exists():
-        try:
-            AVATAR_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(raw)
-        except OSError as exc:
-            log.error("头像写入失败 | name=%s | err=%s", name, exc)
-            raise ValueError("头像保存失败，请重试") from exc
-    log.info("头像已保存 | name=%s | bytes=%d", name, len(raw))
-    return f"/api/avatar/file/{name}"
 
 
 def resolve_local(name: str) -> Path | None:
-    """把文件名解析为磁盘路径；非法名称或文件不存在返回 None。"""
-    if not _UPLOAD_NAME_RE.match(name or ""):
-        return None
-    path = AVATAR_DIR / name
-    return path if path.is_file() else None
+    """把文件名解析为磁盘路径；非法名称或文件不存在返回 None。
+
+    走 :func:`app.media.find`：**统一仓库与旧头像目录都认**，所以升级前上传的
+    头像（还在 ``data/avatars/`` 里）照旧能读出来。
+    """
+    return media.find(name)
 
 
 def cache_stats() -> dict[str, int]:

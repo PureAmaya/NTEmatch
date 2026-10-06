@@ -12,15 +12,16 @@ import {
   fmtFull,
   fmtRange,
   fmtTime,
+  fmtScore,
   fmtVal,
   hooks,
   isServerAdmin,
   liveAvailable,
   log,
-  metricOf,
   qs,
   qsa,
   reveal,
+  scoringOf,
   sign,
   siteName,
   stateKey,
@@ -29,6 +30,9 @@ import {
   MAIN_ROOM_ID,
   PUSH_TIP_LINE,
   avaHtml,
+  biliKey,
+  biliKnown,
+  biliLiveItems,
   boardHeadHtml,
   channelAvaHtml,
   formChips,
@@ -345,22 +349,14 @@ function renderCasualOverview(s) {
   setPanel('bracketBoard', '');
   setPanel('standingsBoard', '');
   setPanel('formBoard', '');
+  setPanel('subsBoard', '');
   setPanel('rulesBoard', rulesPanelHtml(s));
 }
 
-/**
- * 按「比赛类型」换界面称呼（选手 → 车手 / 作者 / 参赛者…）。
- *
- * 只改最容易看见的页签名，避免把整套文案都参数化；类型未收录时用通用称呼。
- */
-function applySportMeta(s) {
-  const meta = s.sport || {};
-  const rosterTab = qsa('.tab').find((t) => t.dataset.view === 'roster');
-  if (rosterTab) {
-    const label = rosterTab.querySelector('span');
-    if (label) label.textContent = meta.participants || '选手';
-  }
-}
+/* 说明：这里曾经有个 applySportMeta（按「比赛类型」把页签文字换成车手 / 作者…）。
+ * 它已经随「比赛类型」一起退休，顺带修掉了一个 bug：它用 querySelector('span')
+ * 取「文字那个 span」，而页签里第一个 span 是**图标**（`<span class="ic">`），
+ * 于是图标被改写成文字，页签显示成「选手 选手」。 */
 
 /* —— 锦标赛制总览：小组赛 + 双败对阵图 —— */
 function renderTournamentOverview(s) {
@@ -400,6 +396,8 @@ function renderTournamentOverview(s) {
   setPanel('bracketBoard', bracketPanelHtml(s));
   setPanel('standingsBoard', '');
   setPanel('formBoard', '');
+  // 替补只属于积分制：锦标赛制没有「某一场换个人」这回事
+  setPanel('subsBoard', '');
   setPanel('rulesBoard', rulesPanelHtml(s));
 }
 
@@ -427,7 +425,7 @@ function renderLeagueOverview(s) {
   const prog = s.standings?.progress || { played: 0, total: 0, live: 0, pending: 0, percent: 0 };
   const leader = s.standings?.leader;
   const players = s.players || [];
-  const subs = players.filter((p) => p.substitute).length;
+  const subs = (s.substitutions || []).length;
   const quality = s.schedule || { partnerRepeats: 0, opponentRepeats: 0, groupRepeats: 0 };
 
   qs('#kpiRow').innerHTML = [
@@ -447,7 +445,7 @@ function renderLeagueOverview(s) {
     kpiCard(
       '参赛选手',
       String((s.participants || []).length),
-      `替补 ${subs} 人 · 报名池 ${players.length} 人`
+      `替补 ${subs} 处 · 报名池 ${players.length} 人`
     ),
     kpiCard(
       '重复搭档',
@@ -462,6 +460,7 @@ function renderLeagueOverview(s) {
   setPanel('bracketBoard', '');
   setPanel('standingsBoard', leagueStandingsHtml(s));
   setPanel('formBoard', leagueFormHtml(s));
+  setPanel('subsBoard', leagueSubsHtml(s));
   setPanel('rulesBoard', rulesPanelHtml(s));
 }
 
@@ -470,8 +469,7 @@ function leagueStandingsHtml(s) {
   const rows = s.standings?.players || [];
   const wide = window.matchMedia('(min-width: 1024px)').matches;
   const canReveal = reveal();
-  const metric = metricOf(s);
-  const time = metric === 'time';
+  const sc = scoringOf(s);
   let body;
   if (!rows.length) {
     body = `<div class="empty"><b>暂无选手数据</b>请在管理端添加参赛选手</div>`;
@@ -488,7 +486,7 @@ function leagueStandingsHtml(s) {
           : canReveal
             ? `${row.winRate}% 胜率`
             : '已封存';
-        const tieCell = time ? fmtVal(row.spent, metric) : sign(row.diff);
+        const tieCell = sc.lowWins ? fmtVal(row.spent, sc) : sign(row.diff);
         const cells = wide
           ? `<div class="score-cell">${row.played}</div>` +
             `<div class="score-cell">${row.win}</div>` +
@@ -505,16 +503,59 @@ function leagueStandingsHtml(s) {
       .join('');
   }
   const minRank = s.standings?.minRankPlayed ?? s.rules?.minRankPlayed ?? 5;
-  // 「净胜」这一列在用时制下换成总用时（列名与取值都跟着比法走）
+  // 「净胜」这一列在数值低胜下换成总成绩（列名与取值都跟着判断标准走）
   const heads = (wide ? BOARD_HEAD_WIDE : BOARD_HEAD_NARROW).map((head) =>
-    time && head === '净胜' ? '总用时' : head
+    sc.lowWins && head === '净胜' ? `总${sc.label}` : head
   );
   return (
     `<div class="panel__head"><h2>积分榜</h2>` +
     `<span class="panel__hint">按均分排名 · 满 ${minRank} 场参与排名 · ` +
     `胜 ${s.rules?.pointsWin ?? 3} / 负 ${s.rules?.pointsLose ?? 0} / 平 ${s.rules?.pointsDraw ?? 1}` +
-    `${time ? ` · 同分比完成场次与总用时` : ''}</span></div>` +
+    `${sc.lowWins ? ` · 同分比完成场次与总${sc.label}` : ''}</span></div>` +
     `<div class="panel__body panel__body--flush">${boardHeadHtml(heads)}${body}</div>`
+  );
+}
+
+/** 某场对局的显示名（替补一览里用它说清「从哪场起」）。 */
+const roundLabelOf = (s, code) =>
+  (s.rounds || []).find((r) => r.code === code)?.label || code || '';
+
+/**
+ * 本届替补一览：谁换下了谁、影响哪些比赛，可直接在这里取消。
+ *
+ * 换人已经写进对局阵容（积分榜按实际出场统计），所以这里只做两件事：
+ * 把「原谁 → 现在谁」讲清楚，以及提供取消入口。留空时整块不显示。
+ */
+function leagueSubsHtml(s) {
+  const rows = s.substitutions || [];
+  if (!rows.length) return '';
+  const body = rows
+    .map((sub) => {
+      const from = sub.fromPlayer || { name: sub.fromName || sub.fromId };
+      const to = sub.toPlayer || { name: sub.toName || sub.toId };
+      const scopeText =
+        sub.scope === 'event'
+          ? '从第一场起（全场）'
+          : `${roundLabelOf(s, sub.anchor) || sub.anchor} 起`;
+      return (
+        `<div class="subrow">` +
+        `<span class="subrow__who">${whoHtml(from)}</span>` +
+        `<span class="subrow__arrow" aria-hidden="true">→</span>` +
+        `<span class="subrow__who subrow__who--in">${whoHtml(to)}</span>` +
+        `<span class="badge badge--sub">${esc(sub.scopeLabel || '')}</span>` +
+        `<span class="subrow__scope">${esc(scopeText)}</span>` +
+        (canEdit()
+          ? `<button class="btn btn--sm btn--danger subrow__op" type="button" data-act="sub-cancel" ` +
+            `data-id="${esc(sub.id)}">取消</button>`
+          : '') +
+        `</div>`
+      );
+    })
+    .join('');
+  return (
+    `<div class="panel__head"><h2>本届替补</h2>` +
+    `<span class="panel__hint">换下的人由替补顶上 · 已结算的比赛不改写 · 可随时取消</span></div>` +
+    `<div class="panel__body"><div class="sublist">${body}</div></div>`
   );
 }
 
@@ -863,10 +904,9 @@ function groupSectionHtml(s) {
   const ranking = stageDone ? s.ranking || [] : [];
   const advMap = new Map(ranking.map((r) => [r.team.id, r]));
   const anyPlayed = groups.some((g) => (g.rows || []).some((r) => r.played > 0));
-  // 排名依据的后半截随比法变化（见 app/tournament.table_sort_key）
-  const metric = metricOf(App.state);
-  const time = metric === 'time';
-  const tieText = time ? '完成场次 / 总用时' : '净胜分';
+  // 排名依据的后半截随判断标准变化（见 app/tournament.table_sort_key）
+  const sc = scoringOf(App.state);
+  const tieText = sc.lowWins ? `完成场次 / 总${sc.label}` : '净胜分';
   const head =
     `<h3 class="btree__sec">小组赛` +
     `<span class="panel__hint">${groups.length} 组轮转 · 每场 ${shape} · 按名次分 / ${tieText}排名 · ` +
@@ -880,7 +920,8 @@ function groupSectionHtml(s) {
         `<span>${rows.length} 支队 · 每场 ${shape}${started ? '' : ' · 尚未开赛'}</span></div>` +
         `<div class="gtable__cols"><div>#</div><div>队伍</div><div>场次</div><div>胜</div><div>负</div>` +
         `<div title="第 1 名得分最高">名次分</div>` +
-        `<div title="${time ? '完成场次与总用时合计' : '得分减失分'}">${time ? '总用时' : '净胜'}</div>` +
+        `<div title="${sc.lowWins ? `完成场次与总${sc.label}合计` : `${sc.label}减失分`}">` +
+        `${sc.lowWins ? `总${sc.label}` : '净胜'}</div>` +
         `<div>名次</div></div>` +
         rows
           .map((row) => {
@@ -894,7 +935,7 @@ function groupSectionHtml(s) {
               `</div>` +
               `<div>${row.played}</div><div>${row.win}</div><div>${row.lose}</div>` +
               `<div class="gtable__pts">${row.placement ?? 0}</div>` +
-              `<div>${time ? esc(fmtVal(row.spent, metric)) : sign(row.diff)}</div>` +
+              `<div>${sc.lowWins ? esc(fmtVal(row.spent, sc)) : sign(row.diff)}</div>` +
               `<div>${
                 stageDone && adv?.advanced
                   ? `<span class="badge badge--done">晋级 #${adv.seed}</span>`
@@ -1193,13 +1234,15 @@ function leagueMembersHtml(s, rnd, side) {
   for (let i = 0; i < teamSize; i += 1) {
     const p = side.players[i];
     if (p) {
+      // 本场是否有「他是替补上场」这回事：有就把换下的人一起标出来
+      const sub = (rnd.substitutions || []).find((item) => item.toId === p.id);
       items.push(
-        `<button type="button" class="member${editable ? ' member--editable' : ''}${p.substitute ? ' member--sub' : ''}" ` +
+        `<button type="button" class="member${editable ? ' member--editable' : ''}${sub ? ' member--sub' : ''}" ` +
           `data-act="member" data-code="${esc(rnd.code)}" data-side="${side.key}" data-pid="${esc(p.id)}"` +
           (editable ? '' : ' disabled') +
           `>${avaHtml(p, 'xs')}<span class="member__name">${esc(p.name || p.id)}</span>` +
           (isLivePlayer(p.id) ? liveTag('直播') : '') +
-          (p.substitute ? '<span class="member__sub">替补</span>' : '') +
+          (sub ? `<span class="member__sub">替补·替 ${esc(sub.fromName || sub.fromId)}</span>` : '') +
           `</button>`
       );
     } else if (editable) {
@@ -1253,9 +1296,24 @@ function leagueOpsHtml(rnd) {
   }
   ops.push(
     `<button class="btn btn--sm btn--danger" type="button" data-act="round-delete" data-code="${esc(rnd.code)}">删除本局</button>` +
-      `<span class="panel__hint">点击选手换人 / 移出 · 空位补人</span>`
+      `<span class="panel__hint">点击选手安排替补 / 移出 · 空位补人</span>`
   );
   return `<div class="round__ops">${ops.join('')}</div>`;
+}
+
+/** 本场的替补说明：原谁 → 现在谁 + 生效范围（没有替补就整行不出现）。 */
+function leagueSubsNoteHtml(rnd) {
+  const subs = rnd.substitutions || [];
+  if (!subs.length) return '';
+  const items = subs
+    .map(
+      (sub) =>
+        `<span class="round__sub-item">${esc(sub.fromName || sub.fromId)} ` +
+        `<i aria-hidden="true">→</i> <b>${esc(sub.toName || sub.toId)}</b>` +
+        `<em>${esc(sub.scopeLabel || '')}</em></span>`
+    )
+    .join('');
+  return `<div class="round__subs"><span class="round__subs-tag">替补</span>${items}</div>`;
 }
 
 function leagueRoundCardHtml(s, rnd) {
@@ -1266,7 +1324,7 @@ function leagueRoundCardHtml(s, rnd) {
       rnd.winner === 'DRAW' ? '平局' : `${rnd.winner === 'A' ? rnd.sideA.label : rnd.sideB.label} 胜`;
     foot.push(`<span class="badge badge--win">${esc(reveal() ? label : '结果已封存')}</span>`);
   }
-  // 打完的局要把成绩说全：各局小分 + 双方总得分（时间行已经给了起止时间与用时）
+  // 打完的比赛要把成绩说全：各轮成绩 + 双方合计（时间行已经给了起止时间与时长）
   foot.push(resultStatsHtml(rnd));
   return (
     `<article class="round${cls}" data-code="${esc(rnd.code)}">` +
@@ -1277,6 +1335,7 @@ function leagueRoundCardHtml(s, rnd) {
     `<div class="vs-mid">${leagueScore(rnd, rnd.sideA)}<span class="vs-mid__tag">VS</span>${leagueScore(rnd, rnd.sideB)}</div>` +
     leagueDuoHtml(s, rnd, rnd.sideB) +
     `</div></div>` +
+    leagueSubsNoteHtml(rnd) +
     (foot.length ? `<div class="round__foot">${foot.join('')}</div>` : '') +
     (rnd.note ? `<div class="round__note">${esc(rnd.note)}</div>` : '') +
     watchRoundHtml(rnd) +
@@ -1323,18 +1382,19 @@ function roundTimeHtml(rnd) {
 }
 
 function matchSideHtml(side, key, rnd) {
-  const metric = metricOf(App.state);
+  const sc = scoringOf(App.state);
   const ready = Boolean(side.teamId);
   const done = rnd.status === 'done';
   const win = done && rnd.winner === key;
   const forfeit = Boolean(side.forfeit);
-  const score = done ? bigScoreText(side, rnd, metric) : '';
+  const rounds = (rnd.sets || []).length;
+  const score = done ? bigScoreText(side, rnd) : '';
   // 多队同场：显示本场名次与（可选的）细则分
   const rank = done && side.rank ? `<span class="mside__rank">#${side.rank}</span>` : '';
-  const pointsLabel = metric === 'time' ? ((rnd.sets || []).length ? '总用时' : '罚时') : '小分';
+  const pointsLabel = rounds ? `总${sc.label}` : '小分';
   const points =
     done && side.points
-      ? `<span class="mside__pts">${pointsLabel} ${esc(fmtVal(side.points, metric))}</span>`
+      ? `<span class="mside__pts">${pointsLabel} ${esc(fmtVal(side.points, sc))}</span>`
       : '';
   const members = (side.players || [])
     .map(
@@ -1359,35 +1419,35 @@ function matchSideHtml(side, key, rnd) {
   );
 }
 
-/** 各局成绩：25:20 · 22:25 · 15:12（用时制则是 1:23.45 · 1:25.10）。 */
+/** 各轮成绩：25:20 · 22:25 · 15:12（时间型则是 1:23.45 · 1:25.10）。 */
 function setsChipHtml(rnd) {
   const sets = rnd.sets || [];
   if (!sets.length) return '';
-  const metric = metricOf(App.state);
-  const title = metric === 'time' ? '各局用时' : '各局小分';
-  return `<span class="chip chip--sets" title="${title}">${sets
-    .map((s) => `${fmtVal(s.a, metric)}:${fmtVal(s.b, metric)}`)
+  const sc = scoringOf(App.state);
+  const title = `各轮${sc.label}`;
+  return `<span class="chip chip--sets" title="${esc(title)}">${sets
+    .map((s) => `${fmtVal(s.a, sc)}:${fmtVal(s.b, sc)}`)
     .join(' · ')}</span>`;
 }
 
 /**
  * 大比分 / 该场成绩的显示文本。
  *
- * 填了各局时 ``side.score`` 是**赢的局数**（计数：任何比法下都是多者胜），
- * 否则它就是该场成绩本身（用时制下要显示成 1:23.456）。
+ * 填了轮次时 ``side.score`` 是**赢的轮数**（计数：任何口径下都是多者胜），
+ * 否则它就是该场成绩本身（时间型下要显示成 1:23.456）。
  */
-const bigScoreText = (side, rnd, metric = metricOf()) =>
-  (rnd?.sets || []).length ? String(side.score) : fmtVal(side.score, metric);
+const bigScoreText = (side, rnd, sc = scoringOf(App.state)) =>
+  fmtScore(side.score, (rnd?.sets || []).length > 0, sc);
 
 /**
- * 已结束比赛的「成绩」：各局小分 + 双方总得分。
+ * 已结束比赛的「成绩」：各轮成绩 + 双方合计。
  *
- * 只结算了胜负（没填小分 / 总得分）时返回空串，不占位置；
- * 多队同场（3~4 队）不显示「总得分 A:B」——那种场次看各队名次与得分。
+ * 只结算了胜负（没填轮次 / 合计）时返回空串，不占位置；
+ * 多队同场（3~4 队）不显示「总 A:B」——那种场次看各队名次与得分。
  */
 function resultStatsHtml(rnd) {
   if (rnd.status !== 'done') return '';
-  const metric = metricOf(App.state);
+  const sc = scoringOf(App.state);
   const sides = (rnd.sides || []).slice(0, 2);
   const bits = [];
   const sets = setsChipHtml(rnd);
@@ -1395,10 +1455,10 @@ function resultStatsHtml(rnd) {
   if (sides.length === 2) {
     const points = sides.map((side) => side.points || 0);
     if (points.some((n) => n > 0)) {
-      const label = metric === 'time' ? '总用时' : '总得分';
+      const label = `总${sc.label}`;
       bits.push(
-        `<span class="chip chip--total" title="双方${label}">${label} ` +
-          `${fmtVal(points[0], metric)} : ${fmtVal(points[1], metric)}</span>`
+        `<span class="chip chip--total" title="双方${esc(label)}">${esc(label)} ` +
+          `${fmtVal(points[0], sc)} : ${fmtVal(points[1], sc)}</span>`
       );
     }
   }
@@ -1542,7 +1602,6 @@ function filteredPlayers(s) {
   const f = App.rosterFilter || 'all';
   if (f === 'joined') list = list.filter((p) => !isOut(p.id));
   else if (f === 'out') list = list.filter((p) => isOut(p.id));
-  else if (f === 'sub') list = list.filter((p) => p.substitute);
   else if (f === 'live') list = list.filter((p) => isLivePlayer(p.id));
   else if (f === 'banned') list = list.filter((p) => Boolean(playerBan(s, p)));
   return list;
@@ -1552,7 +1611,6 @@ const ROSTER_FILTERS = [
   ['all', '全部'],
   ['joined', '已参与本届'],
   ['out', '未参与本届'],
-  ['sub', '替补'],
   ['live', '直播中'],
   ['banned', '封禁中'],
 ];
@@ -1570,10 +1628,6 @@ function renderRosterTools(s) {
     `<div class="tool-group" style="margin-left:auto">` +
     `<span class="panel__hint">${filteredPlayers(s).length} / ${(s.players || []).length} 人</span>` +
     (canEdit() ? `<button class="btn btn--sm btn--primary" type="button" data-act="player-add">新增选手</button>` : '') +
-    // 积分制才谈得上替补（锦标赛制用「替补换人」按队换）
-    (canEdit() && isLeague(s)
-      ? `<button class="btn btn--sm" type="button" data-act="player-add-sub">新增替补</button>`
-      : '') +
     `</div>`;
   if (focused) qs('#rosterSearch').focus();
 }
@@ -1585,9 +1639,10 @@ const progressById = (id) => (App.state?.playerProgress || {})[id];
 /** 后端下发的「本届参与名单」为生效名单，未指定时即全部启用选手。 */
 const joinedIds = () => new Set(App.state?.participants || []);
 
+/** 未参与本届：只在**显式指定过名单**时才有意义（空名单 = 本届无人参与）。 */
 const isOut = (id) => {
-  const set = joinedIds();
-  return set.size > 0 && !set.has(id);
+  if (!App.state?.participantsSet) return false;
+  return !joinedIds().has(id);
 };
 
 function playerCardHtml(p) {
@@ -1600,8 +1655,7 @@ function playerCardHtml(p) {
   const win = league ? st.win : pr?.win || 0;
   const rate = league ? st.winRate || 0 : played ? Math.round((win / played) * 100) : 0;
   const out = isOut(p.id);
-  const cls = `${p.substitute ? ' pcard--sub' : ''}` +
-    `${p.active === false ? ' pcard--inactive' : ''}${out ? ' pcard--out' : ''}`;
+  const cls = `${p.active === false ? ' pcard--inactive' : ''}${out ? ' pcard--out' : ''}`;
   const tags = [];
   if (out) tags.push(`<span class="badge badge--out">未参与本届</span>`);
   if (isLivePlayer(p.id)) tags.push(liveTag('直播中'));
@@ -1615,7 +1669,6 @@ function playerCardHtml(p) {
   if (league && st.bestStreak >= 2) tags.push(`<span class="badge badge--win">连胜×${st.bestStreak}</span>`);
   if (!league && pr?.teamName) tags.push(`<span class="badge badge--done">${esc(pr.teamName)}</span>`);
   if (p.tag) tags.push(`<span class="badge badge--pending">${esc(p.tag)}</span>`);
-  if (p.substitute) tags.push(`<span class="badge badge--sub">替补</span>`);
   if (p.active === false) tags.push(`<span class="badge badge--lose">停用</span>`);
 
   const stats = league
@@ -1696,6 +1749,38 @@ function liveCandidates(s) {
 }
 
 /**
+ * 在播的 **B站** 机位：成员填了 B站 直播间号、且服务端探到他此刻在播。
+ *
+ * 这一路和 MediaMTX 那套无关：``room`` 里没有 webrtc / hls，只有
+ * ``embed``（直嵌的 B站 官方播放器）与 ``jump``（在 B站 打开）。
+ * ``id`` 用 ``bili:<成员 uid>``，与选手 ID、主直播间 ID 都不撞车。
+ */
+function biliCandidates() {
+  return biliLiveItems().map((item) => ({
+    id: biliKey(item.uid),
+    name: item.name,
+    player: null,
+    live: true,
+    bili: true,
+    memberUid: item.uid,
+    room: {
+      key: biliKey(item.uid),
+      bili: true,
+      room: item.room,
+      roomId: item.roomId || item.room,
+      embed: item.embed,
+      jump: item.jump,
+      title: item.title || '',
+      uname: item.uname || '',
+      online: Number(item.online) || 0,
+      area: item.area || '',
+      liveTime: item.liveTime || '',
+    },
+    round: null,
+  }));
+}
+
+/**
  * 主直播间这一路机位（不属于任何选手）。
  *
  * 只有「默认流名」真的在推流、并且配了源地址时才给；
@@ -1716,8 +1801,8 @@ function mainCandidate() {
   };
 }
 
-/** 直播页的全部可播机位：主直播间（在播时）+ 在播的选手机位。 */
-const livePool = (s) => [mainCandidate(), ...liveCandidates(s)].filter(Boolean);
+/** 直播页的全部可播机位：主直播间（在播时）+ 在播的 B站 机位 + 在播的选手机位。 */
+const livePool = (s) => [mainCandidate(), ...biliCandidates(), ...liveCandidates(s)].filter(Boolean);
 
 const inRound = (r, pid) => [...r.sideA.players, ...r.sideB.players].some((p) => p.id === pid);
 
@@ -1829,7 +1914,10 @@ export function renderLive(s) {
         )
       : []
   );
-  const pool = App.liveRound ? all.filter((c) => c.main || castIds.has(c.id)) : all;
+  // B站 机位和主直播间一样不属于任何一场比赛：选中某场时照样留在选择条上
+  const pool = App.liveRound
+    ? all.filter((c) => c.main || c.bili || castIds.has(c.id))
+    : all;
   let picked = pool.find((c) => c.id === App.livePlayerId) || null;
   if (!picked) {
     // 没选、或原来选的那路已经下播：自动落到第一路在播信号
@@ -1845,7 +1933,6 @@ export function renderLive(s) {
   const st = s.stream || {};
   const sig = [
     st.mode,
-    st.enabled,
     App.liveProto,
     // 管理端登录状态也要进签名：否则登录后「复制推流」按钮不会补出来
     canEdit() ? 'admin' : 'guest',
@@ -1891,12 +1978,18 @@ function liveChipHtml(c, picked) {
   const active = picked && picked.id === c.id;
   const cls =
     `live-chip${active ? ' live-chip--active' : ''}${c.live ? ' live-chip--live' : ''}` +
-    `${c.main ? ' live-chip--main' : ''}`;
+    `${c.main ? ' live-chip--main' : ''}${c.bili ? ' live-chip--bili' : ''}`;
+  const title = c.main
+    ? '主直播间（直播配置里的默认流名）'
+    : c.bili
+      ? `${c.name} 正在 B站 直播${c.room?.title ? `：${c.room.title}` : ''}`
+      : c.name;
   return (
     `<button type="button" class="${cls}" data-act="live-select" data-pid="${esc(c.id)}" ` +
-    `title="${esc(c.main ? '主直播间（直播配置里的默认流名）' : c.name)}">` +
+    `title="${esc(title)}">` +
     (c.player ? avaHtml(c.player, 'xs') : '<span class="ava ava--xs ava--placeholder">主</span>') +
     `<span class="live-chip__name">${esc(c.name)}</span>` +
+    (c.bili ? '<span class="live-chip__tag">B站</span>' : '') +
     (c.live ? liveTag('LIVE') : '') +
     `</button>`
   );
@@ -1906,6 +1999,28 @@ function liveChipHtml(c, picked) {
 function vsLineHtml(picked) {
   const r = picked.round;
   if (!r) {
+    // B站 直播是另一条链路：说清「这是 B站 直播」，标题与在线人数直接同步 B站 的
+    if (picked.bili) {
+      const room = picked.room || {};
+      const jump = room.jump || '';
+      const meta = [
+        room.area ? esc(room.area) : '',
+        Number(room.online) > 0 ? `${Number(room.online)} 人在看` : '',
+        room.liveTime ? `${esc(fmtFull(room.liveTime))} 开播` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return (
+        `<div class="vs-line vs-line--bili"><span class="vs-line__tag">B站直播</span>` +
+        `<b class="vs-line__title">${esc(picked.name)}${room.title ? `：${esc(room.title)}` : ''}</b>` +
+        (meta ? `<span class="vs-line__meta">${meta}</span>` : '') +
+        (jump
+          ? `<a class="vs-line__link" href="${esc(jump)}" target="_blank" ` +
+            `rel="noopener noreferrer">在 B站打开 ↗</a>`
+          : '') +
+        `</div>`
+      );
+    }
     // 主直播间是「全场那一路」，不绑定某一场比赛
     return picked.main
       ? `<div class="vs-line vs-line--idle"><span class="vs-line__tag">主直播间</span>` +
@@ -1928,39 +2043,65 @@ function vsLineHtml(picked) {
 
 function stageHtml(s) {
   const st = s.stream || {};
+  // 选中的是 B站 机位时，画面直接嵌 B站 官方播放器（**不经本站**），
+  // 于是这里没有 <video>、也没有本站的播放线路/播放按钮。
+  const bili = App.livePicked?.bili ? App.livePicked.room || {} : null;
+  const frame = bili
+    ? `<iframe class="stage-frame__bili" id="liveBili" src="${esc(bili.embed || '')}" ` +
+      `title="${esc(`${App.livePicked.name} 的 B站 直播间`)}" frameborder="0" scrolling="no" ` +
+      `allowfullscreen allow="autoplay; fullscreen; picture-in-picture" ` +
+      `referrerpolicy="no-referrer"></iframe>`
+    : `<video id="liveVideo" playsinline autoplay controls muted></video>`;
+  const bar = bili
+    ? `<div class="stage-bar"><div class="stage-bar__left">` +
+      `<a class="btn btn--primary btn--sm" href="${esc(bili.jump || '#')}" target="_blank" ` +
+      `rel="noopener noreferrer">在 B站打开</a>` +
+      `<span class="stage-bar__label">直播间 ${esc(bili.room || '')}</span></div>` +
+      `<div class="stage-bar__right">` +
+      `<button class="btn btn--sm" type="button" data-act="live-refresh">刷新信号</button>` +
+      `</div></div>`
+    : `<div class="stage-bar"><div class="stage-bar__left">` +
+      `<button class="btn btn--primary btn--sm" type="button" data-act="live-play">播放</button>` +
+      `<button class="btn btn--sm" type="button" data-act="live-stop">停止</button></div>` +
+      `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
+      `<span class="stage-bar__label">线路</span>` +
+      `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
+      `data-act="live-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
+      `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
+      `data-act="live-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
+      `</div>` +
+      `<div class="stage-bar__right">` +
+      `<button class="btn btn--sm" type="button" data-act="live-open">打开源页</button>` +
+      // 推流地址属于凭据，只给登录后的管理端；推流只有 WHIP 一种
+      (canEdit()
+        ? `<button class="btn btn--sm" type="button" data-act="live-copy-push" ` +
+          `title="复制 WHIP 推流地址 · ${esc(PUSH_TIP_LINE)}">复制推流（WHIP）</button>`
+        : '') +
+      `<button class="btn btn--sm" type="button" data-act="live-copy">复制播放地址</button>` +
+      `<button class="btn btn--sm" type="button" data-act="live-refresh">刷新信号</button>` +
+      `</div></div>`;
   return (
     `<div class="panel__head"><h2>赛事直播</h2>` +
-    `<span class="panel__hint">${esc(st.provider || 'mediamtx')} · 多机位 · ${esc(STREAM_MODE_LABEL[st.mode] || st.mode || 'auto')}</span></div>` +
+    `<span class="panel__hint">${
+      bili
+        ? `B站直播 · 源站直嵌 · 直播间 ${esc(String(bili.roomId || bili.room || ''))}`
+        : `${esc(st.provider || 'mediamtx')} · 多机位 · ${esc(STREAM_MODE_LABEL[st.mode] || st.mode || 'auto')}`
+    }</span></div>` +
     `<div class="live-pick live-pick--rounds" id="liveRounds"></div>` +
     `<div class="live-pick" id="livePick"></div>` +
-    `<div class="stage-frame" id="stageFrame">` +
-    `<video id="liveVideo" playsinline autoplay controls muted></video>` +
-    `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
-    `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>` +
-    `<span class="stage-state" id="liveState">待连接</span>` +
+    `<div class="stage-frame${bili ? ' stage-frame--bili' : ''}" id="stageFrame">` +
+    frame +
+    (bili ? '' : '<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>') +
+    `<span class="stage-badge">${
+      bili
+        ? '<span class="chip chip--bili"><b>B站</b></span>'
+        : '<span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span>'
+    }</span>` +
+    `<span class="stage-state" id="liveState">${bili ? 'B站直播中' : '待连接'}</span>` +
     `<div class="stage-cover" id="liveCover" hidden></div></div>` +
     // 对阵条放在画面**下面**：原来压在画面底部，既挡住视频又和原生控制条抢位置
     `<div class="stage-meta" id="stageMeta"></div>` +
-    `<div class="stage-bar"><div class="stage-bar__left">` +
-    `<button class="btn btn--primary btn--sm" type="button" data-act="live-play">播放</button>` +
-    `<button class="btn btn--sm" type="button" data-act="live-stop">停止</button></div>` +
-    `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
-    `<span class="stage-bar__label">线路</span>` +
-    `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="live-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
-    `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="live-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
-    `</div>` +
-    `<div class="stage-bar__right">` +
-    `<button class="btn btn--sm" type="button" data-act="live-open">打开源页</button>` +
-    // 推流地址属于凭据，只给登录后的管理端；推流只有 WHIP 一种
-    (canEdit()
-      ? `<button class="btn btn--sm" type="button" data-act="live-copy-push" ` +
-        `title="复制 WHIP 推流地址 · ${esc(PUSH_TIP_LINE)}">复制推流（WHIP）</button>`
-      : '') +
-    `<button class="btn btn--sm" type="button" data-act="live-copy">复制播放地址</button>` +
-    `<button class="btn btn--sm" type="button" data-act="live-refresh">刷新信号</button>` +
-    `</div></div>`
+    bar
   );
 }
 
@@ -1973,7 +2114,18 @@ function pushPanelHtml(s, picked) {
   const endpoints = pushEndpointsOf(picked?.id);
   // [标签, 值, 是否可复制, 复制提示类型]
   const rows = [];
-  if (room.key) {
+  if (picked?.bili) {
+    // B站 这一路没有本站的推流 / 观看地址：画面直嵌 B站 官方播放器。
+    // 标题 / 主播 / 在线人数 / 分区 / 开播时间都是**从 B站 现取的**，不需要成员手填。
+    rows.push(['机位', picked.name, false]);
+    rows.push(['B站直播间', room.roomId || room.room, false]);
+    if (room.title) rows.push(['直播标题', room.title, false]);
+    if (room.uname) rows.push(['主播', room.uname, false]);
+    if (room.area) rows.push(['分区', room.area, false]);
+    if (Number(room.online) > 0) rows.push(['在线人数', String(room.online), false]);
+    if (room.liveTime) rows.push(['开播时间', fmtFull(room.liveTime), false]);
+    rows.push(['跳转地址', room.jump, true]);
+  } else if (room.key) {
     rows.push(['机位', picked.name, false]);
     // 推流标识 = 选手自己的流名（主直播间 = 配置里的默认流名）：整届都用同一个地址
     rows.push([main ? '主直播间流名' : '推流标识', room.key, true]);
@@ -2003,20 +2155,26 @@ function pushPanelHtml(s, picked) {
       }</div>`;
   const note = [
     st.note ? `<div class="notice" style="margin-top:10px">${esc(st.note)}</div>` : '',
-    admin
-      ? `<div class="panel__hint" style="margin-top:8px">推流<b>只有 WHIP</b>（WebRTC，UDP，延迟最低）。${
-          main
-            ? `主直播间推的是直播配置里的<b>默认流名</b>（这里 …/${esc(room.key || '<流名>')}）。`
-            : `每位选手只要推自己的流名（这里 …/${esc(room.key || '<流名>')}），` +
-              `整届赛事都用同一个地址，换比赛不用改。`
-        }仅管理员可见。</div>` +
-        pushTipsHtml()
-      : `<div class="panel__hint" style="margin-top:8px">播放线路可在播放器上方切换：` +
-        `WebRTC 延迟低、HLS 更稳（推流地址属于凭据，仅登录管理员可见）。</div>`,
+    picked?.bili
+      ? `<div class="panel__hint" style="margin-top:8px">画面由 <b>B站 官方播放器直嵌</b>：` +
+        `视频流走 B站 的源地址，不经本站中继 / 转码。要弹幕、送礼这些完整功能请点「在 B站打开」。</div>`
+      : admin
+        ? `<div class="panel__hint" style="margin-top:8px">推流<b>只有 WHIP</b>（WebRTC，UDP，延迟最低）。${
+            main
+              ? `主直播间推的是直播配置里的<b>默认流名</b>（这里 …/${esc(room.key || '<流名>')}）。`
+              : `每位选手只要推自己的流名（这里 …/${esc(room.key || '<流名>')}），` +
+                `整届赛事都用同一个地址，换比赛不用改。`
+          }仅管理员可见。</div>` +
+          pushTipsHtml()
+        : // 观众侧不再解释「WebRTC / HLS / 加密 / 证书」这些实现细节：线路切换本身
+          // 就在播放器上方，看得见、点得到，用不着一段说明书。
+          '',
   ].join('');
   return (
     `<div class="panel__head"><h2>${admin ? '推流 / 播放地址' : '播放地址'}</h2>` +
-    `<span class="panel__hint">${admin ? '选手自行推流 · 观众拉流' : '观众拉流 · 源站直连'}</span></div>` +
+    `<span class="panel__hint">${
+      picked?.bili ? 'B站直播 · 源站直嵌' : admin ? '选手自行推流 · 观众拉流' : '观众拉流 · 源站直连'
+    }</span></div>` +
     `<div class="panel__body">${body}${note}</div>`
   );
 }
@@ -2048,16 +2206,42 @@ export function liveInfoHtml(s, picked = null) {
     : live.known
       ? `${nowCount} 路 · 媒体服务器上报`
       : `无法判断 · ${live.reason || '媒体服务器 API 不可达'}（只影响「直播中」标记，不影响播放）`;
+  const biliItems = biliLiveItems();
+  // B站 是另一条链路（直嵌 B站 官方播放器）：单独一行说清楚，别和「正在推流」混在一起
+  const biliText = !biliKnown()
+    ? '无法判断 · B站 接口不可达（不影响 B站 机位的跳转链接）'
+    : biliItems.length
+      ? `${biliItems.length} 路 · ${biliItems.map((item) => item.name).join('、')}`
+      : '无';
   const kv = [
-    ['状态', s.stream?.enabled ? '已启用' : '已关闭'],
     ['WebRTC 端口', health ? probeText('webrtc') : '未探测'],
     ['HLS 端口', health ? probeText('hls') : '未探测'],
     ['进行中', `${liveRounds.length} 场`],
     ['已配置机位', `${configured} 路`],
     ['正在推流', streamingText],
-    ['当前机位', picked ? `${picked.name} · ${picked.room.key || '—'}` : '没人直播'],
+    ['B站直播', biliText],
+    [
+      '当前机位',
+      picked
+        ? picked.bili
+          ? `${picked.name} · B站 ${picked.room.roomId || picked.room.room || '—'}（源站直嵌）`
+          : `${picked.name} · ${picked.room.key || '—'}`
+        : '没人直播',
+    ],
     ['源地址', e.origin || s.stream?.baseUrl || '—'],
   ];
+  // 选中的是 B站 机位：把同步过来的直播信息单列出来（标题 / 分区 / 在线 / 开播）
+  if (picked?.bili) {
+    const room = picked.room || {};
+    kv.push(
+      ['直播标题', room.title || '未填标题'],
+      ['主播', room.uname || picked.name],
+      ...(room.area ? [['分区', room.area]] : []),
+      ...(Number(room.online) > 0 ? [['在线人数', `${room.online} 人`]] : []),
+      ...(room.liveTime ? [['开播时间', fmtFull(room.liveTime)]] : []),
+      ['跳转地址', room.jump || '—']
+    );
+  }
   return (
     `<div class="panel__head"><h2>直播信息</h2><span class="panel__hint">源站直连（不做反代）</span></div>` +
     `<div class="panel__body"><dl class="kv">` +
@@ -2118,14 +2302,21 @@ export function channelRooms(s) {
 /** 一个房间是否在推流（成员直播间 / 传统频道两套判定）。 */
 const roomLive = (room) => (room?.member ? isMemberLive(room.uid) : isChannelLive(room?.id));
 
-/** 能播的频道：配了推流流名的才算（没流名的只在目录里展示）。 */
-const channelPool = (s) => channelRooms(s).filter((c) => c.hasStream);
+/**
+ * 能播的频道（配了推流流名的才算，没流名的只在目录里展示）。
+ *
+ * **观众只看在播的**：频道页是「谁在播」，不是花名册——一堆没开播的房间会把
+ * 真正在播的那几个挤到后面。管理员看全部（要管理 / 封禁 / 改公告），
+ * 没开播的在他们那边另有标记。
+ */
+const channelPool = (s) => {
+  const rooms = channelRooms(s).filter((c) => c.hasStream);
+  return canEdit() ? rooms : rooms.filter(roomLive);
+};
 
 /** 选中频道 / 线路变化才重建舞台，避免每次刷新都打断正在播的画面。 */
 function channelStageSig(picked) {
-  const st = App.state?.stream || {};
   return [
-    st.enabled,
     App.liveProto,
     canEdit() ? 'admin' : 'guest',
     picked ? picked.id : '',
@@ -2202,8 +2393,15 @@ function renderChannelTools(channels) {
   const host = qs('#channelTools');
   if (!host) return;
   const liveCount = channels.filter((c) => roomLive(c)).length;
+  // 观众拿到的本来就只有「在播的」（见 renderChannels），所以说几个在播就够；
+  // 管理员看的是全量，另有用途（管理 / 封禁），说明写成「总数 · 在播数」。
+  const hint = canEdit()
+    ? `${channels.length} 个频道 · ${liveCount} 个在播`
+    : liveCount
+      ? `当前 ${liveCount} 个在播`
+      : '当前没有人在播';
   host.innerHTML =
-    `<div class="tool-group"><span class="panel__hint">${channels.length} 个频道 · ${liveCount} 个在播</span></div>` +
+    `<div class="tool-group"><span class="panel__hint">${hint}</span></div>` +
     // 频道与公告是**全局**资源（跨届共享），只给服务器管理员动：
     // 赛事管理员只管自己那一届，不该改别人的常驻频道与公告。
     (isServerAdmin()
@@ -2310,7 +2508,14 @@ function renderChannelGrid(channels) {
 export function renderChannels(s) {
   if (!qs('#channelStage')) return false;
   const all = channelRooms(s);
+  // 观众只有在播的（见 channelPool），管理员是全部
   const pool = channelPool(s);
+  // 深链点名了一个**没开播**的频道（/channels/<流名>）：仍把它放进池子里，
+  // 好让页面把「当前未开播」说清楚，而不是默默跳到别人那一路上。
+  const requested = all.find((c) => c.id === App.channelId && c.hasStream);
+  if (requested && !pool.some((c) => c.id === requested.id)) pool.unshift(requested);
+  // 卡片列表：观众跟池子同一口径（在播的）；管理员多出那些没开播 / 没流名的
+  const listed = canEdit() ? all : all.filter(roomLive);
   // 状态快照不完整（`channels` / `streams` 两个字段都缺失：还没加载完，或中途被一次
   // 局部状态覆盖过）→ **别动舞台**。否则会闪一下「还没有直播间」，还会把选中的频道
   // 清成 null，看起来就像「来回切两次线路，直播就没了」。
@@ -2350,8 +2555,8 @@ export function renderChannels(s) {
   if (metaEl) metaEl.innerHTML = channelMetaHtml(picked);
 
   renderChannelNotice(s);
-  renderChannelTools(all);
-  renderChannelGrid(all);
+  renderChannelTools(listed);
+  renderChannelGrid(listed);
 
   // 舞台重建时先把「没得播」的几种情况收拾干净（停连接 + 给封面）；
   // 「有的播」走下面那条自动开播，只留一个播放入口。
@@ -2360,10 +2565,13 @@ export function renderChannels(s) {
     if (picked) {
       ChannelLive.setCover('当前未开播', `${picked.name} 现在没有推流；开播后这里会自动有画面。`);
     } else {
+      // 「有能播的频道但都没开播」与「压根没有频道」是两件事：前者等一会儿就来，
+      // 后者得先有人去配推流 ID。
+      const playable = all.filter((c) => c.hasStream);
       ChannelLive.setCover(
-        all.length ? '当前没有直播' : '还没有直播间',
-        all.length
-          ? '还没有配置推流地址，配置后即可播放。'
+        playable.length ? '当前没有人在播' : '还没有直播间',
+        playable.length
+          ? '有人开播后这里会自动出现画面，不用刷新这一页。'
           : canEdit()
             ? '点右上角「新增频道」，或让成员在「我的」里设置推流 ID。'
             : '等成员开播后再来看。'
@@ -2555,7 +2763,6 @@ export function renderPublic() {
   renderHeader(s);
   syncTabs(s);
   syncHeader();
-  applySportMeta(s);
   applyCustomHtml(s.customHtml);
   renderView(App.view, s);
 }

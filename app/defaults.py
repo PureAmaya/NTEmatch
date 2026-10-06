@@ -12,9 +12,24 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-# 比赛类型预设：只影响**界面文案**（参赛者 / 成绩 / 场次的称呼），
-# 数据模型仍是「若干方同场 + 记录分数 / 名次」，因此赛车、摄影、桌游等都能直接用。
-# ``key`` 可自由填写（未收录的类型按 generic 处理，并把 key 原样作为名称展示）。
+#: 界面的**固定用词**。
+#:
+#: 「比赛类型」（排球 / 赛车 / 摄影…）这一层已经退休：它只干一件事——把「选手」
+#: 换成「车手」、「对局」换成「赛段」，而组织者真正要的是**规则跟着赛制走**。
+#: 多一层可选择的东西，就多一处会跟实际赛制对不上的地方（也是「规则里出现了
+#: 另一种比赛的用词」的来源）。保留键名不变，取词的代码不用改结构。
+SPORT_WORDS: dict[str, str] = {
+    "key": "default",
+    "label": "比赛",
+    "participant": "选手",
+    "participants": "选手",
+    "score": "比分",
+    "round": "对局",
+    "venue": "场地",
+}
+
+# 兼容壳：老数据里还留着 ``sport`` 字段，代码里也可能还有零星调用点。
+# 无论传什么 key 都回同一套用词（**不再按类型换称呼**）。
 SPORT_PRESETS: dict[str, dict[str, str]] = {
     "volleyball": {
         "label": "排球 / 对抗赛",
@@ -23,9 +38,11 @@ SPORT_PRESETS: dict[str, dict[str, str]] = {
         "score": "比分",
         "round": "对局",
         "venue": "场地",
-        # 比法的**建议值**（见 app/metrics.py）：只用来在管理端提示，
+        # 计分口径的**建议值**（见 app/metrics.py）：只用来在管理端提示，
         # 不会自动改组织者选定的赛制——赛制是他的事，工具不该替他做主。
-        "metric": "score",
+        "valueType": "integer",
+        "valueLabel": "得分",
+        "better": "high",
     },
     "racing": {
         "label": "赛车",
@@ -34,7 +51,9 @@ SPORT_PRESETS: dict[str, dict[str, str]] = {
         "score": "成绩",
         "round": "赛段",
         "venue": "赛道",
-        "metric": "time",
+        "valueType": "time",
+        "valueLabel": "用时",
+        "better": "low",
     },
     "photography": {
         "label": "摄影",
@@ -43,7 +62,9 @@ SPORT_PRESETS: dict[str, dict[str, str]] = {
         "score": "得分",
         "round": "作品",
         "venue": "赛区",
-        "metric": "score",
+        "valueType": "decimal",
+        "valueLabel": "评分",
+        "better": "high",
     },
     "generic": {
         "label": "通用 / 其它",
@@ -52,7 +73,9 @@ SPORT_PRESETS: dict[str, dict[str, str]] = {
         "score": "得分",
         "round": "场次",
         "venue": "场地",
-        "metric": "score",
+        "valueType": "integer",
+        "valueLabel": "得分",
+        "better": "high",
     },
 }
 
@@ -60,15 +83,13 @@ DEFAULT_SPORT = "volleyball"
 
 
 def sport_meta(key: str = "") -> dict[str, str]:
-    """把比赛类型 key 解析成文案字典（未知类型回落到通用称呼）。"""
-    clean = (key or "").strip() or DEFAULT_SPORT
-    preset = SPORT_PRESETS.get(clean)
-    if preset is None:
-        base = dict(SPORT_PRESETS["generic"])
-        base["label"] = clean
-        base["key"] = clean
-        return base
-    return {"key": clean, **preset}
+    """**已退休**：比赛类型不再影响界面用词，一律回 :data:`SPORT_WORDS`。
+
+    留着这个函数只为一件事：老库里仍有 ``sport`` 字段、代码里也有零星调用点，
+    让它们照常拿到一套用词，而不是报错。
+    """
+    del key  # 传什么都不再影响结果
+    return dict(SPORT_WORDS)
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -93,25 +114,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "endTime": "",
         "locked": False,
         "lockedAt": "",
-        "rulesText": (
-            "固定队伍：确定参与名单后随机分配队友并全程固定（每个组的人数可调，默认 2 人）。"
-            "小组赛每场可为组 vs 组 / 三队同场 / 四队同场，按名次分排名，"
-            "取总排名前 N 名进入淘汰赛（十六强 / 八强 / 半决赛 / 决赛）。"
-            "淘汰赛默认双败：落败者进入败者组，最终由胜者组冠军与败者组冠军争夺总冠军；"
-            "关闭败者组即为单败淘汰，输一场直接淘汰。"
-        ),
+        # 赛事信息（可写 Markdown 的「参赛须知」）：**出厂留空**。
+        # 规则由「比赛规则」面板按当前赛制自动生成（见 logic.rulebook），
+        # 这里只说组织者想补充的话——预填一段通则既会与自动规则重复，
+        # 又会在改了赛制之后变成一句假话。
+        "rulesText": "",
         "logoText": "NTE",
     },
     "rules": {
         "teamSize": 2,             # 固定队伍人数（2 即 2v2）
-        "targetScore": 0,          # 单局目标分，0 表示不限制
+        "targetScore": 0,          # 单轮目标分，0 表示不限制
         "groupCount": 0,           # 小组赛组数，0 = 按队伍数自动推算
         "allowDraw": False,        # 仅小组赛允许平局
-        "bestOf": 1,               # 系列赛：1 / 3 / 5 / 7（奇数局，谁先过半谁赢）
-        "metric": "score",         # 比法：score 计分制（高分胜）/ time 用时制（短时胜）
+        # 计分口径（见 app/metrics.py）：类型决定怎么解析与显示，判断标准决定谁赢
+        "valueType": "integer",    # integer 自然数 / decimal 小数 / time 时间
+        "valueLabel": "得分",      # 展示标签：得分 / 评分 / 用时 / 自定义
+        "better": "high",          # high 数值高胜 / low 数值低胜
     },
     "stream": {
-        "enabled": True,
         "provider": "mediamtx",
         # 出厂**不预填任何地址**：每一套部署的媒体服务器都不一样，预填别人的域名
         # 会让新装的人「看起来配好了、其实连的是别人的服务器」。留空时各处都会
@@ -136,18 +156,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "whipPush": "",
         "poster": "",
         "title": "赛事直播",
-        "note": (
-            "推流用 WHIP（OBS 30+）；观看有两个地址：8889（WebRTC）与 8888（HLS），"
-            "均为 HTTPS。媒体服务器需开启 webrtcEncryption / hlsEncryption 并配置证书。"
-            "上面的地址请在「服务器管理 → 直播配置」里按自己那台填。"
-        ),
+        # 备注**默认留空**：以前这里预填了一段「推流用 WHIP、8889/8888、要开
+        # webrtcEncryption…」的实现说明，而它会出现在直播页上给观众看——
+        # 观众不需要读技术文档（那些内容归 README）。组织者想说什么自己填。
+        "note": "",
     },
     "ui": {
         "accent": "cyan",
         "showQq": True,
         "showAvatar": True,
         "revealResults": True,
-        "ticker": "BO1 一局定胜负 · 多局累计积分 · 输一局不淘汰 · NEVERNESS TO EVERNESS",
+        "ticker": "一场可记多轮 · 赢的轮数就是大比分 · 逐局累计积分 · NEVERNESS TO EVERNESS",
     },
     # 出厂不带任何示例数据：没有队伍、没有选手、没有比赛
     "teams": [],

@@ -2,7 +2,7 @@
  * 只做 HTML 字符串生成，不绑定事件（事件统一由 app.js 委托）。
  */
 
-import { App, esc, qsa, toLocalInput } from './core.js';
+import { App, esc, hasEntered, qsa, scoringOf, toLocalInput } from './core.js';
 import { icon, panelIcon } from './icons.js';
 
 const PLACEHOLDER = (name, size) =>
@@ -144,11 +144,87 @@ export function mainRoom() {
   };
 }
 
-/** 取一个机位的直播间地址集合（选手机位，或主直播间）。 */
+/** 取一个机位的直播间地址集合（选手机位 / 主直播间 / B站直播）。 */
 export function roomFor(pid) {
   if (!pid) return null;
+  if (isBiliKey(pid)) return biliRoomFor(pid);
   if (isMainRoom(pid)) return mainRoom();
   return (App.state?.streams || {})[pid] || null;
+}
+
+/* --------------------------- B站直播（源站直嵌） ---------------------------
+ *
+ * 成员的 B站 直播和 MediaMTX 那套**完全独立**：视频流一概不经本站
+ * （不中继、不转码、不代理），只由服务端探测「他此刻在不在播」，
+ * 在播就把 B站 官方外链播放器**直嵌**到舞台里，并给出跳转地址。
+ *
+ * 数据来自 ``/api/live/health`` 的 ``bili``（``/api/state`` 里的 ``liveStatus.bili``
+ * 是同一份兜底）：服务端只读缓存，探测在后台做，所以这里永远毫秒级。
+ */
+export const BILI_PREFIX = 'bili:';
+export const biliKey = (uid) => `${BILI_PREFIX}${uid || ''}`;
+export const isBiliKey = (pid) => String(pid || '').startsWith(BILI_PREFIX);
+
+function biliBox() {
+  return (App.liveHealth && App.liveHealth.bili) || App.state?.liveStatus?.bili || null;
+}
+
+/** 正在 B站 直播的成员（服务端判定；探测不到时是空数组，不是「没人播」）。 */
+export function biliLiveItems() {
+  const box = biliBox();
+  return box && Array.isArray(box.items) ? box.items : [];
+}
+
+/** B站 开播状态是不是**探到了**（``false`` = 不知道，不能说「没人播」）。 */
+export const biliKnown = () => {
+  const box = biliBox();
+  return Boolean(box && box.known !== false);
+};
+
+/** 某位成员此刻在不在 B站 直播。 */
+export const isBiliLive = (uid) => Boolean(biliLiveOf(uid));
+
+/**
+ * 某位成员此刻的 B站 直播信息（不在播就是 ``null``）。
+ *
+ * 里面的标题 / 主播名 / 在线人数 / 分区 / 开播时间**都是开播后从 B站 现取的**，
+ * 不需要成员在站内维护——这就是「开播后自动同步」的那一份数据。
+ */
+export function biliLiveOf(uid) {
+  if (!uid) return null;
+  return biliLiveItems().find((item) => item.uid === uid) || null;
+}
+
+/** 展示用的直播标题：B站 没填标题时给一句兜底，别显示成空白。 */
+export const biliTitleOf = (item) => (item && item.title ? item.title : '未填标题');
+
+/** B站 机位的房间信息（``pid`` 形如 ``bili:<成员 uid>``）。 */
+export function biliRoomFor(pid) {
+  if (!isBiliKey(pid)) return null;
+  const uid = String(pid).slice(BILI_PREFIX.length);
+  const item = biliLiveItems().find((entry) => entry.uid === uid);
+  if (!item) return null;
+  return {
+    key: biliKey(item.uid),
+    bili: true,
+    room: item.room,
+    roomId: item.roomId || item.room,
+    embed: item.embed,
+    jump: item.jump,
+    title: item.title || '',
+    uname: item.uname || '',
+    online: Number(item.online) || 0,
+    area: item.area || '',
+    liveTime: item.liveTime || '',
+  };
+}
+
+/** 成员填的 B站 直播间号（不管在不在播；列表里拿不到就是空串）。 */
+export function biliRoomOf(uid) {
+  const list = App.state?.members;
+  if (!Array.isArray(list)) return '';
+  const member = list.find((item) => item.uid === uid);
+  return (member && member.biliRoom) || '';
 }
 
 /* --------------------------- 成员频道（日常直播） --------------------------- */
@@ -286,7 +362,6 @@ export function whoHtml(player, { size = 'sm', form = [] } = {}) {
   const parts = [];
   if (player) {
     if (player.tag) parts.push(player.tag);
-    if (player.substitute) parts.push('替补');
     if (player.active === false) parts.push('停用');
   }
   const chips = form && form.length ? formChips(form) : '';
@@ -313,17 +388,22 @@ export const roundBadge = (status) =>
   `<span class="badge ${ROUND_BADGE[status] || 'badge--pending'}">${ROUND_TEXT[status] || esc(status)}</span>`;
 
 /**
- * 这局是否已经有任何结果痕迹。
+ * 这局是否已经有任何**录入痕迹**。
  *
  * 与后端 ``tournament.round_has_result`` 同一口径：动过比分 / 名次 / 弃权 / 状态
  * 就算「已经开打」。小组赛对阵只允许在**一场都没开打**时调整，前后端都用它判断。
+ *
+ * 注意这里问的是「动过没有」：数值型的 0 是合法读数，但它和旧库里从没打过的 0
+ * 长得一样，所以用 ``hasEntered``（0 不算痕迹）而不是「非零即真」的糊法。
  */
-export const roundHasResult = (rnd) =>
+export const roundHasResult = (rnd, sc = scoringOf(App.state)) =>
   Boolean(rnd) &&
   (rnd.status !== 'pending' ||
     Boolean(rnd.winner) ||
     (rnd.sets || []).length > 0 ||
-    (rnd.sides || []).some((s) => s.score || s.points || s.rank || s.forfeit));
+    (rnd.sides || []).some(
+      (s) => hasEntered(s.score, sc) || s.points || s.rank || s.forfeit
+    ));
 
 export function kpiCard(label, value, sub, barPercent) {
   const bar =
@@ -377,33 +457,49 @@ export function rulebookBodyHtml(s) {
   const facts = rb.facts || {};
   const chips = [
     ['赛制', facts.formatLabel || ''],
-    // 比法：计分制 / 用时制——它决定「哪种数值更好」（后端 app/metrics.py）
-    ['比法', facts.metricLabel || ''],
+    // 计分口径：类型（怎么记） + 标签（怎么写） + 判断标准（谁赢），见 app/metrics.py
+    ['计分', facts.typeLabel || ''],
+    ['记作', facts.valueLabel || ''],
+    ['判定', facts.betterLabel || ''],
     ['参赛', facts.format === 'league' ? `${facts.players || 0} 人` : `${facts.teams || 0} 支队`],
     ['每队', `${facts.teamSize || 0} 人`],
-    facts.format === 'league'
-      ? ['总轮次', `${facts.totalRounds || 0} 局`]
-      : ['每场', facts.teamsPerMatch === 2 ? '组 vs 组' : `${facts.teamsPerMatch || 2} 队同场`],
-    facts.format === 'league'
-      ? ['排名', '均分']
-      : ['淘汰', facts.loserBracket ? '双败' : '单败'],
-    !facts.format || facts.format === 'tournament'
-      ? ['晋级', facts.size ? `${facts.size} 强` : '待定']
-      : ['平局', facts.allowDraw ? '允许' : '不允许'],
-  ].filter(([, value]) => value !== '' && value != null);
+  ];
+  if (facts.format === 'league') {
+    chips.push(
+      ['总轮次', `${facts.totalRounds || 0} 局`],
+      ['排名', '均分'],
+      ['淘汰', '不淘汰']
+    );
+    if (facts.minRankPlayed) chips.push(['计分门槛', `出场 ≥ ${facts.minRankPlayed} 局`]);
+  } else {
+    chips.push(
+      ['每场', facts.shape || (facts.teamsPerMatch === 2 ? '组 vs 组' : `${facts.teamsPerMatch || 2} 队同场`)],
+      ['分组', facts.groupSizes || '待分组'],
+      ['淘汰', facts.loserBracket ? '双败' : '单败'],
+      ['出线', facts.size ? `${facts.size} 强` : '待定']
+    );
+    if (facts.perTeamMatches) chips.push(['小组赛场次', String(facts.perTeamMatches)]);
+    if (facts.allowDraw) chips.push(['平局', '允许']);
+  }
+  const visibleChips = chips.filter(([, value]) => value !== '' && value != null);
 
   const sections = (rb.sections || [])
     .map(
       (sec) =>
         `<div class="rules__sec"><h3>${esc(sec.title)}</h3><ul>` +
-        (sec.items || []).map((text) => `<li>${esc(text)}</li>`).join('') +
+        // 条目用服务端渲染好的行内 HTML（`**加粗**` 才会真的加粗）。
+        // 服务端先转义再按白名单渲染，所以这里可以放心当 HTML 放；
+        // 万一某条没有 html（旧数据 / 老接口），退回纯文本转义显示。
+        (sec.items || [])
+          .map((text, i) => `<li>${sec.itemsHtml?.[i] ?? esc(text)}</li>`)
+          .join('') +
         `</ul></div>`
     )
     .join('');
 
   return (
     `<div class="rules">` +
-    `<div class="rules__facts">${chips
+    `<div class="rules__facts">${visibleChips
       .map(
         ([key, value]) =>
           `<span class="rules__fact"><i>${esc(key)}</i><b>${esc(value)}</b></span>`

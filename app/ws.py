@@ -25,6 +25,9 @@ class Hub:
         self._clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self._last_state: dict[str, Any] | None = None
+        # 最近一次的直播状态（``live.watch_loop`` 变化时推的那份）：新连接也回放一份，
+        # 否则刚打开页面的人要等到下一次状态变化才知道谁在播（全站的「直播中」标记会慢半拍）
+        self._last_live: dict[str, Any] | None = None
         self._broadcast_count = 0
 
     @property
@@ -48,6 +51,8 @@ class Hub:
         log.info("客户端接入 | 在线=%d", total)
         if self._last_state is not None:
             await self._send(ws, {"type": "state", "data": self._last_state})
+        if self._last_live is not None:
+            await self._send(ws, {"type": "live", "data": self._last_live})
         return True
 
     async def disconnect(self, ws: WebSocket) -> None:
@@ -61,6 +66,9 @@ class Hub:
         await self.broadcast({"type": "state", "data": state})
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
+        if payload.get("type") == "live":
+            # 顺手记住这份直播状态：新连接要回放（见 connect）
+            self._last_live = payload.get("data") or None
         async with self._lock:
             targets = list(self._clients)
         if not targets:

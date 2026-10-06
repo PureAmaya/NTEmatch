@@ -65,7 +65,33 @@ function imageBarHtml() {
   );
 }
 
-function bodyHtml({ value, hint, placeholder, titleLabel, titleValue, titlePlaceholder }) {
+/** 编辑器底部的附加勾选项（如「同时发到 QQ 群」）：用 ``data-extra`` 收集。 */
+function extrasHtml(extras) {
+  if (!extras.length) return '';
+  return (
+    `<div class="mdx__extras">` +
+    extras
+      .map(
+        (item) =>
+          `<label class="mdx__extra"${item.hint ? ` title="${esc(item.hint)}"` : ''}>` +
+          `<input type="checkbox" data-extra="${esc(item.name)}"` +
+          `${item.checked ? ' checked' : ''}> ` +
+          `<span>${esc(item.label)}</span></label>`
+      )
+      .join('') +
+    `</div>`
+  );
+}
+
+function bodyHtml({
+  value,
+  hint,
+  placeholder,
+  titleLabel,
+  titleValue,
+  titlePlaceholder,
+  extras = [],
+}) {
   return (
     `<div class="mdx" data-mdx>` +
     // 通知需要标题，信息类不需要 —— 同一套编辑器，多一个字段而已。
@@ -86,7 +112,8 @@ function bodyHtml({ value, hint, placeholder, titleLabel, titleValue, titlePlace
     `<div class="mdx__preview md" data-preview>` +
     `<div class="mdx__empty">预览会显示在这里（与发布后的效果一致）</div></div>` +
     `</div>` +
-    `<div class="mdx__foot"><span class="mdx__hint">${hint ? esc(hint) : ''}</span>` +
+    `<div class="mdx__foot">${extrasHtml(extras)}` +
+    `<span class="mdx__hint">${hint ? esc(hint) : ''}</span>` +
     `<span class="mdx__count" data-count></span></div>` +
     `</div>`
   );
@@ -181,12 +208,22 @@ export function openMarkdownEditor({
   titleValue = '',
   titlePlaceholder = '',
   readOnly = false,
+  extras = [],
   onSave,
 } = {}) {
   Modal.open({
     title,
     className: 'modal__box--mdx',
-    body: bodyHtml({ value, hint, placeholder, titleLabel, titleValue, titlePlaceholder }),
+    body: bodyHtml({
+      value,
+      hint,
+      placeholder,
+      titleLabel,
+      titleValue,
+      titlePlaceholder,
+      // 只读时勾选项没有意义（保存按钮都没了），干脆不渲染
+      extras: readOnly ? [] : extras,
+    }),
     footer: readOnly
       ? `<button class="btn btn--sm btn--ghost" type="button" data-close>关闭</button>`
       : `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
@@ -373,8 +410,14 @@ export function openMarkdownEditor({
         }
         const saveBtn = footEl.querySelector('[data-save]');
         if (saveBtn) saveBtn.disabled = true;
+        // 附加勾选项（如「同时发到 QQ 群」）：按 data-extra 收成一个对象交给调用方，
+        // 编辑器本身不认识任何具体业务
+        const extraState = {};
+        bodyEl.querySelectorAll('[data-extra]').forEach((el) => {
+          extraState[el.dataset.extra] = el.checked;
+        });
         try {
-          await onSave({ title: heading, text: ta.value });
+          await onSave({ title: heading, text: ta.value, extras: extraState });
           Modal.close();
         } catch (err) {
           toast(err.message || '保存失败', 'err');

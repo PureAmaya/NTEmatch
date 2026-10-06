@@ -1,24 +1,46 @@
 """帮助图上要写的**文字内容**（纯数据，不依赖 Pillow）。
 
-拆出来的理由：渲染脚本要用 Pillow（只在生成时装），而测试要能**仅凭文本**核对
-「图上的命令与插件里的 ``HELP_TEXT`` 一致」——把内容放在这个零依赖模块里，两边都能读。
+为什么放在 ``app/`` 里（而不是 ``tools/``）：这张图现在是**服务启动时自动生成**的
+（见 :mod:`app.helpcard`），所以内容与排版都得跟着应用一起发布——装成 wheel 之后
+``tools/`` 根本不存在，把内容留在那边等于「装完就画不出来」。
 
-改命令时改这里、并同步插件的 ``HELP_TEXT``：``tests/test_plugin_helpers.py`` 有一条
-用例比对两边（漂了会红），因为图上的命令写错一个字，群友照着打就是**毫无反应**。
+渲染脚本（``tools/make_help_card.py``，手工重画用）与测试都读这一份；
+``tests/test_plugin_helpers.py`` 比对「图上的命令」与插件的 ``HELP_TEXT``
+——图上的命令写错一个字，群友照着打就是**毫无反应**（命令是精确匹配的）。
 
-另外**改了内容要重跑一次出图脚本**（``tools/make_help_card.py``）：它会把下面那个指纹
-写进 ``static/help.jpg.src.sha256``，自检与用例据此判断「图是不是比文案旧」。
+``source_digest()`` 是这几个源文件的指纹：图不入库，但**万一本地有一份**（启动时生成的），
+自检与测试就靠它判断「这份图是不是比文案旧」。
+
+**别在这里用 Markdown 记号**（``**加粗**``、`` `代码` ``）：图是直接画字的，
+星号会原样印出来（``tools/check_assets.py`` 有一条检查盯着这个）。
 """
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
 NOTICE_TITLE = "必须先 @ 机器人，或发以 / 开头的命令"
 NOTICE_NOTE = "直接打「比赛进度」不会触发：不 @ 或没前缀时，机器人不会有任何回复"
 
 SUBTITLE = "在群里 @ 机器人，或按唤醒前缀发命令"
+
+#: 「先看这三步」：新用户最先要的三件事（只写**怎么做**，不引入新命令）
+STEPS_TITLE = "第一次用，看这三步"
+STEPS: tuple[tuple[str, str], ...] = (
+    ("看比赛", "「比赛届次」找到编号 → 「比赛 e001」看信息与进度；「比赛信息」还会发一张图，赛制与完整规则都在上面"),
+    ("看 / 改自己", "「比赛资料」会私聊发你一份完整资料，每一项怎么写都写在里面（名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ）"),
+    ("要开播", "「比赛直播注册」把推流码、令牌、推流地址和 OBS 注意事项一次给全（没有的它会补上，已有的不动）"),
+)
+
+#: 「群里回 vs 私聊发你」：省得用户到处找答案（也不引入新命令）
+PRIVACY_TITLE = "哪些在群里回、哪些只私聊发你"
+PRIVACY: tuple[tuple[str, str], ...] = (
+    ("群里直接回", "比赛 / 进度 / 结果 / 名单 / 直播 / 比赛UID（游戏 UUID 就是拿来群里给举办者的）"),
+    ("只私聊发你", "资料、推流地址、登录密钥、直播令牌；届次很多时列表也走私聊，免得刷屏"),
+    ("发不出去时", "资料与说明会退回群里说一声；密钥与令牌不会——它们只显示一次，泄在群里等于白送账号"),
+)
 
 #: 三张命令卡：(标题, ((命令, 说明), ...))
 SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
@@ -29,22 +51,25 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("比赛直播", "现在谁在直播（主直播间 + 选手 / 成员机位）"),
             ("比赛列表 [页码]", "全部赛事"),
             ("比赛届次 [我的] [页码]", "编号与名称；写「我的」只看自己创建的，多时私聊发你"),
-            ("比赛信息 [届次]", "时间 / 赛制 / 人数 / 简介 / 是否排名"),
+            ("比赛信息 [届次]", "时间 / 赛制 / 人数 / 简介 / 比赛规则（发一张卡片图）"),
             ("比赛进度 [届次]", "已赛多少、正在打谁 vs 谁"),
             ("比赛下一场 [届次]", "接下来看哪场（含计划时间）"),
             ("比赛结果 [届次]", "冠军 / 榜单 + 逐场比分"),
             ("比赛冠军 [届次]", "冠军（或积分制榜首前三）"),
             ("比赛名单 [届次]", "参赛名单（选手 / 队伍 / 替补）"),
             ("比赛详情 [届次] [场次]", "综合信息；给场次编号就细说那一场"),
+            ("比赛UID [@某人]", "游戏 UUID（群里直接回；不 @ 就是你自己）"),
         ),
     ),
     (
         "② 你自己的",
         (
             ("比赛我的", "你的推流地址 + 直播间地址（私聊发你）"),
+            ("比赛直播注册 [流名] [@某人]", "开播要用的东西一次给全：缺推流码 / 令牌就补上（私聊发本人）"),
+            ("比赛资料 [字段 新值] [@某人]", "资料与改法（私聊发你）：名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ"),
             ("比赛重置密钥 [@某人]", "换登录密钥（旧密钥立即失效，私聊发本人）"),
             ("比赛重置令牌 [@某人]", "换直播令牌（要先有推流码，私聊发本人）"),
-            ("比赛改推流码 <流名> [@某人]", "改推流码（英文 / 数字；令牌不变）"),
+            ("比赛改推流码 <流名> [@某人]", "改推流码（等同「比赛资料 推流码 <流名>」）"),
             ("比赛帮助", "就是这张图"),
         ),
     ),
@@ -75,7 +100,7 @@ TIPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "e001 / 1 / 第2届 / 名称片段 都行",
             "必须写明；不填会提示你补上",
-            "「比赛直播」「比赛列表」「比赛届次」不用填届次",
+            "「比赛直播」「比赛列表」「比赛届次」不用填",
             "写错了会列出候选，不会瞎猜",
         ),
     ),
@@ -86,12 +111,14 @@ TIPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "群里 @ 你 = 要开打了",
             "要用「比赛我的」查推流地址先得是成员",
             "（服务器管理员发：比赛添加 @你）",
+            "自己有什么、怎么改：发「比赛资料」",
         ),
     ),
 )
 
 FOOTER_TITLE = "@机器人 比赛帮助"
 FOOTER_NOTE = "命令说明、推流地址、登录密钥、直播令牌，都只私聊发给你本人"
+
 
 #: 卡片标题（大字下那行）
 TITLE_LABEL = "NTE MATCH · QQ BOT"
@@ -102,21 +129,55 @@ TITLE = "比赛机器人 · 使用说明"
 # 出图源文件的指纹：让「改了文案忘了重画」立刻可见
 # --------------------------------------------------------------------------- #
 #: 出图依赖的源文件（改了其中任何一个，图都该重画一次）。
-SOURCE_FILES = ("help_card_content.py", "make_help_card.py", "make_share_card.py")
+#: 与内容模块同目录（都在 ``app/``），所以这里只写文件名。
+SOURCE_FILES = ("helpcard_content.py", "helpcard.py")
+
+
+#: 图里**不能出现**的 Markdown 记号：渲染器只会画字，星号会原样印出来
+_MARKDOWN_MARKERS = ("**", "`", "__")
+
+
+def _all_texts() -> Iterator[str]:
+    """内容里**所有**会画到图上的字符串（供下面的检查用）。"""
+    yield from (NOTICE_TITLE, NOTICE_NOTE, SUBTITLE, STEPS_TITLE, PRIVACY_TITLE)
+    for label, text in (*STEPS, *PRIVACY):
+        yield label
+        yield text
+    for section_title, rows in SECTIONS:
+        yield section_title
+        for cmd, desc in rows:
+            yield cmd
+            yield desc
+    yield from SECTION_NOTES.values()
+    for tip_title, lines in TIPS:
+        yield tip_title
+        yield from lines
+    yield from (FOOTER_TITLE, FOOTER_NOTE, TITLE, TITLE_LABEL)
+
+
+def markdown_leaks() -> list[str]:
+    """内容里带 Markdown 记号的条目（**图里会原样印出星号**）。
+
+    这条检查是踩过坑才加的：规则文案习惯写 ``**加粗**``，而帮助图只会画字——
+    「**密钥与令牌不会**」在图上就是四个星号加一句话。自检与测试都调它。
+    """
+    return [
+        text[:60]
+        for text in _all_texts()
+        if any(marker in text for marker in _MARKDOWN_MARKERS)
+    ]
 
 
 def source_digest() -> str:
     """这几个源文件的指纹（换行统一成 ``\\n``，Linux / Windows 上算出来一致）。
 
-    ``tools/make_help_card.py`` 出图后把它写进 ``static/help.jpg.src.sha256``，
-    ``tools/check_assets.py`` 与 ``tests/test_plugin_helpers.py`` 拿它比对。
+    :func:`app.helpcard.write` 出图后把它写进 ``static/help.jpg.src.sha256``，
+    ``tools/check_assets.py`` 与 ``tests/test_plugin_helpers.py`` 拿它比对
+    ——**图不入库**，所以只在「本地确实有一份图」时才比对（见两边说明）。
 
     为什么要这东西：这张图是**给群友照着打命令**的，文案改了不重画，群里发出去的就是
     一张写着旧命令的图——命令精确匹配，照着打**毫无反应**，而且没人知道为什么。
     图本身没有版本号（地址固定 `/help.jpg`），所以只能靠这个指纹认「新旧」。
-
-    放在这个**零依赖**模块里，是为了渲染脚本与自检脚本共用同一份实现：
-    两边各写一遍，迟早会漂成两种算法。
     """
     here = Path(__file__).resolve().parent
     blob = b""

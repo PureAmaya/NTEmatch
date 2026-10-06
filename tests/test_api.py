@@ -352,11 +352,10 @@ async def test_api_password_never_reaches_the_browser(admin_client):
         await store.update({"stream": saved})
 
 
-async def test_saving_the_live_switch_keeps_the_media_server_config(admin_client):
-    """赛事页只发 ``enabled``：其余键必须保持原值（``store.update`` 深合并）。
+async def test_partial_stream_patch_keeps_the_rest(admin_client):
+    """直播配置是**局部补丁**：改一个键不能把地址与凭据一起冲成默认值。
 
-    直播配置存在**同一行**里，一次整份写就会把地址与凭据一起冲成默认值——所以
-    「补丁是局部的」这件事值得钉一条。
+    它们存在同一行里，一次整份写就会互相覆盖——所以「补丁是局部的」值得钉一条。
     """
     saved = store.snapshot().stream.dump()
     try:
@@ -370,10 +369,10 @@ async def test_saving_the_live_switch_keeps_the_media_server_config(admin_client
                 }
             }
         )
-        res = await admin_client.put("/api/config", json={"stream": {"enabled": False}})
+        res = await admin_client.put("/api/config", json={"stream": {"title": "场馆直播"}})
         assert res.status_code == 200
         stream = (await admin_client.get("/api/server/config")).json()["stream"]
-        assert stream["enabled"] is False
+        assert stream["title"] == "场馆直播"
         assert stream["baseUrl"] == "https://live.test:8889"
         assert stream["hlsBase"] == "https://live.test:8888"
         assert stream["pushToken"] == "tk-live"

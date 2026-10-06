@@ -38,6 +38,9 @@ data/
 logs/
 # 数据备份同样含密钥与全部数据（见「备份」面板），绝不入库
 backups/
+# 热更新守护的运行时状态（status.json / ready-* / app.json）：随时在变，
+# 而且是「这一台机器此刻跑到哪一代」的本地信息，跨机器没有意义
+hot/
 *.log
 *.sqlite3
 *.sqlite3-shm
@@ -46,6 +49,10 @@ backups/
 *.db-journal
 
 # ---- 前端 / 构建产物 ----
+# 帮助图是**服务启动时渲染**出来的（见 app/helpcard.py）：文案一改就该重画，
+# 而入库的图只会变成「照着打没反应」的陷阱。连它的指纹文件一起忽略。
+static/help.jpg
+static/help.jpg.src.sha256
 node_modules/
 .npm/
 .pnpm-store/

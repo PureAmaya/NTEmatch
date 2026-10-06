@@ -12,9 +12,13 @@ import {
   isFinished,
   isServerAdmin,
   log,
+  normScoring,
   qs,
   qsa,
   stateKey,
+  VALUE_TYPE_OPTIONS,
+  BETTER_OPTIONS,
+  LABEL_PRESETS,
 } from './core.js';
 import {
   avaHtml,
@@ -239,39 +243,33 @@ function eventTimeEditorHtml(t) {
   );
 }
 
-/** 系列赛（BO）选项：只给奇数局，因为偶数局可能出现「各赢一半」。 */
-const SERIES_OPTIONS = [
-  ['1', '一局定胜负（BO1）'],
-  ['3', '三局两胜（BO3）'],
-  ['5', '五局三胜（BO5）'],
-  ['7', '七局四胜（BO7）'],
-];
-const SERIES_HINT =
-  '每场打几局。填了「各局小分」时，局分就是各局胜负的计数（先赢过半者胜），' +
-  '不需要另外填大比分；只填大比分的老习惯也照旧可用';
-
 /**
- * 比法：决定「哪种数值更好」。这是全套赛制里最底层的一个开关——
- * 判定、名次、名次分、晋级与积分榜排序都跟着它走（后端见 app/metrics.py）。
+ * 计分口径三件套：**类型 → 怎么解析与显示**、**标签 → 怎么写**、**判断标准 → 谁赢**。
+ *
+ * 这是全套赛制里最底层的一组开关：判定、名次、名次分、晋级与积分榜排序都跟着它走
+ * （后端见 app/metrics.py）。三件事分开，是因为它们本来就是独立的——
+ * 「时间 + 用时 + 数值低胜」是最常见的一种组合，而不是唯一一种。
  */
-const METRIC_OPTIONS = [
-  ['score', '计分制（分数高者胜）'],
-  ['time', '用时制（用时短者胜）'],
-];
-const METRIC_HINT =
-  '计分制给排球、篮球这类比分制项目；用时制给赛车、跑酷、速通这类计时项目。' +
-  '用时制下成绩按 1:23.456 或 83.45 录入（内部按毫秒存），未填或填 0 视为「未完赛」并垫底。' +
-  '改它等于改已有成绩的含义，赛中一般不要动';
-
-/**
- * 比法提示：如果当前「比赛类型」另有惯用比法（如赛车 → 用时制），
- * 就在提示里说出来——**只提示、不自动改**，赛制是组织者定的。
- */
-function metricHint(current) {
-  const suggested = App.state?.sport?.metric;
-  if (!suggested || suggested === current) return METRIC_HINT;
-  const label = suggested === 'time' ? '用时制' : '计分制';
-  return `${METRIC_HINT}。（当前比赛类型通常用「${label}」，需要的话在上面切换）`;
+function scoringFields(rules) {
+  const sc = normScoring(rules);
+  return (
+    fieldSelect('valueType', '计分类型（记什么）', sc.valueType, VALUE_TYPE_OPTIONS, {
+      hint:
+        '决定怎么录入与怎么显示：自然数原样、小数保留三位、时间按时分秒。' +
+        '改它等于改已有成绩的含义，赛中一般不要动',
+    }) +
+    `<div class="field"><label for="f-valueLabel">计分标签（怎么写）</label>` +
+    `<input id="f-valueLabel" name="valueLabel" list="scoring-labels" value="${esc(
+      rules.valueLabel || ''
+    )}" placeholder="${esc(sc.label)}">` +
+    `<datalist id="scoring-labels">${LABEL_PRESETS.map(
+      (text) => `<option value="${esc(text)}"></option>`
+    ).join('')}</datalist>` +
+    `<span class="field__hint">展示时怎么称呼这项成绩：得分 / 评分 / 用时，也可以自己填（留空按类型给默认）</span></div>` +
+    fieldSelect('better', '判断标准（谁赢）', sc.better, BETTER_OPTIONS, {
+      hint: '数值高胜 = 分高者赢；数值低胜 = 成绩小者赢',
+    })
+  );
 }
 
 /** 锦标赛制规则表单。 */
@@ -279,12 +277,13 @@ function tournamentRulesForm(rules, s) {
   const maxSize = s?.format?.maxSize || 0;
   const perMatch = Number(rules.teamsPerMatch) || 2;
   const loser = rules.loserBracket !== false;
-  const time = (rules.metric || 'score') === 'time';
+  const sc = normScoring(rules);
+  const teams = Number(s?.format?.teams) || 0;
+  // 「0 自动」时到底会分几组：由后端算好放在 rulebook.facts 里（同一套算法，界面不自己猜）
+  const autoGroups = Number(s?.rulebook?.facts?.groups) || 0;
   return (
     `<form class="form form--2" data-form="rules">` +
-    fieldSelect('metric', '比法（怎么算赢）', rules.metric ?? 'score', METRIC_OPTIONS, {
-      hint: metricHint(rules.metric ?? 'score'),
-    }) +
+    scoringFields(rules) +
     fieldSelect(
       'teamSize',
       '每个组的人数',
@@ -306,53 +305,47 @@ function tournamentRulesForm(rules, s) {
       { hint: '关闭 = 单败淘汰，输一场即淘汰；开启 = 输一场进败者组，输两场才淘汰' }
     ) +
     fieldNum('groupCount', '小组赛组数 (0 自动)', rules.groupCount ?? 0, {
-      hint: '自动时约 4 队一组，并尽量让每组队数刚好排满整场',
+      hint: `自动 = 在「每组排得满一场」的前提下尽量多分组（队伍越多组越多，小组赛更短、出线名额更多）；当前${teams ? ` ${teams} 支队会分 ${autoGroups} 组` : '还没有队伍'}。填了就按填的来`,
     }) +
     fieldNum('knockoutSize', '淘汰赛规模 (0 自动)', rules.knockoutSize ?? 0, {
       hint: maxSize
         ? `2 的幂且不超过 ${maxSize}（当前 ${s?.format?.teams || 0} 支队）；改后需重新生成赛程`
         : '2 的幂，如 16 表示十六强；需先组队',
     }) +
-    // 单局目标分只对计分制有意义（用时制的「目标」是跑完而不是够分）
-    (time
+    // 单轮目标只对数值型有意义（时间型的「目标」是跑完而不是够分）
+    (sc.timeBased
       ? ''
-      : fieldNum('targetScore', '单局目标分 (0 不限)', rules.targetScore)) +
-    fieldSelect('bestOf', '系列赛（每场几局）', rules.bestOf ?? 1, SERIES_OPTIONS, {
-      hint: SERIES_HINT,
-    }) +
+      : fieldNum('targetScore', '单轮目标 (0 不限)', rules.targetScore)) +
     fieldSwitch('allowDraw', '小组赛允许平局', rules.allowDraw) +
-    `<div class="notice" style="grid-column:1/-1">赛制：确定参与名单 → <b>随机组队</b>（队友随机、全程固定）→ ` +
-    `小组赛轮转（每场 ${perMatch === 2 ? '组 vs 组' : `${perMatch} 队同场`}，按名次分排名）→ ` +
-    `总排名前 N 名进入<b>${loser ? '双败淘汰（含败者组）' : '单败淘汰'}</b>` +
-    `${loser ? '，胜者组冠军与败者组冠军争夺总冠军' : '，最后一轮即决赛'}。</div>` +
+    // 这里刻意**不再复述一遍赛制**：那几句话是「通用说明」，与实际参数一旦不一致
+    // （比如单败的届里写着双败怎么打）就是错的。规则由参数推导、显示在
+    // 「总览 → 比赛规则」里，改完保存一看便知。
+    `<div class="notice" style="grid-column:1/-1">保存后，<b>总览 → 比赛规则</b>` +
+    `会按当前参数（每队人数 / 每场同场队伍数 / 小组数 / ${loser ? '双败' : '单败'}淘汰…）` +
+    `自动重算并展示本届的完整规则。</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存规则</button></div></form>`
   );
 }
 
 /** 积分制规则表单。 */
 function leagueRulesForm(rules) {
-  const time = (rules.metric || 'score') === 'time';
+  const sc = normScoring(rules);
   return (
     `<form class="form form--2" data-form="rules">` +
-    fieldSelect('metric', '比法（怎么算赢）', rules.metric ?? 'score', METRIC_OPTIONS, {
-      hint: metricHint(rules.metric ?? 'score'),
-    }) +
+    scoringFields(rules) +
     fieldNum('teamSize', '每队人数', rules.teamSize, { hint: '2 即 2v2，每局自动从参与名单排阵' }) +
     fieldNum('totalRounds', '总轮次', rules.totalRounds) +
     fieldNum('pointsWin', '胜方积分', rules.pointsWin) +
     fieldNum('pointsLose', '负方积分', rules.pointsLose) +
     fieldNum('pointsDraw', '平局积分', rules.pointsDraw) +
     fieldNum('minRankPlayed', '参与排名最少场次', rules.minRankPlayed ?? 5, {
-      hint: '不足该场次的选手列在榜尾、不参与名次（仍显示场次与得分）',
-    }) +
-    fieldSelect('bestOf', '系列赛（每场几局）', rules.bestOf ?? 1, SERIES_OPTIONS, {
-      hint: SERIES_HINT,
+      hint: '不足该场次的选手列在榜尾、不参与名次（仍显示场次与成绩）',
     }) +
     fieldSwitch('allowDraw', '允许平局', rules.allowDraw) +
-    fieldSwitch('includeSubstitutes', '人数不足时启用替补', rules.includeSubstitutes) +
     fieldSwitch('fairRotation', '公平轮换（均衡出场）', rules.fairRotation) +
     `<div class="notice" style="grid-column:1/-1">赛制：每局从参与名单自动排 2v2 阵容 → 逐局独立结算 → ` +
-    `按<b>均分（总得分 ÷ 场次）</b>排名${time ? '，同分再比完成场次与总用时' : ''}，` +
+    `按<b>均分（总${esc(sc.label)} ÷ 场次）</b>排名` +
+    `${sc.lowWins ? `，同分再比完成场次与总${esc(sc.label)}` : ''}，` +
     `积分记在实际出场的选手名下。</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存规则</button></div></form>`
   );
@@ -415,16 +408,16 @@ function lockPanelHtml(s) {
       `</span></div>` +
       `<div class="notice" style="margin-top:10px"><b>已冻结</b>：赛制、每队人数、每场同场队伍数、败者组开关、` +
       `参赛名单、重新组队、赛程重建 / 清空、删除选手。<br>` +
-      `<b>仍然可用</b>：<b>直播开关</b>、<b>替补换人</b>（替补不在名单里会自动加入）、录分与重置、` +
+      `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补 / 队伍换人</b>（替上的人不在名单里会自动加入）、录分与重置、` +
       `时间登记、赛事信息、新增选手档案。</div>` +
       `<div class="tool-group" style="margin-top:10px">` +
-      `<button class="btn btn--sm btn--primary" type="button" data-act="team-sub">替补换人</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-act="team-sub">队伍换人</button>` +
       `<button class="btn btn--sm btn--danger" type="button" data-act="event-unlock">解除锁定</button></div>`
     : `<div class="etime etime--slim">` +
       `<span class="etime__pill etime__pill--upcoming">尚未开赛</span>` +
       `<span class="etime__text">名单、赛制与赛程都可以自由调整</span></div>` +
       `<div class="notice" style="margin-top:10px">确认无误后点「开始比赛」：` +
-      `<b>赛制与参赛名单会被冻结</b>，但<b>直播开关</b>与<b>替补换人</b>始终可用。` +
+      `<b>赛制与参赛名单会被冻结</b>，但<b>直播开关</b>与<b>对局替补 / 队伍换人</b>始终可用。` +
       `开始比赛需要二次确认。</div>` +
       `<div class="kv kv--inline" style="margin-top:10px">` +
       `<div class="kv__row"><dt>赛制</dt><dd>${esc(r.format)}</dd></div>` +
@@ -436,7 +429,7 @@ function lockPanelHtml(s) {
         : '') +
       `<div class="tool-group" style="margin-top:10px">` +
       `<button class="btn btn--sm btn--primary" type="button" data-act="event-start">开始比赛（二次确认）</button>` +
-      `<button class="btn btn--sm" type="button" data-act="team-sub">替补换人</button></div>`;
+      `<button class="btn btn--sm" type="button" data-act="team-sub">队伍换人</button></div>`;
   return panelHtml('比赛状态', r.locked ? '已开赛 · 赛制与名单已锁定' : '开赛前请确认名单与赛制', body);
 }
 
@@ -491,7 +484,9 @@ export function adminPanelHtml(s) {
   // 拿不到值时渲染出空输入框、一保存就把地址清空，正是要避免的那种事故。
   // 界面配置（主题色 / 分享图 / 展示开关）同理：它按届保存，但**只有服务器管理员**能改，
   // 所以表单也搬去了「服务器」页（见 members.js 的 uiPanelHtml）。
-  const stream = s.stream || {};
+  // 直播配置同理，而且更彻底：这一页**没有**任何直播表单了——直播没有总开关
+  // （只要有赛事就允许直播），媒体服务器地址 / 账号 / 凭据全是站点级设置，
+  // 统一在「服务器 → 直播配置」里维护（写接口也把关，见 main._apply_stream_patch）。
 
   const eventTime = s.eventTime || {};
   // 已结束的届：赛事信息转为只读（服务端同样会拒），但通知照旧可发
@@ -509,13 +504,8 @@ export function adminPanelHtml(s) {
       maxlength: 30,
       hint: '≤30 字。留空则总览与主页 / 全部赛事的卡片都不显示这一项',
     }) +
-    fieldSelect(
-      'sport',
-      '比赛类型',
-      evt.sport || 'volleyball',
-      (s.sportPresets || []).map((p) => [p.key, p.label]),
-      { hint: '只影响界面称呼（参赛者 / 成绩 / 场次），不影响数据与赛制' }
-    ) +
+    // 「比赛类型」已退休：它只换称呼（选手 → 车手…），而组织者要的是规则跟着赛制走。
+    // 界面上不再提供这一项；老数据里的取值会被忽略。
     fieldSwitch('ranked', '排名模式（关闭 = 娱乐记录，不排名 / 不晋级）', evt.ranked !== false) +
     fieldText('venue', '场地', evt.venue) +
     fieldText('organizer', '主办方', evt.organizer) +
@@ -546,17 +536,6 @@ export function adminPanelHtml(s) {
 
   const rulesForm = isLeague(s) ? leagueRulesForm(rules) : tournamentRulesForm(rules, s);
 
-  // 这一页**只留一个直播开关**：赛事管理员能决定「本届要不要直播」，但碰不到媒体服务器
-  // 本身——根地址 / API 地址与账号 / 凭据 / 默认流名 / 推流令牌 / 封面 / 备注都是
-  // **站点级**设置（一处媒体服务器给整站所有届共用），只出现在「服务器 → 直播配置」里，
-  // 由服务器管理员维护；写接口那边同样把关（见 main._STREAM_SERVER_KEYS）。
-  const streamForm = `<form class="form" data-form="stream">` +
-    fieldSwitch('enabled', '启用直播', stream.enabled !== false, {
-      hint: '站点级开关：关掉后直播页与所有推流地址一起隐藏。' +
-        '媒体服务器地址、API 账号与凭据在「服务器 → 直播配置」里填',
-    }) +
-    `<div class="form-actions"><button class="btn btn--primary" type="submit">保存</button></div></form>`;
-
   // 已完结的届只留只读信息：编辑面板整体上锁，只放行「恢复进行」
   const finished = isFinished(s);
   const editing =
@@ -573,19 +552,17 @@ export function adminPanelHtml(s) {
       isLeague(s) ? '积分制' : '双败淘汰制',
       lockedWrap(rulesForm, s.event?.locked, '比赛已开始，赛制与人数已锁定')
     ) +
-    panelHtml('赛事直播', '总开关', streamForm) +
     participantsPanelHtml(s) +
     panelHtml(
       '组队台',
-      s.event?.locked ? '已锁定 · 用「替补换人」调整' : '固定分组 · 拖拽调整队友',
+      s.event?.locked ? '已锁定 · 用「队伍换人」调整' : '固定分组 · 拖拽调整队友',
       `<div class="tool-group" style="margin-bottom:10px">` +
         `<button class="btn btn--sm${s.event?.locked ? ' btn--primary' : ''}" type="button" data-act="team-sub">` +
-        `替补换人（不重排队伍）</button>` +
-        `<span class="panel__hint">把某队的一位队员换成替补；替补不在参与名单里会自动加入</span>` +
+        `队伍换人（不重排队伍）</button>` +
+        `<span class="panel__hint">把某队的一位队员换成候选池里的其他人；不在参与名单里会自动加入</span>` +
         `</div>` +
         lockedWrap('<div id="teamHost"></div>', s.event?.locked, '比赛已开始，队伍已锁定')
     ) +
-    teamsPanelHtml(s) +
     schedulePanelHtml(s);
 
   return (
@@ -612,11 +589,7 @@ function participantsPanelHtml(s) {
   const card = (p) => {
     const on = joined.has(p.id);
     const idle = p.active === false;
-    const meta = [
-      p.tag || p.id,
-      p.substitute ? (isLeague(s) ? '替补' : '替补（锦标赛制不参与）') : '',
-      idle ? '停用' : '',
-    ]
+    const meta = [p.tag || p.id, idle ? '停用' : '']
       .filter(Boolean)
       .join(' · ');
     return (
@@ -631,7 +604,10 @@ function participantsPanelHtml(s) {
   const body =
     `<div class="notice">` +
     (explicit
-      ? `已手动指定本届参与名单：<b>${joined.size}</b> / ${players.length} 人。`
+      ? joined.size
+        ? `已手动指定本届参与名单：<b>${joined.size}</b> / ${players.length} 人。`
+        : `本届参与名单是<b>空的</b>（没有人参与）：现有赛程按旧名单保留，` +
+          `重新勾选并保存后才会按新名单重排。`
       : `尚未指定，默认<b>全员参与</b>（${players.length} 人）；保存后即成为显式名单。`) +
     `</div>` +
     `<div class="tool-group" style="margin-top:10px">` +
@@ -655,8 +631,8 @@ function participantsPanelHtml(s) {
       body +
         (locked
           ? `<div class="notice" style="margin-top:10px">名单已锁定。` +
-            `<b>替补不受影响</b>：在对局里点选手换人，或在上方「替补换人」里选队伍，` +
-            `换上的人若不在名单中会<b>自动加入</b>。</div>`
+            `<b>替补不受影响</b>：在赛程里点某位选手安排替补（可只替一场），` +
+            `替上的人若不在名单中会<b>自动加入</b>。</div>`
           : ''),
       locked,
       '比赛已开始，参赛名单已锁定（替补仍可用）'
@@ -664,45 +640,8 @@ function participantsPanelHtml(s) {
   );
 }
 
-function memberNames(s, ids) {
-  const map = new Map((s.players || []).map((p) => [p.id, p]));
-  return (ids || []).map((pid) => map.get(pid)?.name || pid).join(' / ');
-}
-
-function teamsPanelHtml(s) {
-  const rows = (s.teams || [])
-    .map(
-      (t) =>
-        `<div class="editor-row" data-team-row="${esc(t.id)}">` +
-        `<div class="field"><label>队名</label><input name="name" value="${esc(t.name)}"></div>` +
-        `<div class="field"><label>缩写</label><input name="short" value="${esc(t.short)}"></div>` +
-        `<div class="field"><label>主题色</label><input name="color" type="color" value="${esc(t.color || '#22e0e8')}"></div>` +
-        `<div class="field"><label>队员</label><div class="panel__hint">${esc(memberNames(s, t.playerIds)) || '—'} · ${
-          t.group ? `${esc(t.group)} 组` : '未分组'
-        }</div></div>` +
-        `<div class="editor-row__ops"><input type="hidden" name="id" value="${esc(t.id)}">` +
-        `<button class="btn btn--sm btn--danger" type="button" data-act="team-del" data-id="${esc(t.id)}">删除</button></div></div>`
-    )
-    .join('');
-  const league = isLeague(s);
-  const body =
-    `<div class="notice">队员由上方「组队台」拖拽编排；这里只调整队名、缩写与配色。删除队伍会清空当前赛程。` +
-    (league ? '积分制下只有在「固定队伍」模式生成赛程时才会用到这些队伍。' : '') +
-    `</div>` +
-    `<div style="margin-top:10px">${rows || '<div class="empty"><b>尚未组队</b>确定参与名单后执行「随机组队」</div>'}</div>` +
-    `<div class="form-actions" style="margin-top:10px">` +
-    `<button class="btn btn--sm btn--primary" type="button" data-act="team-save">保存队名与配色</button></div>`;
-  const locked = Boolean(s.event?.locked);
-  return panelHtml(
-    '队伍信息',
-    locked ? '已锁定 · 用「替补换人」' : '名称 / 缩写 / 配色',
-    lockedWrap(
-      body,
-      locked,
-      '比赛已开始，队伍与队员已锁定；换人请用「替补换人」（不影响赛程）'
-    )
-  );
-}
+/* 「队伍信息」面板已移除：队名 / 缩写 / 主题色 / 分组 / 成员全部在「组队台」上就地编辑
+ * （见 static/js/teams.js），两处重复的表单只会各自漂移。 */
 
 /* 选手名单的编辑面板已移除：名单统一在「选手」页处理（卡片上可新增 / 编辑 / 删除） */
 
@@ -749,7 +688,7 @@ function schedulePanelHtml(s) {
         `<div class="notice" style="margin-top:8px">录入比分后胜者自动晋级、败者进败者组；` +
         `队伍长期没人或人数不足时，在对局上点「<b>弃权</b>」即可让对方直接晋级。</div>`) +
     (locked
-      ? `<div class="notice" style="margin-top:8px">比赛已开始：<b>录分、重置、时间、直播、弃权、替补换人</b>` +
+      ? `<div class="notice" style="margin-top:8px">比赛已开始：<b>录分、重置、时间、直播、弃权、队伍换人</b>` +
         `都照常可用，只有上方的结构性操作被锁定。</div>`
       : '');
   return panelHtml('赛程与系统', league ? '积分制操作' : '锦标赛操作', body);
@@ -786,7 +725,11 @@ export async function refreshDiagnostics() {
       ['在线客户端', d.ws?.online ?? 0],
       ['广播次数', d.ws?.broadcasts ?? 0],
       ['头像缓存', `${d.avatarCache?.files ?? 0} 文件 / ${Math.round((d.avatarCache?.bytes || 0) / 1024)} KB`],
-      ['公告图片', `${d.uploads?.files ?? 0} 个 / ${Math.round((d.uploads?.bytes || 0) / 1024)} KB`],
+      [
+        '上传图片',
+        `${d.uploads?.files ?? 0} 个 / ${Math.round((d.uploads?.bytes || 0) / 1024)} KB` +
+          `（通知 / 信息插图与本地头像，同图只存一份）`,
+      ],
       ['待升级凭据', d.legacyCredentials ? `${d.legacyCredentials} 位成员仍是旧格式` : '无'],
       ['赛制状态', scheduleQualityText()],
     ]

@@ -189,6 +189,9 @@ class ConfigStore:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(db.init_db, self._db_path)
         await asyncio.to_thread(self._migrate_sync)
+        # 计分口径升级：把老数据的 metric 落成「类型 / 标签 / 判断标准」。
+        # **写入之前先留一份旧库快照**（只读、可下载、不提供还原，见 app/legacy.py）。
+        await asyncio.to_thread(self.migrate_scoring)
 
         current = await asyncio.to_thread(self._read_current_sync)
         if not current:
@@ -560,6 +563,65 @@ class ConfigStore:
     #   * 新增 / 编辑选手时自动建号并关联；
     #   * 成员资料变更时反向同步到各届里关联的选手，保证两边一致。
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # 计分口径升级（老数据：只有一个 metric 字段）
+    # ------------------------------------------------------------------ #
+    def migrate_scoring(self) -> int:
+        """把只有旧口径 ``metric`` 的届落成「类型 / 标签 / 判断标准」，返回处理了几届。
+
+        为什么要有这一步：新字段（``value_type`` / ``value_label`` / ``better``）
+        出现之前的库只有 ``metric``。模型层本来就会按 ``metric`` 推导（读取无损），
+        但那只是「读的时候假装有」——这里把它**真的写下来**，之后的一切都只看新字段。
+
+        两条硬规矩：
+
+        * **动手之前先留一份旧库快照**（见 :mod:`app.legacy`）。留不下来就不转换——
+          数据本来也是无损可读的，宁可不转换，也不能在没有退路的情况下改库；
+        * 无损：数值一个字节都不动，只是把「含义」拆成三个字段
+          （``score`` → 自然数 + 得分 + 数值高胜，``time`` → 时间 + 用时 + 数值低胜）。
+        """
+        from . import legacy
+
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for entry in self._list_sync():
+            event_id = str(entry.get("id") or "")
+            if not event_id:
+                continue
+            data = self._raw_sync(event_id)
+            if data is None:
+                continue
+            rules = data.get("rules") or {}
+            if str(rules.get("valueType") or "").strip():
+                continue  # 已经是新口径，不必动
+            pending.append((event_id, data))
+        if not pending:
+            return 0
+
+        try:
+            legacy.snapshot(
+                reason="scoring-upgrade",
+                note=f"计分口径升级前的旧数据（{len(pending)} 届待转换）",
+            )
+        except Exception:
+            log.exception("旧数据快照失败，本次不转换（数据仍按旧口径无损读取）")
+            return 0
+
+        done = 0
+        for event_id, data in pending:
+            try:
+                cfg = Config.model_validate(data)
+                self._save_sync(event_id, cfg, touch_current=False)
+                done += 1
+            except Exception:
+                log.exception("计分口径升级失败（该届保持原样）| 届=%s", event_id)
+        if done:
+            log.warning(
+                "计分口径已升级 | 届=%d/%d | 旧数据快照见「服务器 → 旧数据备份」",
+                done,
+                len(pending),
+            )
+        return done
+
     async def migrate_players_to_members(self) -> int:
         """一次性迁移：历届所有选手 → 成员并建立关联（幂等，跑过即打标记）。"""
         async with self._lock:
@@ -1138,7 +1200,7 @@ class ConfigStore:
         cfg = Config.model_validate(data)
         dumped = [
             r.dump()
-            for r in tournament.resolve_tournament(cfg.teams, cfg.rounds, cfg.rules.metric)
+            for r in tournament.resolve_tournament(cfg.teams, cfg.rounds, cfg.rules.scoring)
         ]
         if dumped == data.get("rounds"):
             return data
@@ -1191,7 +1253,9 @@ class ConfigStore:
         """设定本届参与名单，并按赛制自动跟进。
 
         * 积分制：名单变化后可在同一事务内重排未开赛对局（人数不足则整体拒绝）；
-        * 锦标赛制：只改名单，提示需要重新组队并生成赛程。
+        * 锦标赛制：只改名单，提示需要重新组队并生成赛程；
+        * **空名单是合法状态**（本届没有参与者）：不重排、不报错，现有赛程原样留着，
+          由诊断面板提示「未开赛对局里还有非参与选手」。
         """
         from .logic import joined_players, normalize_participants  # 局部导入，避免模块级循环依赖
 
@@ -1201,7 +1265,14 @@ class ConfigStore:
             cfg = Config.model_validate(data)
             before = {p.id for p in joined_players(cfg)}
             chosen = normalize_participants(cfg, ids)
-            merged = {**data, "participants": chosen}
+            # 显式保存过就置位：此后「空名单」也是一份真正的名单（不再回落成全员参与）
+            merged = {**data, "participants": chosen, "participantsSet": True}
+            if not chosen:
+                if cfg.rounds:
+                    warnings.append(
+                        "本届参与名单为空：现有赛程仍按旧名单保留，可重新生成或清空赛程。"
+                    )
+                return merged
             if cfg.rounds and before == set(chosen):
                 return merged
             if cfg.rules.format == "league" and cfg.rounds:
@@ -1241,13 +1312,11 @@ class ConfigStore:
         def _mutate(data: dict[str, Any]) -> dict[str, Any]:
             cfg = Config.model_validate(data)
             size = int(team_size) if team_size else cfg.rules.team_size
-            # 锦标赛制没有替补：替补选手不进入队伍（积分制仍允许）
             teams, warns = tournament.auto_form_teams(
                 joined_players(cfg),
                 size,
                 seed,
                 merge_remainder=merge_remainder,
-                allow_substitutes=cfg.rules.format == "league",
             )
             warnings.extend(warns)
             rules = dict(data.get("rules") or {})
@@ -1312,7 +1381,6 @@ class ConfigStore:
                     joined_players(cfg),
                     cfg.rules.team_size,
                     seed,
-                    allow_substitutes=cfg.rules.format == "league",
                 )
                 warnings.extend(warns)
             if size:
@@ -1348,12 +1416,15 @@ class ConfigStore:
         warnings: list[str] = []
 
         def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+            from .logic import has_custom_roster  # 局部导入，避免模块级循环依赖
+
             cfg = Config.model_validate(data)
             # 未指定参与名单时按「全部启用选手」落成显式名单，避免后续歧义
-            if not cfg.participants:
+            if not has_custom_roster(cfg):
                 data = {
                     **data,
                     "participants": normalize_participants(cfg, [p.id for p in joined_players(cfg)]),
+                    "participantsSet": True,
                 }
                 cfg = Config.model_validate(data)
             rounds, warns = league.generate_schedule(
@@ -1433,6 +1504,10 @@ class ConfigStore:
             if copy_roster:
                 template["players"] = current.get("players", [])
                 template["participants"] = current.get("participants", [])
+                # 连「名单是显式指定的」这一点一起沿用：否则空名单会在新一届里变回全员
+                template["participantsSet"] = bool(
+                    current.get("participantsSet") or current.get("participants")
+                )
                 # 沿用固定队伍（积分制的「固定队伍」模式也依赖它）；
                 # 新一届没有赛程，可随时在组队台重新随机
                 template["teams"] = current.get("teams", [])
@@ -1546,11 +1621,16 @@ class ConfigStore:
         with db.connect(self._db_path) as conn:
             return db.list_events(conn)
 
-    def _load_sync(self, event_id: str) -> Config:
+    def _raw_sync(self, event_id: str) -> dict[str, Any] | None:
+        """读一届的**原始字典**（已做过出厂示例名单清理），不做模型校验。
+
+        升级路径要看「库里存的到底是什么」（例如计分三件套是否为空），
+        拿不到校验后的模型——校验会把旧值就地补成新值，线索就没了。
+        """
         with db.connect(self._db_path) as conn:
             data = db.load_event(conn, event_id)
         if data is None:
-            raise FileNotFoundError(f"第 {event_id} 届不存在")
+            return None
         data, purged = _strip_demo_roster(data)
         if purged and event_id == self._current:
             # 标记待落盘：清理结果需要在启动时写回数据库（见 start）
@@ -1559,6 +1639,12 @@ class ConfigStore:
                 "检测到出厂示例选手且从未使用，已从数据库清除 | 届=%s | 可在「选手名单」重新录入",
                 (data.get("event") or {}).get("name") or "(未命名)",
             )
+        return data
+
+    def _load_sync(self, event_id: str) -> Config:
+        data = self._raw_sync(event_id)
+        if data is None:
+            raise FileNotFoundError(f"第 {event_id} 届不存在")
         return Config.model_validate(data)
 
     def _save_sync(self, event_id: str, cfg: Config, touch_current: bool = True) -> None:

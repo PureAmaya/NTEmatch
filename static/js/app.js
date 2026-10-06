@@ -32,6 +32,7 @@ import { checkNotices } from './notices.js';
 import { loadEvents, renderEventsGroups, renderHomeGroups } from './events.js';
 import { installDnD as installTeamDnD } from './teams.js';
 import {
+  applyLiveHealth,
   ChannelLive,
   installStageDelegation,
   Live,
@@ -446,6 +447,43 @@ let ws = null;
 let wsRetry = 0;
 let wsTimer = null;
 let pingTimer = null;
+/** 本页面启动时跑的静态资源版本号（见 checkAppVersion）。 */
+let bootAssets = '';
+/** 「站点已更新」只提示一次：提示多了就成了噪音。 */
+let updateNotified = false;
+
+/**
+ * 站点是不是已经更新到新的一版了？
+ *
+ * 热更新换代时旧进程会被**优雅停掉**，所以这一页的 WebSocket 必然断一次、再自动重连
+ * ——正好借这一刻比一次静态资源版本号（`/api/health` 里的 `assets`，就是页面地址里
+ * 那个 `/static/v/<版本>/` 的版本）。不一致 = 页面还跑着上一版前端。
+ *
+ * **不自动刷新**：人可能正在录入比分、正在编辑通知，刷新一下输入就没了。
+ * 只给一条带按钮的提示，刷新与否由他决定。
+ */
+async function checkAppVersion() {
+  let assets = '';
+  try {
+    const health = await api('/health');
+    assets = String(health?.assets || '');
+  } catch (err) {
+    log.debug('版本自检跳过', err?.message || err);
+    return;
+  }
+  if (!assets) return;
+  if (!bootAssets) {
+    bootAssets = assets; // 第一次连上：记下本页跑的版本
+    return;
+  }
+  if (assets === bootAssets || updateNotified) return;
+  updateNotified = true;
+  log.info('静态资源已更新', bootAssets, '→', assets);
+  toast('站点已更新到新版本，刷新后使用最新的界面与功能', 'info', 0, {
+    label: '刷新页面',
+    onClick: () => location.reload(),
+  });
+}
 
 /** 记录实时通道状态（顶栏不再显示芯片，断开时仍按下面逻辑自动重连）。 */
 export function setOnline(online) {
@@ -476,6 +514,9 @@ function connectWS() {
     log.info('WebSocket 已连接');
     wsRetry = 0;
     setOnline(true);
+    // 每次（重）连都顺手比一次前端版本：热更新换代会让这里重连，于是「站点已更新」
+    // 的提示就是准的；而没更新过时它只是复用一次连接的开销（一次轻量 GET）。
+    void checkAppVersion();
     // 连接握手时服务端会回放最近状态，无需再主动请求，省一次全量下发
     clearInterval(pingTimer);
     pingTimer = setInterval(() => {
@@ -495,6 +536,12 @@ function connectWS() {
       // 正在只读查看另一届：服务端推的是「当前届」，忽略它，别把页面拽回去
       if (App.routeEvent && App.routeEvent !== msg.data.eventId) return;
       applyState(msg.data);
+    } else if (msg.type === 'live' && msg.data) {
+      // 服务端常驻探测的结果（**状态变了才推**，见 live.watch_loop）：与轮询走
+      // 同一段 applyLiveHealth，所以两边的判定口径一致；只有真的变了才重绘，
+      // 正在播的画面不受影响（视图签名没变就不重建播放器）。
+      if (App.routeEvent && App.routeEvent !== App.eventId) return; // 看别的届时不吃这份数据
+      if (hooks.onLiveHealth) hooks.onLiveHealth(applyLiveHealth(msg.data));
     } else if (msg.type === 'pong') {
       log.debug('心跳回包');
     }
@@ -808,6 +855,18 @@ async function init() {
   hooks.goto = goto;
   // 数据变更后重新拉一遍当前路由（补齐 WS 推送里没有的 live/server 字段）
   hooks.refreshState = () => goto(route.eventId, route.page, { replace: true });
+  /**
+   * 「刚改过东西，把界面刷新一遍」。
+   *
+   * 给 notices / mdeditor 这类**不在 actions.js 里**的模块用：那边保存成功后有自己的
+   * `hooksRenderAdmin + renderPublic`，而通知、赛事信息这些保存完只是发个 toast，
+   * 界面要等下一次 WebSocket 广播才变——「保存并关闭后看不出变化」就是这么来的。
+   */
+  hooks.onSaved = () => {
+    if (App.state) renderView(App.view, App.state);
+    // 管理面板（赛事管理页）不在 renderView 的渲染表里，单独补一次
+    renderAdmin({ force: true });
+  };
 
   bindStatic();
   setView(App.view, { silent: true });

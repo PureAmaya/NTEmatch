@@ -21,10 +21,19 @@ Source = "https://github.com/PureAmaya/NTEmatch"
 "开源组件清单" = "https://github.com/PureAmaya/NTEmatch/blob/main/app/credits.py"
 
 [project.optional-dependencies]
+# 图片推送（比赛卡片，见 app/card.py + README「图片推送：比赛卡片」）。
+# **可选**：没装就自动退回纯文本推送，功能不残（信息一条不少）。
+#   pip install 'nte-match[cards]'   或   uv sync --extra cards
+cards = [
+    "pillow>=10",
+]
+
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # dev 里也放一份：卡片渲染那条路径要有真用例跑（tests/test_card.py）
+    "pillow>=10",
 ]
 
 [project.scripts]

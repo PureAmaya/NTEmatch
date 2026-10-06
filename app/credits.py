@@ -44,6 +44,7 @@ RUNTIME: list[tuple[str, str, str, str]] = [
     ("Pydantic", "MIT", "https://github.com/pydantic/pydantic", "配置与数据模型校验"),
     ("pydantic-core", "MIT", "https://github.com/pydantic/pydantic-core", "Pydantic 的 Rust 内核"),
     ("annotated-types", "MIT", "https://github.com/annotated-types/annotated-types", "带注解的类型约束"),
+    ("annotated-doc", "MIT", "https://github.com/pydantic/annotated-doc", "FastAPI 的依赖：把文档字符串带进接口说明"),
     ("typing-inspection", "MIT", "https://github.com/pydantic/typing-inspection", "运行时类型检查工具"),
     ("typing-extensions", "PSF-2.0", "https://github.com/python/typing_extensions", "新版类型特性回填"),
     ("Uvicorn", "BSD-3-Clause", "https://github.com/encode/uvicorn", "ASGI 服务器"),
@@ -55,14 +56,21 @@ RUNTIME: list[tuple[str, str, str, str]] = [
     ("websockets", "BSD-3-Clause", "https://github.com/python-websockets/websockets", "实时推送（WebSocket）"),
     ("python-dotenv", "BSD-3-Clause", "https://github.com/theskumar/python-dotenv", "读取 .env"),
     ("PyYAML", "MIT", "https://github.com/yaml/pyyaml", "Uvicorn 的 YAML 配置"),
-    ("colorama", "BSD-3-Clause", "https://github.com/tartley/colorama", "Windows 终端彩色输出"),
+    # 本站自己的终端彩色输出是手写的（app/console.py，零依赖）；colorama 是 Click
+    # 在 Windows 上的依赖，只是跟着装进来
+    ("colorama", "BSD-3-Clause", "https://github.com/tartley/colorama", "Windows 终端的 ANSI 支持（Click 的依赖）"),
     ("AnyIO", "MIT", "https://github.com/agronholm/anyio", "异步兼容层（asyncio / trio）"),
-    ("Sniffio", "MIT", "https://github.com/python-trio/sniffio", "检测当前异步库"),
     ("HTTPX", "BSD-3-Clause", "https://github.com/encode/httpx", "出站 HTTP 客户端"),
     ("httpcore", "BSD-3-Clause", "https://github.com/encode/httpcore", "HTTPX 的底层传输"),
     ("Certifi", "MPL-2.0", "https://github.com/certifi/python-certifi", "CA 根证书（弱著佐权，可自由组合）"),
     ("IDNA", "BSD-3-Clause", "https://github.com/kjd/idna", "国际化域名支持"),
     ("opentelemetry-api", "Apache-2.0", "https://github.com/open-telemetry/opentelemetry-python", "遥测接口（Starlette 依赖）"),
+    (
+        "Pillow",
+        "MIT-CMU",
+        "https://github.com/python-pillow/Pillow",
+        "可选：比赛卡片图与帮助图的渲染；没装就退回纯文本推送、不发图，功能不残",
+    ),
 ]
 
 FRONTEND: list[tuple[str, str, str, str]] = [
@@ -79,7 +87,7 @@ PROGRAM: list[tuple[str, str, str, str]] = [
         "MediaMTX",
         "MIT",
         "https://github.com/bluenviron/mediamtx",
-        "直播推流与分发（WHIP 推流 / WebRTC 与 HLS 观看）。**独立部署，不在本仓库内**",
+        "直播推流与分发（WHIP 推流 / WebRTC 与 HLS 观看）。独立部署，不在本仓库内",
     ),
 ]
 

@@ -317,6 +317,12 @@ img { display: block; max-width: 100%; }
 }
 .qqbot-preview:focus { outline: none; border-color: var(--accent); }
 
+/* 群推送预览里的卡片图（服务端生成的比赛信息 + 规则）：窄屏也整张放得下 */
+.qqbot-card {
+  display: block; width: 100%; max-width: 420px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 2px; background: var(--panel);
+}
+
 /* 比赛简介（往届卡片里的那一行；留空则整行不渲染） */
 .evt-card__brief {
   margin: 6px 0 2px; font-size: 12.5px; line-height: 1.5; color: var(--txt-dim);
@@ -601,7 +607,11 @@ img { display: block; max-width: 100%; }
 }
 .pcard__top { display: flex; gap: 11px; padding: 13px; align-items: center; }
 .pcard__name { font-family: var(--font-disp); font-size: 17px; font-weight: 700; letter-spacing: .04em; }
-.pcard__sub { font-family: var(--font-mono); font-size: 10px; color: var(--txt-mute); letter-spacing: .1em; }
+.pcard__sub {
+  font-family: var(--font-mono); font-size: 10px; color: var(--txt-mute); letter-spacing: .1em;
+  /* 这一行在 B站 直播时显示的是同步过来的直播标题：可能很长，截断显示，全文在 title 里 */
+  max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pcard__stats { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
 .pcard__stat { padding: 8px 4px; text-align: center; border-right: 1px solid rgba(120, 196, 255, .08); }
 .pcard__stat:last-child { border-right: 0; }
@@ -816,6 +826,49 @@ img { display: block; max-width: 100%; }
 .toast.out { animation: toastOut .2s ease-in forwards; }
 @keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @keyframes toastOut { to { opacity: 0; transform: translateY(-8px); } }
+/* 提示里的正文与动作按钮：文字占满，按钮靠右（带按钮的提示不会自动消失，见 core.js） */
+.toast__text { flex: 1; min-width: 0; }
+.toast__act {
+  flex: none; font: inherit; font-size: 12.5px; font-weight: 700; cursor: pointer;
+  padding: 4px 10px; border-radius: 2px; color: var(--ink);
+  border: 1px solid var(--accent); background: var(--accent);
+}
+.toast__act:hover { filter: brightness(1.12); }
+
+/* ---------- 16.1 热更新面板（服务器页） ---------- */
+.hot__row { display: flex; gap: 10px; font-size: 12.5px; padding: 3px 0; }
+.hot__key {
+  flex: none; min-width: 84px; color: var(--txt-mute);
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .08em; padding-top: 2px;
+}
+.hot__val { color: var(--txt); word-break: break-word; }
+.hot__val--ok { color: var(--ok); }
+.hot__val--bad { color: var(--bad); }
+.hot__hint { color: var(--txt-mute); font-size: 11.5px; }
+/* 换代的日志尾巴：竖向滚动、保持原样（缩进是有意义的） */
+.hot__log {
+  max-height: 190px; overflow: auto; margin: 10px 0 0; padding: 10px 12px;
+  background: rgba(0, 0, 0, .34); border: 1px solid var(--line);
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.6; color: var(--txt-dim);
+  white-space: pre-wrap; word-break: break-word;
+}
+.hot__cmd {
+  display: inline-block; margin-top: 6px; padding: 3px 8px;
+  background: rgba(0, 0, 0, .34); border: 1px solid var(--line);
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--cyan);
+}
+.hot__acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+/* 自检清单：一行一项（✓ / ! + 名称 + 依据），名称定宽，依据折行 */
+.hot__label {
+  margin: 14px 0 6px; font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .1em; color: var(--txt-mute); text-transform: uppercase;
+}
+.hot__chk { display: flex; gap: 8px; padding: 3px 0; font-size: 12.5px; align-items: baseline; }
+.hot__chk b { flex: none; width: 1em; color: var(--ok); font-weight: 700; }
+.hot__chk--bad b { color: var(--bad); }
+.hot__chk-name { flex: none; min-width: 76px; color: var(--txt); }
+.hot__chk-detail { color: var(--txt-mute); word-break: break-word; }
+.hot__chk--bad .hot__chk-detail { color: var(--warn); }
 
 /* ---------- 17. （原底部 NOTICE 滚动条已移除） ---------- */
 
@@ -1068,12 +1121,44 @@ img { display: block; max-width: 100%; }
 /* 22.3 选手卡：UUID 单行省略 */
 .pcard__sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* 22.4 阵容中的替补标记 */
+/* 22.4 阵容中的替补标记（替补是「谁换谁」，不是选手的一种类别） */
 .member--sub { border-style: dashed; border-color: rgba(255, 216, 61, .55); background: rgba(43, 34, 8, .45); }
 .member__sub {
-  font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em; white-space: nowrap;
   color: #12040a; background: var(--amber); padding: 1px 5px; border-radius: 2px; flex: none;
 }
+
+/* 22.4b 对局替补：赛程卡片上的一行说明 + 总览里的「本届替补」一览 */
+.round__subs {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: 0 0 9px; padding: 7px 10px;
+  border: 1px dashed color-mix(in srgb, var(--amber) 45%, transparent);
+  background: color-mix(in srgb, var(--amber) 7%, transparent);
+  font-size: 11.5px; color: var(--txt-dim);
+}
+.round__subs-tag {
+  flex: none; padding: 1px 6px; border-radius: 2px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em;
+  color: #12040a; background: var(--amber);
+}
+.round__sub-item { display: inline-flex; align-items: center; gap: 4px; }
+.round__sub-item b { color: var(--txt); }
+.round__sub-item i { font-style: normal; color: var(--txt-mute); }
+.round__sub-item em {
+  font-style: normal; font-family: var(--font-mono); font-size: 10px;
+  color: var(--txt-mute); padding-left: 2px;
+}
+.sublist { display: grid; gap: 8px; }
+.subrow {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--solid) 55%, transparent);
+}
+.subrow__who { flex: 1 1 150px; min-width: 0; }
+.subrow__who--in .who__name { color: var(--amber); }
+.subrow__arrow { flex: none; color: var(--txt-mute); }
+.subrow__scope { font-family: var(--font-mono); font-size: 11px; color: var(--txt-mute); }
+.subrow__op { margin-left: auto; }
 
 /* 22.5 分组台 */
 .group-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 12px; }
@@ -1276,6 +1361,29 @@ img { display: block; max-width: 100%; }
   font-family: var(--font-disp); font-size: 12.5px; letter-spacing: .04em;
 }
 .vs-line__tag { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .12em; color: var(--txt-mute); flex: none; }
+
+/* B站 直播：另一条链路（直嵌 B站 官方播放器），用粉色把它和 MediaMTX 那套区分开 */
+.vs-line--bili { border-color: rgba(255, 102, 153, .55); }
+.vs-line--bili .vs-line__tag { color: #ff9ec4; }
+/* 标题是主角（它是从 B站 同步过来的），小字是辅助信息 */
+.vs-line__title { font-weight: 700; color: #fff; min-width: 0; }
+.vs-line__meta {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .04em; color: var(--txt-mute);
+}
+.vs-line--bili .vs-line__link { margin-left: auto; }
+.vs-line__link { color: #ffb3d1; text-decoration: none; border-bottom: 1px dotted currentColor; }
+.vs-line__link:hover { color: #fff; }
+.live-chip--bili { border-color: rgba(255, 102, 153, .6); }
+.live-chip--bili .live-chip__name { color: #ffb3d1; }
+.live-chip--bili.live-chip--active { border-color: #ff6699; background: rgba(255, 102, 153, .18); }
+.live-chip--bili.live-chip--active .live-chip__name { color: #fff; }
+.live-chip__tag {
+  flex: none; padding: 1px 5px; border-radius: 2px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: .08em;
+  color: #1a0410; background: #ff6699;
+}
+.chip--bili { border-color: rgba(255, 102, 153, .7); color: #ffb3d1; }
+.chip--bili b { color: #ff6699; }
 .vs-line__side { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; color: var(--txt-dim); }
 .vs-line__side b { color: var(--c, var(--accent)); font-size: 12px; }
 .vs-line__side--own { color: #fff; }
@@ -1628,6 +1736,40 @@ img { display: block; max-width: 100%; }
 .zone--full { border-color: rgba(255, 216, 61, .5); }
 .zone--full .zone__count { color: var(--amber); }
 
+/* 26.4.1 队伍卡片就地编辑：主题色走 --tc（卡片左边框一眼可见），队名 / 缩写 / 分组 / 换组 / 删除 */
+.zone--team { border-left: 4px solid var(--tc, rgba(34, 224, 232, .35)); }
+.zone--team .zone__head b { color: var(--tc, var(--accent)); }
+.zone__edit { display: grid; grid-template-columns: 1fr 88px; gap: 6px; margin-bottom: 6px; }
+.zfield { display: grid; gap: 2px; min-width: 0; }
+.zfield > span {
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--txt-mute);
+}
+.zfield input {
+  width: 100%; min-width: 0; padding: 4px 6px; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 2px;
+  background: var(--panel-2, rgba(8, 13, 21, .6)); color: var(--txt);
+}
+.zfield input:focus { outline: none; border-color: var(--accent); }
+.zone__ops { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.zone__group {
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 2px;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; color: var(--txt-dim);
+}
+.zcolor { display: inline-flex; align-items: center; cursor: pointer; }
+.zcolor input[type="color"] {
+  width: 26px; height: 22px; padding: 0; border: 1px solid var(--line);
+  border-radius: 2px; background: none; cursor: pointer;
+}
+.zcolor input[type="color"]:disabled { opacity: .35; cursor: not-allowed; }
+.zauto {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; color: var(--txt-mute);
+}
+.zauto input { margin: 0; accent-color: var(--accent); }
+.zone__ops .btn { margin-left: auto; }
+.zone__ops .btn + .btn { margin-left: 0; }
+
 /* 26.5 赛程按阶段分组 */
 .stage-block + .stage-block { margin-top: 14px; }
 .stage-round + .stage-round { margin-top: 12px; }
@@ -1737,18 +1879,44 @@ img { display: block; max-width: 100%; }
   flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--txt-mute);
 }
 .rrow__f input { width: 100%; min-width: 0; }
+/* 只读展示（大比分 / 总成绩）：与输入框同一格宽，切换录入方式时版面不跳 */
+.rrow__f > b {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--txt);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .rsets {
   margin-top: 10px; padding: 9px 10px;
   border: 1px dashed var(--line); background: rgba(8, 12, 19, .42);
 }
-.rsets__head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.rsets__head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; flex-wrap: wrap; }
 .rsets__head b { font-family: var(--font-disp); font-size: 12px; letter-spacing: .1em; }
 .rsets__head .btn { margin-left: auto; }
 .rsets__body { display: flex; flex-direction: column; gap: 6px; }
 .setrow { display: flex; align-items: center; gap: 6px; }
-.setrow input { width: 76px; text-align: center; }
+.setrow__no {
+  flex: none; width: 52px; font-family: var(--font-mono); font-size: 10px; color: var(--txt-mute);
+}
 .setrow__sep { color: var(--txt-mute); }
+
+/* 计分输入控件：数值型一个框，时间型「时 : 分 : 秒」三个框 */
+.nvinput { display: inline-flex; min-width: 0; }
+.nvinput input { width: 76px; text-align: center; }
+.tvinput { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
+.tvinput input { width: 46px; text-align: center; }
+.tvinput input[data-t="s"] { width: 58px; }
+.tvinput i { color: var(--txt-mute); font-style: normal; }
+
+/* 次要信息折叠（胜方 / 时长 / 时间 / 备注）：展开时才知道里面有什么 */
+.rfold { margin-top: 10px; border: 1px solid var(--line); background: rgba(8, 12, 19, .35); }
+.rfold > summary {
+  padding: 7px 10px; cursor: pointer; user-select: none;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--txt-dim);
+}
+.rfold > summary:hover { color: var(--accent); }
+.rfold[open] > summary { border-bottom: 1px solid var(--line); color: var(--txt); }
+.rfold > :not(summary) { padding: 0 10px 10px; }
+.rfold .form { margin-top: 10px; }
 
 .rpreview {
   display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-top: 10px;
@@ -2446,8 +2614,18 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 
 /* ---------- 弹窗尺寸 ---------- */
 /* 编辑器要一个「悬浮大窗」；通知阅读窗稍窄，但比默认宽 */
-.modal__box--mdx { width: min(1200px, 96vw); max-width: none; height: min(88vh, 920px); }
-.modal__box--mdx .modal__body { padding: 0; display: flex; overflow: hidden; }
+.modal__box--mdx {
+  width: min(1200px, 96vw); max-width: none;
+  height: min(88vh, 920px);
+  /* 基类的 max-height（720px）会把这个高度**截短**，于是窗高了、内容却只占上半截 */
+  max-height: none;
+}
+/* 关键的一行是 flex: 1 + min-height: 0：让编辑区**撑满**弹窗，底部那行
+   （提示 / 字数 / 取消保存）才会老老实实贴在窗底；不加就是「按钮悬在半空、
+   下面一大片空白」——内容越长、空白越大。 */
+.modal__box--mdx .modal__body {
+  padding: 0; display: flex; flex: 1; min-height: 0; overflow: hidden;
+}
 .modal__box--notice { width: min(860px, 94vw); }
 
 /* ---------- 编辑器 ---------- */
@@ -2482,15 +2660,25 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 .mdx__btn--toggle { width: auto; padding: 0 10px; gap: 6px; font-size: 12px; }
 .mdx__btn--toggle span { font-family: var(--font-ui); }
 .mdx__sep { flex: none; width: 1px; height: 18px; margin: 0 4px; background: var(--line); }
-.mdx__panes { display: grid; grid-template-columns: 1fr 1fr; flex: 1; min-height: 0; }
+.mdx__panes {
+  display: grid; grid-template-columns: 1fr 1fr;
+  /* minmax(0, 1fr) 而不是默认的 auto：内容超长时**让格子内滚动**，
+     而不是把整个弹窗顶高（那样底部那行又会被挤出屏幕） */
+  grid-template-rows: minmax(0, 1fr);
+  flex: 1; min-height: 0;
+}
 .mdx__input {
   width: 100%; height: 100%; padding: 14px; resize: none; border: 0; outline: 0;
   background: transparent; color: var(--txt);
   font-family: var(--font-mono); font-size: 13px; line-height: 1.75;
+  /* 正文长了就在文本域里滚，不牵动布局 */
+  overflow: auto; overscroll-behavior: contain;
 }
 .mdx__preview {
   overflow: auto; padding: 14px; border-left: 1px solid var(--line);
   background: rgba(0, 0, 0, .18);
+  /* 同一条规矩：预览长了也自己滚 */
+  overscroll-behavior: contain;
 }
 .mdx__empty { color: var(--txt-mute); font-size: 12px; }
 .mdx__foot {
@@ -2500,6 +2688,14 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 }
 .mdx__hint { line-height: 1.5; }
 .mdx__count { flex: none; font-family: var(--font-mono); }
+/* 底部附加勾选项（如「同时发到 QQ 群」）：左侧、可点、和提示文字同高 */
+.mdx__extras { display: flex; align-items: center; gap: 14px; flex: none; }
+.mdx__extra {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--txt-dim); cursor: pointer; user-select: none;
+}
+.mdx__extra input { accent-color: var(--accent); cursor: pointer; }
+.mdx__extra:hover { color: var(--txt); }
 /* 图片宽度条：点预览里的图片才出现 */
 .mdx__imgbar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;

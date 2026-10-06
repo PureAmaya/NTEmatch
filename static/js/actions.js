@@ -9,17 +9,25 @@ import {
   Modal,
   TOKEN_KEY,
   api,
+  MISSING,
   cmpVal,
   copyText,
+  downloadFile,
   esc,
+  fmtScore,
   fmtVal,
+  hasEntered,
+  hasResult,
   log,
-  metricOf,
+  missingValue,
   nowLocalInput,
+  parseHms,
   parseVal,
   qs,
   qsa,
   refreshPrivate,
+  scoringOf,
+  splitMilli,
   routePath,
   toLocalInput,
   toast,
@@ -67,200 +75,315 @@ const roundOf = (ref) =>
   (App.state?.rounds || []).find((r) => r.code === ref) ||
   (App.state?.rounds || []).find((r) => String(r.index) === String(ref));
 
-/* ------------------------------ 弹窗 ---------------------------------- */
-/** 读出弹窗里的各局成绩（只保留填了内容的行）；按比法解析（用时制 → 毫秒）。 */
-function readSetRows(bodyEl) {
-  const metric = metricOf(App.state);
-  const read = (row, role) => parseVal(qs(`[data-role="${role}"]`, row).value, metric);
-  return qsa('.setrow', bodyEl)
-    .map((row) => ({ a: read(row, 'set-a'), b: read(row, 'set-b') }))
-    .filter((item) => item.a || item.b);
+/* ------------------------------ 计分控件 ------------------------------ */
+/**
+ * 计分输入控件：**按计分类型给不同的控件**。
+ *
+ * * 时间型 → 「时 : 分 : 秒」三个框（比一整串 `1:23.456` 好填得多，也不会填错位）；
+ * * 小数   → 数字框，步长 0.001（存的是千分之一）；
+ * * 自然数 → 数字框，步长 1。
+ */
+function valueInputHtml(role, value, sc) {
+  if (sc.timeBased) {
+    const [h, m, s] = splitMilli(value || 0);
+    const cell = (key, ph, text) =>
+      `<input data-t="${key}" inputmode="decimal" placeholder="${ph}" value="${esc(text)}">`;
+    return (
+      `<span class="tvinput" data-role="${esc(role)}">` +
+      cell('h', '时', h) +
+      `<i>:</i>` +
+      cell('m', '分', m) +
+      `<i>:</i>` +
+      cell('s', '秒', s) +
+      `</span>`
+    );
+  }
+    const step = sc.valueType === 'decimal' ? '0.001' : '1';
+  // 有成绩就回填（**数值型的 0 也要填出来**：它是合法读数，留空会被当成「没填」）；
+  // 没有成绩则留空，让人一眼看出还没录。
+  const text = hasResult(value, sc) ? fmtVal(value, sc) : '';
+  return (
+    `<span class="nvinput" data-role="${esc(role)}">` +
+    `<input type="number" min="0" step="${step}" placeholder="0" value="${esc(text)}">` +
+    `</span>`
+  );
 }
 
-function setRowHtml(a = '', b = '') {
-  const metric = metricOf(App.state);
-  const time = metric === 'time';
-  const val = (v) => esc(v ? fmtVal(v, metric) : '');
-  const attrs = time
-    ? 'type="text" inputmode="decimal" placeholder="1:23.45"'
-    : 'type="number" min="0" placeholder="0"';
+/** 读回一个计分控件（时间型读三个框，其余读一个）；解析不了抛错，由调用方提示。 */
+function readValueInput(host, role, sc) {
+  if (!host) return missingValue(sc);
+  const box = qs(`[data-role="${role}"]`, host);
+  if (!box) return missingValue(sc);
+  if (!sc.timeBased) {
+    const input = qs('input', box);
+    return parseVal(input ? input.value : '', sc);
+  }
+  const part = (key) => {
+    const input = qs(`[data-t="${key}"]`, box);
+    return input ? input.value : '';
+  };
+  return parseHms(part('h'), part('m'), part('s'));
+}
+
+/** 一行轮次：`第 N 轮  A 输入 : B 输入  ×`。 */
+function roundRowHtml(a, b, sc) {
   return (
-    `<div class="setrow">` +
-    `<input ${attrs} data-role="set-a" value="${val(a)}">` +
+    `<div class="setrow" data-round>` +
+    `<span class="setrow__no"></span>` +
+    valueInputHtml('set-a', a, sc) +
     `<span class="setrow__sep">:</span>` +
-    `<input ${attrs} data-role="set-b" value="${val(b)}">` +
-    `<button class="btn btn--sm btn--ghost" type="button" data-set-del title="删除这一局">×</button>` +
+    valueInputHtml('set-b', b, sc) +
+    `<button class="btn btn--sm btn--ghost" type="button" data-set-del title="删除这一轮">×</button>` +
     `</div>`
   );
+}
+
+/** 轮次重新编号：删掉中间一轮后仍要显示连续的「第 1 / 2 / 3 轮」。 */
+function renumberRounds(bodyEl) {
+  qsa('[data-round]', bodyEl).forEach((row, index) => {
+    const tag = row.querySelector('.setrow__no');
+    if (tag) tag.textContent = `第 ${index + 1} 轮`;
+  });
+}
+
+/** 读出弹窗里的轮次（整轮都没填的行丢掉）。 */
+function readRoundRows(bodyEl, sc) {
+  return qsa('[data-round]', bodyEl)
+    .map((row) => ({ a: readValueInput(row, 'set-a', sc), b: readValueInput(row, 'set-b', sc) }))
+    .filter((item) => hasResult(item.a, sc) || hasResult(item.b, sc));
+}
+
+/**
+ * 由轮次推导大比分与总成绩（与后端 ``tournament.judge_round`` 同一套规则）。
+ *
+ * 每一轮谁赢看判断标准（数值高胜或数值低胜）；大比分是**赢的轮数**（计数），
+ * 总成绩是各轮成绩合计——没填的那一方按 0 计，不能把哨兵 ``-1`` 减进去。
+ */
+function deriveFromRounds(rounds, sc) {
+  const wins = [0, 0];
+  const totals = [0, 0];
+  rounds.forEach((item) => {
+    totals[0] += Math.max(0, Number(item.a) || 0);
+    totals[1] += Math.max(0, Number(item.b) || 0);
+    const cmp = cmpVal(item.a, item.b, sc);
+    if (cmp < 0) wins[0] += 1;
+    else if (cmp > 0) wins[1] += 1;
+  });
+  return { wins, totals };
 }
 
 /**
  * 按当前填写内容实时推导比分 / 名次 / 胜负，并回写到界面上。
  *
- * 规则与后端 `tournament.judge_round` 完全一致：先看各局成绩（2 队），
- * 再看该场成绩，最后看细则分；**每局谁赢由比法决定**（计分制比大、用时制比小）。
- * 填了各局之后 `score` 是「赢的局数」（计数，多者胜），成绩在 `points` 里。
+ * 规则与后端 `tournament.judge_round` 完全一致：先看轮次（2 队），再看本场成绩，
+ * 最后看小分；**每轮谁赢由判断标准决定**（数值高胜或数值低胜）。
+ * 填了轮次之后 `score` 是「赢的轮数」（计数，多者胜），各轮合计在 `points` 里。
  */
 function refreshResultPreview(bodyEl, sides, allowDraw) {
   const box = qs('#rq-preview', bodyEl);
-  const metric = metricOf(App.state);
+  const sc = scoringOf(App.state);
   const multi = sides.length > 2;
-  let sets;
-  let entries;
+  const manualHost = qs('#rq-manual', bodyEl);
+  let rounds = [];
+  let entries = [];
   try {
-    sets = readSetRows(bodyEl);
-    entries = sides.map((side) => ({
-      key: side.key,
-      label: side.label,
-      score: parseVal(qs(`[data-sid="${side.key}"] [data-role="score"]`, bodyEl).value, metric),
-      points: parseVal(qs(`[data-sid="${side.key}"] [data-role="points"]`, bodyEl).value, metric),
-    }));
+    rounds = multi ? [] : readRoundRows(bodyEl, sc);
+    entries = sides.map((side) => {
+      // 多队同场：成绩就填在每一方那一行上；两方对局：没有轮次时才读「本场成绩」那一组
+      const host = multi
+        ? qs(`[data-sid="${side.key}"]`, bodyEl)
+        : qs(`[data-sid="${side.key}"]`, manualHost);
+      return {
+        key: side.key,
+        label: side.label,
+        score: readValueInput(host, 'score', sc),
+        points: readValueInput(host, 'points', sc),
+      };
+    });
   } catch (err) {
     // 预览是「边打字边算」的：格式还没写完就报错很正常，
     // 这里必须提示而不是抛出去（抛出去会让整块预览停在上一帧，看起来像卡住）
     if (box) {
       box.innerHTML =
         `<span class="rpreview__warn">${esc(err.message)}</span>` +
-        `<span class="rpreview__sub">改成 1:23.456 这样的写法会自动重算</span>`;
+        `<span class="rpreview__sub">改成 1:23.456 或 25 这样的写法会自动重算</span>`;
     }
     return;
   }
 
-  const counted = !multi && sets.length > 0;
-  if (counted) {
-    const wins = [0, 0];
-    const totals = [0, 0];
-    sets.forEach((item) => {
-      totals[0] += item.a;
-      totals[1] += item.b;
-      const cmp = cmpVal(item.a, item.b, metric);
-      if (cmp < 0) wins[0] += 1;
-      else if (cmp > 0) wins[1] += 1;
-    });
+  // 两种录入方式互斥（折叠关系）：填了轮次就按轮次算，那一组「本场成绩」输入框收起来
+  const counted = rounds.length > 0;
+  const derived = counted ? deriveFromRounds(rounds, sc) : null;
+  if (derived) {
     [0, 1].forEach((i) => {
-      entries[i].score = wins[i];
-      entries[i].points = totals[i];
+      entries[i].score = derived.wins[i];
+      entries[i].points = derived.totals[i];
     });
-    // 回写，让管理员直接看到推导出的局分与总成绩
-    ['A', 'B'].forEach((key, i) => {
-      qs(`[data-sid="${key}"] [data-role="score"]`, bodyEl).value = wins[i];
-      qs(`[data-sid="${key}"] [data-role="points"]`, bodyEl).value = fmtVal(totals[i], metric);
+  }
+  if (manualHost) manualHost.hidden = counted;
+
+  // 两方对局把推导结果显示在那一行上（多队同场的成绩本身就是输入框，不做回显）
+  if (!multi) {
+    sides.forEach((side, index) => {
+      const row = qs(`[data-sid="${side.key}"]`, bodyEl);
+      if (!row) return;
+      const put = (role, text) => {
+        const node = row.querySelector(`[data-role="${role}"]`);
+        if (node) node.textContent = text;
+      };
+      put('score-label', counted ? '大比分' : sc.label);
+      put('points-label', counted ? `总${sc.label}` : '小分');
+      put('score-view', fmtScore(entries[index].score, counted, sc));
+      put('points-view', fmtVal(entries[index].points, sc));
     });
   }
 
-  // 局分是计数（多者胜）；没有各局时 score 就是该场成绩（按比法比）
+  // 大比分是计数（多者胜）；没有轮次时 score 就是本场成绩（按判断标准比）
   const better = (x, y) =>
     counted
-      ? y.score - x.score || cmpVal(x.points, y.points, metric)
-      : cmpVal(x.score, y.score, metric) || cmpVal(x.points, y.points, metric);
+      ? y.score - x.score || cmpVal(x.points, y.points, sc)
+      : cmpVal(x.score, y.score, sc) || cmpVal(x.points, y.points, sc);
   const order = [...entries].sort(better);
   const top = order[0];
   const tied = entries.filter((e) => !better(e, top) && !better(top, e));
-  const labels = entries
-    .map((e) => `${e.key} ${counted ? e.score : fmtVal(e.score, metric)}`)
-    .join(' : ');
+  const labels = entries.map((e) => `${e.key} ${fmtScore(e.score, counted, sc)}`).join(' : ');
   let verdict;
-  if (!entries.some((e) => e.score || e.points)) {
+  // 「填了没有」问的是**有没有成绩**：数值型的 0 也算（0:0 就是一场 0 比 0）
+  if (!entries.some((e) => hasResult(e.score, sc) || e.points)) {
     verdict = '<span class="rpreview__mute">还没有填写成绩</span>';
   } else if (tied.length > 1) {
     verdict =
       allowDraw && !multi
-        ? '<span class="rpreview__warn">平局</span>'
+        ? '<span class="rpreview__warn">平局（大比分与总成绩都相同）</span>'
         : '<span class="rpreview__warn">并列，请在下方指定胜方</span>';
   } else {
     verdict = `<b>${esc(top.label)}</b> 胜（${esc(labels)}）`;
   }
-  const setsText = sets.length
-    ? ` · ${sets.map((item) => `${fmtVal(item.a, metric)}:${fmtVal(item.b, metric)}`).join(' / ')}`
+  const roundsText = counted
+    ? ` · ${rounds
+        .map((item, i) => `第${i + 1}轮 ${fmtVal(item.a, sc)}:${fmtVal(item.b, sc)}`)
+        .join(' / ')}`
     : '';
   if (box) {
-    const note = multi ? (metric === 'time' ? '按用时排名' : '按得分排名') : resFields(metric).total;
-    box.innerHTML = `${verdict}<span class="rpreview__sub">${esc(note)}${esc(setsText)}${esc(
-      seriesText(sets, multi)
-    )}</span>`;
+    const note = counted
+      ? `大比分 = 赢的轮数 · 总${sc.label} = 各轮合计`
+      : multi
+        ? `按${sc.label}排名 · ${sc.betterLabel || sc.better}`
+        : `${sc.label} · ${sc.betterLabel || sc.better}`;
+    box.innerHTML = `${verdict}<span class="rpreview__sub">${esc(note)}${esc(roundsText)}</span>`;
   }
 }
 
-/** 录分弹窗里的三个词：比法不同，叫法不同（都是同一批字段）。 */
-const resFields = (metric) =>
-  metric === 'time'
-    ? { big: '局分', total: '局分 / 总用时', value: '用时', extra: '罚时' }
-    : { big: '局分', total: '局分 / 总得分', value: '得分', extra: '小分' };
-
-/** 系列赛（BO）提示：几局几胜、打到哪了、是否已经出结果。 */
-function seriesText(sets, multi) {
-  const metric = metricOf(App.state);
-  const bestOf = Number(App.state?.rules?.bestOf) || 1;
-  if (bestOf <= 1 || multi) return '';
-  const name = { 3: '三局两胜', 5: '五局三胜', 7: '七局四胜' }[bestOf] || `${bestOf} 局`;
-  const half = (bestOf + 1) / 2;
-  const wins = [0, 0];
-  sets.forEach((item) => {
-    const cmp = cmpVal(item.a, item.b, metric);
-    if (cmp < 0) wins[0] += 1;
-    else if (cmp > 0) wins[1] += 1;
-  });
-  const tail =
-    wins[0] >= half || wins[1] >= half
-      ? `已 ${wins[0]}:${wins[1]} · 胜负已定`
-      : `已 ${wins[0]}:${wins[1]} · 先赢 ${half} 局者胜`;
-  return ` · ${name}（${tail}）`;
-}
-
+/**
+ * 录分弹窗：**多轮次录入 + 自动大比分**。
+ *
+ * 折叠关系（从上往下读一遍就是录入顺序）：
+ *   ① 实时预览：大比分 / 胜负 / 各轮明细             —— 常驻
+ *   ② 每一方的「大比分 / 总成绩」                    —— 常驻（只读展示）
+ *   ③ 轮次录入（默认一轮，可增删；仅两方对局）        —— 常驻
+ *   ④ 「直接填本场成绩」（只在没有任何轮次时出现）     —— 与 ③ 互斥
+ *   ⑤ 胜方 / 时长 / 起止时间 / 备注                  —— 折叠（details）
+ */
 function openResultModal(rnd) {
   const sides = rnd.sides || [rnd.sideA, rnd.sideB];
-  const metric = metricOf(App.state);
-  const f = resFields(metric);
-  const time = metric === 'time';
+  const sc = scoringOf(App.state);
   const multi = sides.length > 2;
-  const counted = !multi && (rnd.sets || []).length > 0;
+  const stored = rnd.sets || [];
+  // 已经「直接填过成绩」的场次仍按原样编辑（想改用轮次就点「添加一轮」）
+  // 「填过没填」看录入痕迹：数值型的 0 是合法读数，不能用真假值糊过去
+  const hasPlainScore = !stored.length && sides.some((side) => hasEntered(side.score) || side.points);
+  const initial = stored.length
+    ? stored.map((item) => ({ a: item.a, b: item.b }))
+    : multi || hasPlainScore
+      ? []
+      : [{ a: MISSING, b: MISSING }]; // 全新的一场：默认一轮（空）
   const allowDraw = App.state?.rules?.allowDraw && rnd.stage === 'group';
   const winnerOpts = [['', '自动判定']].concat(
     sides.map((side) => [side.key, `${side.label} 第 1`])
   );
   if (allowDraw && !multi) winnerOpts.push(['DRAW', '平局']);
-  const setRows = (rnd.sets || []).map((item) => setRowHtml(item.a, item.b)).join('');
-  // 用时制下这两个框收时间文本；填了各局时「局分」是计数，仍按数字显示。
-  // 0 / 空一律留空框（而不是显示「—」）——空格子才是「还没填」该有的样子。
-  const entryAttrs = time ? 'type="text" inputmode="decimal"' : 'type="number" min="0"';
-  const box = (value) => (value ? esc(fmtVal(value, metric)) : '');
 
   const sideRows = sides
+    .map((side) => {
+      const head =
+        `<span class="rrow__key" style="--c:${esc(side.color || 'var(--accent)')}">${esc(side.key)}</span>` +
+        `<span class="rrow__name">${esc(side.label)}</span>`;
+      // 多队同场没有「轮次」：成绩就是每一方自己那一格 → 直接给输入框
+      if (multi) {
+        return (
+          `<div class="rrow" data-sid="${esc(side.key)}">` +
+          head +
+          `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
+          valueInputHtml('score', side.score, sc) +
+          `</label>` +
+          `<label class="rrow__f"><span>细则分</span>` +
+          valueInputHtml('points', side.points, sc) +
+          `</label></div>`
+        );
+      }
+      return (
+        `<div class="rrow" data-sid="${esc(side.key)}">` +
+        head +
+        `<span class="rrow__f"><span data-role="score-label">大比分</span>` +
+        `<b data-role="score-view">—</b></span>` +
+        `<span class="rrow__f"><span data-role="points-label">总${esc(sc.label)}</span>` +
+        `<b data-role="points-view">—</b></span></div>`
+      );
+    })
+    .join('');
+
+  // 没有轮次时才需要手填「本场成绩」（与轮次互斥：显隐由预览里的 refresh 切换）
+  const manualRows = sides
     .map(
       (side) =>
         `<div class="rrow" data-sid="${esc(side.key)}">` +
         `<span class="rrow__key" style="--c:${esc(side.color || 'var(--accent)')}">${esc(side.key)}</span>` +
         `<span class="rrow__name">${esc(side.label)}</span>` +
-        `<label class="rrow__f"><span>${multi ? f.value : f.big}</span>` +
-        `<input ${entryAttrs} data-role="score" value="${counted ? side.score || '' : box(side.score)}"></label>` +
-        `<label class="rrow__f"><span>${multi ? f.extra : f.total.split(' / ')[1]}</span>` +
-        `<input ${entryAttrs} data-role="points" value="${box(side.points)}"></label>` +
-        `</div>`
+        `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
+        valueInputHtml('score', side.score, sc) +
+        `</label>` +
+        `<label class="rrow__f"><span>小分</span>` +
+        valueInputHtml('points', side.points, sc) +
+        `</label></div>`
     )
     .join('');
+
+  const roundsBlock = multi
+    ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按 <b>${esc(
+        sc.label
+      )}</b>（${esc(sc.betterLabel || sc.better)}）排名，第 1 名即为本场胜者，` +
+      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。</div>`
+    : `<div class="rsets"><div class="rsets__head"><b>轮次</b>` +
+      `<span class="panel__hint">默认一轮；每轮 ${esc(sc.label)}，赢的轮数就是大比分` +
+      `${sc.timeBased ? '（可写 1:23.456 或 83.45）' : ''}</span>` +
+      `<button class="btn btn--sm" type="button" data-set-add>+ 添加一轮</button></div>` +
+      `<div class="rsets__body" id="rq-sets">${initial
+        .map((row) => roundRowHtml(row.a, row.b, sc))
+        .join('')}</div></div>`;
+  const manualBlock = multi
+    ? ''
+    : `<div id="rq-manual"${initial.length ? ' hidden' : ''}>` +
+      `<div class="notice" style="margin-top:10px">没有轮次时按下面这一组「本场成绩」判定；` +
+      `点上面的「添加一轮」就改用轮次录入。</div>` +
+      `<div class="rrows">${manualRows}</div></div>`;
+  const foldOpen = Boolean(
+    rnd.duration || rnd.startedAt || rnd.finishedAt || rnd.note || rnd.winner
+  );
 
   Modal.open({
     title: `录入结果 · ${rnd.label || rnd.code}`,
     body:
-      `<div class="rrows">${sideRows}</div>` +
-      (multi
-        ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按<b>${
-            time ? '用时' : '得分'
-          }</b>排名，第 1 名即为本场胜者，名次分按 ${sides.length}/${
-            sides.length - 1
-          }/…/1 计入小组赛。</div>`
-        : `<div class="rsets"><div class="rsets__head"><b>${time ? '各局用时' : '各局小分'}</b>` +
-          `<span class="panel__hint">填了就自动算${f.total.replace(' / ', '与')}${
-            time ? '（可写 1:23.456 或 83.45）' : ''
-          }</span>` +
-          `<button class="btn btn--sm" type="button" data-set-add>+ 添加一局</button></div>` +
-          `<div class="rsets__body" id="rq-sets">${setRows}</div></div>`) +
       `<div id="rq-preview" class="rpreview"></div>` +
+      `<div class="rrows">${sideRows}</div>` +
+      roundsBlock +
+      manualBlock +
+      `<details class="rfold"${foldOpen ? ' open' : ''}>` +
+      `<summary>胜方 / 时长 / 时间 / 备注</summary>` +
       `<div class="form form--2" style="margin-top:10px">` +
       `<div class="field"><label for="rq-winner">胜方</label><select id="rq-winner">${winnerOpts
         .map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`)
         .join('')}</select></div>` +
-      // 这是「这场比赛持续了多久」，与用时制里的成绩（`各局用时`）不是一回事
+      // 这是「这场比赛持续了多久」，与计分里的成绩不是一回事
       `<div class="field"><label for="rq-duration">本场时长（分钟）</label><input id="rq-duration" type="number" min="0" value="${
         rnd.duration || ''
       }" placeholder="可留空"></div>` +
@@ -278,6 +401,7 @@ function openResultModal(rnd) {
       `<button class="btn btn--sm" type="button" data-now="rt-start">开始=现在</button>` +
       `<button class="btn btn--sm" type="button" data-now="rt-end">结束=现在</button>` +
       `</div>` +
+      `</details>` +
       `<div class="notice" style="margin-top:10px">结算后：${
         rnd.stage === 'group'
           ? '小组赛只影响名次分与排名'
@@ -292,7 +416,10 @@ function openResultModal(rnd) {
         : '') +
       `<button class="btn btn--sm btn--primary" type="button" data-submit>保存结果</button>`,
     onMount(bodyEl, footEl) {
-      const refresh = () => refreshResultPreview(bodyEl, sides, allowDraw);
+      const refresh = () => {
+        renumberRounds(bodyEl);
+        refreshResultPreview(bodyEl, sides, allowDraw, sc);
+      };
       footEl.querySelector('[data-close]').onclick = () => Modal.close();
       const woBtn = footEl.querySelector('[data-wo-open]');
       if (woBtn) {
@@ -310,7 +437,9 @@ function openResultModal(rnd) {
       const addBtn = bodyEl.querySelector('[data-set-add]');
       if (addBtn) {
         addBtn.onclick = () => {
-          qs('#rq-sets', bodyEl).insertAdjacentHTML('beforeend', setRowHtml());
+          const host = qs('#rq-sets', bodyEl);
+          // 新行留空：0 是合法读数，拿它当「空」会让人一保存就记下两个 0 分
+          if (host) host.insertAdjacentHTML('beforeend', roundRowHtml(MISSING, MISSING, sc));
           refresh();
         };
       }
@@ -327,25 +456,32 @@ function openResultModal(rnd) {
       refresh();
 
       footEl.querySelector('[data-submit]').onclick = async () => {
-        const read = (sel) => qs(sel, bodyEl).value.trim();
+        const read = (sel) => (qs(sel, bodyEl) || {}).value || '';
         let body;
         try {
-          const sets = readSetRows(bodyEl);
-          // 填了各局时「局分」是赢的局数（计数）：不能拿用时的解析器去解它，
-          // 否则「2」会被读成 2 毫秒
-          const asCount = !multi && sets.length > 0;
-          const scoreOf = (text) =>
-            asCount ? Math.max(0, Math.trunc(Number(text) || 0)) : parseVal(text, metric);
-          const pointsOf = (text) => parseVal(text, metric);
+          const sets = multi ? [] : readRoundRows(bodyEl, sc);
+          // 填了轮次时大比分是「赢的轮数」（计数）：不能拿时间/小数的解析器去解它
+          const counted = sets.length > 0;
+          const derived = counted ? deriveFromRounds(sets, sc) : null;
+          const manualHost = qs('#rq-manual', bodyEl);
           body = {
             winner: read('#rq-winner'),
             note: read('#rn'),
             sets,
-            sides: sides.map((side) => ({
-              key: side.key,
-              score: scoreOf(qs(`[data-sid="${side.key}"] [data-role="score"]`, bodyEl).value),
-              points: pointsOf(qs(`[data-sid="${side.key}"] [data-role="points"]`, bodyEl).value),
-            })),
+            sides: sides.map((side, index) => {
+              const host = multi
+                ? qs(`[data-sid="${side.key}"]`, bodyEl)
+                : qs(`[data-sid="${side.key}"]`, manualHost);
+              return {
+                key: side.key,
+                score: derived
+                  ? derived.wins[index]
+                  : readValueInput(host, 'score', sc),
+                points: derived
+                  ? derived.totals[index]
+                  : readValueInput(host, 'points', sc),
+              };
+            }),
             durationMinutes: Number(read('#rq-duration')) || 0,
           };
         } catch (err) {
@@ -580,11 +716,30 @@ function openGroupPairingModal() {
     renderBody(bodyEl);
   };
 
-  /** 与后端原值不同的那些场次（保存时只提交它们）。 */
+  /** 基线：上一次保存（或恢复默认）之后的样子。未保存的改动 = 草案与它不同。 */
+  let baseline = new Map(list.map((r) => [r.code, (r.sides || []).map((s) => s.teamId)]));
   const changedRows = () =>
     list
-      .filter((r) => (draft.get(r.code) || []).join('~') !== (r.sides || []).map((s) => s.teamId).join('~'))
+      .filter((r) => (draft.get(r.code) || []).join('~') !== (baseline.get(r.code) || []).join('~'))
       .map((r) => ({ code: r.code, team_ids: draft.get(r.code) }));
+
+  /** 保存改过的场次；成功后基线跟着走，这样「还没保存」的判断才不会一直为真。 */
+  const saveRows = async (rows) => {
+    const res = await api('/tournament/group-pairings', {
+      method: 'POST',
+      auth: true,
+      body: { rounds: rows },
+    });
+    if (res.state) App.state = res.state;
+    baseline = new Map(draft);
+    renderPublic();
+    hooksRenderAdmin();
+    toast(`对阵已保存：${rows.length} 场（用户端已刷新）`, 'ok', 6000);
+    return res;
+  };
+
+  // 关闭前拦一道：改过还没保存就问一句（保存成功 / 放弃改动都能关）
+  let closing = false;
 
   Modal.open({
     title: '调整小组赛对阵',
@@ -593,6 +748,25 @@ function openGroupPairingModal() {
       `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
       `<button class="btn btn--sm" type="button" data-reset>恢复默认对阵</button>` +
       `<button class="btn btn--sm btn--primary" type="button" data-save>保存对阵</button>`,
+    onBeforeClose: () => {
+      if (closing) return true;
+      const rows = changedRows();
+      if (!rows.length) return true;
+      const save = window.confirm(
+        `有 ${rows.length} 场对阵改过但还没保存。\n\n` +
+          `「确定」= 保存后关闭；「取消」= 放弃这些改动并关闭。`
+      );
+      if (!save) return true; // 放弃改动，直接关
+      // 先拦住这一次关闭，保存完再自己关（失败就留在弹窗里，别把改动丢了）
+      closing = true;
+      saveRows(rows)
+        .then(() => Modal.close())
+        .catch((err) => {
+          closing = false;
+          toast(err.message, 'err', 8000);
+        });
+      return false;
+    },
     onMount(bodyEl, footEl) {
       renderBody(bodyEl);
       bodyEl.addEventListener('click', (e) => {
@@ -606,19 +780,16 @@ function openGroupPairingModal() {
           toast('对阵没有变化', 'info');
           return;
         }
+        const btn = footEl.querySelector('[data-save]');
+        if (btn) btn.disabled = true;
         try {
-          const res = await api('/tournament/group-pairings', {
-            method: 'POST',
-            auth: true,
-            body: { rounds: rows },
-          });
-          if (res.state) App.state = res.state;
+          await saveRows(rows);
+          closing = true;
           Modal.close();
-          toast(`已保存 ${rows.length} 场新对阵`, 'ok', 5000);
-          renderPublic();
-          hooksRenderAdmin();
         } catch (err) {
           toast(err.message, 'err', 8000);
+        } finally {
+          if (btn) btn.disabled = false;
         }
       };
       footEl.querySelector('[data-reset]').onclick = async () => {
@@ -634,11 +805,12 @@ function openGroupPairingModal() {
           draft = new Map(
             list.map((r) => [r.code, ((now.get(r.code) || r).sides || []).map((s) => s.teamId)])
           );
+          baseline = new Map(draft);
           picked = null;
           renderBody(bodyEl);
           renderPublic();
           hooksRenderAdmin();
-          toast('已恢复默认对阵', 'ok', 5000);
+          toast('已恢复默认对阵（用户端已刷新）', 'ok', 5000);
         } catch (err) {
           toast(err.message, 'err', 8000);
         }
@@ -847,7 +1019,7 @@ function startEvent() {
     body:
       `<div class="notice">开始后 <b>赛制与参赛名单将锁定</b>：赛制、每队人数、每场同场队伍数、` +
       `败者组开关、参与名单、重新组队、赛程重建与清空、删除选手都会被拒绝。<br>` +
-      `<b>仍然可用</b>：<b>直播开关</b>、<b>替补换人</b>（替补不在名单里会自动加入）、` +
+      `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补 / 队伍换人</b>（替上的人不在名单里会自动加入）、` +
       `录分与重置、时间登记、弃权、赛事信息与界面配置。</div>` +
       readinessHtml(r) +
       `<div style="margin-top:12px">${fieldSwitch(
@@ -930,9 +1102,10 @@ function unlockEvent() {
 }
 
 /**
- * 替补换人（锦标赛制）：队伍内 1:1 换人，不动赛程。
+ * 队伍换人（固定队伍）：队内 1:1 换人，不动赛程结构。
  *
- * 换上的人不在参与名单里时会由服务端**自动加入**；开赛后同样可用。
+ * 用于「到不齐人」：换上的人不在参与名单里时会由服务端**自动加入**，开赛后同样可用。
+ * 只换某一场、或从某一场起换人，请用积分制赛程里的「对局替补」。
  */
 function openTeamSubModal() {
   const s = App.state || {};
@@ -948,15 +1121,12 @@ function openTeamSubModal() {
     .join('');
 
   Modal.open({
-    title: '替补换人',
+    title: '队伍换人',
     body:
       `<div class="form form--2">` +
       `<div class="field"><label for="subTeam">队伍</label><select id="subTeam">${options}</select></div>` +
       `<div class="field"><label for="subFrom">换下（本队队员）</label><select id="subFrom"></select></div>` +
-      `<div class="field"><label for="subTo">换上（替补）</label><select id="subTo"></select></div>` +
-      fieldSwitch('subMark', '把换上的人标记为「替补」', false, {
-        hint: '标记只作展示与统计口径；锦标赛制的上场人选由本窗口决定',
-      }) +
+      `<div class="field"><label for="subTo">换上（候选池 / 其他人）</label><select id="subTo"></select></div>` +
       `</div>` +
       `<div class="notice" style="margin-top:10px">只换这支队伍里的一个人，<b>不动赛程结构</b>：` +
       `该队未结算的对局会同步成新阵容，已打完的对局保留当时的阵容与比分。` +
@@ -1003,17 +1173,13 @@ function openTeamSubModal() {
           const res = await api(`/teams/${encodeURIComponent(teamSel.value)}/substitute`, {
             method: 'POST',
             auth: true,
-            body: {
-              fromId,
-              toId,
-              markSubstitute: qs('#f-subMark', bodyEl).checked,
-            },
+            body: { fromId, toId },
           });
           Modal.close();
           if (res.state) App.state = res.state;
           renderPublic();
           renderAdmin();
-          toast(`${res.from.name} → ${res.to.name}：替补已上场`, 'ok', 6000);
+          toast(`${res.from.name} → ${res.to.name}：队伍已换人`, 'ok', 6000);
           (res.addedToParticipants || []).forEach((name) =>
             toast(`${name} 不在参与名单里，已自动加入本届名单`, 'info', 8000)
           );
@@ -1045,24 +1211,17 @@ function clearEventTimeField(name) {
 
 /* --------------------------- 积分制操作 --------------------------- */
 function openPlayerPicker({ title, currentIds = [], onPick, onRemove }) {
+  const rosterKnown = Boolean(App.state?.participantsSet);
   const joined = new Set(App.state?.participants || []);
-  const players = (App.state?.players || [])
-    .slice()
-    .sort((a, b) => (a.substitute ? 1 : 0) - (b.substitute ? 1 : 0));
-  const items = players
+  const items = (App.state?.players || [])
     .map((p) => {
       const cur = currentIds.includes(p.id);
-      const out = joined.size > 0 && !joined.has(p.id);
-      const meta = [
-        p.tag,
-        p.substitute ? '替补' : '',
-        out ? '未参与本届' : '',
-        p.active === false ? '停用' : '',
-      ]
+      const out = rosterKnown && !joined.has(p.id);
+      const meta = [p.tag, out ? '未参与本届' : '', p.active === false ? '停用' : '']
         .filter(Boolean)
         .join(' · ');
       return (
-        `<button type="button" class="pick${cur ? ' pick--current' : ''}${p.substitute ? ' pick--sub' : ''}${out ? ' pick--out' : ''}" data-pid="${esc(p.id)}">` +
+        `<button type="button" class="pick${cur ? ' pick--current' : ''}${out ? ' pick--out' : ''}" data-pid="${esc(p.id)}">` +
         avaHtml(p, 'sm') +
         `<span class="who__txt"><span class="who__name">${esc(p.name || p.id)}</span>` +
         `<span class="pick__meta">${esc(meta || p.id)}</span></span></button>`
@@ -1239,7 +1398,7 @@ export function openQuickGroupModal() {
         '每个组的人数',
         Number(rules.teamSize) || 2,
         [['1', '1 人'], ['2', '2 人（默认）'], ['3', '3 人'], ['4', '4 人'], ['5', '5 人'], ['6', '6 人']],
-        { hint: '替补在锦标赛制下不参与组队' }
+        { hint: '凑不满一组的人留在候选池，可在组队台里顶上' }
       ) +
       fieldNum('groupCount', '小组数（0 = 自动）', Number(rules.groupCount) || 0, {
         hint: '自动时约 4 队一组，并尽量排满整场',
@@ -1422,46 +1581,169 @@ async function roundDelete(ref) {
   }
 }
 
-function swapMember(ref, fromId) {
+/**
+ * 积分制替补：点某位选手 → 换下他、选定替补与生效范围。
+ *
+ * 三档范围：仅当前比赛 / 本场及之后 / 全场。同一选手在同一范围再次指定即为**改人**，
+ * 页面上只保留最后一次；已在生效的替补可在本窗口或「总览 → 本届替补」里取消。
+ */
+function openSubstituteModal(ref, fromId) {
+  const s = App.state || {};
   const rnd = roundOf(ref);
-  if (!rnd) return;
-  const current = [...rnd.sideA.players.map((p) => p.id), ...rnd.sideB.players.map((p) => p.id)];
-  const fromSide = rnd.sideA.players.some((p) => p.id === fromId) ? 'A' : 'B';
-  openPlayerPicker({
-    title: `${rnd.label || ref} · 换人 / 移出`,
-    currentIds: current,
-    onPick: async (toId) => {
-      if (toId === fromId) return;
-      try {
-        const res = await api(`/rounds/${encodeURIComponent(ref)}/swap`, {
-          method: 'POST',
-          auth: true,
-          body: { fromId, toId },
-        });
-        toast('已换人', 'ok');
-        // 替补原本不在参与名单里时，服务端会把他补进本届名单
-        (res.addedToParticipants || []).forEach((name) =>
-          toast(`${name} 不在参与名单里，已自动加入本届名单`, 'info', 8000)
-        );
-      } catch (err) {
-        toast(err.message, 'err');
-      }
-    },
-    onRemove: async () => {
-      const side = fromSide === 'A' ? rnd.sideA : rnd.sideB;
-      const ids = side.players.map((p) => p.id).filter((id) => id !== fromId);
-      try {
-        await api(`/rounds/${encodeURIComponent(ref)}/lineup`, {
-          method: 'POST',
-          auth: true,
-          body: { side: fromSide, playerIds: ids },
-        });
-        toast('已移出阵容', 'ok');
-      } catch (err) {
-        toast(err.message, 'err');
-      }
+  const from = (s.players || []).find((p) => p.id === fromId);
+  if (!rnd || !from) return;
+  const sides = [rnd.sideA, rnd.sideB].filter(Boolean);
+  const onCourt = sides.flatMap((side) => (side.players || []).map((p) => p.id));
+  const rosterKnown = Boolean(s.participantsSet);
+  const joined = new Set(s.participants || []);
+  const existing = (s.substitutions || []).filter((item) => item.fromId === fromId);
+  const who = (p) => (p ? p.name || p.tag || p.id : '');
+  let chosen = '';
+
+  const existingHtml = existing.length
+    ? `<div class="notice notice--warn" style="margin-top:10px">已有替补：` +
+      existing
+        .map(
+          (item) =>
+            `<b>${esc(item.toName || item.toId)}</b>（${esc(item.scopeLabel || '')}）` +
+            `<button class="btn btn--sm btn--danger" type="button" data-act="sub-cancel" ` +
+            `data-id="${esc(item.id)}">取消</button>`
+        )
+        .join('') +
+      `</div>`
+    : '';
+
+  const candidates = (s.players || [])
+    .filter((p) => p.id !== fromId)
+    .sort((a, b) => Number(onCourt.includes(a.id)) - Number(onCourt.includes(b.id)))
+    .map((p) => {
+      const clash = onCourt.includes(p.id);
+      const out = rosterKnown && !joined.has(p.id);
+      const meta = [
+        p.tag || p.id,
+        clash ? '已在本场阵容' : '',
+        out ? '未参与本届（自动加入）' : '',
+        p.active === false ? '停用' : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return (
+        `<button type="button" class="pick${clash ? ' pick--out' : ''}" data-pid="${esc(p.id)}"` +
+        (clash ? ' disabled' : '') +
+        `>${avaHtml(p, 'sm')}<span class="who__txt"><span class="who__name">${esc(who(p))}</span>` +
+        `<span class="pick__meta">${esc(meta)}</span></span></button>`
+      );
+    })
+    .join('');
+
+  Modal.open({
+    title: `安排替补 · ${who(from)}`,
+    body:
+      `<div class="notice"><b>${esc(who(from))}</b> 下场，由你选的人顶上（按实际出场计入积分榜）；` +
+      `已结算的比赛不改写。</div>` +
+      existingHtml +
+      `<div class="form form--2" style="margin-top:10px">` +
+      fieldSelect('scope', '影响范围', 'round', [
+        ['round', `仅当前比赛（${rnd.label || rnd.code}）`],
+        ['rest', '本场及之后（从这场起全部替换）'],
+        ['event', '全场（本届所有比赛）'],
+      ]) +
+      `</div>` +
+      `<div class="field" style="margin-top:8px"><label>选择替补选手</label></div>` +
+      `<div class="pick-list">${
+        candidates || '<div class="empty"><b>没有可选的选手</b>请先在「选手」页新增</div>'
+      }</div>`,
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm btn--danger" type="button" data-remove>移出阵容</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-submit disabled>确定替补</button>`,
+    onMount(bodyEl, footEl) {
+      const submit = footEl.querySelector('[data-submit]');
+      bodyEl.querySelectorAll('.pick').forEach((btn) => {
+        btn.onclick = () => {
+          chosen = btn.dataset.pid;
+          bodyEl.querySelectorAll('.pick').forEach((item) => item.classList.remove('pick--current'));
+          btn.classList.add('pick--current');
+          submit.disabled = false;
+        };
+      });
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-remove]').onclick = async () => {
+        const side = sides.find((item) => (item.players || []).some((p) => p.id === fromId));
+        if (!side) {
+          // 已经被替补换下（或本场没上场）：没有可移出的位置
+          toast('这位选手已经不在本场阵容里了', 'warn', 5000);
+          return;
+        }
+        const ids = (side.players || []).map((p) => p.id).filter((id) => id !== fromId);
+        Modal.close();
+        try {
+          await api(`/rounds/${encodeURIComponent(ref)}/lineup`, {
+            method: 'POST',
+            auth: true,
+            body: { side: side.key, playerIds: ids },
+          });
+          toast('已移出阵容', 'ok');
+        } catch (err) {
+          toast(err.message, 'err');
+        }
+      };
+      submit.onclick = async () => {
+        if (!chosen) {
+          toast('请先选择替补选手', 'warn');
+          return;
+        }
+        const scope = (qs('#f-scope', bodyEl) || {}).value || 'round';
+        submit.disabled = true;
+        try {
+          const res = await api(`/rounds/${encodeURIComponent(ref)}/substitute`, {
+            method: 'POST',
+            auth: true,
+            body: { fromId, toId: chosen, scope },
+          });
+          Modal.close();
+          if (res.state) App.state = res.state;
+          renderPublic();
+          hooksRenderAdmin();
+          toast(`${res.from.name} → ${res.to.name}（${res.scopeLabel}）替补已生效`, 'ok', 6000);
+          // 替补原本不在参与名单里时，服务端会把他补进本届名单
+          (res.addedToParticipants || []).forEach((name) =>
+            toast(`${name} 不在参与名单里，已自动加入本届名单`, 'info', 8000)
+          );
+          if (res.lockedRounds?.length) {
+            toast(`已打完的 ${res.lockedRounds.length} 场保留原阵容与比分`, 'info', 7000);
+          }
+          if (res.conflictRounds?.length) {
+            toast(`${res.conflictRounds.length} 场因替补已在该场阵容中而跳过`, 'warn', 7000);
+          }
+        } catch (err) {
+          submit.disabled = false;
+          toast(err.message, 'err', 7000);
+        }
+      };
     },
   });
+}
+
+/** 取消一处替补：把换上的选手换回原主（已结算的比赛不改写）。 */
+async function cancelSubstitution(id) {
+  if (!window.confirm('取消这处替补？被换下的选手会回到他的位置（已结算的比赛不改写）。')) return;
+  Modal.close();
+  try {
+    const res = await api(`/substitutions/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+      auth: true,
+    });
+    if (res.state) App.state = res.state;
+    renderPublic();
+    hooksRenderAdmin();
+    toast('已取消这处替补', 'ok');
+    if (res.lockedRounds?.length) {
+      toast(`已打完的 ${res.lockedRounds.length} 场保留原阵容与比分`, 'info', 7000);
+    }
+  } catch (err) {
+    toast(err.message, 'err', 6000);
+  }
 }
 
 function fillSlot(ref, side) {
@@ -1734,16 +2016,15 @@ async function deleteEvent(id) {
   }
 }
 
-function openPlayerEditModal(player, defaults = {}) {
+function openPlayerEditModal(player) {
   const url = player?.avatar || '';
-  const isSub = player ? Boolean(player.substitute) : Boolean(defaults.substitute);
   // 隐私字段（UUID / QQ / 推流流名）只在登录后的私有数据里
   const priv = privateOf(player?.id);
   const preview = url
     ? `<img src="${esc(url)}" alt=""><span class="ava__ring"></span>`
     : esc(String(player?.name || player?.id || '?').slice(0, 1));
   Modal.open({
-    title: player ? `编辑选手 · ${player.name || player.id}` : isSub ? '新增替补' : '新增选手',
+    title: player ? `编辑选手 · ${player.name || player.id}` : '新增选手',
     body:
       `<div class="form form--2">` +
       fieldText('name', '姓名', player?.name || '') +
@@ -1772,8 +2053,6 @@ function openPlayerEditModal(player, defaults = {}) {
       `<input name="avatar" type="text" value="${esc(url)}" placeholder="或直接填写图片 URL">` +
       `</div></div></div>` +
       `<div style="grid-column:1/-1">${fieldArea('note', '备注', priv.note || '')}</div>` +
-      `<div class="field field--switch"><span class="switch">` +
-      `<input id="f-substitute" name="substitute" type="checkbox"${isSub ? ' checked' : ''}><i></i></span><label for="f-substitute">替补</label></div>` +
       `<div class="field field--switch"><span class="switch">` +
       `<input id="f-active" name="active" type="checkbox"${player?.active !== false ? ' checked' : ''}><i></i></span><label for="f-active">启用</label></div>` +
       `</div>`,
@@ -2184,7 +2463,13 @@ export async function handleAction(act, el) {
       refreshDiagIfAdmin();
       return;
     case 'export':
-      window.open(`/api/export?token=${encodeURIComponent(App.token)}`, '_blank', 'noopener');
+      // 带请求头取 blob 另存：链接里不再出现会话令牌（见 core.downloadFile）
+      try {
+        await downloadFile('/export', 'export.json');
+        toast('已开始下载导出文件', 'ok');
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
       return;
     case 'logout':
       try {
@@ -2237,7 +2522,9 @@ export async function handleAction(act, el) {
     case 'round-delete':
       return roundDelete(el.dataset.code);
     case 'member':
-      return swapMember(el.dataset.code, el.dataset.pid);
+      return openSubstituteModal(el.dataset.code, el.dataset.pid);
+    case 'sub-cancel':
+      return cancelSubstitution(el.dataset.id);
     case 'empty-slot':
       return fillSlot(el.dataset.code, el.dataset.side);
     case 'round-status':
@@ -2272,8 +2559,6 @@ export async function handleAction(act, el) {
       return clearEventTimeField(el.dataset.field);
     case 'player-add':
       return openPlayerEditModal(null);
-    case 'player-add-sub':
-      return openPlayerEditModal(null, { substitute: true });
     case 'player-edit':
       return openPlayerEditModal((App.state?.players || []).find((p) => p.id === el.dataset.id));
     case 'player-del':
@@ -2288,10 +2573,8 @@ export async function handleAction(act, el) {
       return setParticipants(null);
     case 'participants-save':
       return saveParticipants();
-    case 'team-del':
-      return deleteTeam(el.dataset.id);
-    case 'team-save':
-      return saveTeams();
+    // 注：队伍编辑（队名 / 配色 / 分组 / 成员）统一在组队台上就地完成，见 teams.js，
+    // 这里不再有「队伍信息」面板的保存与删除。
     // 注：复制按钮统一由 app.js 的 [data-copy] 委托处理（它先于 data-act 拦截），
     // 这里不再重复处理，否则会弹出两条 toast。
     default:
@@ -2363,58 +2646,8 @@ async function deletePlayer(id) {
 
 /* 选手名单的批量表单已移除：名单统一在「选手」页按人编辑（/api/config 那次整体 PUT 不再需要） */
 
-function collectTeamRows() {
-  const rows = qsa('[data-team-row]', qs('#adminPanel'));
-  const base = new Map((App.state?.teams || []).map((t) => [t.id, t]));
-  return rows.map((row) => {
-    const id = row.dataset.teamRow;
-    const prev = base.get(id) || {};
-    const get = (n) => qs(`[name="${n}"]`, row);
-    return {
-      id,
-      name: get('name').value.trim(),
-      short: get('short').value.trim(),
-      color: get('color').value.trim(),
-      group: prev.group || '',
-      playerIds: prev.playerIds || [],
-    };
-  });
-}
-
-async function saveTeams() {
-  const teams = collectTeamRows().filter((t) => t.name);
-  if (!teams.length) {
-    toast('没有可保存的队伍', 'warn');
-    return;
-  }
-  try {
-    const res = await api('/teams', { method: 'PUT', auth: true, body: { teams } });
-    toast(`已保存 ${res.count} 支队伍`, 'ok');
-    (res.warnings || []).forEach((w) => toast(w, 'warn', 6000));
-    if (res.state) App.state = res.state;
-    setTimeout(hooksRenderAdmin, 300);
-  } catch (err) {
-    toast(err.message, 'err');
-  }
-}
-
-async function deleteTeam(id) {
-  const teams = (App.state?.teams || []).filter((t) => t.id !== id);
-  if (!teams.length) {
-    toast('至少要保留一支队伍', 'warn');
-    return;
-  }
-  if (!window.confirm('删除队伍属于结构性变更，会清空当前赛程。确认继续？')) return;
-  try {
-    const res = await api('/teams', { method: 'PUT', auth: true, body: { teams } });
-    toast('已删除队伍', 'ok');
-    (res.warnings || []).forEach((w) => toast(w, 'warn', 6000));
-    if (res.state) App.state = res.state;
-    setTimeout(hooksRenderAdmin, 300);
-  } catch (err) {
-    toast(err.message, 'err');
-  }
-}
+/* 队伍的保存 / 删除也已移除：全部在「组队台」上就地完成（static/js/teams.js 的 save()）——
+ * 「队伍信息」面板与组队台功能重叠，重复的表单只会各自漂移。 */
 
 /* ------------------------------ 头像 ------------------------------ */
 /**
@@ -2509,7 +2742,7 @@ async function saveParticipants() {
 /* ------------------------------ 表单 ------------------------------ */
 const NUMERIC_RULE_KEYS = [
   'teamSize', 'totalRounds', 'pointsWin', 'pointsLose', 'pointsDraw',
-  'targetScore', 'minRankPlayed', 'groupCount', 'knockoutSize', 'bestOf',
+  'targetScore', 'minRankPlayed', 'groupCount', 'knockoutSize',
 ];
 
 const PATCH_BUILDERS = {

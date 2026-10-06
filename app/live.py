@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import time
+from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -34,6 +35,7 @@ from .auth import verify_secret
 from .logging_conf import get_logger
 from .models import Config, LiveBan, NTEModel, StreamConfig
 from .store import store
+from .ws import hub
 
 log = get_logger("live")
 
@@ -41,9 +43,27 @@ router = APIRouter(prefix="/api/live", tags=["live"])
 
 # 校验证书 / 不校验证书各一个连接池（证书校验只能在创建客户端时指定）
 _clients: dict[bool, httpx.AsyncClient] = {}
+#: 这些连接池是在哪个事件循环上建的（见 :func:`_client_get`）
+_clients_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _client_get(verify: bool = True) -> httpx.AsyncClient:
+    """取一个连接池（证书校验 / 不校验各一个）。
+
+    ``httpx.AsyncClient`` **绑死在创建它的那个事件循环上**：换一个循环再拿旧客户端发请求，
+    会直接报 ``RuntimeError: Event loop is closed``（连接池里全是上一个循环的句柄）。
+    长驻服务只有一个循环，但脚本里反复 ``asyncio.run``、测试里每个用例一个新循环都会撞上
+    ——所以这里记住建池时的循环，发现换了就整体重建（旧池的子连接已经没用了，
+    异步关闭也不敢在别的循环里 await，直接丢引用交给 GC）。
+    """
+    global _clients_loop
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _clients_loop is not loop:
+        _clients.clear()
+        _clients_loop = loop
     client = _clients.get(verify)
     if client is None:
         client = httpx.AsyncClient(
@@ -57,21 +77,28 @@ def _client_get(verify: bool = True) -> httpx.AsyncClient:
 
 
 async def aclose() -> None:
+    global _clients_loop
     for client in list(_clients.values()):
         await client.aclose()
     _clients.clear()
+    _clients_loop = None
 
 
 # =========================================================================== #
-# 按需探测：**请求处理路径永不等待媒体服务器**
+# 探测策略：**常驻后台探测 + 请求路径只读缓存**
 #
 # 媒体服务器（MediaMTX）不可达时，一次探测要一直等到超时才返回。以前
 # ``/api/state`` 会同步等 4 次这样的探测（主直播间 / 选手 / 成员频道 / 状态视图），
 # 媒体服务器没开时首屏就要卡十几秒 —— 而且只缓存成功结果，失败还会反复重试。
 #
-#   * 探测**按需触发**：只有前端在直播 / 频道页请求 ``/api/live/health`` 时才安排一次
-#     后台探测（``kick_refresh``），没人看直播时后端完全不做任何探测；
+# 现在的分工：
+#
+#   * **常驻探测**（:func:`watch_loop`，由启动流程拉起）：没人访问也一直在探
+#     （间隔见 ``WATCH_INTERVAL`` / ``WATCH_IDLE_INTERVAL``），所以「谁在直播」永远是
+#     新数据，任何页面一打开读到的就是刚探回来的结果；状态**变了**就通过 WebSocket
+#     广播出去（``{"type": "live"}``），前端因此不必频繁轮询；
 #   * ``/api/state`` 与 ``/api/live/health`` **只读缓存**，因此永远毫秒级返回；
+#     前者顺手 ``kick_refresh`` 兜一下（有人刚打开页面时催一次，避免看到一轮前的数据）；
 #   * 只有显式 ``probe=1``（「刷新信号」）才现场同步探测。
 # =========================================================================== #
 #
@@ -209,12 +236,13 @@ def ready_paths_snapshot() -> set[str] | None:
 
     以下三种情况都返回 ``None``（= 查不到）：
 
-    * 还没探测过；
+    * 还没探测过（冷启动的头一两秒）；
     * 上次探测失败（媒体服务器未配置 / 不可达）；
-    * 缓存已经太旧（超过 ``_SNAPSHOT_MAX_AGE``）——没人看直播就不再刷新，
-      不能让最后一次结果永久挂成「直播中」。
+    * 缓存已经太旧（超过 ``_SNAPSHOT_MAX_AGE``）——常驻探测（:func:`watch_loop`）
+      每几秒刷一次，所以「过期」只可能是探测任务停了或媒体服务器一直不可达；
+      宁可说「查不到」，也不能把最后一次结果永久挂成「直播中」。
 
-    新鲜度由按需刷新负责（见 :func:`kick_refresh`），请求处理方直接拿走即可。
+    新鲜度由常驻探测负责，请求处理方直接拿走即可。
     """
     if time.monotonic() - _ready_cache["at"] > _SNAPSHOT_MAX_AGE:
         return None
@@ -257,12 +285,284 @@ async def streaming_member_uids() -> list[str]:
     return [m.uid for m in store.members() if logic.clean_key(m.stream_id) in ready]
 
 
+# --------------------------------------------------------------------------- #
+# B站直播：**只探开播状态 + 直嵌官方外链播放器**
+#
+# 成员的 B站 直播和 MediaMTX 那套完全独立：视频流我们**一概不碰**
+# （不中继、不转码、不代理），只做两件事：
+#
+# 1. 用 B站**免登录**的开播状态接口判断他此刻在不在播：
+#    ``GET https://api.live.bilibili.com/room/v1/Room/get_info?room_id=<房间号>``
+#    里的 ``live_status``（0 未开播 / 1 直播中 / 2 轮播）；
+# 2. 在播时告诉前端「把官方外链播放器嵌进来」，并把跳转地址一并给出。
+#
+# 播放器用的是 B站官方文档里的「嵌入活动播放器」：
+# ``https://www.bilibili.com/blackboard/live/live-activity-player.html?cid=<房间号>``
+# （`danmaku` / `logo` / `sendpanel` 参数见官方文档，0 = 不显示）。
+#
+# 两条刻意的约定：
+#
+# * 探测失败**不影响任何别的直播功能**：当作「不知道」，前端仍给出跳转链接，
+#   观众照样能点进 B站 看（只是本站不再自己判断「在播」）；
+# * 探测结果同样只读缓存（``BILI_TTL``），由按需刷新更新——请求路径永不等待 B站。
+# --------------------------------------------------------------------------- #
+BILI_API = "https://api.live.bilibili.com/room/v1/Room/get_info"
+BILI_ROOM_PAGE = "https://live.bilibili.com/{room}"
+BILI_EMBED = "https://www.bilibili.com/blackboard/live/live-activity-player.html"
+BILI_TTL = 20.0          # 开播状态可复用多久（B站 有风控，别打太勤）
+BILI_TIMEOUT = 4.0       # 单次探测超时
+#: B站 接口对浏览器特征比较敏感：没有 UA 容易直接 403，Referer 也一并带上
+BILI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    ),
+    "Referer": "https://live.bilibili.com/",
+}
+_bili_cache: dict[str, Any] = {
+    "at": float("-inf"),
+    "known": False,
+    "rooms": {},
+    "missing": {},
+    "reason": "",
+}
+
+
+def bili_jump_url(room: str) -> str:
+    """B站直播间跳转地址（观众点「在 B站打开」用）。"""
+    return BILI_ROOM_PAGE.format(room=room) if room else ""
+
+
+def bili_embed_url(room: str) -> str:
+    """B站官方外链播放器地址（**直连 B站，不经本站**）。
+
+    关掉弹幕、水印与右侧互动区：这一路是嵌在赛场页面里的一个画面，
+    要弹幕 / 送礼这些完整功能请点「在 B站打开」。
+    """
+    if not room:
+        return ""
+    return f"{BILI_EMBED}?cid={room}&danmaku=0&logo=0&sendpanel=0"
+
+
+def _bili_area(data: dict[str, Any]) -> str:
+    """B站直播间分区（字段名在不同版本里换过几次，这里按候选依次取）。"""
+    for key in ("area_name", "parent_area_name", "areaName", "parentName"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _bili_live_time(data: dict[str, Any]) -> str:
+    """开播时间：B站 给的是**秒级时间戳字符串**，这里转成本站的 ISO 文本。
+
+    拿不到就返回空串（前端不显示这一行），不要为了「看起来完整」编一个时间。
+    """
+    raw = str(data.get("live_time") or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return ""
+    try:
+        # 本地无时区（与站内其它时间戳一致），因此不传 tz
+        return datetime.fromtimestamp(int(raw)).replace(microsecond=0).isoformat()  # noqa: DTZ006
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def bili_rooms_wanted() -> dict[str, str]:
+    """需要探测的房间号 → 成员 uid（只取启用且有房间号的成员）。"""
+    return {
+        m.bili_room: m.uid
+        for m in store.members()
+        if m.active and m.bili_room
+    }
+
+
+async def bili_probe(*, force: bool = False) -> dict[str, Any]:
+    """探测成员们的 B站 直播间是否在播（结果进缓存）。
+
+    ``known=False`` 表示**一个都没探到**（网络不通 / 被风控）：这时前端不该说
+    「没人播」，只能说「不知道」——和 MediaMTX 那套一样，宁可不说，不给假信息。
+    """
+    wanted = bili_rooms_wanted()
+    if not wanted:
+        _bili_cache.update(
+            {"at": time.monotonic(), "known": True, "rooms": {}, "missing": {}, "reason": ""}
+        )
+        return bili_snapshot()
+    if not force and time.monotonic() - _bili_cache["at"] < BILI_TTL:
+        return bili_snapshot()
+
+    client = _client_get(True)
+
+    async def one(room: str) -> tuple[str, dict[str, Any] | None, str]:
+        """返回 ``(房间号, 详情 | None, 错误说明)``。
+
+        「**明确没有这个直播间**」与「**探测失败**」分开记：前者是确定的答案
+        （填错了，能直接告诉人），后者只能叫「不知道」。混成一种就会把
+        「房间号写错了」说成「B站 暂时不可用」，用户永远查不出问题在哪。
+        """
+        try:
+            resp = await client.get(
+                BILI_API, params={"room_id": room}, headers=BILI_HEADERS, timeout=BILI_TIMEOUT
+            )
+            if resp.status_code != 200:
+                return room, None, f"B站接口返回 HTTP {resp.status_code}"
+            payload = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return room, None, f"B站接口不可达：{exc.__class__.__name__}"
+        code = int(payload.get("code") or 0)
+        if code != 0:
+            message = str(payload.get("message") or f"B站返回 code={code}")
+            # -400 = 房间不存在；其余（-352 / -412 之类）是风控或参数问题
+            return room, None, ("不存在" if code == -400 else "") + message
+        data = payload.get("data") or {}
+        status = int(data.get("live_status") or 0)
+        return (
+            room,
+            {
+                "room": str(data.get("room_id") or room),
+                "shortId": str(data.get("short_id") or ""),
+                "live": status == 1,
+                "replay": status == 2,          # 2 = 轮播（不在直播，但也不是「没开播」）
+                # 以下这些就是「开播后自动同步到本站」的东西：标题、主播名、
+                # 在线人数、分区、开播时间——全部按需从 B站 现取，不需要成员手填。
+                "title": str(data.get("title") or ""),
+                "uname": str(data.get("uname") or ""),
+                "online": int(data.get("online") or 0),
+                "uid": str(data.get("uid") or ""),
+                "area": _bili_area(data),
+                "liveTime": _bili_live_time(data),
+            },
+            "",
+        )
+
+    results = await asyncio.gather(*(one(room) for room in sorted(wanted)))
+    rooms: dict[str, dict[str, Any]] = {}
+    missing: dict[str, str] = {}
+    errors: list[str] = []
+    for room, info, error in results:
+        if info is not None:
+            rooms[room] = info
+        elif error:
+            if "不存在" in error:
+                missing[room] = error
+            else:
+                errors.append(error)
+    # 「知道」= 至少有一个房间得到了确定答案（存在，或明确不存在）
+    known = bool(rooms or missing)
+    reason = ""
+    if not known:
+        # 同一个原因反复出现只留一条，日志 / 界面都不至于刷屏
+        reason = errors[0] if errors else "B站接口没有返回可用的房间信息"
+        log.warning("B站 直播状态探测失败（不影响其它直播功能） | %s", reason)
+    else:
+        for room in missing:
+            log.info("B站 直播间不存在（房间号可能填错）| room=%s", room)
+        if errors:
+            log.debug("部分 B站 直播间探测失败 | %s", "；".join(errors[:3]))
+    _bili_cache.update(
+        {
+            "at": time.monotonic(),
+            "known": known,
+            "rooms": rooms,
+            "missing": missing,
+            "reason": reason,
+        }
+    )
+    return bili_snapshot()
+
+
+def bili_snapshot() -> dict[str, Any]:
+    """**只读缓存**的 B站 开播状态（绝不发网络请求）。"""
+    fresh = time.monotonic() - _bili_cache["at"] <= max(BILI_TTL * 3, 60.0)
+    rooms = _bili_cache["rooms"] if fresh else {}
+    missing = _bili_cache["missing"] if fresh else {}
+    known = bool(_bili_cache["known"]) if fresh else False
+    return {
+        "known": known,
+        "reason": "" if known else (_bili_cache["reason"] or "尚未检测 B站 开播状态"),
+        "rooms": rooms,
+        # B站 **明确说没有**的直播间（房间号多半填错了）：与「探不到」不是一回事
+        "missing": missing,
+        # 正在直播的那些（room 号 → 详情），前端据此多出一路 B站 机位
+        "live": {room: info for room, info in rooms.items() if info.get("live")},
+    }
+
+
+def bili_view() -> dict[str, Any]:
+    """给前端 / 推送用的 B站 直播视图。
+
+    ``items`` 是**正在直播**的成员，除了 uid / 名字，还带上从 B站 现取的
+    **标题 / 主播名 / 在线人数 / 分区 / 开播时间**——这些就是「开播后自动同步到本站」
+    的东西，成员不需要（也没法）在这里手填。
+
+    播放器与跳转地址一律用 B站 返回的**真实房间号**（``room_id``）：成员填短号也能用，
+    而外链播放器的 ``cid`` 只认真实房间号。
+    """
+    owners = {m.bili_room: m for m in store.members() if m.active and m.bili_room}
+    items: list[dict[str, Any]] = []
+    for room, info in (bili_snapshot().get("live") or {}).items():
+        member = owners.get(room)
+        if member is None:
+            continue
+        real = str(info.get("room") or room)
+        items.append(
+            {
+                "uid": member.uid,
+                "name": member.display_name,
+                # room = 成员填的那个（可能只是短号），roomId = B站 认的真实房间号
+                "room": room,
+                "roomId": real,
+                "shortId": str(info.get("shortId") or ""),
+                "uname": str(info.get("uname") or ""),
+                "title": str(info.get("title") or member.room_title or ""),
+                "online": int(info.get("online") or 0),
+                "area": str(info.get("area") or ""),
+                "liveTime": str(info.get("liveTime") or ""),
+                "embed": bili_embed_url(real),
+                "jump": bili_jump_url(real),
+            }
+        )
+    items.sort(key=lambda item: str(item["name"]))
+    snap = bili_snapshot()
+    return {"known": bool(snap["known"]), "reason": str(snap["reason"]), "items": items}
+
+
+async def bili_check(room: str) -> str:
+    """填完房间号**当场验一次**，返回给人看的一句话（空串 = 不用提示）。
+
+    只做提示、**不拦保存**：B站 接口可能不可达或被风控，因为第三方抖动而不让保存
+    房间号是本末倒置——填错的人至少能立刻看到「查不到这个直播间」，而不是等到开播那天
+    才发现这里一直不出画面。
+
+    顺带把缓存刷成最新的：刚保存就要在直播页看到它，没必要再等一轮后台探测。
+    """
+    if not room:
+        return ""
+    await bili_probe(force=True)
+    snap = bili_snapshot()
+    if room in (snap.get("missing") or {}):
+        return f"B站 查不到直播间 {room}：房间号可能写错了（也可以直接粘直播间链接）"
+    info = snap["rooms"].get(room)
+    if not snap["known"] or info is None:
+        return (
+            f"暂时无法确认 B站 直播间 {room}（{snap['reason'] or '接口没给出确定答案'}）："
+            "房间号填对了就会在开播后自动出现，稍后可在直播页「刷新信号」再看"
+        )
+    if info.get("live"):
+        title = info.get("title") or "未填标题"
+        return f"B站 直播间 {room} 正在直播：《{title}》——标题与在线人数会自动同步"
+    title = info.get("title") or "暂无"
+    return f"B站 直播间 {room} 已确认存在（当前未开播，上次标题：{title}）"
+
+
 # 直播各路的称呼（群里 / 推送里展示用）
 LIVE_KIND_LABEL = {
     "main": "主直播间",
     "player": "选手机位",
     "member": "成员直播间",
     "channel": "成员频道",
+    "bili": "B站直播",
 }
 # 同一个流名常常同时对应「选手 / 成员 / 频道」（本来就常是同一个人），
 # 展示时只留信息最全的那一层：选手带比赛上下文，其次成员，最后频道。
@@ -322,7 +622,31 @@ async def collect_live(*, force: bool = True) -> dict[str, Any]:
             note=(rnd.label or rnd.code) if rnd is not None else "",
         )
 
-    order = {"main": 0, "player": 1, "member": 2, "channel": 3}
+    # B站直播：成员填了房间号且在播时，多出一路（画面直嵌 B站 官方播放器，不经本站）
+    for item in bili_view()["items"]:
+        entries[f"bili:{item['uid']}"] = {
+            "key": f"bili:{item['uid']}",
+            "kind": "bili",
+            "name": item["name"],
+            "title": item["title"],
+            "note": "B站直播",
+            "memberUid": item["uid"],
+            "bili": {
+                "room": item["room"],
+                "roomId": item["roomId"],
+                "uname": item["uname"],
+                "title": item["title"],
+                "online": item["online"],
+                "area": item.get("area", ""),
+                "liveTime": item.get("liveTime", ""),
+                "embed": item["embed"],
+                "jump": item["jump"],
+            },
+            # 这一路没有本站的播放地址：看的是 B站 自己的播放器
+            "play": {},
+        }
+
+    order = {"main": 0, "bili": 1, "player": 2, "member": 3, "channel": 4}
     items = sorted(entries.values(), key=lambda e: (order.get(str(e["kind"]), 9), str(e["name"])))
     main_live = bool(main_key) and main_key in keys
     main = {
@@ -336,7 +660,8 @@ async def collect_live(*, force: bool = True) -> dict[str, Any]:
     return {
         "known": known,
         "reason": "" if known else (status.get("reason") or "媒体服务器不可达，无法判断谁在推流"),
-        "enabled": bool(cfg.stream.enabled),
+        # 直播没有总开关：只要有赛事就可能有人在推流（见 models.StreamConfig.enabled）
+        "enabled": True,
         "main": main,
         "items": items,
         "total": len(items),
@@ -357,8 +682,6 @@ async def probe_ports(force: bool = False) -> dict[str, dict[str, Any]]:
     两个端口**并发**探（串行会让失败路径耗时翻倍）。
     """
     endpoints = stream_endpoints()
-    if not endpoints["enabled"]:
-        return {}
     cached = _health_cache["probes"]
     if cached is not None and not force and time.monotonic() - _health_cache["at"] < _PROBE_TTL:
         return cached
@@ -392,16 +715,22 @@ def probe_ports_snapshot() -> dict[str, dict[str, Any]]:
 
 
 async def _refresh_once() -> None:
-    """把「谁在推流」与端口可达性各刷新一次。
+    """把「谁在推流」、端口可达性与 B站 开播状态各刷新一次。
 
     异常一律吞掉（只记日志）：这是后台任务，挂掉不会再有人来重启它。
+
+    这里存的是**函数**而不是协程对象：协程一旦构造出来就必须被 await，
+    中间任何一步抛出 ``CancelledError``（关站时会）都会让后面的协程**从未被执行**，
+    于是每个请求都留下一条 "coroutine was never awaited" 的警告。
     """
-    for label, coro in (
-        ("推流状态", ready_paths(max_age=0.0)),
-        ("源端口", probe_ports()),
+    for label, factory in (
+        ("推流状态", lambda: ready_paths(max_age=0.0)),
+        ("源端口", probe_ports),
+        # B站 开播状态：和上面两项并列刷，失败只记日志（它挂了不该影响媒体服务器那条线）
+        ("B站直播状态", bili_probe),
     ):
         try:
-            await coro
+            await factory()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -413,6 +742,10 @@ def kick_refresh() -> None:
 
     这是「不卡前端」的关键：请求处理方只管调用，绝不等待探测完成。
     幂等且带节流，所以前端轮询多频繁都不会把媒体服务器打爆。
+
+    常驻探测（:func:`watch_loop`）跑起来之后，它本来就一直在刷新缓存，所以这里
+    加了一条「**刚探过就别再探**」的短路：否则一位访客打开页面就会与常驻循环
+    各探一次，白白多打一轮媒体服务器（探测本身很轻，但没必要翻倍）。
     """
     global _refresh_task, _last_refresh
     if _refresh_task is not None and not _refresh_task.done():
@@ -420,21 +753,137 @@ def kick_refresh() -> None:
     now = time.monotonic()
     if now - _last_refresh < _REFRESH_MIN_INTERVAL:
         return
+    if now - _ready_cache["at"] < _REFRESH_MIN_INTERVAL:
+        return  # 缓存刚更新过（常驻探测刚跑完）：这次不用再探
     _last_refresh = now
     _refresh_task = asyncio.create_task(_refresh_once())
 
 
-async def stop_refresher() -> None:
-    """取消尚未跑完的探测任务（关闭 HTTP 连接池之前调用）。"""
-    global _refresh_task
-    task, _refresh_task = _refresh_task, None
-    if task is None or task.done():
+# --------------------------------------------------------------------------- #
+# 常驻探测：没人看直播也一直在探
+# --------------------------------------------------------------------------- #
+#: 常驻探测间隔（秒）：**有人在播 / 有人在线**时用它。
+#: MediaMTX 的推流列表是本地 HTTP（毫秒级、几十字节），5 秒一次完全可以忽略；
+#: 换来的是「刚开播最多 5 秒后，任何页面都能看到」。
+WATCH_INTERVAL = 5.0
+#: 空闲间隔：没人开播、**也没有客户端在线**时放宽到它。
+#: 注意是「放宽」不是「停」——一停下，第一个访问者看到的又会是旧数据。
+WATCH_IDLE_INTERVAL = 20.0
+#: 单轮探测的超时兜底：媒体服务器半死不活时别把循环挂在这儿（正常远小于它）
+WATCH_STEP_TIMEOUT = 12.0
+#: 探测失败 / 超时后的重试间隔：**不能用空闲间隔去等**——那等于媒体服务器一抖，
+#: 我们就瞎 20 秒（这段时间里开播 / 下播谁都看不见）。
+WATCH_RETRY = 2.0
+
+_watch_task: asyncio.Task[None] | None = None
+
+
+def live_fingerprint(view: dict[str, Any]) -> tuple[Any, ...]:
+    """直播状态的指纹：**只有真的变了才广播**。
+
+    取的字段与前端「谁算在播」用的那一组完全对应（见 ``static/js/live.js`` 的
+    ``applyLiveHealth``）。刻意**不含**标题 / 在线人数这类细节：它们变了不值得让
+    前端重绘一遍视图（B站 标题走的是另一条数据流）。
+    """
+    bili = view.get("bili") or {}
+    return (
+        bool(view.get("pending")),
+        bool(view.get("streamingKnown")),
+        bool(view.get("mainStreaming")),
+        tuple(sorted(view.get("streaming") or ())),
+        tuple(sorted(view.get("streamingChannels") or ())),
+        tuple(sorted(view.get("streamingMembers") or ())),
+        tuple(sorted(str(item.get("uid") or "") for item in (bili.get("items") or ()))),
+    )
+
+
+def watch_delay(view: dict[str, Any] | None = None) -> float:
+    """下一轮探测该隔多久（纯函数，方便单测）。
+
+    * **有人在播** → 勤一点（``WATCH_INTERVAL``）；
+    * 没人播但**有客户端在线**（某个页面开着，可能在等开播）→ 还是勤一点；
+    * 没人播、也没人在线 → 放宽到 ``WATCH_IDLE_INTERVAL``。
+    """
+    if view is not None:
+        bili = view.get("bili") or {}
+        busy = bool(
+            view.get("mainStreaming")
+            or view.get("streaming")
+            or view.get("streamingChannels")
+            or view.get("streamingMembers")
+            or bili.get("items")
+        )
+        if busy:
+            return WATCH_INTERVAL
+    if hub.size == 0:
+        return WATCH_IDLE_INTERVAL
+    return WATCH_INTERVAL
+
+
+async def watch_loop() -> None:
+    """常驻探测循环：**没人访问也一直在探**，状态变化时通过 WebSocket 推给前端。
+
+    为什么要有它：探测以前只在「前端打开直播 / 频道页」时才触发，于是没人看的时候
+    缓存会过期（``_SNAPSHOT_MAX_AGE``），第一位访客看到的先是旧数据、还要等一轮才知道
+    谁在播。现在缓存始终是新的，页面只做「读缓存 + 收到推送时重绘」。
+
+    三件必须守住的事：
+
+    * **不拖慢任何请求**：它跑在自己的任务里，请求路径只读缓存，谁也不等它；
+    * **不打死媒体服务器**：间隔按需放大（见 :func:`watch_delay`），单轮还有超时兜底；
+    * **崩了也继续**：任何异常只记日志，循环继续下一轮——它挂掉不会有第二个进程来救。
+
+    广播的内容与 ``GET /api/live/health`` 完全一致，前端两条路径（轮询 / 推送）共用
+    同一段解析逻辑，不会出现「推送说在播、轮询说没播」的抖动。
+    """
+    key: tuple[Any, ...] | None = None
+    log.info(
+        "直播常驻探测开始 | 间隔 %.0f 秒 / 空闲 %.0f 秒", WATCH_INTERVAL, WATCH_IDLE_INTERVAL
+    )
+    while True:
+        delay = WATCH_IDLE_INTERVAL
+        try:
+            await asyncio.wait_for(_refresh_once(), timeout=WATCH_STEP_TIMEOUT)
+            view = await health_view(force=False)
+            delay = watch_delay(view)
+            current = live_fingerprint(view)
+            if current != key:
+                key = current
+                await hub.broadcast({"type": "live", "data": view})
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            log.warning("直播探测超时（跳过本轮）| 超过 %.0f 秒", WATCH_STEP_TIMEOUT)
+            delay = WATCH_RETRY
+        except Exception:
+            # 常驻任务：任何异常都只记日志，循环必须活下去（挂了不会有第二个进程来救）
+            log.exception("直播常驻探测异常（继续下一轮）")
+            delay = WATCH_RETRY
+        await asyncio.sleep(max(0.2, delay))
+
+
+def start_watcher() -> None:
+    """启动常驻探测（幂等；由启动流程调用，不要在导入期自动拉起）。"""
+    global _watch_task
+    if _watch_task is not None and not _watch_task.done():
         return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    _watch_task = asyncio.create_task(watch_loop())
+    log.info("直播常驻探测任务已启动")
+
+
+async def stop_refresher() -> None:
+    """取消常驻探测与尚未跑完的按需探测（关闭 HTTP 连接池之前调用）。"""
+    global _refresh_task, _watch_task
+    watch, _watch_task = _watch_task, None
+    task, _refresh_task = _refresh_task, None
+    for item in (watch, task):
+        if item is None or item.done():
+            continue
+        item.cancel()
+        try:
+            await item
+        except asyncio.CancelledError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -732,6 +1181,8 @@ async def live_status_view() -> dict[str, Any]:
         "count": len(ready) if ready else 0,
         "apiConfigured": bool(api),
         "reason": reason,
+        # B站 直播（另一条完全独立的链路）：只读缓存，前端据此多出 B站 机位
+        "bili": bili_view(),
     }
 
 
@@ -747,7 +1198,8 @@ def stream_endpoints() -> dict[str, Any]:
     hls = (cfg.hls_base or "").rstrip("/")
     key = (cfg.stream_key or "").strip("/") or "stream"
     return {
-        "enabled": cfg.enabled,
+        # 直播没有总开关（见 models.StreamConfig.enabled），留着这个键是为了兼容前端读法
+        "enabled": True,
         "mode": cfg.mode,
         "key": key,
         # 源站是否 HTTPS：HTTPS 站点上只能连 HTTPS 源，否则会被按混合内容拦掉
@@ -817,14 +1269,16 @@ def _friendly_error(exc: Exception) -> str:
 
 
 async def health_view(force: bool = False) -> dict[str, Any]:
-    """组装「直播链路健康」视图（接口与后台任务共用）。
+    """组装「直播链路健康」视图（接口、常驻探测与 WebSocket 推送共用同一份）。
 
-    ``force=False``（默认）**只读缓存并安排一次后台刷新**，本身不发任何网络请求——
-    这个接口会被前端在直播页轮询，绝不能因为媒体服务器不可达而挂住。
+    它就是前端的**唯一数据源**：轮询拉的是它，常驻探测推的也是它——所以「谁算在播」
+    两边口径完全一致（服务端拿 :func:`live_fingerprint` 判断要不要推，前端拿
+    ``applyLiveHealth`` 判断要不要重绘，两组字段刻意对齐）。
+
+    ``force=False``（默认）**只读缓存**（外加一次可能被跳过的后台催更），本身不等待网络——
+    这个接口会被前端轮询，绝不能因为媒体服务器不可达而挂住。
     """
     endpoints = stream_endpoints()
-    if not endpoints["enabled"]:
-        return {"ok": False, "reason": "disabled", "probes": {}}
     if force:
         # 显式刷新：现场探一次（可能等到超时，但这是用户主动要求的）
         await ready_paths(max_age=0.0)
@@ -847,7 +1301,7 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         elif not _ready_cache["attempted"]:
             api_reason = "尚未检测：正在向媒体服务器查询推流状态"
         elif _ready_cache["paths"] is not None:
-            api_reason = "推流状态已过期：离开直播页后不再检测"
+            api_reason = "推流状态已过期：后台探测没有更新成功（检查日志里的探测原因）"
         else:
             api_reason = _ready_cache.get("reason") or "MediaMTX API 不可达：请确认 api: yes 且端口已开放"
     out: dict[str, Any] = {
@@ -869,6 +1323,9 @@ async def health_view(force: bool = False) -> dict[str, Any]:
         # 主直播间（默认流名）是否有人在推：只有真的在推，前端才给出这一路信号
         "mainStreaming": bool(ready) and main_stream_key() in (ready or set()),
         "api": {"configured": bool(api), "ok": known, "url": api, "reason": api_reason},
+        # B站 直播：与媒体服务器那套**完全独立**（成员填了房间号才有），
+        # 只读缓存；在播的那些前端会多出「B站直播」机位
+        "bili": bili_view(),
     }
     if pending:
         out["reason"] = "正在检测源站端口…"

@@ -177,8 +177,30 @@ def test_cli_help_points_to_the_help_card_script(capsys):
     out = capsys.readouterr().out
     assert "tools/make_help_card.py" in out
     assert "static/help.jpg" in out
-    assert "help_card_content" in out, "要指出图上文字在哪个文件（改命令时才知道去改哪儿）"
+    # 帮助文案现在住在 app/ 里（服务启动时会自己重画那张图，tools/ 那个脚本只是薄封装）
+    assert "helpcard_content" in out, "要指出图上文字在哪个文件（改命令时才知道去改哪儿）"
     assert "tools/check_assets.py" in out
+
+
+def test_cli_help_has_no_markdown_marks(capsys):
+    """帮助是给**终端**看的：星号、反引号在这里不会变成粗体 / 代码块，只会原样印出来。
+
+    （用户直接提过这一条。强调靠用词、高亮靠颜色，见 app/console.py。）
+    """
+    assert cli.main(["--help"]) == 0
+    out = capsys.readouterr().out
+    for mark in ("**", "`", "~~"):
+        assert mark not in out, f"帮助里不该出现 Markdown 记号 {mark!r}"
+
+
+def test_cli_help_is_grouped(capsys):
+    """按用途分组，一眼能分「启动 / 自检 / 维护 / 环境变量 / 脚本」。"""
+    assert cli.main(["--help"]) == 0
+    out = capsys.readouterr().out
+    for title in ("启动服务", "启动前自检", "本机维护", "环境变量", "常见操作", "配套脚本"):
+        assert title in out, f"帮助里少了分组：{title}"
+    # 同一条命令不许出现两次（曾经 hotrun 写了两遍）
+    assert out.count("python -m app hotrun") == 1, "同一命令别在帮助里重复"
 
 
 def test_config_no_longer_carries_an_admin_key():

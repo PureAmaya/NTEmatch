@@ -8,12 +8,14 @@
 * ``require_server`` ：仅服务器管理员；
 * ``require_event``  ：赛事管理员或服务器管理员。
 
-会话 token 从请求头 ``X-NTE-Token`` 或查询参数 ``token`` 取（导出等 GET 用）。
+**会话 token 只认请求头 `X-NTE-Token`**（见 :func:`session_token`）：
+查询串里的 ``?token=`` 会原样进反向代理 / CDN 的访问日志，而且是「一个链接就能
+改数据 / 下载文件」——下载与导出改成前端带请求头取 blob（见 ``core.downloadFile``）。
 """
 
 from __future__ import annotations
 
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException
 
 from .auth import Session, auth
 from .store import store
@@ -21,12 +23,18 @@ from .store import store
 SESSION_HEADER = "X-NTE-Token"
 
 
-async def current_session(
-    request: Request, x_nte_token: str | None = Header(default=None)
-) -> Session:
-    """解析并校验会话；无效 / 过期回 401。"""
-    token = x_nte_token or request.query_params.get("token")
-    session = auth.get(token)
+def session_token(x_nte_token: str | None) -> str:
+    """从请求头取会话 token（**不接受查询串**，理由见模块开头）。"""
+    return (x_nte_token or "").strip()
+
+
+async def current_session(x_nte_token: str | None = Header(default=None)) -> Session:
+    """解析并校验会话；无效 / 过期回 401。
+
+    用 :meth:`AuthManager.resolve` 而不是内存查表：热更新换代后新进程的内存里
+    没有旧会话，它会去库里找一次（找到就放回内存），所以**更新不会把人踢下线**。
+    """
+    session = await auth.resolve(session_token(x_nte_token))
     if session is None:
         raise HTTPException(status_code=401, detail="登录无效或已过期，请重新登录")
     return session
@@ -85,9 +93,9 @@ async def require_current_event(session: Session = Depends(require_event)) -> Se
     return session
 
 
-async def optional_session(
-    request: Request, x_nte_token: str | None = Header(default=None)
-) -> Session | None:
-    """可选会话：未登录返回 ``None``（用于需要「登录可见更多」的只读接口）。"""
-    token = x_nte_token or request.query_params.get("token")
-    return auth.get(token)
+async def optional_session(x_nte_token: str | None = Header(default=None)) -> Session | None:
+    """可选会话：未登录返回 ``None``（用于需要「登录可见更多」的只读接口）。
+
+    同样走 :meth:`AuthManager.resolve`：登录状态要能活过下一次热更新换代。
+    """
+    return await auth.resolve(session_token(x_nte_token))

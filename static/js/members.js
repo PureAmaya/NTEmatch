@@ -15,6 +15,7 @@ import {
   TOKEN_KEY,
   api,
   copyText,
+  downloadFile,
   esc,
   fmtFull,
   hooks,
@@ -31,6 +32,8 @@ import {
   fieldArea,
   fieldNum,
   fieldSelect,
+  biliLiveOf,
+  biliTitleOf,
   fieldSwitch,
   fieldText,
   isMemberLive,
@@ -40,6 +43,7 @@ import {
   panelHtml,
   PUSH_TIP_LINE,
 } from './ui.js';
+import { refreshHotPanel, renderHotPanel, requestHotUpdate } from './hot.js';
 import { renderNoticeBoard, renderServerInfo } from './notices.js';
 import { loadEvents, statusBadge } from './events.js';
 import { refreshLiveHealth } from './live.js';
@@ -59,13 +63,24 @@ export async function refreshServerData({ silent = false } = {}) {
     App.server = null;
     return null;
   }
+  // 封禁列表按当前查询状态单独拉（分页 / 搜索 / 过滤在服务端做）
+  App.banQuery = App.banQuery || { page: 1, size: 20, q: '', kind: '' };
+  const banQs = new URLSearchParams({
+    page: String(App.banQuery.page || 1),
+    size: String(App.banQuery.size || 20),
+    q: String(App.banQuery.q || ''),
+    kind: String(App.banQuery.kind || ''),
+  });
   try {
-    const [members, config, guard, backups, qqbot, activity] = await Promise.all([
+    const [members, config, guard, bans, backups, qqbot, legacy, activity] = await Promise.all([
       api('/members', { auth: true }),
       api('/server/config', { auth: true }),
       api('/server/login-guard', { auth: true }),
+      api(`/server/bans?${banQs}`, { auth: true }).catch(() => ({ items: [], total: 0, page: 1, pages: 1 })),
       api('/backups', { auth: true }),
       api('/qqbot', { auth: true }),
+      // 旧数据快照是只读留存：拿不到也不该拖垮整页（旧版本升级上来才会有）
+      api('/legacy-backups', { auth: true }).catch(() => ({ backups: [], note: '' })),
       // 操作日志是「顺带看看」的东西：它挂了不该把整页拖垮，所以单独兜底
       api('/activity', { auth: true }).catch(() => ({ items: [] })),
     ]);
@@ -74,8 +89,10 @@ export async function refreshServerData({ silent = false } = {}) {
       duplicates: members.duplicates || {},
       config,
       guard,
+      bans,
       backups,
       qqbot,
+      legacy,
       activity: activity.items || [],
       at: Date.now(),
     };
@@ -104,7 +121,7 @@ const serverGateHtml = () =>
 function memberSearchMatch(m) {
   const kw = App.memberSearch.trim().toLowerCase();
   if (!kw) return true;
-  return [m.name, m.uid, m.gameUuid, m.streamId, m.roomTitle]
+  return [m.name, m.uid, m.gameUuid, m.streamId, m.roomTitle, m.biliRoom]
     .filter(Boolean)
     .some((v) => String(v).toLowerCase().includes(kw));
 }
@@ -122,6 +139,8 @@ const duplicateOf = (m) => (m.streamId ? (App.server?.duplicates || {})[m.stream
 
 function memberCardHtml(m) {
   const live = isMemberLive(m.uid);
+  // B站：填了房间号就标一下；在播时标题 / 在线人数是**开播后自动同步**过来的
+  const bili = biliLiveOf(m.uid);
   const dup = duplicateOf(m);
   const tags = [];
   if (live) tags.push(liveTag('直播中'));
@@ -141,6 +160,15 @@ function memberCardHtml(m) {
     );
   }
   if (m.active === false) tags.push('<span class="badge badge--lose">停用</span>');
+  if (m.biliRoom) {
+    tags.push(
+      bili
+        ? `<span class="badge badge--live" title="B站直播间 ${esc(m.biliRoom)}：《${esc(
+            biliTitleOf(bili)
+          )}》">B站直播中</span>`
+        : `<span class="badge badge--pending" title="B站直播间 ${esc(m.biliRoom)}">B站</span>`
+    );
+  }
   if (m.hasKey) tags.push('<span class="badge badge--pending" title="已配置登录密钥（加盐哈希）">密钥</span>');
   if (m.hasBearer) tags.push('<span class="badge badge--pending" title="已配置 Bearer 令牌（加盐哈希）">令牌</span>');
   if (m.legacyCredential) {
@@ -153,6 +181,11 @@ function memberCardHtml(m) {
   const meta = [m.uid, m.gameUuid ? `游戏 ${m.gameUuid}` : '', m.streamId ? `推流 ${m.streamId}` : '']
     .filter(Boolean)
     .join(' · ');
+  // 在 B站 直播时，这一行直接显示 B站 的**当前标题**（开播后自动同步，成员不用改这里）
+  const subText = bili ? `B站直播中：${biliTitleOf(bili)}` : m.roomTitle || m.uid;
+  const subTitle = bili
+    ? `B站直播间 ${m.biliRoom}：《${biliTitleOf(bili)}》${meta ? ` · ${meta}` : ''}`
+    : meta;
   const ops =
     `<div class="round__ops">` +
     `<button class="btn btn--sm" type="button" data-act="member-edit" data-uid="${esc(m.uid)}">编辑</button>` +
@@ -172,7 +205,7 @@ function memberCardHtml(m) {
     `<div class="pcard__band"></div>` +
     `<div class="pcard__top">${memberAvaHtml(m, 'md')}<div>` +
     `<div class="pcard__name">${esc(m.name || m.uid)}</div>` +
-    `<div class="pcard__sub" title="${esc(meta)}">${esc(m.roomTitle || m.uid)}</div>` +
+    `<div class="pcard__sub" title="${esc(subTitle)}">${esc(subText)}</div>` +
     `</div></div>` +
     (dup
       ? `<div class="pcard__tags"><span class="panel__hint">推流 ID「${esc(m.streamId)}」与 ${esc(
@@ -380,7 +413,7 @@ function backupPanelHtml() {
             `<div class="bak__name">${esc(it.name)}</div>` +
             `<div class="bak__meta">${esc(fmtFull(it.createdAt))} · ${backupSizeText(it.size)} · ` +
             `${esc(backupReasonText(it))}` +
-            (it.avatars ? ` · 头像 ${it.avatars}` : '') +
+            (it.media ? ` · 图片 ${it.media}` : '') +
             (it.ok ? '' : ' · <b>清单损坏</b>') +
             `</div></div>` +
             `<div class="tool-group">` +
@@ -392,12 +425,12 @@ function backupPanelHtml() {
         .join('') +
       `</div>`
     : `<div class="empty"><b>还没有备份</b>点上面的「立即备份」生成第一份——` +
-      `备份会打包整个数据库与头像目录。</div>`;
+      `备份会打包整个数据库与上传的图片。</div>`;
 
   const nextText = !s.enabled ? '未开启' : b.nextRunAt ? fmtFull(b.nextRunAt) : '尽快';
   const body =
     `<div class="notice">一份备份 = <b>全部数据</b>：所有届次与赛程、成员与凭据、直播封禁、` +
-    `自定义 HTML、本地上传的头像（QQ 头像缓存不算，它可再生）。` +
+    `自定义 HTML、上传的图片（通知 / 赛事信息里的插图与本地头像；QQ 头像缓存不算，它可再生）。` +
     `文件保存在服务器上的 <code>${esc(b.dir || '')}</code>。</div>` +
     `<div class="notice notice--warn" style="margin-top:8px"><b>还原会覆盖当前全部数据</b>：` +
     `服务端会先自动打一份「还原前」的安全备份，还原完成后<b>所有会话失效</b>，需要重新登录。</div>` +
@@ -419,6 +452,47 @@ function backupPanelHtml() {
     `</div>` +
     `<div style="margin-top:10px">${rows}</div>`;
   return panelHtml('备份', items.length ? `${items.length} 份` : '尚无备份', body);
+}
+
+/**
+ * 旧数据备份：**升级前的原样快照**，只供留存与下载。
+ *
+ * 与上面的「备份」是两回事：备份能还原回现在，这里的东西是「新版本已经读不动的过去」。
+ * 所以没有还原按钮——把它塞回新版本只会得到一份读不动的数据。
+ */
+function legacyPanelHtml() {
+  const box = App.server?.legacy;
+  const items = box?.backups || [];
+  if (!box) return '';
+  const rows = items.length
+    ? `<div class="bak-list">` +
+      items
+        .map(
+          (it) =>
+            `<div class="bak">` +
+            `<div class="bak__main">` +
+            `<div class="bak__name">${esc(it.name)}</div>` +
+            `<div class="bak__meta">${esc(fmtFull(it.createdAt))} · ${backupSizeText(it.size)}` +
+            ` · 届 ${it.events || 0} / 选手 ${it.players || 0} / 比赛 ${it.rounds || 0}` +
+            `</div>` +
+            (it.note ? `<div class="bak__meta">${esc(it.note)}</div>` : '') +
+            `</div>` +
+            `<div class="tool-group">` +
+            `<button class="btn btn--sm" type="button" data-act="legacy-download" data-name="${esc(it.name)}">下载</button>` +
+            `<button class="btn btn--sm btn--danger" type="button" data-act="legacy-delete" data-name="${esc(it.name)}">删除</button>` +
+            `</div></div>`
+        )
+        .join('') +
+      `</div>`
+    : `<div class="empty"><b>没有旧数据快照</b>` +
+      `升级时会自动留存，不需要手动操作。</div>`;
+  const body =
+    `<div class="notice">${esc(box.note || '')}</div>` +
+    `<div class="notice notice--warn" style="margin-top:8px">这些快照<b>不能被当前版本使用</b>，` +
+    `也没有还原入口：它们的唯一用途是「万一升级转换出了问题，原始数据还在」。` +
+    `解压后 <code>config/nte.sqlite3</code> 就是一份完整旧库，用任何 SQLite 工具都能打开。</div>` +
+    `<div style="margin-top:10px">${rows}</div>`;
+  return panelHtml('旧数据备份', items.length ? `${items.length} 份` : '无', body);
 }
 
 /**
@@ -499,6 +573,11 @@ export function qqbotPushPanelHtml(s) {
     `<button class="btn btn--sm btn--primary" type="button" data-act="qqbot-push">发送到群</button>` +
     `<span class="panel__hint" style="margin-left:auto">「预览」不会真的发送</span>` +
     `</div>` +
+    // 比赛信息会先发一张卡片图（信息 + 自动生成的比赛规则），所以预览里也把它显示出来
+    `<div id="qqbotCardBox" hidden style="margin-top:10px">` +
+    `<img id="qqbotCard" class="qqbot-card" alt="比赛信息卡片">` +
+    `<span class="field__hint">上面这张图会先发到群里；下面的文字是跟在图后面的部分</span>` +
+    `</div>` +
     `<textarea id="qqbotPreview" class="qqbot-preview" readonly rows="8" ` +
     `placeholder="点「预览」看看要发什么…"></textarea>`;
   return panelHtml('推送到群', '当前这一届 · QQ 机器人', body);
@@ -553,6 +632,7 @@ function qqbotPanelHtml() {
     `<form class="form form--2" data-form="qqbot" style="margin-top:10px">` +
     fieldSwitch('enabled', '启用群推送', q.enabled === true) +
     // 赛前提醒：站点侧定时巡检（app/remind.py），到点在群里 @ 举办者
+    fieldSwitch('imageCards', '图片推送（比赛信息发一张卡片图）', q.imageCards !== false) +
     fieldSwitch('remindEnabled', '赛前提醒（开赛前 @ 举办者）', q.remindEnabled !== false) +
     fieldText('remindLeads', '提前量（分钟，逗号分隔）', q.remindLeads || '1440,120', {
       hint: '默认「前一天 + 前 2 小时」；只在【提前量 − 1 小时, 提前量】窗口内发，避免服务重启后把「明天开赛」补发成错话',
@@ -599,7 +679,8 @@ function qqbotPanelHtml() {
     }) +
     `<div class="form-actions" style="grid-column:1/-1">` +
     `<button class="btn btn--primary" type="submit">保存推送设置</button>` +
-    `<button class="btn" type="button" data-act="qqbot-test">发送测试消息</button></div>` +
+    `<button class="btn" type="button" data-act="qqbot-test">发送测试消息</button>` +
+    `<button class="btn" type="button" data-act="qqbot-test" data-image="1">测试发图</button></div>` +
     `</form>` +
     `<div class="notice" style="margin-top:10px">当前目标会话：<code>${esc(q.umo || '未设置')}</code>` +
     (q.hasKey ? ' · API Key 已配置' : ' · <b>未配置 API Key</b>') +
@@ -626,13 +707,95 @@ function serverConfigPanelHtml() {
   return panelHtml('自定义 HTML', '服务器级 · 全局注入', body);
 }
 
+//: 封禁列表的查询状态（分页 / 搜索 / 过滤）。放在 App 上：翻页、搜索、改时长之后
+//: 都要重拉一次，状态丢了就会「搜完跳回第一页」。
+const BAN_KINDS = [
+  ['', '全部'],
+  ['permanent', '永久'],
+  ['temp', '临时'],
+  ['auto', '自动封禁（登录失败过多）'],
+  ['manual', '人工封禁'],
+];
+
+/** 剩余时长的人话（永久 / 秒 → 分 / 小时 / 天）。 */
+function banRemainText(row) {
+  if (row.permanent) return '永久';
+  const sec = Number(row.remaining) || 0;
+  if (sec >= 86400) return `约 ${Math.ceil(sec / 86400)} 天`;
+  if (sec >= 3600) return `约 ${Math.ceil(sec / 3600)} 小时`;
+  if (sec >= 60) return `约 ${Math.ceil(sec / 60)} 分钟`;
+  return `${sec} 秒`;
+}
+
+/** 封禁 IP 列表：搜索 / 过滤 / 分页 / 改时长 / 解除 / 新增。 */
+function banListHtml() {
+  const data = App.server?.bans || {};
+  const items = data.items || [];
+  const q = App.banQuery || {};
+  const total = Number(data.total) || 0;
+  const page = Number(data.page) || 1;
+  const pages = Number(data.pages) || 1;
+  const rows = items
+    .map((b) => {
+      const meta = [
+        banRemainText(b),
+        b.auto ? '自动' : '人工',
+        b.reason || '',
+        b.failures ? `失败 ${b.failures} 次` : '',
+        b.until ? `到期 ${fmtFull(b.until)}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return (
+        `<div class="url-row"><span class="url-row__value">${esc(b.ip)}</span>` +
+        `<span class="url-row__label">${esc(meta)}</span>` +
+        `<button class="btn btn--sm" type="button" data-act="ban-set" data-ip="${esc(b.ip)}" ` +
+        `data-sec="${b.permanent ? 0 : Math.max(60, Number(b.remaining) || 60)}">改时长</button>` +
+        `<button class="btn btn--sm btn--danger" type="button" data-act="login-guard-unban" ` +
+        `data-ip="${esc(b.ip)}">解除</button></div>`
+      );
+    })
+    .join('');
+  const [search, kind] = [String(q.q || ''), String(q.kind || '')];
+  return (
+    `<div class="notice" style="margin-top:12px">封禁 IP 列表：自动封禁来自登录失败，` +
+    `也可以在这里<b>手工封禁</b>任意 IP（时长填 0 = 永久）。列表存在内存里，重启即清空。</div>` +
+    `<div class="tool-group" style="margin-top:10px;flex-wrap:wrap;gap:6px">` +
+    `<input class="zfield__input" id="banSearch" placeholder="搜索 IP / 原因" value="${esc(search)}" ` +
+    `style="min-width:160px;padding:6px 8px;border:1px solid var(--line);background:var(--bg-2);color:var(--txt)">` +
+    `<select id="banKind" style="padding:6px 8px;border:1px solid var(--line);background:var(--bg-2);color:var(--txt)">` +
+    BAN_KINDS.map(
+      ([value, label]) =>
+        `<option value="${esc(value)}"${value === kind ? ' selected' : ''}>${esc(label)}</option>`
+    ).join('') +
+    `</select>` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="ban-search">搜索 / 过滤</button>` +
+    `<span class="panel__hint" style="margin-left:auto">共 ${total} 条 · 第 ${page}/${pages} 页` +
+    `${Object.keys(data.failing || {}).length ? ` · ${Object.keys(data.failing).length} 个 IP 正在失败计数` : ''}</span>` +
+    `<button class="btn btn--sm" type="button" data-act="ban-page" data-page="${page - 1}"` +
+    `${page <= 1 ? ' disabled' : ''}>上一页</button>` +
+    `<button class="btn btn--sm" type="button" data-act="ban-page" data-page="${page + 1}"` +
+    `${page >= pages ? ' disabled' : ''}>下一页</button>` +
+    (total ? `<button class="btn btn--sm btn--danger" type="button" data-act="login-guard-clear">解除全部</button>` : '') +
+    `</div>` +
+    (rows || `<div class="panel__hint" style="margin-top:8px">没有匹配的封禁记录。</div>`) +
+    // 新增封禁：表单走 members.js 里统一的服务端表单处理（data-form="ban-add"）
+    `<form class="form form--2" data-form="ban-add" style="margin-top:12px">` +
+    fieldText('ip', '封禁 IP', '', { ph: '203.0.113.7', hint: '单个 IP（不支持网段）' }) +
+    fieldNum('seconds', '时长（秒 · 0 = 永久）', 3600, {
+      hint: '常用：3600 = 1 小时、86400 = 1 天、0 = 永久',
+    }) +
+    `<div style="grid-column:1/-1">${fieldText('reason', '原因（会显示在列表里）', '手动封禁')}</div>` +
+    `<div class="form-actions" style="grid-column:1/-1">` +
+    `<button class="btn btn--primary" type="submit">封禁这个 IP</button></div></form>`
+  );
+}
+
 /** 登录失败限制（类 fail2ban）：配置 + 当前封禁列表。 */
 function loginGuardPanelHtml() {
   const g = App.server?.guard;
   if (!g) return '';
   const s = g.settings || {};
-  const bans = (g.status || {}).bans || [];
-  const failing = Object.entries((g.status || {}).failing || {});
   const proxyHint = g.proxyConfigured
     ? ''
     : `<br><b>未配置可信反向代理</b>：只能拿到直连 IP。若站点前面有反向代理 / CDN（如 EdgeOne），` +
@@ -662,28 +825,7 @@ function loginGuardPanelHtml() {
     )}</div>` +
     `<div class="form-actions" style="grid-column:1/-1">` +
     `<button class="btn btn--primary" type="submit">保存登录限制</button></div></form>` +
-    `<div class="tool-group" style="margin-top:12px">` +
-    `<span class="panel__hint">当前封禁 ${bans.length} 个 IP</span>` +
-    (bans.length
-      ? `<button class="btn btn--sm btn--danger" type="button" data-act="login-guard-clear">解除全部封禁</button>`
-      : '') +
-    `</div>` +
-    (bans.length
-      ? bans
-          .map(
-            (b) =>
-              `<div class="url-row"><span class="url-row__value">${esc(b.ip)}</span>` +
-              `<span class="url-row__label">剩余约 ${Math.max(1, Math.ceil(b.remaining / 60))} 分钟</span>` +
-              `<button class="btn btn--sm" type="button" data-act="login-guard-unban" ` +
-              `data-ip="${esc(b.ip)}">解除</button></div>`
-          )
-          .join('')
-      : `<div class="panel__hint" style="margin-top:8px">当前没有被封禁的 IP。</div>`) +
-    (failing.length
-      ? `<div class="panel__hint" style="margin-top:8px">失败中：${esc(
-          failing.map(([ip, n]) => `${ip}(${n})`).join('、')
-        )}</div>`
-      : '');
+    banListHtml();
   return panelHtml('登录限制', '类 fail2ban · 服务器级', body);
 }
 
@@ -729,8 +871,8 @@ function streamPanelHtml() {
     );
   }
   const form =
+    // 没有「启用直播」开关：只要有赛事就允许直播（见 models.StreamConfig.enabled）
     `<form class="form form--2" data-form="stream">` +
-    fieldSwitch('enabled', '启用直播', stream.enabled !== false) +
     fieldSelect(
       'mode',
       '默认播放线路',
@@ -757,10 +899,8 @@ function streamPanelHtml() {
     fieldSwitch('verifyTls', '校验源站 HTTPS 证书', stream.verifyTls !== false, {
       hint: '只影响「信号探测」；自签名证书时关掉。观众侧仍需浏览器信任的证书',
     }) +
-    `<div class="notice" style="grid-column:1/-1"><b>推流只有 WHIP；观众看直播只有两个地址：</b>` +
-    `<code>&lt;WebRTC 根地址&gt;/&lt;流名&gt;/</code>（8889）与 <code>&lt;HLS 根地址&gt;/&lt;流名&gt;/</code>（8888），` +
-    `打开就能看，播放器用的也是这两个（信令另外接 <code>/whep</code>）。地址都是<b>源站地址</b>` +
-    `（本站不做反代），因此站点是 HTTPS 时源站也要 HTTPS。</div>` +
+    `<div class="notice" style="grid-column:1/-1">下面填你自己的媒体服务器地址（<b>源站地址</b>，本站不做反代）：` +
+    `站点是 HTTPS 时，源站也要 HTTPS，否则浏览器会按混合内容拦截播放。</div>` +
     `<div style="grid-column:1/-1">${fieldText('baseUrl', 'WebRTC 根地址', stream.baseUrl, {
       hint: '8889 端口：WHIP 推流 + 观众观看地址，例如 https://live.example.com:8889',
     })}</div>` +
@@ -885,6 +1025,9 @@ export function renderServerPage() {
     membersPanelHtml() +
     eventsPanelHtml() +
     backupPanelHtml() +
+    // 热更新：内容要请求接口，放在下面异步填（见 renderHotPanel）
+    `<div class="panel" id="hotBox"></div>` +
+    legacyPanelHtml() +
     qqbotPanelHtml() +
     streamPanelHtml() +
     loginGuardPanelHtml() +
@@ -895,7 +1038,8 @@ export function renderServerPage() {
     `<div class="panel" id="serverNotices"></div>` +
     activityPanelHtml();
   renderMemberGrid();
-  // 这两块要请求接口，异步填（不拖慢整页渲染）
+  // 这几块要请求接口，异步填（不拖慢整页渲染）
+  renderHotPanel(qs('#hotBox'));
   renderServerInfo(qs('#serverInfoBox'), { title: '服务器信息', manage: true });
   renderNoticeBoard('server', qs('#serverNotices'), {
     manage: true,
@@ -926,6 +1070,7 @@ const ACTIVITY_PATH_LABEL = [
   [/^\/api\/me(\/rotate)?$/, '我的资料'],
   [/^\/api\/live\/bans/, '直播封禁'],
   [/^\/api\/backups/, '备份操作'],
+  [/^\/api\/legacy-backups/, '旧数据备份'],
   [/^\/api\/qqbot/, 'QQ 机器人'],
   [/^\/api\/server\//, '服务器设置'],
   [/^\/api\/site\/name$/, '站点名称'],
@@ -1052,6 +1197,12 @@ function meRoomPanel(m) {
     fieldText('roomTitle', '直播间名字', m.roomTitle, {
       hint: '开播后展示在频道里的标题（可随时改）',
     }) +
+    fieldText('biliRoom', 'B站直播间号（可选）', m.biliRoom || '', {
+      hint:
+        '打开你的 B站 直播间，地址里那段数字就是房间号（粘整条链接也行）。' +
+        '填了之后：你在 B站 开播时，这里会自动出现一路「B站直播」（直嵌官方播放器 + 跳转链接），' +
+        '标题与在线人数从 B站 自动同步——推流还是在 B站 客户端 / OBS 里推，本站只负责显示',
+    }) +
     `<div style="grid-column:1/-1" class="notice">` +
     (m.streamId
       ? `OBS → 推流：服务选 <b>WHIP</b>，服务器填 ` +
@@ -1171,6 +1322,12 @@ function openMemberModal(member) {
           : '成员用「推流 ID + Bearer 令牌」推流；留空则不能推流。只能用字母、数字、- 与 _',
       }) +
       fieldText('roomTitle', '直播间名字（可选）', m.roomTitle || '') +
+      fieldText('biliRoom', 'B站直播间号（可选）', m.biliRoom || '', {
+        hint:
+          '打开自己的 B站 直播间，地址里那段数字就是房间号（直接粘整条链接也行）。' +
+          '填了之后：他在 B站 开播时直播页会自动多出一路「B站直播」（直嵌官方播放器 + 跳转链接），' +
+          '**标题 / 在线人数 / 分区自动同步**，不需要在这里维护',
+      }) +
       fieldText('qq', 'QQ（可选）', m.qq || '', { hint: '仅服务端用于取头像' }) +
       fieldSelect(
         'permission',
@@ -1209,13 +1366,16 @@ function openMemberModal(member) {
     onMount(bodyEl, footEl) {
       footEl.querySelector('[data-close]').onclick = () => Modal.close();
       footEl.querySelector('[data-submit]').onclick = async () => {
-        const data = collectForm(bodyEl);
+        // 表单只发自己渲染出来的字段：改动时先把原值铺底，
+        // 这样以后新增字段也不会被一次「无关的保存」悄悄清空
+        const data = isNew ? collectForm(bodyEl) : { ...m, ...collectForm(bodyEl), uid: m.uid };
         if (!String(data.name || '').trim()) return toast('请填写名字', 'warn');
-        if (!isNew) data.uid = m.uid;
         try {
           const res = await api('/members', { method: 'POST', auth: true, body: data });
           Modal.close();
           toast('成员已保存', 'ok');
+          // B站 房间号当场验过的结果（查不到 / 正在直播…）：只提示，不拦保存
+          (res.warnings || []).forEach((msg) => toast(msg, 'info', 9000));
           await refreshServerData();
           renderServerPage();
           if (res.secretKey || res.bearerToken) {
@@ -1345,6 +1505,16 @@ function findMember(uid) {
 /** 处理成员 / 服务器相关动作；返回是否已处理（未处理则交回 actions.js）。 */
 export async function handleMemberAction(act, el) {
   switch (act) {
+    // 热更新（面板在 hot.js 里）
+    case 'hot-reload':
+      await requestHotUpdate('reload');
+      return true;
+    case 'hot-pull':
+      await requestHotUpdate('pull');
+      return true;
+    case 'hot-status':
+      await refreshHotPanel();
+      return true;
     case 'server-refresh':
       App.serverTried = false;
       App.eventsTried = false;
@@ -1370,13 +1540,16 @@ export async function handleMemberAction(act, el) {
     case 'backup-upload':
       qs('#backupFile')?.click();
       return true;
-    case 'backup-download':
-      window.open(
-        `${API}/backups/${encodeURIComponent(el.dataset.name || '')}/download?token=${encodeURIComponent(App.token)}`,
-        '_blank',
-        'noopener'
-      );
+    case 'backup-download': {
+      const name = el.dataset.name || '';
+      try {
+        await downloadFile(`/backups/${encodeURIComponent(name)}/download`, name);
+        toast('已开始下载备份', 'ok');
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
       return true;
+    }
     case 'backup-restore': {
       const name = el.dataset.name || '';
       if (!window.confirm(restoreConfirmText(`「${name}」`))) return true;
@@ -1394,6 +1567,35 @@ export async function handleMemberAction(act, el) {
       try {
         await api(`/backups/${encodeURIComponent(name)}`, { method: 'DELETE', auth: true });
         toast('备份已删除', 'ok');
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      return true;
+    }
+    case 'legacy-download': {
+      const name = el.dataset.name || '';
+      try {
+        await downloadFile(`/legacy-backups/${encodeURIComponent(name)}/download`, name);
+        toast('已开始下载旧数据快照', 'ok');
+      } catch (err) {
+        toast(err.message, 'err', 8000);
+      }
+      return true;
+    }
+    case 'legacy-delete': {
+      const name = el.dataset.name || '';
+      if (
+        !window.confirm(
+          `确认删除旧数据快照「${name}」？\n\n这是升级前的原始数据，删掉就真的没有了（不能再从别处恢复）。`
+        )
+      ) {
+        return true;
+      }
+      try {
+        await api(`/legacy-backups/${encodeURIComponent(name)}`, { method: 'DELETE', auth: true });
+        toast('旧数据快照已删除', 'ok');
         await refreshServerData();
         renderServerPage();
       } catch (err) {
@@ -1432,9 +1634,12 @@ export async function handleMemberAction(act, el) {
     }
     case 'qqbot-test': {
       try {
-        const res = await api('/qqbot/test', { method: 'POST', auth: true, body: {} });
+        const body = el.dataset.image === '1' ? { image: true } : {};
+        const res = await api('/qqbot/test', { method: 'POST', auth: true, body });
         toast(
-          res.ok ? `测试消息已发送到 ${res.umo}` : `发送失败：${res.detail || '未知原因'}`,
+          res.ok
+            ? `测试${res.image ? `图片（字段名 ${res.shape || '?'}）` : '消息'}已发送到 ${res.umo}`
+            : `发送失败：${res.detail || '未知原因'}`,
           res.ok ? 'ok' : 'err',
           8000
         );
@@ -1447,16 +1652,31 @@ export async function handleMemberAction(act, el) {
       const q = qqbotPushQuery();
       try {
         const res = await api(`/qqbot/preview?${new URLSearchParams(q).toString()}`, { auth: true });
+        // 有卡片就显示图，并且**文字只显示「图后面那几行」**（那才是真正发出去的正文）
+        const cardBox = qs('#qqbotCardBox');
+        const img = qs('#qqbotCard');
+        const parts = res.card ? res.cardText || [] : res.parts;
+        if (cardBox && img) {
+          if (res.card) {
+            img.src = res.card.url;
+            cardBox.hidden = false;
+          } else {
+            img.removeAttribute('src');
+            cardBox.hidden = true;
+          }
+        }
         const box = qs('#qqbotPreview');
         if (box) {
-          box.value = res.parts
-            .map((part, i) => (res.parts.length > 1 ? `— 第 ${i + 1} 段 —\n${part}` : part))
+          box.value = parts
+            .map((part, i) => (parts.length > 1 ? `— 第 ${i + 1} 段 —\n${part}` : part))
             .join('\n\n');
         }
-        toast(
-          `预览完成：${res.parts.length} 段` + (res.pages > 1 ? `（列表共 ${res.pages} 页）` : ''),
-          'ok'
-        );
+        const notes = [];
+        if (res.card) notes.push('1 张卡片图');
+        else if (res.imageAvailable === false) notes.push('未安装 Pillow，图片推送不可用（改发文本）');
+        notes.push(`${parts.length} 段文字`);
+        if (res.pages > 1) notes.push(`列表共 ${res.pages} 页`);
+        toast(`预览完成：${notes.join(' + ')}`, 'ok', 6000);
       } catch (err) {
         toast(err.message, 'err', 7000);
       }
@@ -1467,7 +1687,12 @@ export async function handleMemberAction(act, el) {
       if (!window.confirm('确认把这条消息发送到群里？')) return true;
       try {
         const res = await api('/qqbot/push', { method: 'POST', auth: true, body: q });
-        toast(`已发送到群（${res.sent}/${res.total} 段）`, 'ok', 6000);
+        toast(
+          `已发送到群（${res.image ? '图片 + ' : ''}${res.sent}/${res.total} 段）` +
+            (res.image === false && q.kind === 'event' ? '（图没发出去，已改为完整文本）' : ''),
+          'ok',
+          6000
+        );
       } catch (err) {
         toast(err.message, 'err', 9000);
       }
@@ -1505,6 +1730,63 @@ export async function handleMemberAction(act, el) {
     case 'me-rotate':
       await doMeRotate(el.dataset.what || 'key');
       return true;
+    case 'ban-search': {
+      // 搜索 / 过滤：回到第 1 页再拉（在第 3 页上搜出 2 条却停在 3 页会看到空列表）
+      App.banQuery = {
+        ...(App.banQuery || {}),
+        page: 1,
+        q: (qs('#banSearch')?.value || '').trim(),
+        kind: qs('#banKind')?.value || '',
+      };
+      try {
+        await refreshServerData();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      renderServerPage();
+      return true;
+    }
+    case 'ban-page': {
+      const target = Math.max(1, Number(el.dataset.page) || 1);
+      App.banQuery = { ...(App.banQuery || {}), page: target };
+      try {
+        await refreshServerData();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      renderServerPage();
+      return true;
+    }
+    case 'ban-set': {
+      const ip = el.dataset.ip || '';
+      const current = Number(el.dataset.sec) || 60;
+      const raw = window.prompt(
+        `把「${ip}」的封禁时长改成多少秒？（0 = 永久）`,
+        String(current)
+      );
+      if (raw === null) return true;
+      const seconds = Number(String(raw).trim());
+      if (!Number.isFinite(seconds) || seconds < 0) {
+        toast('时长要填一个非负整数（0 = 永久）', 'err');
+        return true;
+      }
+      try {
+        await api('/server/bans', {
+          method: 'PUT',
+          auth: true,
+          body: { ip, seconds, reason: '人工调整时长' },
+        });
+        toast(
+          seconds === 0 ? `已把 ${ip} 改为永久封禁` : `已把 ${ip} 的封禁改为 ${seconds} 秒`,
+          'ok'
+        );
+        await refreshServerData();
+        renderServerPage();
+      } catch (err) {
+        toast(err.message, 'err', 7000);
+      }
+      return true;
+    }
     case 'login-guard-unban': {
       try {
         await api(`/server/login-guard/${encodeURIComponent(el.dataset.ip || '')}`, {
@@ -1611,6 +1893,28 @@ export async function handleMemberForm(formEl) {
     }
     return true;
   }
+  if (name === 'ban-add') {
+    const v = collectForm(formEl);
+    const seconds = Math.max(0, Number(v.seconds) || 0);
+    try {
+      await api('/server/bans', {
+        method: 'PUT',
+        auth: true,
+        body: { ip: v.ip, seconds, reason: v.reason || '手动封禁' },
+      });
+      toast(
+        seconds === 0 ? `已永久封禁 ${v.ip}` : `已封禁 ${v.ip}（${seconds} 秒）`,
+        'ok',
+        6000
+      );
+      App.banQuery = { ...(App.banQuery || {}), page: 1 };
+      await refreshServerData();
+      renderServerPage();
+    } catch (err) {
+      toast(err.message, 'err', 7000);
+    }
+    return true;
+  }
   if (name === 'backup') {
     const v = collectForm(formEl);
     try {
@@ -1666,8 +1970,14 @@ export async function handleMemberForm(formEl) {
   if (name === 'me') {
     const v = collectForm(formEl);
     try {
-      await api('/me', { method: 'PUT', auth: true, body: v });
+      // 表单只发自己渲染的字段：拿当前资料铺底，免得把没渲染出来的字段（如 B站 房间号）清空
+      const res = await api('/me', {
+        method: 'PUT',
+        auth: true,
+        body: { ...(App.me?.member || {}), ...v },
+      });
       toast('资料已保存', 'ok');
+      (res.warnings || []).forEach((msg) => toast(msg, 'info', 9000));
       await refreshMeData();
       renderUserPage();
       hooks.refreshState?.();
@@ -1680,12 +1990,13 @@ export async function handleMemberForm(formEl) {
     const v = collectForm(formEl);
     const m = App.me?.member || {};
     try {
-      await api('/me', {
+      const res = await api('/me', {
         method: 'PUT',
         auth: true,
-        body: { ...m, roomTitle: v.roomTitle }, // 只改标题，其余字段原样回传
+        body: { ...m, roomTitle: v.roomTitle, biliRoom: v.biliRoom }, // 其余字段原样回传
       });
-      toast('直播间名字已保存', 'ok');
+      toast('直播间资料已保存', 'ok');
+      (res.warnings || []).forEach((msg) => toast(msg, 'info', 9000));
       await refreshMeData();
       renderUserPage();
       hooks.refreshState?.();

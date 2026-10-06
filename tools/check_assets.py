@@ -9,7 +9,8 @@
    这类错没有任何静态检查兜着，只有在浏览器里点开那个页面才会炸；
 4. ``index.html`` 里引用的 ``/static/...`` 文件真的存在；
 5. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）；
-6. **帮助图不比它的文案旧**（``static/help.jpg`` 由脚本渲染，见该函数注释）。
+6. **帮助图这一份（若有）不比它的文案旧**，且文案里没有 Markdown 记号
+   （``static/help.jpg`` 由服务启动时渲染，**不入库**，见该函数注释）。
 
 用法：``uv run python tools/check_assets.py``
 """
@@ -195,43 +196,51 @@ def check_sync_tabs_fallback() -> list[str]:
     return []
 
 
-def _help_digest() -> str | None:
-    """当前文案「应该」对应的指纹（直接加载 tools/help_card_content.py：它是零依赖的）。"""
-    path = ROOT / "tools" / "help_card_content.py"
+def _help_content():
+    """加载帮助图的内容模块（零依赖；内容在 ``app/helpcard_content.py``）。"""
+    path = ROOT / "app" / "helpcard_content.py"
     spec = importlib.util.spec_from_file_location("help_card_content", path)
     if spec is None or spec.loader is None:  # pragma: no cover - 文件在就不会走到
         return None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return str(module.source_digest())
+    return module
 
 
 def check_help_card_freshness() -> list[str]:
-    """帮助图不能比它的文案旧（``static/help.jpg`` vs ``tools/help_card_content.py``）。
+    """帮助图：**本地若有这一份，它必须与文案同步**；内容里不许有 Markdown 记号。
 
-    这张图是**代码渲染**的（``tools/make_help_card.py``），上面每一条命令群友都会照着打；
+    图是**代码渲染**的（``app/helpcard.py``），上面每一条命令群友都会照着打；
     文案改了不重画，发出去的就是一张写着旧命令的图——命令精确匹配，照着打**毫无反应**，
-    而且群里没人知道为什么。图没有版本号（地址固定 ``/help.jpg``），所以出图时把源文件
-    指纹写进 ``static/help.jpg.src.sha256``，这里比对。没放图（帮助图是可选的）就跳过。
+    而且群里没人知道为什么。
+
+    注意：这张图**不入库**，服务启动时会自动重画一份（见 ``app/helpcard.py``），
+    所以「没有这张图」是正常状态（干净检出就是这样），只比对**存在**的那一份：
+    出图时把源文件指纹写进 ``static/help.jpg.src.sha256``，这里比对。
     """
+    module = _help_content()
+    problems: list[str] = []
+    leaks = module.markdown_leaks() if module is not None else []
+    if leaks:
+        problems.append(
+            "帮助图文案里出现了 Markdown 记号（图只会画字，星号会原样印出来）：" + "、".join(leaks)
+        )
     art = ROOT / "static" / "help.jpg"
     if not art.exists():
-        print("  --  没有 static/help.jpg（帮助图可选，跳过）")
-        return []
-    want = _help_digest()
-    if want is None:  # pragma: no cover - 见上
-        return []
+        print("  --  没有 static/help.jpg（不入库，服务启动时会自动生成，跳过比对）")
+        return problems
+    if module is None:  # pragma: no cover - 见上
+        return problems
     stamp = art.with_name(art.name + ".src.sha256")
     got = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else ""
-    if got != want:
-        return [
-            (
-                "static/help.jpg 比它的文案旧（或指纹缺失）：跑一次 "
-                "`uv run --with pillow python tools/make_help_card.py` 重画"
-            )
-        ]
-    print("  OK  帮助图与文案同步（static/help.jpg）")
-    return []
+    if got != str(module.source_digest()):
+        problems.append(
+            "static/help.jpg 比它的文案旧（或指纹缺失）：重启一次服务会自动重画，"
+            "也可以跑 `uv run --with pillow python tools/make_help_card.py`"
+        )
+    if not problems:
+        print("  OK  帮助图与文案同步（static/help.jpg，且文案里没有 Markdown 记号）")
+    return problems
 
 
 def main() -> int:
