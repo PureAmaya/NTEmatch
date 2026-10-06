@@ -1401,7 +1401,7 @@ export function openQuickGroupModal() {
         { hint: '凑不满一组的人留在候选池，可在组队台里顶上' }
       ) +
       fieldNum('groupCount', '小组数（0 = 自动）', Number(rules.groupCount) || 0, {
-        hint: '自动时约 4 队一组，并尽量排满整场',
+        hint: '自动 = 在「每组排得满一场」的前提下尽量多分组（队伍越多组越多，小组赛更短）；下面会按当前人数实时预估',
       }) +
       fieldSelect('size', '淘汰赛规模', '0', sizeOpts, { hint: '人少自动短赛程（如 4/8 强）' }) +
       fieldSelect(
