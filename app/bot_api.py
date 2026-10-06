@@ -354,6 +354,13 @@ async def api_bot_manifest(
                 "note": "用 GET /api/bot/uid：游戏 UUID，群里直接回，不需要权限",
             },
             {
+                "command": "比赛UUID",
+                "kind": "uuids",
+                "args": "届次（必填）",
+                "alias": ["选手UUID", "UUID列表", "全部UUID", "nteuuid"],
+                "note": "本届参赛选手的 UUID 清单：每行「名字 UUID」，可整段复制（kind=uuids）",
+            },
+            {
                 "command": "比赛资料",
                 "kind": "—",
                 "args": "「字段 新值」/@某人（都可选）",
@@ -609,13 +616,14 @@ async def api_bot_query(
         live_info=live_info,
         scope=scope_key,
     )
-    # 「比赛信息 / 比赛详情」再多给一张**卡片图**（信息 + 自动生成的比赛规则）：
-    # 插件先发图、再发文本；没有 Pillow 时 card 为 null，文本里也已带规则摘要，
+    # 「比赛信息 / 比赛详情」再多给一张**卡片图**（信息 + 自动生成的比赛规则），
+    # 「比赛结果」给一张**结果图**（逐场比分 + 淘汰赛树状图）：插件先发图、再发文本；
+    # 没有 Pillow 时 card 为 null，文本里也已带规则摘要 / 逐场比分，
     # 所以插件那边**不需要**分支判断——照着发就行。
     site = _site_base(request)
     card_info = None
-    if cfg is not None and key in ("event", "detail") and not ref:
-        card_info = await card.card_for_event(cfg, target, state, site=site)
+    if cfg is not None and key in ("event", "detail", "result") and not ref:
+        card_info = await card.card_for_event(cfg, target, state, site=site, kind=key)
         if card_info:
             card_info = {k: v for k, v in card_info.items() if k != "bytes"}
             card_info["url"] = f"{site}{card_info['url']}"

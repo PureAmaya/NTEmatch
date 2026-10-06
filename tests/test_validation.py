@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from app import logic, tournament
 from app.defaults import default_config
-from app.models import Config, Player
+from app.models import Config, Player, Team
 
 
 def test_round_with_one_side_blank_is_reported(make_config):
@@ -121,6 +121,51 @@ def _detail_config(*, per_match: int, players: int, fmt: str = "tournament") -> 
         cfg.teams = tournament.assign_groups(teams, 2)
         cfg.rounds = tournament.build_group_rounds(cfg.teams, per_match)
     return cfg
+
+
+def test_schedule_keeps_the_groups_set_on_the_team_board():
+    """**组队台里手工分的组必须照用**。
+
+    以前 ``build_tournament`` 无条件再按顺序轮转分一遍，于是「在组队台改了分组 → 保存 →
+    生成赛程」得到的是旧分组——看起来就是改动没生效。这里用一份**刻意与算法顺序不同**
+    的分组（前 3 支排 B 组）钉住它。
+    """
+    base = default_config()
+    cfg = Config.model_validate(
+        {**base, "rules": {**base["rules"], "format": "tournament", "groupCount": 2}}
+    )
+    teams = [Team(id=f"t{i:02d}", label=f"{i} 队") for i in range(1, 7)]
+    for index, team in enumerate(teams):
+        team.group = "B" if index < 3 else "A"
+
+    rounds, _warnings, _summary = tournament.build_tournament(teams, cfg.rules)
+    by_id = {t.id: t for t in teams}
+    seen: dict[str, set[str]] = {}
+    for rnd in rounds:
+        if rnd.stage != "group":
+            continue
+        key = (rnd.label or "").split(" · ")[0].replace(" 组", "")
+        for side in rnd.sides:
+            assert by_id[side.team_id].group == key, "分组被重新排过了"
+            seen.setdefault(side.team_id, set()).add(key)
+    assert seen and all(len(groups) == 1 for groups in seen.values()), "一支队只能在一个组里"
+
+
+def test_unassigned_teams_still_get_groups():
+    """自动组队出来的队伍（一个组都没分）仍然要自动分组——不能因为上面那条就不分了。"""
+    base = default_config()
+    cfg = Config.model_validate(
+        {**base, "rules": {**base["rules"], "format": "tournament", "groupCount": 2}}
+    )
+    teams = [Team(id=f"t{i:02d}", label=f"{i} 队") for i in range(1, 7)]
+    rounds, _warnings, _summary = tournament.build_tournament(teams, cfg.rules)
+    assert {t.group for t in teams} == {"A", "B"}
+    by_id = {t.id: t for t in teams}
+    for rnd in rounds:
+        if rnd.stage != "group":
+            continue
+        key = (rnd.label or "").split(" · ")[0].replace(" 组", "")
+        assert all(by_id[side.team_id].group == key for side in rnd.sides)
 
 
 def test_rulebook_is_specific_about_the_tournament():

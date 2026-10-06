@@ -15,13 +15,16 @@
 * ``live``     —— 当前直播（主直播间 + 正在推流的选手 / 成员机位与观看地址；**全局**）
 * ``progress`` —— 赛程进展（已赛多少、正在打谁 vs 谁）
 * ``call``     —— 一键 @ 参赛者到场准备
-* ``result``   —— 比赛结果（冠军 / 榜 + 逐场比分）
+* ``result``   —— 比赛结果（**一张图**：每场小组赛比分 + 淘汰赛树状图；文本只跟一行说明）
+* ``roster``   —— 参赛名单（选手 / 队伍 / 替补）
+* ``uuids``    —— 选手 UUID（每行一个「名字 UUID」，纯文本，可整段复制）
 * ``list``     —— 全部比赛列表（分页）
 * ``detail``   —— 某一届的信息 + 进程 + 结果；带 ``ref`` 时细说那一场
 
 **图片推送**：``event`` / ``detail``（不带 ``ref``）会顺带生成一张比赛卡片
-（信息 + 规则，见 :mod:`app.card`），先发图、再发文本；图发不出去（没装 Pillow、
-AstrBot 不收图片段、拉不到图）就**退回纯文本**，信息一条不少。
+（信息 + 规则），``result`` 生成结果卡片（逐场比分 + 淘汰赛树状图），见 :mod:`app.card`；
+一律先发图、再发文本；图发不出去（没装 Pillow、AstrBot 不收图片段、拉不到图）
+就**退回纯文本**，信息一条不少。
 """
 
 from __future__ import annotations
@@ -234,9 +237,9 @@ async def _build(
 ) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
     """构建消息（返回 ``(构建结果, 目标届 id, 卡片)``）。
 
-    卡片只给 ``event`` / ``detail``（且没点名某一场）——它们是「赛前信息」；
-    进度、结果、名单这些**逐场次**的东西还是文本更合适，画成图反而看不快。
-    ``card_for_event`` 自带内容缓存与并发闸门，改过赛制才会真的重画一次。
+    卡片给 ``event`` / ``detail``（且没点名某一场）= 「比赛信息 + 规则」，
+    以及 ``result`` = 「逐场结果 + 淘汰赛树状图」。``card_for_event`` 自带内容缓存与
+    并发闸门，只有内容真的变了才会重画一次。
     """
     args = _payload(payload)
     settings = store.qqbot_settings()
@@ -264,11 +267,15 @@ async def _build(
     if (
         cfg is not None
         and settings.get("imageCards", True)
-        and args["kind"] in ("event", "detail")
+        and args["kind"] in ("event", "detail", "result")
         and not args["ref"]
     ):
         card_info = await card.card_for_event(
-            cfg, args["eventId"] or store.current_id, state, site=_site(request)
+            cfg,
+            args["eventId"] or store.current_id,
+            state,
+            site=_site(request),
+            kind=args["kind"],
         )
         if card_info:
             # QQ 客户端要能直接拉图：地址得是绝对的（注册表只认签发过的哈希）

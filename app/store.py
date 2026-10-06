@@ -773,6 +773,61 @@ class ConfigStore:
         )
         return member
 
+    async def propagate_player(self, player: Player, actor: str = "api") -> int:
+        """把**选手档案**的改动同步到关联成员（名字 / QQ / 头像 / 游戏 UUID）。
+
+        与 :meth:`propagate_member` 是一对：那边是「改成员 → 各届关联选手」，
+        这边是「改本届选手 → 成员」。两边都在**保存动作**里各写一次，不做互相回写，
+        所以不会来回打架。以前只有成员 → 选手这一个方向，在「比赛选手」里改完名字
+        成员那边还是旧的（两边看着像两个人）。
+
+        两个例外：
+
+        * **空值不倒灌**：选手档案里空着的字段不会把成员那边清掉（改个名字顺手抹掉
+          QQ / UUID 是最难查的那种坏），要清空请到成员那一侧改；
+        * **推流 ID**：必须全局唯一（两位成员撞同一个流名会串流），所以只在
+          「成员还没有推流 ID、且这个名字没人占用」时才带过去。
+        """
+        from .logic import clean_key  # 局部导入，避免模块级循环依赖
+
+        if not player.member_uid:
+            return 0
+        async with self._lock:
+            member = self.member(player.member_uid)
+            if member is None:
+                return 0
+            patch: dict[str, Any] = {}
+            if player.name and member.name != player.name:
+                patch["name"] = player.name
+            # **空值不倒灌**：选手档案里没填的东西（头像 / QQ / UUID）不该把成员那边
+            # 清掉——改个名字顺手把成员的 QQ 抹了是最难查的那种坏。要清空请到成员里改。
+            if player.qq and member.qq != player.qq:
+                patch["qq"] = player.qq
+            if player.avatar and member.avatar != player.avatar:
+                patch["avatar"] = player.avatar
+            if player.uuid and member.game_uuid != player.uuid:
+                patch["game_uuid"] = player.uuid
+            key = clean_key(player.stream_key)
+            if (
+                key
+                and not member.stream_id
+                and not any(m.stream_id == key for m in self._members if m.uid != member.uid)
+            ):
+                patch["stream_id"] = key
+            if not patch:
+                return 0
+            saved = member.model_copy(update={**patch, "updated_at": now_iso()})
+            await asyncio.to_thread(self._save_member_sync, saved)
+            self._members = [saved if m.uid == saved.uid else m for m in self._members]
+        log.warning(
+            "选手档案已同步到成员 | 选手=%s | uid=%s | 字段=%s",
+            player.display_name,
+            saved.uid,
+            "、".join(sorted(patch)),
+        )
+        await self._notify(self._config, f"player:propagate:{actor}")
+        return 1
+
     def _propagate_member_sync(self, member: Member) -> int:
         """把成员资料写回各届里与之关联的选手，返回被改动的届数。"""
         changed_events = 0

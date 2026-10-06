@@ -1800,6 +1800,10 @@ async def api_upsert_player(payload: Player, _: Session = Depends(require_curren
         player = player.model_copy(update={"member_uid": member.uid})
 
     cfg = await store.mutate(_mutate, actor="web:player-upsert")
+    # **选手 → 成员**：在「比赛选手」里改的名字 / QQ / 头像 / 游戏 UUID 同步到成员资料。
+    # 反方向（改成员 → 各届关联选手）在成员保存时做，见 store.propagate_member。
+    # 两边都只由各自的保存动作触发，不互相回写，所以不会来回覆盖。
+    await store.propagate_player(player, actor="web:player-upsert")
     return {
         "ok": True,
         "revision": cfg.revision,
@@ -1999,13 +2003,15 @@ async def api_teams_auto(payload: TeamsFormPayload, _: Session = Depends(require
 
 @app.put("/api/teams")
 async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
-    """手动调整队伍（成员 / 队名 / 缩写 / 主题色 / 分组）；队伍增删时清空赛程。
+    """手动调整队伍（成员 / 队名 / 缩写 / 主题色 / 分组）；队伍增删或改分组时清空赛程。
 
-    两条约定：
+    三条约定：
 
     * **没有成员的分组自动删除**：组队台保存时就会滤掉，接口这边同样兜一层
       （调用方不守规矩也不该留下一支空队伍——空队伍在赛程里是个永远打不了的席位）；
-    * 队伍被增删（id 集合变化）会清空赛程与比分：旧对阵引用的是已经不在的队伍。
+    * 队伍被增删（id 集合变化）会清空赛程与比分：旧对阵引用的是已经不在的队伍；
+    * **分组改了也清空赛程**：小组赛的对阵是按分组排的，留着旧对阵只会让人以为
+      「分组改了没生效」（真正生效要重新生成赛程）。
 
     比赛开始后禁止整体重排队伍（单个替补请用 ``/api/teams/{id}/substitute``）。
     """
@@ -2024,9 +2030,16 @@ async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_c
             raise HTTPException(status_code=400, detail=f"选手重复出现在多支队伍: {', '.join(dup)}")
         seen.update(team.player_ids)
 
-    before_ids = {t.id for t in store.snapshot().teams}
+    before_teams = {t.id: t for t in store.snapshot().teams}
+    before_ids = set(before_teams)
     after_ids = {t.id for t in teams}
     dropped = before_ids != after_ids
+    regrouped = any(
+        str(before_teams[t.id].group or "") != str(t.group or "")
+        for t in teams
+        if t.id in before_teams
+    )
+    stale = dropped or regrouped
     if dropped_empty:
         log.info(
             "保存队伍时丢弃 %d 个空分组 | 届=%s | 保留=%d",
@@ -2037,12 +2050,16 @@ async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_c
 
     def _mutate(data: dict[str, Any]) -> dict[str, Any]:
         merged = {**data, "teams": [t.dump() for t in teams]}
-        if dropped:
+        if stale:
             merged["rounds"] = []
         return merged
 
     cfg = await store.mutate(_mutate, actor="web:teams-update")
-    warnings = ["队伍有增删，原赛程与比分已清空，请重新生成赛程。"] if dropped else []
+    warnings: list[str] = []
+    if dropped:
+        warnings.append("队伍有增删，原赛程与比分已清空，请重新生成赛程。")
+    elif regrouped:
+        warnings.append("分组有改动，原赛程已清空，请重新生成赛程（小组赛会按新分组来排）。")
     return {
         "ok": True,
         "revision": cfg.revision,
@@ -2246,9 +2263,18 @@ def _reset_group_pairings(data: dict[str, Any]) -> int:
     return changed
 
 
-def _validate_group_rounds(rounds: list[dict[str, Any]]) -> None:
-    """同一组同一轮里每支队最多出场一次（客户端只做对调，正常不会触发）。"""
+def _validate_group_rounds(rounds: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """校验对阵并返回「每支队分别出现在哪些组」。
+
+    两条硬约束：
+
+    * 同一组同一轮里每支队最多出场一次（客户端只做对调，正常不会触发）；
+    * **一支队只能属于一个组**——跨组换队要把这支队在原组的每一场都换过去。
+      只换一半会让它同时挂在两个组上，小组名次就没法算了（必须拦下来，
+      并且把原因说清楚，不然只会看到一句「改不了」）。
+    """
     seen: dict[tuple[str, int], set[str]] = {}
+    team_groups: dict[str, set[str]] = {}
     for rnd in rounds:
         if rnd.get("stage") != "group":
             continue
@@ -2265,16 +2291,69 @@ def _validate_group_rounds(rounds: list[dict[str, Any]]) -> None:
                     detail=f"{key} 组第 {slot[1]} 轮里 {tid} 出现了两次：同一轮每支队只能打一场",
                 )
             bucket.add(tid)
+            team_groups.setdefault(tid, set()).add(key)
+    crossed = {tid: sorted(groups) for tid, groups in team_groups.items() if len(groups) > 1}
+    if crossed:
+        tid, groups = next(iter(crossed.items()))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"队伍 {tid} 同时排进了 {'、'.join(groups)} 组："
+                "跨组换队要把这支队在原组的每一场都换过去（整队互换），否则小组名次算不出来"
+            ),
+        )
+    return {tid: sorted(groups) for tid, groups in team_groups.items()}
+
+
+def _apply_group_pairings(
+    data: dict[str, Any], changes: list[GroupPairingChange], *, reset: bool = False
+) -> None:
+    """把界面提交的对阵改动**就地**写进 ``data``，并把队伍的 ``group`` 同步过去。
+
+    单独抽成纯函数是为了能直接单测：跨组换队之后 ``team.group`` 必须跟着变，
+    否则分组名单 / 选手页 / 队伍列表还写着老的分组，看起来就是「改了没生效」。
+    """
+    rounds = data.get("rounds") or []
+    teams = {str(t.get("id")): t for t in (data.get("teams") or []) if t.get("id")}
+    by_code = {str(r.get("code") or ""): r for r in rounds if r.get("stage") == "group"}
+    if reset:
+        _reset_group_pairings(data)
+    for change in changes:
+        rnd = by_code.get(change.code)
+        if rnd is None:
+            raise HTTPException(status_code=404, detail=f"小组赛对局 {change.code} 不存在")
+        sides = rnd.get("sides") or []
+        if len(change.team_ids) != len(sides):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{change.code} 需要 {len(sides)} 支队伍"
+                    f"（收到 {len(change.team_ids)} 支），场次数与编号不能改"
+                ),
+            )
+        for side, tid in zip(sides, change.team_ids):
+            team = teams.get(tid)
+            if team is None:
+                raise HTTPException(status_code=404, detail=f"队伍 {tid} 不存在")
+            _set_side_team(side, team)
+    team_groups = _validate_group_rounds(rounds)
+    # **分组跟着对阵走**：跨组换队之后队伍的 group 必须同步
+    for tid, groups in team_groups.items():
+        team = teams.get(tid)
+        if team is not None and groups and str(team.get("group") or "") != groups[0]:
+            team["group"] = groups[0]
 
 
 @app.post("/api/tournament/group-pairings")
 async def api_group_pairings(
     payload: GroupPairingsPayload, _: Session = Depends(require_current_event)
 ) -> dict[str, Any]:
-    """**开赛前**手动调整小组赛对阵（换对手 / 恢复默认）。
+    """**开赛前**手动调整小组赛对阵（换对手 / **跨组换队** / 恢复默认）。
 
     * 只允许「还没开打」时调：已锁定返回 409，小组赛已有任何结果返回 400；
     * 一次提交只换阵容，不改场次数与编号——同一组同一轮里每支队仍只打一场；
+    * **允许跨组**：把两支队整队互换（各组的每一场一起换）之后，这两支队的
+      ``group`` 会跟着对阵一起改，所以分组名单 / 选手页 / 队伍列表都同步；
     * ``reset=true`` 按分组算法重排回默认（放弃手改）。
     """
     cfg_now = store.snapshot()
@@ -2297,35 +2376,7 @@ async def api_group_pairings(
         raise HTTPException(status_code=400, detail="没有要调整的对阵")
 
     def _mutate(data: dict[str, Any]) -> dict[str, Any]:
-        rounds = data.get("rounds") or []
-        teams = {str(t.get("id")): t for t in (data.get("teams") or []) if t.get("id")}
-        by_code = {str(r.get("code") or ""): r for r in rounds if r.get("stage") == "group"}
-        if payload.reset:
-            _reset_group_pairings(data)
-        for change in payload.rounds:
-            rnd = by_code.get(change.code)
-            if rnd is None:
-                raise HTTPException(status_code=404, detail=f"小组赛对局 {change.code} 不存在")
-            sides = rnd.get("sides") or []
-            if len(change.team_ids) != len(sides):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"{change.code} 需要 {len(sides)} 支队伍"
-                        f"（收到 {len(change.team_ids)} 支），场次数与编号不能改"
-                    ),
-                )
-            key = _group_key_of(rnd)
-            for side, tid in zip(sides, change.team_ids):
-                team = teams.get(tid)
-                if team is None:
-                    raise HTTPException(status_code=404, detail=f"队伍 {tid} 不存在")
-                if str(team.get("group") or "A") != key:
-                    raise HTTPException(
-                        status_code=400, detail=f"队伍 {tid} 不在 {key} 组，不能排进这一组"
-                    )
-                _set_side_team(side, team)
-        _validate_group_rounds(rounds)
+        _apply_group_pairings(data, payload.rounds, reset=payload.reset)
         return data
 
     cfg = await store.mutate(_mutate, actor="web:group-pairings")

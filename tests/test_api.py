@@ -13,6 +13,77 @@ from app.main import AuditMiddleware, app
 from app.store import store
 
 
+# --------------------------------------------------------------------------- #
+# 小组赛对阵调整：跨组换队
+# --------------------------------------------------------------------------- #
+def _pairing_fixture() -> dict:
+    """两份小组、各两支队、各一场的小组赛数据（跨组换队用）。"""
+    return {
+        "teams": [
+            {"id": "t1", "name": "甲", "group": "A"},
+            {"id": "t2", "name": "乙", "group": "A"},
+            {"id": "t3", "name": "丙", "group": "B"},
+            {"id": "t4", "name": "丁", "group": "B"},
+        ],
+        "rounds": [
+            {
+                "code": "G-A-1-1",
+                "stage": "group",
+                "bracketRound": 1,
+                "slot": 1,
+                "label": "A 组 · 第 1 轮 · 第 1 场",
+                "sides": [{"teamId": "t1"}, {"teamId": "t2"}],
+            },
+            {
+                "code": "G-B-1-1",
+                "stage": "group",
+                "bracketRound": 1,
+                "slot": 1,
+                "label": "B 组 · 第 1 轮 · 第 1 场",
+                "sides": [{"teamId": "t3"}, {"teamId": "t4"}],
+            },
+        ],
+    }
+
+
+def test_cross_group_pairing_swaps_the_team_groups():
+    """跨组换队：两支队**整队互换**后，队伍的 ``group`` 跟着对阵一起改。
+
+    这是「跨组调整后其他界面也应当同步」的落点：分组名单 / 选手页 / 队伍列表都读 ``group``，
+    不同步就还是老的组。以前整段逻辑写在闭包里，跨组直接 400（只能同组同轮）。
+    """
+    from app.main import GroupPairingChange, _apply_group_pairings
+
+    data = _pairing_fixture()
+    _apply_group_pairings(
+        data,
+        [
+            GroupPairingChange(code="G-A-1-1", team_ids=["t3", "t2"]),
+            GroupPairingChange(code="G-B-1-1", team_ids=["t1", "t4"]),
+        ],
+    )
+    assert {t["id"]: t["group"] for t in data["teams"]} == {
+        "t1": "B",
+        "t2": "A",
+        "t3": "A",
+        "t4": "B",
+    }
+    assert [s["teamId"] for s in data["rounds"][0]["sides"]] == ["t3", "t2"]
+
+
+def test_half_crossed_team_is_rejected():
+    """只换一半（同一支队挂在两个组上）必须报错，而不是悄悄把名次算歪。"""
+    import pytest
+    from fastapi import HTTPException
+
+    from app.main import GroupPairingChange, _apply_group_pairings
+
+    data = _pairing_fixture()
+    with pytest.raises(HTTPException) as exc:
+        _apply_group_pairings(data, [GroupPairingChange(code="G-A-1-1", team_ids=["t3", "t2"])])
+    assert "同时排进了" in str(exc.value.detail)
+
+
 async def test_share_card_tags(client):
     """分享到群里抓的是**原始 HTML**，所以 og 标签必须在服务端就写对。"""
     html = (await client.get("/")).text

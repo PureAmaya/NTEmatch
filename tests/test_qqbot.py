@@ -70,6 +70,92 @@ def test_plain_text_conversion_is_idempotent():
     assert "**" not in once
 
 
+# --------------------------------------------------------------------------- #
+# 多队同场：每一方都要出现
+#
+# 真踩过：小组赛可以 3~4 队同场，而旧的「A vs B」拼法只取前两方——
+# 群消息里「四个小队打，只剩两个」。这里钉住每一方都在。
+# --------------------------------------------------------------------------- #
+def _multi_side_round() -> dict:
+    return {
+        "code": "G-A-1-1",
+        "label": "A 组 · 第 1 轮 · 第 1 场",
+        "stage": "group",
+        "stageName": "小组赛",
+        "status": "live",
+        "sets": [],
+        "sides": [
+            {"label": "甲队", "score": 4},
+            {"label": "乙队", "score": 3},
+            {"label": "丙队", "score": 2},
+            {"label": "丁队", "score": 1},
+        ],
+    }
+
+
+def test_round_line_lists_every_team_of_a_multi_team_heat():
+    """4 队同场必须**四个队都出现**（逐队列成绩，不是只写前两队的 A:B）。"""
+    line = qqbot._round_line(_multi_side_round())
+    for name in ("甲队", "乙队", "丙队", "丁队"):
+        assert name in line
+    assert ":" not in line
+
+
+def test_round_line_keeps_the_two_team_shape(make_config):
+    """2 队对阵照旧写 ``甲 2:1 乙``——多队那一改动不能把常规对阵的排版改掉。"""
+    rnd = {
+        "code": "WB-1-1",
+        "label": "半决赛 · 第 1 场",
+        "stageName": "胜者组",
+        "status": "done",
+        "sets": [],
+        "sides": [{"label": "甲队", "score": 2}, {"label": "乙队", "score": 1}],
+    }
+    assert qqbot._round_line(rnd) == "胜者组 · 半决赛 · 第 1 场 甲队 2:1 vs 乙队"
+
+
+def test_progress_and_result_messages_keep_all_sides(make_config):
+    """赛程进度 / 比赛结果的推送同样要完整：正在打的 4 队同场不能只剩两个。"""
+    cfg = make_config(teams=4)
+    live = _multi_side_round()
+    done = {**_multi_side_round(), "status": "done"}
+    for text in (
+        qqbot.build_progress_message(cfg, {"rounds": [live]}),
+        qqbot.build_result_message(cfg, {"rounds": [done]}),
+    ):
+        for name in ("甲队", "乙队", "丙队", "丁队"):
+            assert name in text, text
+
+
+def test_card_parts_shortens_the_result_text_when_the_image_is_sent():
+    """结果图发成功时，文本只留一行说明（逐场比分都在图里，文字再抄一遍就是刷屏）。"""
+    card = {"caption": "【测试赛】比赛结果 · 冠军 甲队 · 完整对阵见图"}
+    assert qqbot.card_parts("result", card, ["一大段文本"]) == [card["caption"]]
+    assert qqbot.card_parts("result", None, ["一大段文本"]) == ["一大段文本"]
+
+
+# --------------------------------------------------------------------------- #
+# 选手 UUID（纯文本清单）
+# --------------------------------------------------------------------------- #
+def test_uuids_message_is_one_line_per_player():
+    """每行一个「名字 UUID」——要能整段复制；缺 UUID 的写「—」并说明有几个。"""
+    from app.models import Config, Player
+
+    cfg = Config.model_validate(default_config())
+    cfg.event.name = "UUID 用例届"
+    cfg.players = [
+        Player(id="p1", name="甲", uuid="GAME-AAA"),
+        Player(id="p2", name="乙"),
+    ]
+    cfg.participants = []
+    lines = qqbot.build_uuids_message(cfg).splitlines()
+    assert lines[0].startswith("【NTE 比赛】UUID 用例届 · 选手 UUID")
+    body = lines[1:3]
+    assert body[0] == "甲 GAME-AAA"
+    assert body[1] == "乙 —"
+    assert "1 人还没登记 UUID" in lines[-1]
+
+
 def test_list_message_hint_points_to_a_real_command():
     """列表翻页提示必须让用户发**真实存在**的命令（以前写「发送「下一页」」）。"""
     events = [

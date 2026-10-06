@@ -903,9 +903,17 @@ def build_tournament(
     loser_bracket = bool(rules.loser_bracket)
 
     if len(teams) > 2:
-        group_count = rules.group_count or group_count_for(len(teams), per_match)
-        group_count = max(1, min(group_count, len(teams)))
-        assign_groups(teams, group_count)
+        # **组队台里手工分好的组照用**：只有「一支都没分组」（自动组队刚出来的）
+        # 才按小组数轮转分配。以前这里无条件重排一遍，等于把保存队伍时改的分组
+        # 直接丢掉——「改了分组、生成赛程却没按新的来」就是这么来的。
+        manual = all((team.group or "").strip() for team in teams)
+        if not manual:
+            group_count = rules.group_count or group_count_for(len(teams), per_match)
+            group_count = max(1, min(group_count, len(teams)))
+            assign_groups(teams, group_count)
+        else:
+            group_count = len({team.group for team in teams})
+            log.info("按组队台的分组生成小组赛 | 队伍=%d | 分组=%d", len(teams), group_count)
         rounds = build_group_rounds(teams, per_match, 1)
         shape = "组 vs 组" if per_match == 2 else f"{per_match} 队同场"
         warnings.append(

@@ -258,3 +258,113 @@ def test_rulebook_is_the_single_source(make_config):
     assert [s["title"] for s in payload["sections"]] == [
         s["title"] for s in rulebook["sections"]
     ]
+
+
+# --------------------------------------------------------------------------- #
+# 比赛结果卡片：小组赛逐场 + 淘汰赛树状图
+#
+# 「比赛结果」不再是一屏文字：每一场小组赛比分 + 每一场淘汰赛比分与晋级走向都在一张图里，
+# 淘汰赛按树状图画（与站点「对阵总览」同一套父子关系：以 srcA / srcB 为准）。
+# --------------------------------------------------------------------------- #
+def _played_tournament(*, teams: int = 8, team_size: int = 1, loser_bracket: bool = False):
+    """造一届**已经打完**的锦标赛（小组赛 + 淘汰赛都有结果），返回 ``Config``。"""
+    from app import tournament
+    from app.defaults import default_config
+    from app.models import Config, Player
+
+    base = default_config()
+    cfg = Config.model_validate(
+        {
+            **base,
+            "rules": {
+                **base["rules"],
+                "format": "tournament",
+                "teamSize": team_size,
+                "teamsPerMatch": 2,
+                "loserBracket": loser_bracket,
+            },
+        }
+    )
+    cfg.event.name = "结果图测试赛"
+    cfg.players = [
+        Player(id=f"p{i}", name=f"选手{i:02d}") for i in range(1, teams * team_size + 1)
+    ]
+    formed, _ = tournament.auto_form_teams(cfg.players, team_size, seed=11)
+    tournament.assign_groups(formed, max(1, teams // 4))
+    cfg.teams = formed
+    cfg.rounds, _warnings, _summary = tournament.build_tournament(formed, cfg.rules)
+
+    def play() -> None:
+        for rnd in cfg.rounds:
+            if rnd.status == "done":
+                continue
+            if rnd.stage == "group":
+                for index, side in enumerate(rnd.sides):
+                    side.score = len(rnd.sides) - index
+            elif all(side.team_id for side in rnd.sides):
+                rnd.sides[0].score = 3
+                rnd.sides[1].score = 1
+            else:
+                continue
+            winner = tournament.judge_round(rnd, scoring=cfg.rules.scoring)
+            if winner:
+                rnd.winner = winner
+                rnd.status = "done"
+
+    for _ in range(4):
+        cfg.rounds = tournament.resolve_tournament(formed, cfg.rounds, cfg.rules.scoring)
+        play()
+    cfg.rounds = tournament.resolve_tournament(formed, cfg.rounds, cfg.rules.scoring)
+    return cfg
+
+
+def test_result_payload_covers_every_played_match():
+    """每一场小组赛、每一场淘汰赛都要进图——少一场，读者就得回站点翻。"""
+    cfg = _played_tournament()
+    payload = card.payload_for_result(cfg, "e001", logic.build_state(cfg))
+    group_rounds = [r for r in cfg.rounds if r.stage == "group"]
+    assert sum(len(group["matches"]) for group in payload["groups"]) == len(group_rounds)
+    knockout = [r for r in cfg.rounds if r.stage in ("wb", "lb", "gf")]
+    assert {node["code"] for node in payload["tree"]["nodes"]} == {r.code for r in knockout}
+    assert payload["caption"] and "结果" in payload["caption"]
+
+
+def test_result_tree_links_follow_src_references():
+    """树状图的连线照 ``srcA`` / ``srcB`` 连：上游对局在左、下游在右。"""
+    cfg = _played_tournament()
+    tree = card.payload_for_result(cfg, "e001", logic.build_state(cfg))["tree"]
+    by_code = {node["code"]: node for node in tree["nodes"]}
+    knockout = [rnd for rnd in cfg.rounds if rnd.stage in ("wb", "lb", "gf")]
+    expected = sum(
+        1
+        for rnd in knockout
+        for ref in (rnd.src_a, rnd.src_b)
+        if str(ref).split(":")[0] in by_code
+    )
+    assert len(tree["links"]) == expected
+    assert all(link["x2"] > link["x1"] for link in tree["links"]), "连线要从上游指向下游"
+
+
+async def test_result_card_is_a_real_image(make_config):
+    """结果图要是能打开的 PNG，而且**比信息卡片宽**（树状图排下来就是更宽）。"""
+    cfg = _played_tournament(loser_bracket=True)
+    info = await card.card_for_event(
+        cfg, "e001", logic.build_state(cfg), site="http://nte.test", kind="result"
+    )
+    assert info is not None
+    path = card.resolve(f"{info['hash']}.png")
+    assert path is not None
+    from PIL import Image
+
+    with Image.open(path) as img:
+        assert img.width >= card.WIDTH
+        assert 400 < img.height < card.MAX_HEIGHT
+
+
+def test_result_card_and_info_card_do_not_share_a_cache_entry(make_config):
+    """同一届的「信息卡」与「结果卡」内容不同 → 指纹必须不同（否则发出去的是错的那张）。"""
+    cfg = _played_tournament()
+    state = logic.build_state(cfg)
+    assert card.digest(card.payload_for(cfg, "e001", state)) != card.digest(
+        card.payload_for_result(cfg, "e001", state)
+    )

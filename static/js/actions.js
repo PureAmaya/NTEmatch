@@ -592,9 +592,16 @@ function openWalkoverModal(rnd) {
 /**
  * 开赛前调整小组赛对阵：**点两个队徽即对调**。
  *
- * 只在同一组、同一轮内交换，因此每轮每队仍然只打一场、场次数与编号不变，
- * 交换只影响「谁碰谁」。每个组给出「组合覆盖 X/Y」：重复组合会标出来但**不拦**——
- * 要不要保留重复组合是组织者的自由（比如为了错开时间）。
+ * 两种对调（都保持「场次数与编号不变、每轮每队只打一场」）：
+ *
+ * * **同一组、同一轮**：只换「谁碰谁」；
+ * * **跨组**：两支队**整队互换**（各自在原来那个组里的每一场都换过去），
+ *   于是它们的分组也跟着变——服务端会把 ``group`` 一起改掉，分组名单 / 选手页
+ *   跟着同步。两组的出场次数不一样（轮空 / 组大小不同）时换不了，会当场说明。
+ *
+ * 同一组里跨轮换人仍然禁止：多队同场会有轮空，跨轮换会让某轮的出场次数对不上。
+ * 每个组给出「组合覆盖 X/Y」（按**当前草案**算，所以跨组换完立刻看得出结果）：
+ * 重复组合会标出来但**不拦**——要不要保留重复组合是组织者的自由。
  * 「恢复默认」＝请服务端按分组算法重排，放弃手改。
  */
 function openGroupPairingModal() {
@@ -640,7 +647,12 @@ function openGroupPairingModal() {
       const n = list.filter((r) => groupOf(r) === key).length;
       return { text: `${n} 场 · 每场最多 ${perMatch} 队同场`, warn: false };
     }
-    const need = new Set(pairKeys(teams.filter((t) => (t.group || 'A') === key).map((t) => t.id)));
+    // 「这组有哪些队」按**草案**算：跨组换队之后分组会变，按 team.group 算就是旧名单
+    const inGroup = new Set();
+    list
+      .filter((r) => groupOf(r) === key)
+      .forEach((r) => (draft.get(r.code) || []).forEach((id) => id && inGroup.add(id)));
+    const need = new Set(pairKeys([...inGroup]));
     const seen = [];
     list
       .filter((r) => groupOf(r) === key)
@@ -682,9 +694,21 @@ function openGroupPairingModal() {
       );
     });
     bodyEl.innerHTML =
-      `<div class="notice">开赛前可以换对手：先点一个队徽，再点<b>同一组、同一轮</b>里的另一个队徽即可对调。` +
-      `每轮每队仍然只打一场，场次数与编号不变。</div>` +
+      `<div class="notice">开赛前可以换对手：先点一个队徽，再点另一个队徽即可对调。` +
+      `<b>同一组同一轮</b>＝只换「谁碰谁」；<b>跨组</b>＝两支队<b>整队互换</b>` +
+      `（分组跟着变，分组名单 / 选手页一起同步）。场次数与编号不变，每轮每队仍然只打一场。</div>` +
       `<div class="pair__wrap">${blocks.join('')}</div>`;
+  };
+
+  /** 某支队在草案里出现的所有位置——跨组换队要**整队**互换，看的就是它。 */
+  const positionsOf = (id) => {
+    const out = [];
+    list.forEach((r) => {
+      (draft.get(r.code) || []).forEach((tid, i) => {
+        if (tid === id) out.push({ code: r.code, index: i });
+      });
+    });
+    return out;
   };
 
   const clickTeam = (bodyEl, code, index) => {
@@ -701,17 +725,48 @@ function openGroupPairingModal() {
     const a = list.find((r) => r.code === picked.code);
     const b = list.find((r) => r.code === code);
     if (!a || !b) return;
-    if (groupOf(a) !== groupOf(b) || (a.bracketRound || 0) !== (b.bracketRound || 0)) {
-      toast('只能在同一组、同一轮里对调（换轮次会打乱每轮的出场次数）', 'warn', 6000);
-      picked = { code, index };
+    const idA = (draft.get(picked.code) || [])[picked.index] || '';
+    const idB = (draft.get(code) || [])[index] || '';
+    if (!idA || !idB || idA === idB) {
+      picked = null;
       renderBody(bodyEl);
       return;
     }
-    const listA = draft.get(picked.code);
-    const listB = draft.get(code);
-    const tmp = listA[picked.index];
-    listA[picked.index] = listB[index];
-    listB[index] = tmp;
+    if (groupOf(a) === groupOf(b)) {
+      // 组内：只在同一轮内对调（多队同场有轮空，跨轮会让某轮的出场次数对不上）
+      if ((a.bracketRound || 0) !== (b.bracketRound || 0)) {
+        toast('同一组里只能在**同一轮**内对调：跨轮换人会让某轮的出场次数对不上', 'warn', 8000);
+        picked = { code, index };
+        renderBody(bodyEl);
+        return;
+      }
+      const listA = draft.get(picked.code);
+      const listB = draft.get(code);
+      const tmp = listA[picked.index];
+      listA[picked.index] = listB[index];
+      listB[index] = tmp;
+    } else {
+      // 跨组：两支队整队互换（各自组里的每一场一起换），分组随之变化
+      const posA = positionsOf(idA);
+      const posB = positionsOf(idB);
+      if (posA.length !== posB.length) {
+        toast(
+          `跨组换队要两边场次一样多：${nameOf(idA)} 出场 ${posA.length} 次、` +
+            `${nameOf(idB)} 出场 ${posB.length} 次，换不了（可先「恢复默认对阵」或重新生成赛程）`,
+          'warn',
+          9000
+        );
+        picked = { code, index };
+        renderBody(bodyEl);
+        return;
+      }
+      posA.forEach((p) => {
+        draft.get(p.code)[p.index] = idB;
+      });
+      posB.forEach((p) => {
+        draft.get(p.code)[p.index] = idA;
+      });
+    }
     picked = null;
     renderBody(bodyEl);
   };

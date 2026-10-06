@@ -137,6 +137,35 @@ async def test_profile_follows_the_member_record(admin_client):
     assert player.name == "新名字" and player.qq == "20009"
 
 
+async def test_player_edit_flows_back_to_the_member(admin_client):
+    """**反方向也要通**：在「比赛选手」里改名字 / QQ / 游戏 UUID，成员资料跟着变。
+
+    以前只有「成员 → 选手」一个方向，于是在选手那边改完、成员那边还是旧的，
+    同一个人在两处对不上（头像 / UUID 都是照成员算的，表现就是「改了没生效」）。
+    """
+    member = await _add_member("原来的名字", qq="20005", uuid="OLD-UUID")
+    await _adopt(admin_client, [member.uid])
+    player = next(p for p in store.snapshot().players if p.member_uid == member.uid)
+
+    res = await admin_client.post(
+        "/api/players",
+        json={
+            "id": player.id,
+            "name": "改过的名字",
+            "qq": "20006",
+            "uuid": "NEW-UUID",
+            "memberUid": member.uid,
+        },
+    )
+    assert res.status_code == 200, res.text
+
+    after = store.member(member.uid)
+    assert after is not None
+    assert after.name == "改过的名字"
+    assert after.qq == "20006"
+    assert after.game_uuid == "NEW-UUID"
+
+
 async def test_unchecking_keeps_the_profile(admin_client):
     """取消勾选只把他移出**名单**，档案留着——删档案会连带断掉赛程与比分。"""
     keep = await _add_member("留下的人")

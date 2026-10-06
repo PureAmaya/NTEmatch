@@ -575,7 +575,7 @@ def test_help_doc_lists_every_command(plugin_module):
     """
     source = PLUGIN.read_text(encoding="utf-8")
     commands = re.findall(r'@filter\.command\(\s*"([^"]+)"', source)
-    assert len(commands) == 22, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
+    assert len(commands) == 23, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
     doc = (PLUGIN.parent / "HELP.md").read_text(encoding="utf-8")
     for name in commands:
         assert name in plugin_module.HELP_TEXT, f"HELP_TEXT 里缺命令：{name}"

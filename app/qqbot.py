@@ -31,7 +31,7 @@ from typing import Any
 
 import httpx
 
-from . import logic, metrics
+from . import logic
 from .defaults import sport_meta
 from .logging_conf import get_logger
 from .models import Config
@@ -726,37 +726,21 @@ def _player_name(cfg: Config, player_id: str) -> str:
 
 def _side_text(side: dict[str, Any]) -> str:
     """一方的显示名：有队伍就用队名，没有就列出场选手。"""
-    label = str(side.get("label") or "").strip()
-    players = side.get("players") or []
-    if label and not re.fullmatch(r"[AB]\s*队", label):
-        return label
-    return _join_names(players)
+    return logic.side_label(side)
 
 
 def _round_line(
     rnd: dict[str, Any], *, with_stage: bool = True, scoring: object = None
 ) -> str:
-    """`八强赛 · 甲队 2:1 乙队` 这样的一行。
+    """`八强赛 · 甲队 2:1 乙队` 这样的一行；3~4 队同场时逐队列出成绩。
 
     比分按计分口径显示：时间型写 ``1:23.456``、小数按小数写；**填了轮次**时
     ``score`` 是「赢的轮数」（计数），一律按整数显示。
     """
-    sc = metrics.as_scoring(scoring) if scoring is not None else metrics.Scoring()
-    sides = rnd.get("sides") or []
-    left = _side_text(sides[0]) if sides else "待定"
-    right = _side_text(sides[1]) if len(sides) > 1 else "待定"
-    counted = bool(rnd.get("sets"))
-    # 「有没有比分」要用录入痕迹判断：数值型的 0 是合法读数，不能用真假值糊过去
-    scored = rnd.get("status") == "done" or any(sc.has_entered(s.get("score")) for s in sides)
-    scores = ""
-    if scored and len(sides) > 1:
-        scores = (
-            f" {sc.format_score(sides[0].get('score', 0), counted=counted)}"
-            f":{sc.format_score(sides[1].get('score', 0), counted=counted)}"
-        )
     head = f"{rnd.get('stageName')} · " if with_stage and rnd.get("stageName") else ""
     label = rnd.get("label") or rnd.get("code") or ""
-    return f"{head}{label} {left}{scores} vs {right}".replace("  ", " ").strip()
+    body = logic.round_sides_text(rnd, scoring)
+    return f"{head}{label} {body}".replace("  ", " ").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -805,12 +789,13 @@ def rules_digest(cfg: Config, limit: int = 14) -> str:
 
 
 def card_parts(kind: str, card: dict[str, Any] | None, parts: list[str]) -> list[str]:
-    """有卡片时，``比赛信息`` 的正文**只留一行说明**。
+    """有卡片时，``比赛信息`` / ``比赛结果`` 的正文**只留一行说明**。
 
-    信息与规则全在图里了，再补一屏文字只是刷屏；图没发出去时（不支持图片 / 拉不到图）
-    调用方原样用 ``parts``，信息一条不少——这个判断故意放在调用方（它才知道图发成功了没）。
+    信息与规则（或逐场结果）全在图里了，再补一屏文字只是刷屏；图没发出去时
+    （不支持图片 / 拉不到图）调用方原样用 ``parts``，信息一条不少——这个判断故意放在
+    调用方（它才知道图发成功了没）。
     """
-    if card and kind == "event" and card.get("caption"):
+    if card and kind in ("event", "result") and card.get("caption"):
         return [str(card["caption"])]
     return parts
 
@@ -1114,6 +1099,30 @@ def build_roster_message(cfg: Config, state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_uuids_message(cfg: Config) -> str:
+    """参赛选手的游戏 UUID：**每行一个「名字 UUID」**。
+
+    要的是一段**能整段复制**的纯文本（加好友 / 建局时一行一行填），所以正文
+    一行一个人、不加序号也不加装饰。没有登记 UUID 的人写成 ``—``，并在末尾说明
+    有几个人没登记——悄悄漏掉才是最坏的做法：照着名单加人会少一个，而没人知道少了谁。
+    """
+    name = cfg.event.name or cfg.event.title or "比赛"
+    players = logic.joined_players(cfg)
+    lines = [f"【NTE 比赛】{name} · 选手 UUID（{len(players)} 人）"]
+    missing = 0
+    for player in players:
+        uid = str(player.uuid or "").strip()
+        if not uid:
+            missing += 1
+            uid = "—"
+        lines.append(f"{player.display_name} {uid}")
+    if not players:
+        lines.append("（还没定参与名单）")
+    if missing:
+        lines.append(f"（{missing} 人还没登记 UUID：到站点「比赛选手」里补上）")
+    return "\n".join(lines)
+
+
 def build_champion_message(cfg: Config, state: dict[str, Any]) -> str:
     """冠军（锦标赛）或榜首前三（积分制）。"""
     name = cfg.event.name or cfg.event.title or "比赛"
@@ -1372,6 +1381,7 @@ KIND_META: dict[str, tuple[str, str]] = {
     "detail": ("单届详情", "信息 + 进度 + 结果；带 ref 时细说某一场"),
     "next": ("下一场", "正在打的场次；没有就报下一场与计划时间"),
     "roster": ("参赛名单", "本届参与名单（名字 / 编号 / 替补 / 队伍）"),
+    "uuids": ("选手 UUID", "参赛选手的游戏 UUID：每行一个「名字 UUID」，可整段复制"),
     "champion": ("冠军与榜首", "锦标赛的冠军，或积分制的榜首前三"),
 }
 KINDS = tuple(KIND_META)
@@ -1420,6 +1430,8 @@ def dispatch(
         text = build_next_message(cfg, state or {})
     elif kind == "roster":
         text = build_roster_message(cfg, state or {})
+    elif kind == "uuids":
+        text = build_uuids_message(cfg)
     elif kind == "champion":
         text = build_champion_message(cfg, state or {})
     elif kind == "live":

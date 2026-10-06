@@ -237,11 +237,12 @@ HELP_TEXT = (
     "· 比赛信息 [届次] —— 时间 / 赛制 / 人数 / 简介 / 比赛规则（发一张卡片图）\n"
     "· 比赛进度 [届次] —— 已赛多少、正在打谁 vs 谁\n"
     "· 比赛下一场 [届次] —— 接下来看哪场（含计划时间）\n"
-    "· 比赛结果 [届次] —— 冠军 / 榜单 + 逐场比分\n"
+    "· 比赛结果 [届次] —— 先发结果图：逐场比分 + 淘汰赛树状图\n"
     "· 比赛详情 [届次] [场次] —— 综合信息；给场次编号就细说那一场\n"
     "· 比赛名单 [届次] —— 参赛名单（选手 / 队伍 / 替补）\n"
     "· 比赛冠军 [届次] —— 冠军（或积分制榜首前三）\n"
     "· 比赛UID [@某人] —— 游戏 UUID（群里直接回；不 @ 就是你自己）\n"
+    "· 比赛UUID [届次] —— 参赛选手的 UUID 清单（每行「名字 UUID」，可整段复制）\n"
     "· 比赛届次 [我的] [页码] —— 届次编号与名称（填参数前先发它；写「我的」只看自己创建的，\n"
     "  一页装不下时私聊发你）\n"
     "· 比赛召集 [届次] —— @ 参赛者到场（本届创建者＝举办者 / 服务器管理员，带冷却）\n"
@@ -978,6 +979,16 @@ class NTEMatchPlugin(star.Star):
     async def cmd_detail(self, event: AstrMessageEvent, event_id: str = "", ref: str = ""):
         """某一届的详情；带场次编号（如 L-1）时细说那一场。"""
         async for block in self._run("detail", event_id, ref):
+            yield self._emit(event, block)
+
+    @filter.command("比赛UUID", alias={"选手UUID", "UUID列表", "全部UUID", "nteuuid"})
+    async def cmd_uuids(self, event: AstrMessageEvent, event_id: str = ""):
+        """本届参赛选手的游戏 UUID 清单：**每行一个「名字 UUID」**，可整段复制。
+
+        与 `比赛UID` 的分工：那条查**一个人**（不 @ 就是你自己），这条一次列全本届
+        选手——建局 / 加好友时要的就是这么一段纯文本。
+        """
+        async for block in self._run("uuids", event_id):
             yield self._emit(event, block)
 
     @filter.command("比赛召集", alias={"召集参赛", "集合", "喊人"})

@@ -12,11 +12,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from . import league, markdown
+from . import league, markdown, metrics
 from . import tournament as T
 from .defaults import SPORT_WORDS
 from .logging_conf import get_logger
@@ -306,6 +307,58 @@ def round_player_ids(rnd: Round) -> list[str]:
             if pid not in out:
                 out.append(pid)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 对局文案：**纯文本推送和结果卡片共用同一份**
+#
+# 这两处原本各写一套「A vs B」的拼法，多队同场（3~4 队）时只取前两方，
+# 结果整支队伍从消息里消失。现在统一在这里算，谁也别再自己拼。
+# --------------------------------------------------------------------------- #
+def side_label(side: dict[str, Any]) -> str:
+    """一方的显示名：有队名 / 标签就用它，否则列出出场选手；都没有 = 「待定」。
+
+    ``round_view`` 会给没有队伍的席位兜一个「A 队 / B 队」的占位标签（那是给
+    只看两队对阵的兼容路径用的），它不是真队名，不能直接显示。
+    """
+    label = str(side.get("label") or "").strip()
+    if label and not re.fullmatch(r"[AB]\s*队", label):
+        return label
+    names = [str(p.get("name") or p.get("id") or "") for p in (side.get("players") or [])]
+    names = [name for name in names if name]
+    return "、".join(names) if names else "待定"
+
+
+def round_sides_text(rnd: dict[str, Any], scoring: object = None) -> str:
+    """一场比赛各方的展示文本——**每一方都在**，无论同场几队。
+
+    * 2 队对阵：``甲 2:1 乙``（比分夹在中间，与网页一致）；
+    * 3~4 队同场：``甲 2 · 乙 1 · 丙 0 · 丁 3``（成绩跟在各自队名后面）。
+
+    只取前两方会**吞掉整支队伍**——「四个小队打，消息里只剩两个」就是这么来的。
+    """
+    sc = metrics.as_scoring(scoring) if scoring is not None else metrics.Scoring()
+    sides = rnd.get("sides") or []
+    counted = bool(rnd.get("sets"))
+    scored = rnd.get("status") == "done" or any(sc.has_entered(s.get("score")) for s in sides)
+    if len(sides) <= 2:
+        left = side_label(sides[0]) if sides else "待定"
+        right = side_label(sides[1]) if len(sides) > 1 else "待定"
+        scores = ""
+        if scored and len(sides) > 1:
+            scores = (
+                f" {sc.format_score(sides[0].get('score', 0), counted=counted)}"
+                f":{sc.format_score(sides[1].get('score', 0), counted=counted)}"
+            )
+        return f"{left}{scores} vs {right}".replace("  ", " ").strip()
+    parts: list[str] = []
+    for side in sides:
+        name = side_label(side)
+        if scored:
+            parts.append(f"{name} {sc.format_score(side.get('score', 0), counted=counted)}")
+        else:
+            parts.append(name)
+    return " · ".join(parts)
 
 
 def current_round_of(cfg: Config, player_id: str) -> Round | None:
