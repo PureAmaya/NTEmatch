@@ -130,6 +130,34 @@ ChangeHook = Callable[[Config, str], Awaitable[None]]
 Finalizer = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def _follow_roster_change(
+    cfg: Config,
+    merged: dict[str, Any],
+    before: set[str],
+    warnings: list[str],
+) -> dict[str, Any]:
+    """参与名单变化之后的赛制跟进（积分制重排未结算对局 / 锦标赛制提示重新组队）。
+
+    ``set_participants``（手工勾选手）与 ``adopt_members``（从成员列表勾人）**共用这一份**
+    ——分两处写迟早会漂移：一个会重排、另一个只提示，用户看到的就是「同样改了名单，
+    结果不一样」。
+    """
+    chosen = list(merged.get("participants") or [])
+    if not chosen:
+        if cfg.rounds:
+            warnings.append("本届参与名单为空：现有赛程仍按旧名单保留，可重新生成或清空赛程。")
+        return merged
+    if cfg.rounds and before == set(chosen):
+        return merged
+    if cfg.rules.format == "league" and cfg.rounds:
+        rounds, warns = league.reconcile_rounds(Config.model_validate(merged))
+        merged["rounds"] = [r.dump() for r in rounds]
+        warnings.extend(warns)
+    elif cfg.rounds:
+        warnings.append("参与名单已变化：现有队伍与赛程仍是按旧名单生成的，请重新组队并生成赛程。")
+    return merged
+
+
 def now_iso() -> str:
     """本地时区的 ISO 秒级时间戳（刻意使用本地无时区表示，便于前端直接展示）。"""
     return datetime.now().replace(microsecond=0).isoformat()  # noqa: DTZ005
@@ -1267,21 +1295,7 @@ class ConfigStore:
             chosen = normalize_participants(cfg, ids)
             # 显式保存过就置位：此后「空名单」也是一份真正的名单（不再回落成全员参与）
             merged = {**data, "participants": chosen, "participantsSet": True}
-            if not chosen:
-                if cfg.rounds:
-                    warnings.append(
-                        "本届参与名单为空：现有赛程仍按旧名单保留，可重新生成或清空赛程。"
-                    )
-                return merged
-            if cfg.rounds and before == set(chosen):
-                return merged
-            if cfg.rules.format == "league" and cfg.rounds:
-                rounds, warns = league.reconcile_rounds(Config.model_validate(merged))
-                merged["rounds"] = [r.dump() for r in rounds]
-                warnings.extend(warns)
-            elif cfg.rounds:
-                warnings.append("参与名单已变化：现有队伍与赛程仍是按旧名单生成的，请重新组队并生成赛程。")
-            return merged
+            return _follow_roster_change(cfg, merged, before, warnings)
 
         cfg = await self.mutate(_mutate, actor=actor, resolve=False)
         log.warning(
@@ -1291,6 +1305,91 @@ class ConfigStore:
             len(cfg.players),
         )
         return cfg, warnings
+
+    async def adopt_members(
+        self,
+        member_uids: list[str],
+        player_ids: list[str],
+        actor: str = "api",
+    ) -> tuple[Config, list[str], list[str]]:
+        """把**勾选的成员**纳入本届参赛：缺档案的按成员资料建好，然后写参与名单。
+
+        这就是「本届名单从成员列表来」的那一步——勾一个成员，他就参加这一届：
+
+        * 该成员本届**已有档案** → 直接用，并顺手把姓名 / QQ / 头像 / 游戏 UUID
+          同步成成员资料里的最新值（选手档案只是成员在本届的一份投影）；
+        * **还没有档案** → 按成员资料建一个（id 沿用 ``p01`` 这套编号）；
+        * ``player_ids``：前端另外勾选的**非成员选手**（手工登记的客串），
+          一并并入名单——否则一次保存就会把他们从参与名单里挤出去。
+
+        返回 ``(配置, 新建的选手 ID, 提示)``。
+        """
+        from .logic import joined_players, normalize_participants  # 局部导入，避免模块级循环
+
+        by_uid = {m.uid: m for m in self._members}
+        warnings: list[str] = []
+        created: list[str] = []
+
+        def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+            cfg = Config.model_validate(data)
+            before = {p.id for p in joined_players(cfg)}
+            players = data.setdefault("players", [])
+            index = {str(p.get("memberUid") or ""): p for p in players if p.get("memberUid")}
+            used = {str(p.get("id") or "") for p in players}
+            chosen = [pid for pid in player_ids if pid]
+            for uid in dict.fromkeys(member_uids):
+                member = by_uid.get(uid)
+                if member is None:
+                    continue
+                hit = index.get(uid)
+                if hit is None:
+                    seq = 1
+                    while f"p{seq:02d}" in used:
+                        seq += 1
+                    pid = f"p{seq:02d}"
+                    used.add(pid)
+                    players.append(
+                        {
+                            "id": pid,
+                            "name": member.name,
+                            "uuid": member.game_uuid or "",
+                            "qq": member.qq,
+                            "avatar": member.avatar or "",
+                            "memberUid": uid,
+                        }
+                    )
+                    created.append(pid)
+                    chosen.append(pid)
+                    continue
+                chosen.append(str(hit.get("id") or ""))
+                patch: dict[str, Any] = {}
+                if member.name and hit.get("name") != member.name:
+                    patch["name"] = member.name
+                if hit.get("qq") != member.qq:
+                    patch["qq"] = member.qq
+                if member.avatar and hit.get("avatar") != member.avatar:
+                    patch["avatar"] = member.avatar
+                if member.game_uuid and hit.get("uuid") != member.game_uuid:
+                    patch["uuid"] = member.game_uuid
+                if patch:  # 只补有变化的，免得白改一遍 revision
+                    hit.update(patch)
+            # 名单要按**新建之后的**报名池校验与排序（拿旧 cfg 会把刚建的人当不存在丢掉）
+            merged = {**data, "participants": [], "participantsSet": True}
+            merged["participants"] = normalize_participants(
+                Config.model_validate(merged), chosen
+            )
+            return _follow_roster_change(cfg, merged, before, warnings)
+
+        cfg = await self.mutate(_mutate, actor=actor, resolve=False)
+        log.warning(
+            "已按成员列表更新参赛名单 | 届=%s | 勾选成员=%d | 新建档案=%d | 参与=%d/%d 人",
+            self._current,
+            len(member_uids),
+            len(created),
+            len(cfg.participants),
+            len(cfg.players),
+        )
+        return cfg, created, warnings
 
     async def form_teams(
         self,

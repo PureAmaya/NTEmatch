@@ -610,7 +610,15 @@ function participantsPanelHtml(s) {
           `重新勾选并保存后才会按新名单重排。`
       : `尚未指定，默认<b>全员参与</b>（${players.length} 人）；保存后即成为显式名单。`) +
     `</div>` +
+    `<div class="notice" style="margin-top:8px">` +
+    `名单以<b>成员列表</b>为准：点「从成员列表选择」勾人参加本届——本届还没有档案的会` +
+    `<b>按成员资料自动建好</b>（姓名 / QQ / 头像 / 游戏 UUID），以后改成员资料这里跟着更新。` +
+    `下面的勾选框是本届已有的选手档案，需要时也能直接改。` +
+    `</div>` +
     `<div class="tool-group" style="margin-top:10px">` +
+    `<button class="btn btn--sm btn--primary" type="button" data-act="participants-members">` +
+    `从成员列表选择</button>` +
+    `<span class="tool-group__sep"></span>` +
     `<button class="btn btn--sm" type="button" data-act="participants-all">全选</button>` +
     `<button class="btn btn--sm" type="button" data-act="participants-none">全不选</button>` +
     `<button class="btn btn--sm" type="button" data-act="participants-invert">反选</button>` +
@@ -626,7 +634,7 @@ function participantsPanelHtml(s) {
   const locked = Boolean(s.event?.locked);
   return panelHtml(
     '本届参与名单',
-    locked ? '比赛已开始 · 名单已锁定' : '手动选择上场选手',
+    locked ? '比赛已开始 · 名单已锁定' : '来自成员列表 · 勾选参加本届',
     lockedWrap(
       body +
         (locked

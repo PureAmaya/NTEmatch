@@ -2565,6 +2565,8 @@ export async function handleAction(act, el) {
       return deletePlayer(el.dataset.id);
     case 'avatar-refresh':
       return refreshAvatar(el.dataset.id);
+    case 'participants-members':
+      return openRosterMembersModal();
     case 'participants-all':
       return setParticipants(true);
     case 'participants-none':
@@ -2687,6 +2689,149 @@ async function refreshAvatar(pid) {
 }
 
 /* --------------------------- 本届参与名单 --------------------------- */
+/**
+ * 「从成员列表选择参赛者」：勾一位成员 = 他参加这一届。
+ *
+ * 与下面那排勾选框的区别：这里列的是**成员**（全局那一份，含本届还没有档案的人）。
+ * 勾上之后服务端按成员资料把选手档案建好（姓名 / QQ / 头像 / 游戏 UUID），
+ * 所以不必先去「选手」页手工登记一遍；取消勾选只是把他移出名单，**档案留着**
+ * （档案一删，赛程与比分就断了）。
+ */
+async function openRosterMembersModal() {
+  let data;
+  try {
+    data = await api('/roster/members', { auth: true });
+  } catch (err) {
+    toast(err.message || '读取成员列表失败', 'err');
+    return;
+  }
+  const members = data.members || [];
+  const loose = data.loosePlayers || [];
+  const explicit = Boolean(data.participantsSet);
+  const avaOf = (m) =>
+    m.hasAvatar
+      ? `<img class="ava ava--xs" src="/api/avatar/m/${encodeURIComponent(m.uid)}?size=40"` +
+        ` alt="" loading="lazy">`
+      : `<span class="ava ava--xs ava--placeholder">${esc(String(m.name || '?').slice(0, 1))}</span>`;
+  const memberRow = (m) => {
+    const idle = m.active === false;
+    const meta = (m.playerId ? m.tag || m.playerId : '本届还没有档案') + (idle ? ' · 已停用' : '');
+    return (
+      `<label class="pick${m.selected ? '' : ' pick--off'}${idle ? ' pick--disabled' : ''}"` +
+      ` data-name="${esc(String(m.name || '').toLowerCase())}">` +
+      `<input type="checkbox" data-role="roster-member" value="${esc(m.uid)}"` +
+      `${m.selected ? ' checked' : ''}${idle ? ' disabled' : ''}>` +
+      avaOf(m) +
+      `<span class="pick__txt"><span class="who__name">${esc(m.name || m.uid)}</span>` +
+      `<span class="pick__meta">${esc(meta)}</span></span></label>`
+    );
+  };
+  const looseRow = (p) =>
+    `<label class="pick${p.selected ? '' : ' pick--off'}"` +
+    ` data-name="${esc(String(p.name || '').toLowerCase())}">` +
+    `<input type="checkbox" data-role="roster-loose" value="${esc(p.id)}"${p.selected ? ' checked' : ''}>` +
+    `<span class="pick__txt"><span class="who__name">${esc(p.name || p.id)}</span>` +
+    `<span class="pick__meta">${esc(p.tag || p.id)} · 没有账号</span></span></label>`;
+
+  Modal.open({
+    title: '从成员列表选择参赛者',
+    body:
+      `<div class="notice">名单来自<b>成员列表</b>：勾上就参加这一届；本届还没有档案的会` +
+      `<b>按成员资料自动建好</b>（姓名 / QQ / 头像 / 游戏 UUID），以后改成员资料这里跟着更新。` +
+      `取消勾选只把他移出名单，<b>档案会留着</b>（赛程与比分不受影响）。` +
+      (explicit ? '' : '当前<b>未指定名单</b>（默认全员参与），保存后会成为一份显式名单。') +
+      `</div>` +
+      `<div class="tool-group" style="margin-top:10px">` +
+      `<div class="field" style="max-width:220px;margin:0">` +
+      `<input id="rosterMemberSearch" placeholder="搜姓名…"></div>` +
+      `<button class="btn btn--sm" type="button" data-roster="all">全选</button>` +
+      `<button class="btn btn--sm" type="button" data-roster="none">全不选</button>` +
+      `<span class="panel__hint" style="margin-left:auto">已选 ` +
+      `<b data-role="roster-count">0</b> 人</span>` +
+      `</div>` +
+      `<div class="pick-grid" data-role="roster-grid">` +
+      (members.map(memberRow).join('') || '<div class="empty"><b>还没有成员</b>先在「服务器 → 成员管理」里添加</div>') +
+      `</div>` +
+      (loose.length
+        ? `<div class="notice" style="margin-top:10px">` +
+          `没有账号的客串选手（手工登记的，不受成员列表影响）</div>` +
+          `<div class="pick-grid">${loose.map(looseRow).join('')}</div>`
+        : ''),
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-submit>保存参赛名单</button>`,
+    onMount(bodyEl, footEl) {
+      const boxes = () =>
+        Array.from(
+          bodyEl.querySelectorAll('[data-role="roster-member"], [data-role="roster-loose"]')
+        );
+      const countEl = bodyEl.querySelector('[data-role="roster-count"]');
+      const sync = () => {
+        boxes().forEach((box) =>
+          box.closest('.pick')?.classList.toggle('pick--off', !box.checked)
+        );
+        if (countEl) countEl.textContent = String(boxes().filter((b) => b.checked).length);
+      };
+      boxes().forEach((box) => box.addEventListener('change', sync));
+      sync();
+      bodyEl.querySelectorAll('[data-roster]').forEach((btn) => {
+        btn.onclick = () => {
+          const on = btn.dataset.roster === 'all';
+          boxes()
+            .filter((b) => !b.disabled)
+            .forEach((b) => {
+              b.checked = on;
+            });
+          sync();
+        };
+      });
+      const search = bodyEl.querySelector('#rosterMemberSearch');
+      if (search) {
+        search.oninput = () => {
+          const term = search.value.trim().toLowerCase();
+          bodyEl.querySelectorAll('.pick[data-name]').forEach((row) => {
+            row.hidden = Boolean(term) && !row.dataset.name.includes(term);
+          });
+        };
+      }
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-submit]').onclick = async () => {
+        const btn = footEl.querySelector('[data-submit]');
+        const memberUids = Array.from(
+          bodyEl.querySelectorAll('[data-role="roster-member"]:checked')
+        ).map((b) => b.value);
+        const playerIds = Array.from(
+          bodyEl.querySelectorAll('[data-role="roster-loose"]:checked')
+        ).map((b) => b.value);
+        btn.disabled = true;
+        try {
+          const res = await api('/roster/members', {
+            method: 'POST',
+            auth: true,
+            body: { memberUids, playerIds },
+          });
+          Modal.close();
+          const created = (res.created || []).length;
+          toast(
+            `参赛名单已更新：${res.count} 人` +
+              (created ? `（新建 ${created} 份选手档案）` : ''),
+            'ok',
+            6000
+          );
+          (res.warnings || []).forEach((w) => toast(w, 'warn', 8000));
+          if (res.state) App.state = res.state;
+          if (hooks.refreshState) await hooks.refreshState();
+          hooksRenderAdmin();
+          refreshDiagIfAdmin();
+        } catch (err) {
+          toast(err.message || '保存失败', 'err', 8000);
+          btn.disabled = false;
+        }
+      };
+    },
+  });
+}
+
 const participantBoxes = () => qsa('[data-role="participant"]', qs('#adminPanel'));
 
 function syncPickStyle(box) {

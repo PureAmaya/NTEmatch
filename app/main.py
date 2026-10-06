@@ -1676,6 +1676,80 @@ async def api_export(_: Session = Depends(require_current_event)) -> Response:
 # --------------------------------------------------------------------------- #
 # 选手
 # --------------------------------------------------------------------------- #
+class RosterMembersPayload(NTEModel):
+    """「从成员列表选择参赛者」提交的内容。
+
+    ``member_uids`` 是勾选的成员；``player_ids`` 是另外勾选的**非成员选手**
+    （手工登记的客串），一起提交免得被挤出去。
+    """
+
+    member_uids: list[str] = Field(default_factory=list)
+    player_ids: list[str] = Field(default_factory=list)
+
+
+@app.get("/api/roster/members")
+async def api_roster_members(_: Session = Depends(require_current_event)) -> dict[str, Any]:
+    """「选择参赛成员」用的候选：**全部成员** + 他在本届的档案情况 + 手工选手。
+
+    名单的**来源是成员列表**（全局那一份）。这里**不下发 QQ**——勾选只需要姓名、
+    「有没有档案」「参不参加」，敏感字段不必为这个界面多说一句。
+    """
+    cfg = store.snapshot()
+    by_uid = {p.member_uid: p for p in cfg.players if p.member_uid}
+    selected = {p.id for p in logic.joined_players(cfg)}
+    rows = [
+        {
+            "uid": member.uid,
+            "name": member.display_name,
+            "active": bool(member.active),
+            "hasAvatar": bool(member.has_avatar_source),
+            "playerId": by_uid[member.uid].id if member.uid in by_uid else "",
+            "tag": by_uid[member.uid].tag if member.uid in by_uid else "",
+            "selected": member.uid in by_uid and by_uid[member.uid].id in selected,
+        }
+        for member in store.members()
+    ]
+    loose = [
+        {"id": p.id, "name": p.display_name, "tag": p.tag, "selected": p.id in selected}
+        for p in cfg.players
+        if not p.member_uid
+    ]
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "members": rows,
+        "loosePlayers": loose,
+        "participantsSet": logic.has_custom_roster(cfg),
+        "participants": [p.id for p in logic.joined_players(cfg)],
+    }
+
+
+@app.post("/api/roster/members")
+async def api_roster_adopt_members(
+    payload: RosterMembersPayload, _: Session = Depends(require_current_event)
+) -> dict[str, Any]:
+    """把勾选的**成员**纳入本届参赛（缺档案的自动建好），并写成本届参与名单。
+
+    这就是「本届名单从成员列表来」的那一步——勾一个成员，他就参加这一届：
+    姓名 / QQ / 头像 / 游戏 UUID 从成员资料带进选手档案；以后改成员资料，
+    各届里关联的选手会跟着更新（见 ``store.propagate_member``）。
+    """
+    _require_unlocked("参赛名单")
+    cfg, created, warnings = await store.adopt_members(
+        payload.member_uids, payload.player_ids, actor="web:roster-members"
+    )
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "created": created,
+        "warnings": warnings,
+        "participants": [p.id for p in logic.joined_players(cfg)],
+        "count": len(cfg.participants),
+        "explicit": logic.has_custom_roster(cfg),
+        "state": build_public_state(cfg),
+    }
+
+
 @app.post("/api/players")
 async def api_upsert_player(payload: Player, _: Session = Depends(require_current_event)) -> dict[str, Any]:
     player = payload.model_copy()
