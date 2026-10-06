@@ -33,9 +33,11 @@ import {
   biliKey,
   biliKnown,
   biliLiveItems,
+  biliRoomFor,
   boardHeadHtml,
   channelAvaHtml,
   formChips,
+  isBiliLive,
   isChannelLive,
   isLivePlayer,
   isMainLive,
@@ -970,14 +972,22 @@ function groupSectionHtml(s) {
 
 /* 多组并行：以卡片列出所有正在进行的对局 */
 
+/** 这位选手此刻在不在 B站 直播（按他关联的成员算；B站 那一路与媒体服务器无关）。 */
+function isBiliPlayer(pid) {
+  const player = (App.state?.players || []).find((p) => p.id === pid);
+  return Boolean(player?.memberUid) && isBiliLive(player.memberUid);
+}
+
 /**
  * 本场在播的机位数。
  *
- * 判定只有一条：**设置了推流流名，且媒体服务器确认在推流**（``isLivePlayer``）。
- * 光配了流名、人还没开播的不算——界面上因此不会出现点了没反应的「直播入口」。
+ * **两条链路都算**：本站推流（``isLivePlayer``，媒体服务器确认在推）与 B站 直播
+ * （``isBiliPlayer``，成员填了房间号且服务端探到在播）。光配了流名 / 房间号、
+ * 人还没开播的不算——界面上因此不会出现点了没反应的「直播入口」。
  */
 const roundLiveCams = (rnd) =>
-  (rnd?.streams?.cast || []).filter((c) => isLivePlayer(c.playerId)).length;
+  (rnd?.streams?.cast || []).filter((c) => isLivePlayer(c.playerId) || isBiliPlayer(c.playerId))
+    .length;
 
 function renderNowPlaying(s) {
   const host = qs('#nowPlaying');
@@ -2262,10 +2272,12 @@ const visibleChannels = (s) => (s.channels || []).filter((c) => c.active || canE
 /**
  * 成员直播间 → 与「频道」同构的合成对象（带 ``member:true``）。
  *
- * 成员只要配了推流 ID 就自动出现在频道里（无需管理员审批），开播与否以
- * 媒体服务器上报为准；关联比赛时带上比赛信息，被禁时带上封禁状态。
+ * **两条链路都算「在播」**：本站推流（MediaMTX，登记了推流 ID）与 **B站 直播**
+ * （成员填了房间号，服务端探到他正在播）。B站 那一路不走本站媒体服务器，
+ * 画面直嵌 B站 官方播放器，所以这里把房间信息一起带上（``biliRoom``）。
  */
 function memberRoom(m) {
+  const bili = isBiliLive(m.uid);
   return {
     id: `m:${m.uid}`,
     uid: m.uid,
@@ -2280,8 +2292,14 @@ function memberRoom(m) {
     avatar: m.avatar || '',
     hasAvatar: m.hasAvatar,
     hasStream: Boolean(m.streamId),
+    //: 填了 B站 房间号（和在不在播无关；在播时另有 ``bili`` 与 ``biliRoom``）
+    hasBili: Boolean(m.biliRoom),
+    //: 此刻在播 B站
+    bili,
+    //: B站 房间信息（嵌入地址 / 跳转地址 / 标题 / 在线人数）；不在播就是 null
+    biliRoom: bili ? biliRoomFor(biliKey(m.uid)) : null,
     play: m.play || {},
-    live: isMemberLive(m.uid),
+    live: isMemberLive(m.uid) || bili,
     banned: m.banned || null,
     roundCode: m.roundCode || '',
     roundLabel: m.roundLabel || '',
@@ -2289,8 +2307,9 @@ function memberRoom(m) {
   };
 }
 
-/** 成员直播间列表（只保留配了推流 ID 的）。 */
-const memberRooms = (s) => (s.members || []).filter((m) => m.streamId).map(memberRoom);
+/** 成员直播间列表（配了推流 ID 或 B站 房间号的都算一个房间）。 */
+const memberRooms = (s) =>
+  (s.members || []).filter((m) => m.streamId || m.biliRoom).map(memberRoom);
 
 /** 频道页的完整房间列表：成员直播间 + 管理员手工建的传统频道。 */
 export function channelRooms(s) {
@@ -2299,20 +2318,33 @@ export function channelRooms(s) {
   return [...members, ...visibleChannels(s).filter((c) => !memberIds.has(c.id))];
 }
 
-/** 一个房间是否在推流（成员直播间 / 传统频道两套判定）。 */
-const roomLive = (room) => (room?.member ? isMemberLive(room.uid) : isChannelLive(room?.id));
+/**
+ * 一个房间此刻在不在播。
+ *
+ * 成员直播间**两条链路任一在播就算**：本站推流（MediaMTX 上报）或 B站 直播；
+ * 传统频道只有 MediaMTX 那一条。
+ */
+const roomLive = (room) =>
+  room?.member
+    ? isMemberLive(room.uid) || isBiliLive(room.uid)
+    : isChannelLive(room?.id);
+
+/** 这个房间「有没有可播的东西」：成员看推流 ID 或 B站 房间号，传统频道看推流流名。 */
+const roomPlayable = (room) =>
+  Boolean(room?.member ? room.hasStream || room.hasBili : room.hasStream);
 
 /**
- * 能播的频道（配了推流流名的才算，没流名的只在目录里展示）。
+ * 频道选择条里的房间：**只列此刻在播的**。
  *
- * **观众只看在播的**：频道页是「谁在播」，不是花名册——一堆没开播的房间会把
- * 真正在播的那几个挤到后面。管理员看全部（要管理 / 封禁 / 改公告），
- * 没开播的在他们那边另有标记。
+ * 频道页这一条是「现在能看哪个」，不是花名册——没开播的摆在这里，只会把真正
+ * 在播的那几个挤到后面（**管理员也一样**：要管理 / 封禁 / 改公告就点下面的频道卡片，
+ * 那里仍然列全量）。深链点名了一个没开播的频道时，``renderChannels`` 会把它单独
+ * 塞回来，好把那句「当前未开播」说清楚。
  */
-const channelPool = (s) => {
-  const rooms = channelRooms(s).filter((c) => c.hasStream);
-  return canEdit() ? rooms : rooms.filter(roomLive);
-};
+const channelPool = (s) =>
+  channelRooms(s)
+    .filter((c) => roomPlayable(c))
+    .filter(roomLive);
 
 /** 选中频道 / 线路变化才重建舞台，避免每次刷新都打断正在播的画面。 */
 function channelStageSig(picked) {
@@ -2321,6 +2353,9 @@ function channelStageSig(picked) {
     canEdit() ? 'admin' : 'guest',
     picked ? picked.id : '',
     picked ? (picked.play || {}).key || '' : '',
+    // 这一路走**哪条链路**（本站推流 / B站 直嵌）也要进签名：两条链路的舞台
+    // 结构不同（<video> ↔ B站 iframe），换链路的场景下不重建就换不过去
+    picked && picked.bili ? `bili:${(picked.biliRoom || {}).roomId || ''}` : 'site',
     // 这一路「在不在播」也要进签名：否则对方开播 / 下播时舞台不重建，
     // 封面会一直停在「当前未开播」——而且画面也不会自己出来。
     picked ? (roomLive(picked) ? 'live' : 'off') : '',
@@ -2328,32 +2363,53 @@ function channelStageSig(picked) {
 }
 
 function channelStageHtml(s, picked) {
+  // B站 那一路：画面**直嵌 B站 官方播放器**（视频不经本站），所以没有 <video>、
+  // 也没有播放线路与播放 / 停止按钮——能做的只有「在 B站 打开」。
+  const bili = picked?.bili ? picked.biliRoom || {} : null;
+  const frame = bili
+    ? `<iframe class="stage-frame__bili" id="channelBili" src="${esc(bili.embed || '')}" ` +
+      `title="${esc(`${picked.name} 的 B站 直播间`)}" frameborder="0" scrolling="no" ` +
+      `allowfullscreen allow="autoplay; fullscreen; picture-in-picture" ` +
+      `referrerpolicy="no-referrer"></iframe>` +
+      `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
+      `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>`
+    : `<video id="channelVideo" playsinline autoplay controls muted></video>` +
+      `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
+      `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>` +
+      `<span class="stage-state" id="channelState">待连接</span>` +
+      `<div class="stage-cover" id="channelCover" hidden></div>`;
+  const bar = bili
+    ? `<div class="stage-bar"><div class="stage-bar__left">` +
+      `<a class="btn btn--primary btn--sm" href="${esc(bili.jump || '#')}" target="_blank" ` +
+      `rel="noopener noreferrer">在 B站打开</a>` +
+      `<span class="stage-bar__label">直播间 ${esc(bili.room || '')}</span></div>` +
+      `<div class="stage-bar__right">` +
+      `<button class="btn btn--sm" type="button" data-act="channel-refresh">刷新信号</button>` +
+      `</div></div>`
+    : `<div class="stage-bar"><div class="stage-bar__left">` +
+      `<button class="btn btn--primary btn--sm" type="button" data-act="channel-play">播放</button>` +
+      `<button class="btn btn--sm" type="button" data-act="channel-stop">停止</button></div>` +
+      `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
+      `<span class="stage-bar__label">线路</span>` +
+      `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
+      `data-act="channel-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
+      `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
+      `data-act="channel-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
+      `</div>` +
+      `<div class="stage-bar__right">` +
+      `<button class="btn btn--sm" type="button" data-act="channel-open">打开源页</button>` +
+      `<button class="btn btn--sm" type="button" data-act="channel-copy">复制播放地址</button>` +
+      `<button class="btn btn--sm" type="button" data-act="channel-refresh">刷新信号</button>` +
+      `</div></div>`;
   return (
     `<div class="panel__head"><h2>成员直播</h2>` +
-    `<span class="panel__hint">异环 · 日常播台 · 与比赛无关</span></div>` +
+    `<span class="panel__hint">${
+      bili ? 'B站直播 · 源站直嵌' : '异环 · 日常播台 · 与比赛无关'
+    }</span></div>` +
     `<div class="live-pick" id="channelPick"></div>` +
-    `<div class="stage-frame" id="channelFrame">` +
-    `<video id="channelVideo" playsinline autoplay controls muted></video>` +
-    `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
-    `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>` +
-    `<span class="stage-state" id="channelState">待连接</span>` +
-    `<div class="stage-cover" id="channelCover" hidden></div></div>` +
+    `<div class="stage-frame" id="channelFrame">${frame}</div>` +
     `<div class="stage-meta" id="channelMeta"></div>` +
-    `<div class="stage-bar"><div class="stage-bar__left">` +
-    `<button class="btn btn--primary btn--sm" type="button" data-act="channel-play">播放</button>` +
-    `<button class="btn btn--sm" type="button" data-act="channel-stop">停止</button></div>` +
-    `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
-    `<span class="stage-bar__label">线路</span>` +
-    `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="channel-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
-    `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-    `data-act="channel-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
-    `</div>` +
-    `<div class="stage-bar__right">` +
-    `<button class="btn btn--sm" type="button" data-act="channel-open">打开源页</button>` +
-    `<button class="btn btn--sm" type="button" data-act="channel-copy">复制播放地址</button>` +
-    `<button class="btn btn--sm" type="button" data-act="channel-refresh">刷新信号</button>` +
-    `</div></div>`
+    bar
   );
 }
 
@@ -2380,9 +2436,10 @@ function channelChipsHtml(pool, picked) {
 function channelMetaHtml(picked) {
   if (!picked) return '';
   const live = roomLive(picked);
+  const tag = live ? (picked.bili ? 'B站直播中' : '直播中') : '未开播';
   return (
     `<div class="vs-line${live ? '' : ' vs-line--idle'}">` +
-    `<span class="vs-line__tag">${live ? '直播中' : '未开播'}</span>` +
+    `<span class="vs-line__tag">${tag}</span>` +
     `<b>${esc(picked.name)}</b>` +
     (picked.title ? `<span class="vs-line__side">${esc(picked.title)}</span>` : '') +
     `</div>`
@@ -2414,7 +2471,10 @@ function renderChannelTools(channels) {
 function channelCardHtml(c) {
   const live = roomLive(c);
   const tags = [];
-  if (live) tags.push(liveTag('直播中'));
+  // 在播的是哪条链路也写清楚（B站 那一路画面直接来自 B站，本站不经手）
+  if (live) tags.push(liveTag(c.bili ? 'B站直播' : '直播中'));
+  // 有可播的东西但此刻没开播：管理员在目录里需要知道**为什么它不在上面那条选择条上**
+  if (!live && roomPlayable(c)) tags.push('<span class="badge badge--pending">未开播</span>');
   if (c.member) tags.push('<span class="badge badge--done">成员直播间</span>');
   if (c.featured) tags.push('<span class="badge badge--done">推荐</span>');
   if (c.server) tags.push(`<span class="badge badge--pending" title="区服">${esc(c.server)}</span>`);
@@ -2434,7 +2494,7 @@ function channelCardHtml(c) {
   (c.tags || []).forEach((t) => tags.push(`<span class="badge badge--pending">${esc(t)}</span>`));
   const ops =
     `<div class="round__ops">` +
-    (c.hasStream
+    (roomPlayable(c)
       ? `<button class="btn btn--sm btn--primary" type="button" data-act="channel-watch" ` +
         `data-id="${esc(c.id)}">${live ? '观看直播' : '打开直播间'}</button>`
       : '') +
@@ -2512,7 +2572,7 @@ export function renderChannels(s) {
   const pool = channelPool(s);
   // 深链点名了一个**没开播**的频道（/channels/<流名>）：仍把它放进池子里，
   // 好让页面把「当前未开播」说清楚，而不是默默跳到别人那一路上。
-  const requested = all.find((c) => c.id === App.channelId && c.hasStream);
+  const requested = all.find((c) => c.id === App.channelId && roomPlayable(c));
   if (requested && !pool.some((c) => c.id === requested.id)) pool.unshift(requested);
   // 卡片列表：观众跟池子同一口径（在播的）；管理员多出那些没开播 / 没流名的
   const listed = canEdit() ? all : all.filter(roomLive);
@@ -2542,13 +2602,14 @@ export function renderChannels(s) {
   }
   const pickEl = qs('#channelPick');
   if (pickEl) {
-    // 没有可播频道时按检测状态给提示；已拿到结果就保持原样（空串）
+    // 没有可播频道时按检测状态给提示：确实没人播就说一句，别留一块空白
     pickEl.innerHTML = pool.length
       ? channelChipsHtml(pool, picked)
       : App.liveHealthState === 'error'
         ? liveFailHtml(App.liveHealth?.reason)
         : App.liveHealthState === 'ok'
-          ? ''
+          ? `<div class="live-pick__empty live-pick__empty--none"><b>当前没有人在播</b>` +
+            `成员（本站推流或 B站 直播）开播后会自动出现在这里。</div>`
           : liveLoadingHtml();
   }
   const metaEl = qs('#channelMeta');

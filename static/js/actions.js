@@ -2164,9 +2164,15 @@ function watchChannel(id) {
   App.channelId = id || null;
   const channel = channelOf(id);
   if (App.state) renderChannels(App.state);
-  // 地址跟着换成 /channels/<推流 ID>（用 replaceState，不新增历史）
-  hooks.syncChannelUrl?.(channel?.play?.key || '');
+  // 地址跟着换成 /channels/<流名>（用 replaceState，不新增历史）
+  hooks.syncChannelUrl?.(channel?.play?.key || channel?.biliRoom?.key || '');
   if (!channel) return;
+  if (channel.bili) {
+    // B站 那一路由舞台**直嵌官方播放器**（见 views.js 的 channelStageHtml）：
+    // 这里不能再去连本站媒体服务器，否则会把 B站 的画面顶掉、封面还写着「未开播」。
+    ChannelLive.stop(false);
+    return;
+  }
   if (isChannelLive(channel.id)) {
     ChannelLive.playRoom(channel.play || null);
   } else {
@@ -2366,6 +2372,8 @@ export async function handleAction(act, el) {
       return watchChannel(el.dataset.id);
     case 'channel-play': {
       const channel = channelOf(App.channelId);
+      // B站 那一路已经自动嵌在舞台里了，没有「播放」这一步
+      if (channel?.bili) return;
       ChannelLive.stoppedByUser = false; // 主动点「播放」：恢复自动开播的资格
       if (channel) ChannelLive.playRoom(channel.play || null);
       return;
@@ -2374,15 +2382,26 @@ export async function handleAction(act, el) {
       ChannelLive.stop(true);
       return;
     case 'channel-open': {
-      const room = channelOf(App.channelId)?.play || {};
+      const channel = channelOf(App.channelId);
+      if (channel?.bili) {
+        // B站 那一路没有本站推流地址，能打开的就是 B站 直播间
+        const jump = channel.biliRoom?.jump || '';
+        if (jump) window.open(jump, '_blank', 'noopener');
+        return;
+      }
+      const room = channel?.play || {};
       const url = (App.liveProto === 'hls' ? room.hls : room.webrtc) || room.webrtc || '';
       if (url) window.open(url, '_blank', 'noopener');
       return;
     }
     case 'channel-copy': {
-      const room = channelOf(App.channelId)?.play || {};
-      // 复制观看地址：跟随当前线路给 8888 或 8889 那一条
-      const url = (App.liveProto === 'hls' ? room.hls : room.webrtc) || room.webrtc || '';
+      const channel = channelOf(App.channelId);
+      const room = channel?.play || {};
+      // B站 那一路没有本站播放地址，复制的是 B站 直播间地址（方便直接分享）
+      const url = channel?.bili
+        ? channel.biliRoom?.jump || ''
+        : (App.liveProto === 'hls' ? room.hls : room.webrtc) || room.webrtc || '';
+      if (!url) return;
       copyText(url).then((ok) =>
         toast(ok ? `已复制播放地址：${url}` : '复制失败', ok ? 'ok' : 'err', ok ? 6000 : 3600)
       );

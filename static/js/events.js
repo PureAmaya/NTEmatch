@@ -25,7 +25,7 @@ import {
   siteName,
   toast,
 } from './core.js';
-import { isChannelLive, isMemberLive, ownerHtml } from './ui.js';
+import { isBiliLive, isChannelLive, isMemberLive, ownerHtml } from './ui.js';
 import { icon } from './icons.js';
 import { renderNoticeBoard, renderServerInfo } from './notices.js';
 
@@ -193,13 +193,15 @@ function eventCardHtml(e, admin = false, index = 0) {
 
 /** 频道概览：成员直播间 + 手工建的传统频道（与频道页同一套「在播」判定）。 */
 function channelStats(s) {
-  const members = (s.members || []).filter((m) => m.streamId);
+  // 成员房间：登记了推流 ID **或** 填了 B站 房间号都算一个房间
+  const members = (s.members || []).filter((m) => m.streamId || m.biliRoom);
   const memberIds = new Set(members.map((m) => m.id));
   const extra = (s.channels || []).filter((c) => c.active !== false && !memberIds.has(c.id));
   return {
     total: members.length + extra.length,
     live:
-      members.filter((m) => isMemberLive(m.uid)).length +
+      // 在播两条链路都算：本站推流或 B站 直播
+      members.filter((m) => isMemberLive(m.uid) || isBiliLive(m.uid)).length +
       extra.filter((c) => isChannelLive(c.id)).length,
   };
 }

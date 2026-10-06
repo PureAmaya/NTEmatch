@@ -36,14 +36,28 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """只实现 ``get``：``responses`` 是 房间号 → 响应体 / 异常。"""
+    """只实现 ``get``：``responses`` 是 房间号 → 响应体 / 异常。
 
-    def __init__(self, responses: dict[str, object]) -> None:
+    主播名走的是**另一个接口**（``get_anchor_in_room``，参数叫 ``roomid``），
+    所以单独用 ``unames`` 打桩、单独记进 ``anchor_calls``——这样才断言得出
+    「只在在播时问」和「缓存生效时不再问」。
+    """
+
+    def __init__(self, responses: dict[str, object], unames: dict[str, str] | None = None) -> None:
         self.responses = responses
+        self.unames = unames or {}
         self.calls: list[str] = []
+        self.anchor_calls: list[str] = []
 
     async def get(self, url, params=None, headers=None, timeout=None):
-        room = str((params or {}).get("room_id") or "")
+        params = params or {}
+        if "get_anchor_in_room" in str(url):
+            room = str(params.get("roomid") or "")
+            self.anchor_calls.append(room)
+            return _FakeResponse(
+                {"code": 0, "data": {"info": {"uname": self.unames.get(room, "")}}}
+            )
+        room = str(params.get("room_id") or "")
         self.calls.append(room)
         item = self.responses.get(room)
         if isinstance(item, Exception):
@@ -57,13 +71,16 @@ def _room_payload(
     *,
     live_status: int,
     title: str = "上分中",
-    uname: str = "主播",
     room: str = "12345",
     online: int = 321,
     area: str = "单机游戏",
     live_time: str = "1780000000",
 ):
-    """一份 ``get_info`` 应答：字段名与 B站 实际返回一致（含标题 / 在线 / 分区 / 开播时间）。"""
+    """一份 ``get_info`` 应答：字段名与 B站 实际返回一致。
+
+    **没有 uname**——B站 这个接口就是不给主播名（它在 ``get_anchor_in_room`` 里），
+    打桩也照实来，免得测试比真实接口还宽松。
+    """
     return {
         "code": 0,
         "data": {
@@ -72,7 +89,6 @@ def _room_payload(
             "uid": 9001,
             "live_status": live_status,
             "title": title,
-            "uname": uname,
             "online": online,
             "area_name": area,
             "live_time": live_time if live_status == 1 else "0",
@@ -93,8 +109,10 @@ def _fresh_bili_cache():
 def stub_bili(monkeypatch):
     """把 ``live._client_get`` 换成假客户端，返回它以便断言「探测了几次」。"""
 
-    def install(responses: dict[str, object]) -> _FakeClient:
-        client = _FakeClient(responses)
+    def install(
+        responses: dict[str, object], unames: dict[str, str] | None = None
+    ) -> _FakeClient:
+        client = _FakeClient(responses, unames)
         monkeypatch.setattr(live, "_client_get", lambda verify=True: client)
         return client
 
@@ -183,6 +201,32 @@ async def test_probe_result_is_cached(admin_client, stub_bili):
     await live.bili_probe()
     await live.bili_probe()
     assert client.calls == ["12345"]
+    assert client.anchor_calls == ["12345"], "主播名也只问一次（缓存生效就别再打）"
+
+
+async def test_anchor_name_is_asked_only_while_live(admin_client, stub_bili):
+    """没开播的人不必为一行「主播名」多打一个请求。"""
+    await _member_with_bili(room="12345")
+    client = stub_bili({"12345": _room_payload(live_status=0)})
+    await live.bili_probe(force=True)
+    assert client.calls == ["12345"]
+    assert client.anchor_calls == [], "未开播：不该问主播名"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect_prefix"),
+    [
+        ("1780000000", "20"),                 # 早期：秒级时间戳字符串
+        ("2026-10-06 11:42:42", "2026-10-06T11:42:42"),  # 现在：日期文本
+        ("0", ""),                             # 未开播时 B站 给的就是 "0"
+        ("", ""),
+        ("不是时间", ""),
+    ],
+)
+def test_live_time_accepts_both_shapes(raw, expect_prefix):
+    """开播时间这个字段 B站 换过格式：两种都得认，认不出就留空（不编时间）。"""
+    got = live._bili_live_time({"live_time": raw})
+    assert got.startswith(expect_prefix), (raw, got)
 
 
 async def test_collect_live_carries_the_bili_room(admin_client, stub_bili):
@@ -205,21 +249,19 @@ async def test_collect_live_carries_the_bili_room(admin_client, stub_bili):
 async def test_probe_syncs_title_and_stats(admin_client, stub_bili):
     """开播后**自动同步**标题 / 主播名 / 在线人数 / 分区 / 开播时间——成员什么都不用填。"""
     await _member_with_bili(room="12345", name="甲")
-    stub_bili(
-        {
-            "12345": _room_payload(
-                live_status=1, title="排位冲分", uname="阿甲", online=1024, area="单机游戏"
-            )
-        }
+    client = stub_bili(
+        {"12345": _room_payload(live_status=1, title="排位冲分", online=1024, area="单机游戏")},
+        unames={"12345": "阿甲"},
     )
     await live.bili_probe(force=True)
     item = live.bili_view()["items"][0]
     assert item["title"] == "排位冲分"
-    assert item["uname"] == "阿甲"
+    assert item["uname"] == "阿甲", "主播名在另一个接口里，必须单独取一次"
     assert item["online"] == 1024
     assert item["area"] == "单机游戏"
     assert item["liveTime"], "开播时间应当换算成站内时间戳文本"
     assert item["liveTime"].startswith("20"), item["liveTime"]
+    assert client.anchor_calls == ["12345"], "在播的人才需要问主播名"
 
     # 「谁在直播」里也带上同一份信息（群消息 / 推送用）
     collected = await live.collect_live(force=False)

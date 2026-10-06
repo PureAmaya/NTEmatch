@@ -307,6 +307,9 @@ async def streaming_member_uids() -> list[str]:
 # * 探测结果同样只读缓存（``BILI_TTL``），由按需刷新更新——请求路径永不等待 B站。
 # --------------------------------------------------------------------------- #
 BILI_API = "https://api.live.bilibili.com/room/v1/Room/get_info"
+#: 主播名**不在** ``get_info`` 里（那个接口只给 uid），得单独问一次；
+#: 只在**在播**时问，所以代价是「每个在播的人一次请求」。
+BILI_ANCHOR_API = "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room"
 BILI_ROOM_PAGE = "https://live.bilibili.com/{room}"
 BILI_EMBED = "https://www.bilibili.com/blackboard/live/live-activity-player.html"
 BILI_TTL = 20.0          # 开播状态可复用多久（B站 有风控，别打太勤）
@@ -354,17 +357,54 @@ def _bili_area(data: dict[str, Any]) -> str:
 
 
 def _bili_live_time(data: dict[str, Any]) -> str:
-    """开播时间：B站 给的是**秒级时间戳字符串**，这里转成本站的 ISO 文本。
+    """开播时间 → 本站的 ISO 文本。
+
+    B站 这个字段换过格式：早期是**秒级时间戳字符串**（``"1759700000"``），现在是
+    **日期文本**（``"2026-10-06 11:42:42"``）——两种都认（只认其中一种的话，
+    另一种就是界面上永远空着的一行，而且看不出为什么）。
 
     拿不到就返回空串（前端不显示这一行），不要为了「看起来完整」编一个时间。
     """
     raw = str(data.get("live_time") or "").strip()
-    if not raw.isdigit() or int(raw) <= 0:
+    if not raw:
         return ""
+    if raw.isdigit():
+        stamp = int(raw)
+        if stamp <= 0:
+            return ""
+        try:
+            # 本地无时区（与站内其它时间戳一致），因此不传 tz
+            return datetime.fromtimestamp(stamp).replace(microsecond=0).isoformat()  # noqa: DTZ006
+        except (OverflowError, OSError, ValueError):
+            return ""
     try:
-        # 本地无时区（与站内其它时间戳一致），因此不传 tz
-        return datetime.fromtimestamp(int(raw)).replace(microsecond=0).isoformat()  # noqa: DTZ006
-    except (OverflowError, OSError, ValueError):
+        # 日期文本：Python 3.11+ 的 fromisoformat 直接吃「YYYY-MM-DD HH:MM:SS」
+        return datetime.fromisoformat(raw).replace(microsecond=0).isoformat()
+    except ValueError:
+        return ""
+
+
+async def _bili_uname(client: httpx.AsyncClient, room: str) -> str:
+    """主播名（B站 昵称）：``get_info`` 不给，单独问一次；取不到就回空串。
+
+    这一步**失败不影响探测结果**：名字只是个展示字段，界面上取不到就隐藏那一行。
+    """
+    try:
+        resp = await client.get(
+            BILI_ANCHOR_API,
+            params={"roomid": room},
+            headers=BILI_HEADERS,
+            timeout=BILI_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ""
+        payload = resp.json() or {}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return ""
+        node = data.get("info") if isinstance(data.get("info"), dict) else data
+        return str(node.get("uname") or "")
+    except (httpx.HTTPError, ValueError, TypeError):
         return ""
 
 
@@ -417,24 +457,25 @@ async def bili_probe(*, force: bool = False) -> dict[str, Any]:
             return room, None, ("不存在" if code == -400 else "") + message
         data = payload.get("data") or {}
         status = int(data.get("live_status") or 0)
-        return (
-            room,
-            {
-                "room": str(data.get("room_id") or room),
-                "shortId": str(data.get("short_id") or ""),
-                "live": status == 1,
-                "replay": status == 2,          # 2 = 轮播（不在直播，但也不是「没开播」）
-                # 以下这些就是「开播后自动同步到本站」的东西：标题、主播名、
-                # 在线人数、分区、开播时间——全部按需从 B站 现取，不需要成员手填。
-                "title": str(data.get("title") or ""),
-                "uname": str(data.get("uname") or ""),
-                "online": int(data.get("online") or 0),
-                "uid": str(data.get("uid") or ""),
-                "area": _bili_area(data),
-                "liveTime": _bili_live_time(data),
-            },
-            "",
-        )
+        info = {
+            "room": str(data.get("room_id") or room),
+            "shortId": str(data.get("short_id") or ""),
+            "live": status == 1,
+            "replay": status == 2,          # 2 = 轮播（不在直播，但也不是「没开播」）
+            # 以下这些就是「开播后自动同步到本站」的东西：标题、在线人数、分区、
+            # 开播时间——全部按需从 B站 现取，不需要成员手填。
+            "title": str(data.get("title") or ""),
+            # 主播名这个接口不给（它只有 uid），要另外问一次；见下面与 _bili_uname
+            "uname": "",
+            "online": int(data.get("online") or 0),
+            "uid": str(data.get("uid") or ""),
+            "area": _bili_area(data),
+            "liveTime": _bili_live_time(data),
+        }
+        if info["live"]:
+            # 只在**在播**时补主播名：没开播的人没必要为一行字多打一个请求
+            info["uname"] = await _bili_uname(client, str(info["room"]))
+        return room, info, ""
 
     results = await asyncio.gather(*(one(room) for room in sorted(wanted)))
     rooms: dict[str, dict[str, Any]] = {}

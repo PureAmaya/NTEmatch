@@ -273,7 +273,8 @@ export function memberAvatarUrl(member) {
 export function memberAvaHtml(member, size = 'sm') {
   const name = member?.name || member?.uid || '?';
   const url = memberAvatarUrl(member);
-  const live = isMemberLive(member?.uid);
+  // 光环两条链路都算：本站推流或 B站 直播（成员在 B站 开播时也该亮着）
+  const live = isMemberLive(member?.uid) || isBiliLive(member?.uid);
   const cls = `ava ava--${size}${url ? '' : ' ava--placeholder'}${live ? ' ava--live' : ''}`;
   const inner = url
     ? `<span class="ava__fb">${esc(String(name).slice(0, 1))}</span>` +
@@ -313,7 +314,9 @@ export function channelAvatarUrl(channel) {
 export function channelAvaHtml(channel, size = 'sm') {
   const name = channel?.name || channel?.id || '?';
   const url = channel?.member ? memberAvatarUrl(channel) : channelAvatarUrl(channel);
-  const live = channel?.member ? isMemberLive(channel.uid) : isChannelLive(channel?.id);
+  const live = channel?.member
+    ? isMemberLive(channel.uid) || isBiliLive(channel.uid)
+    : isChannelLive(channel?.id);
   const cls = `ava ava--${size}${url ? '' : ' ava--placeholder'}${live ? ' ava--live' : ''}`;
   const inner = url
     ? `<span class="ava__fb">${esc(String(name).slice(0, 1))}</span>` +

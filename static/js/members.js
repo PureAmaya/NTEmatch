@@ -36,6 +36,7 @@ import {
   biliTitleOf,
   fieldSwitch,
   fieldText,
+  isBiliLive,
   isMemberLive,
   liveTag,
   memberAvaHtml,
@@ -129,7 +130,7 @@ function memberSearchMatch(m) {
 function memberFilterMatch(m) {
   const f = App.memberFilter || 'all';
   if (f === 'server_admin' || f === 'event_admin' || f === 'member') return m.permission === f;
-  if (f === 'live') return isMemberLive(m.uid);
+  if (f === 'live') return isMemberLive(m.uid) || isBiliLive(m.uid);
   if (f === 'banned') return Boolean(m.banned);
   return true;
 }
@@ -138,7 +139,8 @@ function memberFilterMatch(m) {
 const duplicateOf = (m) => (m.streamId ? (App.server?.duplicates || {})[m.streamId] || null : null);
 
 function memberCardHtml(m) {
-  const live = isMemberLive(m.uid);
+  // 在播两条链路都算：本站推流或 B站 直播
+  const live = isMemberLive(m.uid) || isBiliLive(m.uid);
   // B站：填了房间号就标一下；在播时标题 / 在线人数是**开播后自动同步**过来的
   const bili = biliLiveOf(m.uid);
   const dup = duplicateOf(m);
