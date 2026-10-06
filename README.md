@@ -482,14 +482,14 @@ uv run python -m app --reset-key 我的新密钥
 | --- | --- |
 | **同一份内容只画一次** | 卡片内容的 sha256 就是文件名（`data/cards/<hash>.png`）：没改过赛制 / 赛程，反复推送都直接吃缓存 |
 | **不占事件循环** | 渲染在线程里跑（`asyncio.to_thread`），并发渲染有信号量限流、有超时；同一份内容并发只渲染一次（单飞锁） |
-| **Pillow 是可选依赖** | 没装就**自动退回纯文本**（信息一条不少，文本里也带了规则摘要）。要图片推送就装：`uv add pillow`（或 `pip install pillow`） |
+| **Pillow 是正式依赖** | 它就在 `pyproject.toml` 的 `dependencies` 里，`uv sync` / 镜像装好就**有图**。万一某个环境漏装了，才**自动退回纯文本**（信息一条不少，文本里同样带规则摘要）——那是兜底，不是「要额外装才有图」 |
 
 * **地址只认本站签发过的**：图发在 `/api/cards/<hash>.png`（公开，因为要发到群里给 QQ 客户端拉），
   文件名是内容哈希，而且 `card.resolve()` **只认推送 / 预览时签发过的哈希**——
   没流出去的卡片就算凑出地址也读不到，不是「换个链接就能下载点什么」的口子；
 * **管理端能先看图**（「赛事管理 → 推送到群 → 预览」）会直接把卡片显示出来，
   并标出「1 张卡片图 + N 段文字」；发送后的提示也会写明「图片 + N 段」；
-* **图发不出去就退回完整文本**：没装 Pillow、AstrBot 不认图片段（各版本字段名不一，
+* **图发不出去就退回完整文本**：这台机器上没装 Pillow（异常情况）、AstrBot 不认图片段（各版本字段名不一，
   `send_image` 会依次试 `file` / `url` / `image` 三种写法）、拉不到图——这三种情况都不会让群里少东西，
   推送里也会记一行日志说明「卡片推送失败，退回纯文本」；
 * 卡片目录会按 mtime 只留最近 240 张（内容定址的目录只增不减，得有人扫一下）；
@@ -558,11 +558,11 @@ uv run python -m app --reset-key 我的新密钥
     文案改了重启一次就是新图，不存在「仓库里那张图比文案旧」这种事；
   * 文案在 `app/helpcard_content.py`（**零依赖**，测试直接读它比对插件的 `HELP_TEXT`），
     排版在 `app/helpcard.py`（配色照站点 CSS，所以是一套观感）；
-  * 没装 Pillow（可选依赖）就只记一行日志：图和文字说明二选一，功能一点不少；
+  * 这台机器上万一没装 Pillow 就只记一行日志：图和文字说明二选一，功能一点不少；
   * 想立刻看一眼新版式、或把图写到别处：
 
   ```bash
-  uv run --with pillow python tools/make_help_card.py   # → static/help.jpg
+  uv run python tools/make_help_card.py   # → static/help.jpg
   ```
 
   * 出图时会顺手写一个 `static/help.jpg.src.sha256`（源文件指纹，同样不入库）：
@@ -1837,11 +1837,11 @@ OBS 的 WHIP 输出把这两样分成两个字段填：
   内置那张可以用脚本重画：
 
   ```bash
-  uv run --with pillow python tools/make_share_card.py --title "异环赛事" --tagline "S2 · 秋季赛"
+  uv run python tools/make_share_card.py --title "异环赛事" --tagline "S2 · 秋季赛"
   ```
 
-  Pillow 只在生成时需要，**不进运行时依赖**（运行时那份是可选依赖，只给比赛卡片用，
-  见「图片推送：比赛卡片」）；产物 `static/og.png` 入库，改主色后重跑一次就行。
+  产物 `static/og.png` 入库，改主色后重跑一次就行（Pillow 本来就在运行依赖里，
+  见「图片推送：比赛卡片」——这个脚本不需要额外装什么）。
 * **PWA**：`static/manifest.webmanifest`（`display: standalone` + 主题色 + 图标），
   `<link rel="manifest">` 已挂上；服务端给 `.webmanifest` 注册了 `application/manifest+json`。
   加到手机桌面后是全屏无地址栏的观感。
@@ -2201,14 +2201,12 @@ docker compose logs -f nte    # 第一次启动会自动创建服务器管理员
 `pyproject.toml` 的依赖由 `uv.lock` 决定（镜像内 `uv sync --frozen --no-dev`），
 不会出现「镜像里装的和本地不一致」。`HEALTHCHECK` 打的是 `/api/health`。
 
-想让它发**比赛卡片图**（见「图片推送：比赛卡片」）就在构建时带上 Pillow：
+镜像里就有**图片推送**（比赛卡片图与机器人帮助图都靠 Pillow 渲染，它现在是
+`pyproject.toml` 的正式依赖，`uv sync --frozen --no-dev` 会一起装上，不需要额外参数）。
 
-```bash
-docker build --build-arg NTE_CARDS=1 -t nte-match .
-# 或者本地：uv sync --extra cards
-```
-
-不加也能跑：比赛信息改发纯文本，功能不残（信息一条不少）。
+> 早期版本把 Pillow 放在可选 extra 里（`--extra cards` / `--build-arg NTE_CARDS=1`）——
+> **那个 extra 已经删掉了**：图片推送不是可选功能。老的构建脚本里若还留着那个参数，
+> 现在会报「unknown extra」，去掉它即可。
 
 想在容器里也用**热更新**（见上一节）：镜像里得有 `git`，启动命令换成守护
 （`CMD ["uv", "run", "--no-sync", "python", "-m", "app", "hotrun"]`）——
@@ -2304,15 +2302,15 @@ uv run python -m app --check            # 只体检：代码能不能起来（�
 ## 开发
 
 ```bash
-uv sync --extra dev      # ruff / pytest / pillow 在 dev 可选依赖里，要先装
+uv sync --extra dev      # ruff / pytest 在 dev 可选依赖里，要先装（Pillow 是正式依赖，uv sync 就有）
 uv run ruff check app tests tools
 uv run pytest            # 550 条：结算 / 计分口径 / 替补 / 旧数据升级 / 加固与出厂默认 / 规则文案 / B站 接入 / 比赛卡片 / 直播常驻探测 / 热更新 / 封禁 IP / 备份还原 / 图片去重与缓存 / 终端彩色 / QQ 自助与推送 / 通知推群 / 校验 / 存储 / 接口 / 权限 / 凭据 / 推流鉴权 / 通知 / 版权 / 插件
 uv run python tools/check_assets.py   # 前端静态资源自检（见下）
-uv run --with pillow python tools/make_help_card.py   # 重画 QQ 机器人帮助图（改了命令才需要）
+uv run python tools/make_help_card.py   # 重画 QQ 机器人帮助图（改了命令才需要）
 ```
 
-> Pillow 进 dev 是为了让**卡片渲染那条路径**真的有用例跑（`tests/test_card.py`）；
-> 线上没有它也能跑，只是比赛信息改发纯文本（见「图片推送：比赛卡片」）。
+> Pillow 是**正式依赖**（图片推送与帮助图都靠它渲染），所以 `tools/` 里那两个出图脚本
+> 也不需要 `--with pillow` 了——直接 `uv run python tools/...` 就行。
 
 > 只跑 `uv sync` 的话不会装 ruff / pytest；`uv run ruff` 会报
 > `Failed to spawn: ruff`，补一次 `uv sync --extra dev` 即可。

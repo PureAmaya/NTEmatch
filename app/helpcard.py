@@ -9,8 +9,8 @@
 
 * **内容在** :mod:`app.helpcard_content`（纯数据、零依赖），排版在这里——测试比对
   「图上的命令」与插件 ``HELP_TEXT``，两边漂了直接红；
-* **Pillow 是可选依赖**（与比赛卡片同一个）：没装就只记一行日志，插件那边会退回
-  文字说明，功能一点不少（见 :func:`refresh`）；
+* **Pillow 是正式依赖**（与比赛卡片同一个）：正常情况下一直可用；万一这台机器上没装，
+  就只记一行日志，插件那边会退回文字说明，功能一点不少（见 :func:`refresh`）；
 * **画图跑在线程里**（:func:`refresh` 由启动流程用 ``asyncio.to_thread`` 调），
   不让它拖慢启动；画失败也只记日志。
 
@@ -94,7 +94,7 @@ def available() -> bool:
 
 
 def _pil():
-    """延迟导入 Pillow——它是可选依赖，导入失败由调用方兜住。"""
+    """延迟导入 Pillow（导入失败由调用方兜住，退回文字说明）。"""
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
     return Image, ImageDraw, ImageFilter, ImageFont
@@ -436,9 +436,9 @@ def refresh(*, out: Path | None = None, quality: int = 92) -> bool:
     """启动时调用：重画一份帮助图（**不阻塞事件循环**由调用方负责）。
 
     没装 Pillow 就只记一行 info：帮助图没有也能用——插件会先 ``HEAD /help.jpg``，
-    探不到就退回私聊文字说明；比赛卡片那边也是同一套「可选依赖」策略。
+    探不到就退回私聊文字说明；比赛卡片那边同样是「画不出来就退回文本」的兜底。
     """
     if not available():
-        log.info("没装 Pillow，跳过帮助图生成（插件会改用文字说明；要图就 uv sync --extra cards）")
+        log.info("这台机器上没装 Pillow，跳过帮助图生成（插件会改用文字说明；重装依赖即可）")
         return False
     return bool(write(out=out, quality=quality)["ok"])

@@ -182,16 +182,13 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.optional-dependencies]
-cards = [
-    { name = "pillow" },
-]
 dev = [
-    { name = "pillow" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -201,15 +198,14 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "pillow", marker = "extra == 'cards'", specifier = ">=10" },
-    { name = "pillow", marker = "extra == 'dev'", specifier = ">=10" },
+    { name = "pillow", specifier = ">=10" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
-provides-extras = ["cards", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "opentelemetry-api"

@@ -69,7 +69,7 @@ RUNTIME: list[tuple[str, str, str, str]] = [
         "Pillow",
         "MIT-CMU",
         "https://github.com/python-pillow/Pillow",
-        "可选：比赛卡片图与帮助图的渲染；没装就退回纯文本推送、不发图，功能不残",
+        "图片推送的渲染器：比赛卡片图与机器人帮助图都由它画",
     ),
 ]
 

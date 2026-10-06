@@ -8,8 +8,8 @@
 
 用法：
 
-    uv run --with pillow python tools/make_help_card.py
-    uv run --with pillow python tools/make_help_card.py --out /tmp/help.jpg
+    uv run python tools/make_help_card.py
+    uv run python tools/make_help_card.py --out /tmp/help.jpg
 
 图上的文字在 ``app/helpcard_content.py``（零依赖，测试直接读它比对插件的 ``HELP_TEXT``），
 排版在 ``app/helpcard.py``——改了文案重启一次站点就是新的。

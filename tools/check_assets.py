@@ -236,7 +236,7 @@ def check_help_card_freshness() -> list[str]:
     if got != str(module.source_digest()):
         problems.append(
             "static/help.jpg 比它的文案旧（或指纹缺失）：重启一次服务会自动重画，"
-            "也可以跑 `uv run --with pillow python tools/make_help_card.py`"
+            "也可以跑 `uv run python tools/make_help_card.py`"
         )
     if not problems:
         print("  OK  帮助图与文案同步（static/help.jpg，且文案里没有 Markdown 记号）")

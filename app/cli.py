@@ -112,16 +112,16 @@ _HELP: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
     (
-        "配套脚本（与运行无关，按需执行；Pillow 只在生成图片时需要，不进运行依赖）",
+        "配套脚本（与运行无关，按需执行）",
         (
             (
-                "uv run --with pillow python tools/make_help_card.py",
+                "uv run python tools/make_help_card.py",
                 "重画 QQ 机器人帮助图 → static/help.jpg。服务启动时本来就会自动重画一份，"
                 + "这个脚本只是让你立刻看一眼新版式、或把图输出到别处；"
                 + "图上的文字在 app/helpcard_content.py，排版在 app/helpcard.py",
             ),
             (
-                "uv run --with pillow python tools/make_share_card.py",
+                "uv run python tools/make_share_card.py",
                 "重画默认分享图 → static/og.png（改了主色之后重跑一次）",
             ),
             (

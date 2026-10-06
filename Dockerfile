@@ -12,17 +12,12 @@ WORKDIR /app
 # --no-install-project 只装依赖不装本项目——我们直接跑源码）。
 # 这样 pyproject 里的依赖清单不会在这里被抄第二份。
 #
-# 图片推送（「比赛信息」发卡片图）要 Pillow，它是**可选**依赖：不加这个 build arg
-# 也能跑，只是比赛信息改发纯文本（见 README「图片推送：比赛卡片」）。
-#   docker build --build-arg NTE_CARDS=1 .
-ARG NTE_CARDS=0
+# 图片推送（「比赛信息」发卡片图）与机器人帮助图都靠 Pillow 渲染，它是**正式依赖**，
+# 所以这里不需要任何 build arg（早期版本的 NTE_CARDS 开关已经删掉了，
+# 见 README「图片推送：比赛卡片」）。
 COPY pyproject.toml uv.lock README.md ./
 RUN pip install --no-cache-dir uv \
-    && if [ "$NTE_CARDS" = "1" ]; then \
-           uv sync --frozen --no-dev --no-install-project --extra cards; \
-       else \
-           uv sync --frozen --no-dev --no-install-project; \
-       fi
+    && uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
 COPY static ./static

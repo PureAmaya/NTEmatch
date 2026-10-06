@@ -16,9 +16,10 @@
 2. **渲染在线程里、并发受限**：:func:`asyncio.to_thread` + 信号量 + 超时，事件循环一秒都
    不等；同一份内容的并发请求还会合并成一次渲染（单飞锁），不会出现「十个人同时点预览，
    十次全量渲染」；
-3. **Pillow 是可选依赖**：没装 :func:`available` 就是 ``False``，:func:`card_for_event`
-   回 ``None``，调用方**自动退回纯文本**（信息一条不少，只是排版朴素）。
-   装法：``uv add pillow``（或 ``pip install pillow``）。
+3. **Pillow 是正式依赖**（``pyproject.toml`` 的 ``dependencies`` 里）：图片推送就是靠它
+   渲染，默认装好就有图。万一某个环境没装上（自建镜像漏了依赖、装了坏版本），
+   :func:`available` 是 ``False``、:func:`card_for_event` 回 ``None``，调用方
+   **自动退回纯文本**（信息一条不少，只是排版朴素）——那是**兜底**，不是常态。
 
 安全性
 ------
@@ -104,10 +105,13 @@ _semaphore: asyncio.Semaphore | None = None
 
 
 # --------------------------------------------------------------------------- #
-# Pillow：可选依赖
+# Pillow（图片推送的渲染器）
 # --------------------------------------------------------------------------- #
 def available() -> bool:
-    """有没有 Pillow（它是**可选依赖**；没有就只能回纯文本推送）。
+    """这台机器上能不能画图（Pillow 装没装）。
+
+    Pillow 是正式依赖，正常情况下这里一直是 ``True``；留着这道判断是为了
+    **兜底**：环境没装全 / 装坏了时，与其整个推送报错，不如安静退回纯文本。
 
     只探「装没装」（``find_spec``），**不导入**：这条判断每次推送都会问一次，
     没必要为它真把 Pillow 拉进来（真装坏了也由 :func:`render` 兜住，同样退回文本）。
@@ -119,7 +123,7 @@ def available() -> bool:
 
 
 def _pil():
-    """延迟导入 Pillow——它是可选依赖，导入失败由调用方兜住。"""
+    """延迟导入 Pillow（导入失败由调用方兜住，退回纯文本）。"""
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
     return Image, ImageDraw, ImageFilter, ImageFont

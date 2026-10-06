@@ -5,8 +5,8 @@
 
 用法（Pillow 只在「生成」时需要，不进入运行依赖）：
 
-    uv run --with pillow python tools/make_share_card.py
-    uv run --with pillow python tools/make_share_card.py --title "异环赛事" --tagline "S2 · 秋季赛"
+    uv run python tools/make_share_card.py
+    uv run python tools/make_share_card.py --title "异环赛事" --tagline "S2 · 秋季赛"
 
 产物：``static/og.png``（1200×630，绝大多数分享卡片都吃这个尺寸）。
 """

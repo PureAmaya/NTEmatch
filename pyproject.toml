@@ -11,6 +11,10 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
     "pydantic>=2.7",
+    # 图片推送（QQ 群里的「比赛信息」发的那张卡片）与机器人帮助图都靠它渲染，
+    # 所以是**正式依赖**，不是可选件——默认装好就有图。
+    # 万一某个环境没装上，渲染会安静退回纯文本（那是兜底，不是常态，见 app/card.py）。
+    "pillow>=10",
 ]
 
 [project.urls]
@@ -21,19 +25,10 @@ Source = "https://github.com/PureAmaya/NTEmatch"
 "开源组件清单" = "https://github.com/PureAmaya/NTEmatch/blob/main/app/credits.py"
 
 [project.optional-dependencies]
-# 图片推送（比赛卡片，见 app/card.py + README「图片推送：比赛卡片」）。
-# **可选**：没装就自动退回纯文本推送，功能不残（信息一条不少）。
-#   pip install 'nte-match[cards]'   或   uv sync --extra cards
-cards = [
-    "pillow>=10",
-]
-
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    # dev 里也放一份：卡片渲染那条路径要有真用例跑（tests/test_card.py）
-    "pillow>=10",
 ]
 
 [project.scripts]

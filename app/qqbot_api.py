@@ -199,7 +199,8 @@ async def api_qqbot_test(
         if not info:
             return {
                 "ok": False,
-                "detail": "画不出比赛卡片：多半是没装 Pillow（图片推送是可选依赖，装了才会发图）",
+                "detail": "画不出比赛卡片：这台机器上没装 Pillow（图片推送靠它渲染；"
+                "正常情况下 uv sync / 镜像里就带着，缺了说明环境没装全）",
                 "image": True,
             }
         image = await qqbot.send_image(f"{_site(request)}{info['url']}", settings=settings)

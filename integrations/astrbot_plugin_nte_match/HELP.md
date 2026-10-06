@@ -3,7 +3,7 @@
 ## 怎么出图
 
 ```bash
-uv run --with pillow python tools/make_help_card.py
+uv run python tools/make_help_card.py
 # → static/help.jpg（1080×宽，按内容自适应高度；Pillow 只在生成时需要，不进运行依赖）
 ```
 
