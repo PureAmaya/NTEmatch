@@ -177,17 +177,6 @@ export function fmtMilli(ms) {
   return `${secs}.${millis}`;
 }
 
-/** 毫秒 → 「时 / 分 / 秒」三个输入框的回填值（与后端 hours_minutes_seconds 一致）。 */
-export function splitMilli(ms) {
-  const n = Math.max(0, Math.round(Number(ms) || 0));
-  const text = (value) => (value ? String(Math.round(value * 1000) / 1000) : '');
-  return [
-    text(Math.floor(n / 3_600_000)),
-    text(Math.floor((n % 3_600_000) / 60_000)),
-    text((n % 60_000) / 1000),
-  ];
-}
-
 /** 千分之一 → 8.75 / 8（去掉末尾多余的 0；0 显示成 0，与自然数一致）。 */
 export function fmtDec(value) {
   const n = Math.round(Number(value) || 0);
@@ -294,21 +283,6 @@ export function parseMilli(raw) {
       total += step(part) * 60 ** (i + 1) * 1000;
     });
   return Math.max(0, Math.round(total));
-}
-
-/** 「时 / 分 / 秒」三个输入框 → 毫秒（空 = 0，全空 = 没有成绩）。 */
-export function parseHms(hours, minutes, seconds) {
-  const step = (raw, what) => {
-    const text = String(raw ?? '').trim();
-    if (!text) return 0;
-    const n = Number(text);
-    if (!Number.isFinite(n)) throw new Error(`「${text}」不是合法的${what}`);
-    if (n < 0) throw new Error(`${what}不能是负数`);
-    return n;
-  };
-  const total =
-    step(hours, '小时') * 3600 + step(minutes, '分钟') * 60 + step(seconds, '秒');
-  return Math.max(0, Math.round(total * 1000));
 }
 
 /**

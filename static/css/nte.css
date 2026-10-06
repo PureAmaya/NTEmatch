@@ -1862,7 +1862,7 @@ img { display: block; max-width: 100%; }
 /* 28.1 录分弹窗：各方行 + 各局小分 + 实时判定预览 */
 .rrows { display: flex; flex-direction: column; gap: 6px; }
 .rrow {
-  display: grid; grid-template-columns: 24px minmax(0, 1fr) 86px 86px;
+  display: grid; grid-template-columns: 24px minmax(0, 1fr) 104px 104px;
   gap: 8px; align-items: center;
   padding: 7px 9px; border: 1px solid var(--line); background: rgba(8, 12, 19, .5);
 }
@@ -1899,13 +1899,11 @@ img { display: block; max-width: 100%; }
 }
 .setrow__sep { color: var(--txt-mute); }
 
-/* 计分输入控件：数值型一个框，时间型「时 : 分 : 秒」三个框 */
-.nvinput { display: inline-flex; min-width: 0; }
-.nvinput input { width: 76px; text-align: center; }
-.tvinput { display: inline-flex; align-items: center; gap: 2px; min-width: 0; }
-.tvinput input { width: 46px; text-align: center; }
-.tvinput input[data-t="s"] { width: 58px; }
-.tvinput i { color: var(--txt-mute); font-style: normal; }
+/* 计分输入控件：**每种类型都只有一个框**——时间型按「分:秒.毫秒」写（见 actions.js）。
+   以前时间型拆成「时 : 分 : 秒」三个框，塞进百来像素的成绩格里会挤成一半看不见。 */
+.nvinput, .tvinput { display: inline-flex; min-width: 0; flex: 1; }
+.nvinput input, .tvinput input { width: 100%; min-width: 0; text-align: center; }
+.tvinput input { font-family: var(--font-mono); }
 
 /* 次要信息折叠（胜方 / 时长 / 时间 / 备注）：展开时才知道里面有什么 */
 .rfold { margin-top: 10px; border: 1px solid var(--line); background: rgba(8, 12, 19, .35); }

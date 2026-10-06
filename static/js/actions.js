@@ -21,13 +21,11 @@ import {
   log,
   missingValue,
   nowLocalInput,
-  parseHms,
   parseVal,
   qs,
   qsa,
   refreshPrivate,
   scoringOf,
-  splitMilli,
   routePath,
   toLocalInput,
   toast,
@@ -75,31 +73,30 @@ const roundOf = (ref) =>
 
 /* ------------------------------ 计分控件 ------------------------------ */
 /**
- * 计分输入控件：**按计分类型给不同的控件**。
+ * 计分输入控件：**按计分类型给不同的控件**，但**都只有一个框**。
  *
- * * 时间型 → 「时 : 分 : 秒」三个框（比一整串 `1:23.456` 好填得多，也不会填错位）；
+ * * 时间型 → 文本框，按「分:秒.毫秒」写（``1:23.456``），也可以只写秒数（``83.45``）；
  * * 小数   → 数字框，步长 0.001（存的是千分之一）；
  * * 自然数 → 数字框，步长 1。
+ *
+ * 时间型**为什么不拆成「时 / 分 / 秒」三个框**：录分行里给成绩的格子只有百来像素
+ * （多队同场一行要放「成绩 + 细则分」两个），三个框根本塞不下，会被挤成一半看不见的样子；
+ * 而且解析本来就认整串写法（见 core.parseMilli）——从计时器上读出来直接粘，比拆三个框更快。
  */
 function valueInputHtml(role, value, sc) {
-  if (sc.timeBased) {
-    const [h, m, s] = splitMilli(value || 0);
-    const cell = (key, ph, text) =>
-      `<input data-t="${key}" inputmode="decimal" placeholder="${ph}" value="${esc(text)}">`;
-    return (
-      `<span class="tvinput" data-role="${esc(role)}">` +
-      cell('h', '时', h) +
-      `<i>:</i>` +
-      cell('m', '分', m) +
-      `<i>:</i>` +
-      cell('s', '秒', s) +
-      `</span>`
-    );
-  }
-    const step = sc.valueType === 'decimal' ? '0.001' : '1';
   // 有成绩就回填（**数值型的 0 也要填出来**：它是合法读数，留空会被当成「没填」）；
   // 没有成绩则留空，让人一眼看出还没录。
   const text = hasResult(value, sc) ? fmtVal(value, sc) : '';
+  if (sc.timeBased) {
+    return (
+      `<span class="tvinput" data-role="${esc(role)}">` +
+      // 不设 inputmode：手机上的数字键盘打不出「:」，而冒号是这种写法的一半
+      `<input placeholder="1:23.456" value="${esc(text)}"` +
+      ` title="分:秒.毫秒，例如 1:23.456；也可以只写秒数（83.45）">` +
+      `</span>`
+    );
+  }
+  const step = sc.valueType === 'decimal' ? '0.001' : '1';
   return (
     `<span class="nvinput" data-role="${esc(role)}">` +
     `<input type="number" min="0" step="${step}" placeholder="0" value="${esc(text)}">` +
@@ -107,20 +104,14 @@ function valueInputHtml(role, value, sc) {
   );
 }
 
-/** 读回一个计分控件（时间型读三个框，其余读一个）；解析不了抛错，由调用方提示。 */
+/** 读回一个计分控件（每种类型都只有一个框）；解析不了抛错，由调用方提示。 */
 function readValueInput(host, role, sc) {
   if (!host) return missingValue(sc);
   const box = qs(`[data-role="${role}"]`, host);
   if (!box) return missingValue(sc);
-  if (!sc.timeBased) {
-    const input = qs('input', box);
-    return parseVal(input ? input.value : '', sc);
-  }
-  const part = (key) => {
-    const input = qs(`[data-t="${key}"]`, box);
-    return input ? input.value : '';
-  };
-  return parseHms(part('h'), part('m'), part('s'));
+  const input = qs('input', box);
+  // 时间型交给 parseVal → parseMilli：`1:23.456`、`1'23"45`、`83.45` 都认；留空 = 没填
+  return parseVal(input ? input.value : '', sc);
 }
 
 /** 一行轮次：`第 N 轮  A 输入 : B 输入  ×`。 */
@@ -346,11 +337,15 @@ function openResultModal(rnd) {
     )
     .join('');
 
+  // 时间型只有一个框，写法得先说清（三种录入块都要用）
+  const timeHint = sc.timeBased
+    ? `时间按 <b>分:秒.毫秒</b> 填（如 <b>1:23.456</b>），也可以只写秒数（<b>83.45</b>）。`
+    : '';
   const roundsBlock = multi
     ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按 <b>${esc(
         sc.label
       )}</b>（${esc(sc.betterLabel || sc.better)}）排名，第 1 名即为本场胜者，` +
-      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。</div>`
+      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。${timeHint}</div>`
     : `<div class="rsets"><div class="rsets__head"><b>轮次</b>` +
       `<span class="panel__hint">默认一轮；每轮 ${esc(sc.label)}，赢的轮数就是大比分` +
       `${sc.timeBased ? '（可写 1:23.456 或 83.45）' : ''}</span>` +
@@ -362,7 +357,7 @@ function openResultModal(rnd) {
     ? ''
     : `<div id="rq-manual"${initial.length ? ' hidden' : ''}>` +
       `<div class="notice" style="margin-top:10px">没有轮次时按下面这一组「本场成绩」判定；` +
-      `点上面的「添加一轮」就改用轮次录入。</div>` +
+      `点上面的「添加一轮」就改用轮次录入。${timeHint}</div>` +
       `<div class="rrows">${manualRows}</div></div>`;
   const foldOpen = Boolean(
     rnd.duration || rnd.startedAt || rnd.finishedAt || rnd.note || rnd.winner
