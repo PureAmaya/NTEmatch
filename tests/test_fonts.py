@@ -107,6 +107,15 @@ def test_mono_falls_back_to_cjk(tmp_path, monkeypatch):
     assert fonts.resolve("mono") == cjk
 
 
+def test_a_late_install_is_picked_up(tmp_path, monkeypatch):
+    """服务跑着的时候才装上字体：别把「没找到」也缓存死（否则得重启才认）。"""
+    _isolate(monkeypatch, tmp_path)
+    assert fonts.resolve("cjk") is None
+    late = tmp_path / "NotoSansCJK-Regular.ttc"
+    late.write_bytes(b"x")
+    assert fonts.resolve("cjk") == late
+
+
 def test_load_survives_a_broken_font_file(tmp_path, monkeypatch):
     """字体文件坏掉（不是真 TrueType）也要能画：退回内置位图字体，不抛异常。"""
     broken = tmp_path / "broken.ttc"

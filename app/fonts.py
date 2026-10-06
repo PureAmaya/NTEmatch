@@ -165,7 +165,10 @@ def resolve(kind: str = "cjk") -> Path | None:
     if found is None and kind in ("mono", "latin"):
         # 只有中文字体时，拿它显示数字 / 西文也比方框强
         found = resolve("cjk")
-    _resolved[kind] = found
+    if found is not None:
+        # **只缓存找到的**：「没找到」也缓存的话，运行中（`apt install` 完不重启）
+        # 装上的字体永远不会被认出来——那种「明明装了却还是方框」最难查。
+        _resolved[kind] = found
     if found is None:
         log.warning(
             "没找到 %s 字体（中文会显示成方框）：装一个思源黑体 / Noto Sans CJK"

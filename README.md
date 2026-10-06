@@ -2221,7 +2221,8 @@ Google 那份 **Noto Sans CJK**）；没有的话图里的中文会变成方框�
 | Arch / Manjaro | `sudo pacman -S --noconfirm noto-fonts-cjk` |
 | Alpine | `apk add --no-cache font-noto-cjk` |
 
-装完**不用重启服务**（字体是画图那一刻才去读的）。自检三步：
+装完**重启一次服务**最省事（启动时会用新字体重画帮助图；运行中装的字体也会被后来的
+请求认出来，但已经用内置字体画过的那些卡片要等下次内容变化才重画）。自检三步：
 
 ```bash
 fc-list | grep -i -E "noto.*cjk|source han"          # 系统认到了没
