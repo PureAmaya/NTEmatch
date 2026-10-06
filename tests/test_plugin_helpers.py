@@ -61,6 +61,12 @@ def _install_astrbot_stub() -> None:
     class _Event:
         pass
 
+    class _MessageChain:
+        """AstrBot 的消息链：这里只要求能把组件列表装进去（投递要断言的就是那份列表）。"""
+
+        def __init__(self, chain=None):
+            self.chain = list(chain or [])
+
     def _component(name):
         def factory(*args, **kwargs):
             return {"type": name, "args": args, "kwargs": kwargs}
@@ -75,6 +81,7 @@ def _install_astrbot_stub() -> None:
     event = types.ModuleType("astrbot.api.event")
     event.AstrMessageEvent = _Event
     event.filter = _Filter()
+    event.MessageChain = _MessageChain
     comps = types.ModuleType("astrbot.api.message_components")
     comps.At = _component("at")
     comps.Plain = _component("plain")
@@ -152,6 +159,110 @@ def test_help_text_explains_how_to_trigger(plugin_module):
     assert "@ 机器人" in text
     assert "唤醒前缀" in text
     assert "比赛直播" in text  # 新命令别从帮助里掉出去
+
+
+class _FakeContext:
+    """只带真 @ 投递用到的那一个方法：发消息。"""
+
+    def __init__(self):
+        self.sent: list[tuple[str, object]] = []
+
+    async def send_message(self, umo, chain):
+        self.sent.append((umo, chain))
+
+
+async def test_delivery_builds_a_real_at_chain(plugin_module):
+    """投递一条召集：链里是 ``At`` 组件（**真 @**）+ 正文，正文首行换行靠零宽空格保住。
+
+    为什么盯这个换行：aiocqhttp 会把 ``Plain`` 的首尾空白去掉，直接拼 ``"\\n"`` 会被
+    吃掉，@ 和正文就挤在同一行里（群里看着像一条没排版的乱句子）。
+    """
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    ctx = _FakeContext()
+    plugin.context = ctx
+
+    ok, detail = await plugin._deliver(
+        {
+            "umo": "aiocqhttp:GroupMessage:123",
+            "mentions": ["10001", "10002"],
+            "body": "【NTE 比赛】集合啦！",
+        }
+    )
+    assert ok is True and detail == ""
+    umo, chain = ctx.sent[0]
+    assert umo == "aiocqhttp:GroupMessage:123"
+    comps = getattr(chain, "chain", chain)
+    assert comps[0] == {"type": "at", "args": (), "kwargs": {"qq": "10001"}}
+    assert comps[1]["kwargs"]["qq"] == "10002"
+    assert comps[2]["type"] == "plain"
+    assert comps[2]["kwargs"]["text"].startswith("\u200b\n")
+    assert "集合啦！" in comps[2]["kwargs"]["text"]
+
+
+async def test_delivery_without_a_session_reports_why(plugin_module):
+    """没有目标会话：回报失败（站点会据此退回文本写法），绝不静默丢掉。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    plugin.context = _FakeContext()
+    ok, detail = await plugin._deliver({"mentions": ["10001"], "body": "集合啦！"})
+    assert ok is False and "目标会话" in detail
+
+
+async def test_delivery_failure_is_reported_to_the_site(plugin_module):
+    """``send_message`` 抛异常：回报失败——站点据此**立刻**退回文本写法重发。"""
+
+    class _Boom(_FakeContext):
+        async def send_message(self, umo, chain):
+            raise RuntimeError("这个会话发不出去")
+
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    plugin.context = _Boom()
+    ok, detail = await plugin._deliver(
+        {"umo": "aiocqhttp:GroupMessage:123", "mentions": ["10001"], "body": "x"}
+    )
+    assert ok is False and "发不出去" in detail
+
+
+async def test_outbox_once_acks_every_item(plugin_module):
+    """取一轮件：逐条发 + **逐条回执**（回执里带上成没成、为什么）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    plugin.context = _FakeContext()
+    acks: list[dict] = []
+
+    async def fake_get(path, **params):
+        assert path == "outbox"
+        return {
+            "ok": True,
+            "items": [
+                {"id": "n1", "umo": "g:1", "mentions": ["10001"], "body": "第一条"},
+                {"id": "n2", "umo": "", "mentions": ["10002"], "body": "没有会话"},
+            ],
+        }
+
+    async def fake_post(path, payload):
+        acks.append({"path": path, **payload})
+        return {"ok": True}
+
+    plugin._get = fake_get
+    plugin._post = fake_post
+
+    assert await plugin._outbox_once() == 1
+    assert [ack["id"] for ack in acks] == ["n1", "n2"]
+    assert [ack["ok"] for ack in acks] == [True, False]
+    assert {ack["path"] for ack in acks} == {"outbox/ack"}
+
+
+async def test_outbox_loop_can_be_switched_off(plugin_module):
+    """配置里关掉投递：加载时不起取件任务（站点那边就只能把 @ 写进文本）。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+    plugin.config = {"outbox_enabled": False}
+
+    async def fake_get(path, **params):
+        return {"ok": True, "currentEvent": {"name": "x"}, "eventCount": 1}
+
+    plugin._get = fake_get
+    await plugin.initialize()
+    assert plugin._outbox_task is None
+    await plugin.terminate()
 
 
 class _FakeEvent:

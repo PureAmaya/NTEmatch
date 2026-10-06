@@ -17,7 +17,7 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-from . import logic, qqbot
+from . import logic, outbox, qqbot
 from .logging_conf import get_logger
 from .store import store
 
@@ -85,14 +85,30 @@ async def tick(*, now: datetime | None = None) -> list[dict[str, Any]]:
         mark = f"{MARK_PREFIX}{store.current_id}:{lead}"
         if (await store.meta(mark)).strip():
             continue
-        text = qqbot.build_remind_message(
-            cfg,
-            lead_minutes=lead,
-            owner_qq=owner_qq,
-            owner_name=owner_name,
-            settings=settings,
-        )
-        result = await qqbot.send_text(text, settings=settings)
+        if owner_qq:
+            # 有 QQ：走投递队列——插件在线就**真 @** 到举办者本人，不在线则退回文本写法
+            # （atMode 决定长什么样），两条路都不会漏发（见 app/outbox.py）。
+            # 正文取「不含 @ 行」的那一版：@ 由发送侧负责，免得拼两遍。
+            text = qqbot.build_remind_message(
+                cfg,
+                lead_minutes=lead,
+                owner_qq="",
+                owner_name="",
+                settings={**settings, "atMode": "none"},
+            )
+            result = await outbox.deliver(
+                kind="remind", body=text, mentions=[owner_qq], settings=settings
+            )
+        else:
+            # 没登记 QQ：退化成正文里的「@名字」（纯文本）——总比什么都不说强
+            text = qqbot.build_remind_message(
+                cfg,
+                lead_minutes=lead,
+                owner_qq="",
+                owner_name=owner_name,
+                settings=settings,
+            )
+            result = await qqbot.send_text(text, settings=settings)
         if not result.get("ok"):
             # 发失败**不记标记**：下一轮还会再试（机器人恢复后照样提醒得上）
             log.warning("赛前提醒发送失败 | 提前=%s 分钟 | %s", lead, result.get("detail"))

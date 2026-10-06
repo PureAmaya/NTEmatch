@@ -11,6 +11,10 @@
 插件本身**不做业务计算**，只调站点的只读查询 API（``/api/bot/*``），
 所以文案、赛制、分页逻辑全在站点那一侧，改一处两边同步。
 
+唯一的例外是**真 @ 投递**（见 :meth:`NTEMatchPlugin._outbox_loop`）：AstrBot 的
+OpenAPI **没有 at 段**，站点从外面发不出真 @，所以「要 @ 人」的消息（召集 / 赛前提醒）
+由站点排队、插件每隔几秒取走，**在 AstrBot 进程内**用 ``At`` 组件发出去再回执。
+
 安装：把本目录整个复制到 AstrBot 的 ``data/plugins/`` 下，然后在 AstrBot 的
 插件配置里填 **站点地址** 与 **查询 API 令牌**（站点「服务器 → QQ 机器人」生成）。
 
@@ -19,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 
@@ -27,6 +32,14 @@ import astrbot.api.star as star
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Plain
+
+try:  # MessageChain 的位置各版本不一：先按文档，再按内核路径，都没有就退化成列表
+    from astrbot.api.event import MessageChain
+except Exception:  # noqa: BLE001  (老版本没有这个导出)
+    try:
+        from astrbot.core.message.message_event_result import MessageChain
+    except Exception:  # noqa: BLE001  (实在没有就用列表，有的版本也收)
+        MessageChain = None  # type: ignore[assignment]
 
 __all__ = ["NTEMatchPlugin"]
 
@@ -283,6 +296,22 @@ HELP_TEXT = (
 )
 
 
+def _wrap_chain(components: list) -> object:
+    """把组件列表包成 ``MessageChain``（各版本签名不一，最后退回裸列表）。
+
+    ``context.send_message(umo, chain)`` 在有些版本里只认 ``MessageChain`` 对象，
+    另一些版本拿列表也照发——所以**拿不到类就用列表**，至少有的版本能发出去。
+    """
+    if MessageChain is None:
+        return components
+    try:
+        return MessageChain(chain=components)
+    except Exception:  # noqa: BLE001  (老版本签名不同：先建空的再塞)
+        chain = MessageChain()
+        chain.chain = components  # type: ignore[attr-defined]
+        return chain
+
+
 def _image_result(event, image: str):
     """发一张图：优先用框架的 ``image_result``，取不到就退化成 OneBot 的 CQ 码。
 
@@ -311,6 +340,8 @@ class NTEMatchPlugin(star.Star):
         self._client: httpx.AsyncClient | None = None
         # 「召集」的冷却记录：{会话: [时间戳, ...]}（只留一小时内）
         self._call_times: dict[str, list[float]] = {}
+        # 真 @ 投递的后台任务（站点排队、这里取走发；见 _outbox_loop）
+        self._outbox_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ #
     # 配置（每次读取，见上面关于注入时机的说明）
@@ -1043,6 +1074,72 @@ class NTEMatchPlugin(star.Star):
             yield event.plain_result(f"{head}\n" + "\n".join(texts))
 
     # ------------------------------------------------------------------ #
+    # 真 @ 投递：站点排队，**这里**来发
+    #
+    # 为什么非得插件发：AstrBot 的 OpenAPI（`POST /api/v1/im/message`）**没有 at 段**
+    # ——它的消息段解析只认 plain / image / record / file / video，而且是严格模式
+    # （塞 at 直接报错）。所以站点从外面怎么发都 @ 不到人，只能把 `[CQ:at,qq=…]`
+    # 写进文本（多数 OneBot 实现不解析数组段里的 CQ 码）。
+    # 真 @ 只能在 AstrBot **进程内部**用 `At` 组件发，而那正是本插件呆的地方：
+    # 站点把「要 @ 谁 + 正文」排进队列（站点侧 app/outbox.py），这里每隔几秒取一次、
+    # 发出去、再回执。站点那边等到期还没回执就自己退回文本写法，消息不会因为插件挂了而丢。
+    # ------------------------------------------------------------------ #
+    def _start_outbox(self) -> None:
+        """起后台取件任务（已经在跑就什么都不做）。"""
+        if self._outbox_task is not None and not self._outbox_task.done():
+            return
+        try:
+            self._outbox_task = asyncio.create_task(self._outbox_loop())
+        except RuntimeError as exc:  # 没有事件循环（少见的加载方式）：不起就不起
+            logger.warning("[NTE 比赛] 真 @ 投递没起来：%s", exc)
+
+    async def _outbox_loop(self) -> None:
+        interval = max(2, int(_conf(self.config, "outbox_interval", 5) or 5))
+        logger.info("[NTE 比赛] 真 @ 投递已启动 | 每 %s 秒取一次件", interval)
+        while True:
+            try:
+                await self._outbox_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001  (取件失败不能把循环打停)
+                logger.debug("[NTE 比赛] 取件失败（下一轮再试）：%s", exc)
+            await asyncio.sleep(interval)
+
+    async def _outbox_once(self) -> int:
+        """取一轮件并逐条发出去，返回发出几条。"""
+        data = await self._get("outbox", limit=10)
+        if not data.get("ok"):
+            return 0
+        sent = 0
+        for item in data.get("items") or []:
+            ok, detail = await self._deliver(item)
+            # 回执：发不出去的由站点**立刻**退回文本写法重发（见站点侧 app/outbox.py）
+            await self._post("outbox/ack", {"id": item.get("id"), "ok": ok, "detail": detail})
+            if ok:
+                sent += 1
+        return sent
+
+    async def _deliver(self, item: dict) -> tuple[bool, str]:
+        """发一条：``At`` 组件（**这才是真 @**）在前，正文在后。"""
+        umo = str(item.get("umo") or "")
+        if not umo:
+            return False, "这条消息没有目标会话"
+        mentions = [str(q) for q in (item.get("mentions") or []) if str(q).strip()]
+        body = str(item.get("body") or "")
+        chain = [At(qq=qq) for qq in mentions]
+        if body:
+            # 开头那个零宽空格不是装饰：aiocqhttp 会把 Plain 的首尾空白去掉，
+            # 直接拼 "\n" 会被吃掉，@ 和正文就挤在同一行了。
+            chain.append(Plain(text="\u200b\n" + body))
+        try:
+            await self.context.send_message(umo, _wrap_chain(chain))
+        except Exception as exc:  # noqa: BLE001  (发失败要回报给站点，由它兜底)
+            logger.warning("[NTE 比赛] 真 @ 投递失败：%s", exc)
+            return False, f"{type(exc).__name__}: {exc}"
+        logger.info("[NTE 比赛] 真 @ 已投递 | @ %d 人 | %s", len(mentions), umo)
+        return True, ""
+
+    # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
     async def initialize(self):
@@ -1051,6 +1148,9 @@ class NTEMatchPlugin(star.Star):
         站点侧专门留了 ``/api/bot/ping`` 就是给这一步用的——否则要等到群友发命令，
         才发现「令牌忘了填」，而且错误只能靠 401 / 403 的文案去猜。
         """
+        # 真 @ 投递先起：站点地址 / 令牌配错也先让它跑着（配好之后下一轮自己就接上了）
+        if bool(_conf(self.config, "outbox_enabled", True)):
+            self._start_outbox()
         try:
             data = await self._get("ping")
         except Exception as exc:  # noqa: BLE001  (探活失败绝不能影响插件加载)
@@ -1067,7 +1167,17 @@ class NTEMatchPlugin(star.Star):
         )
 
     async def terminate(self):
-        """插件卸载 / 停用：把复用的连接池关掉。"""
+        """插件卸载 / 停用：停掉取件任务，再把复用的连接池关掉。"""
+        task = self._outbox_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001  (收尾失败不值得报错)
+                logger.debug("[NTE 比赛] 停投递任务失败（忽略）", exc_info=True)
+        self._outbox_task = None
         if self._client is not None and not self._client.is_closed:
             try:
                 await self._client.aclose()

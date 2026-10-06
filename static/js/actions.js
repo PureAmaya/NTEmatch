@@ -2540,8 +2540,12 @@ export async function handleAction(act, el) {
           auth: true,
           body: { kind: 'call', ref: rnd.code },
         });
-        const atNote = res.at ? `真 @ 生效（${res.at}）` : '真 @ 不支持（已退回文本写法）';
-        toast(`已召集「${who}」：${res.sent}/${res.total} 段，${atNote}`, 'ok', 9000);
+        // 真 @ 只能由群里的插件发（AstrBot 的 OpenAPI 没有 at 段）：说清这条走了哪条路
+        const atNote =
+          res.via === 'plugin'
+            ? `已交给插件真 @ ${res.mentions || 0} 人`
+            : '插件不在线：已把 @ 写进文本发出';
+        toast(`已召集「${who}」：${atNote}`, 'ok', 9000);
       } catch (err) {
         toast(err.message, 'err', 9000);
       }

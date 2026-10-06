@@ -22,6 +22,8 @@
 | `GET /api/bot/profile` | 资料全文：QQ / 名字 / 游戏 UUID / B站 房间号 / 推流码 / 推流地址 / 密钥与令牌**有没有**（都不是明文） |
 | `POST /api/bot/profile` | 改资料（名字 / 游戏 UUID / B站 房间号 / 推流码 / 直播间标题 / QQ），回一份新资料 |
 | `POST /api/bot/notify` | 把一条消息**私聊**发给某人（帮助说明 / 推流地址 / 资料） |
+| `GET /api/bot/outbox` | **取走待发的群消息**（真 @ 只能由插件发：站点排队、插件用 `At` 组件发，见 `app/outbox.py`） |
+| `POST /api/bot/outbox/ack` | 投递回执（发成功收尾；发失败站点立刻退回文本写法重发） |
 
 前面几个 ``GET`` 是只读查询；``POST /members``、``POST /credential`` 与 ``POST /notify`` 会
 **写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，不是用户手输），权限判定在站点这一侧；
@@ -49,7 +51,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 
-from . import card, live, logic, qqbot
+from . import card, live, logic, outbox, qqbot
 from .auth import verify_secret
 from .logging_conf import get_logger
 from .members import ensure_stream_unique
@@ -864,6 +866,44 @@ async def api_bot_notify(
         "umo": qqbot.private_umo(settings, qq),
         "detail": result.get("detail") or "",
     }
+
+
+class BotOutboxAckPayload(NTEModel):
+    """真 @ 投递的回执：这条消息到底发出去了没有。"""
+
+    id: str = ""
+    ok: bool = False
+    detail: str = ""
+
+
+@router.get("/outbox")
+async def api_bot_outbox(
+    limit: int = Query(default=20, ge=1, le=50),
+    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """**真 @ 投递**：取走待发的群消息（插件每隔几秒来取一次）。
+
+    为什么要有这条：AstrBot 的 OpenAPI 没有 at 段（站点从外面发不出真 @，见
+    :mod:`app.outbox`），所以「要 @ 人」的消息由站点排队、插件用 ``At`` 组件发。
+
+    **取件这个动作本身就是「插件在线」的信号**（站点据此决定是排队等真 @，
+    还是当场按文本写法发），所以哪怕队列是空的也要照常来取。
+    """
+    await outbox.mark_seen()
+    items = await outbox.pending(limit=limit)
+    return {"ok": True, "count": len(items), "items": items}
+
+
+@router.post("/outbox/ack")
+async def api_bot_outbox_ack(
+    payload: BotOutboxAckPayload,
+    _: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """投递回执：发成功就收尾；插件说发不出去，站点**立刻**退回文本写法重发。"""
+    if not payload.id:
+        raise HTTPException(status_code=400, detail="缺少 id")
+    await outbox.mark_seen()
+    return await outbox.ack(str(payload.id), ok=bool(payload.ok), detail=str(payload.detail or ""))
 
 
 @router.post("/credential")

@@ -27,11 +27,12 @@
 一律先发图、再发文本；图发不出去（没装 Pillow、AstrBot 不收图片段、拉不到图）
 就**退回纯文本**，信息一条不少。
 
-**@ 与退回**：``call``（召集）的第一段会**先试真 @ 消息段**（平铺的 ``qq`` 与 OneBot
-风格的 ``data.qq`` 两种写法各试一次，试出来记住，见 :func:`app.qqbot.send_at_parts`）；
-这个 AstrBot 收不了 at 段时退回 ``atMode`` 的文本写法（CQ 码 / ``@QQ号`` / 不 @）——
-**消息绝不会因为「@ 不到人」而发不出去**。预览会给出退回时的样子，返回里的 ``at``
-说明真 @ 用的是哪种段写法。
+**@ 只能由插件发**：AstrBot 的 OpenAPI **没有 at 消息段**（段解析只认
+``plain / image / record / file / video``，且 ``strict=True``——塞 ``at`` 直接报错），
+所以站点从外面**发不出真 @**。``call``（召集）走 :mod:`app.outbox` 的投递队列：
+插件在线 → 排队让它用 ``At`` 组件发**真 @**；插件不在线 → 按 ``atMode`` 的文本写法
+（CQ 码 / ``@QQ号`` / 不 @）当场发。**消息绝不会因为「@ 不到人」而发不出去**，
+返回里的 ``via`` 说明这条走了哪条路（``plugin`` = 真 @ / ``webhook`` = 文本）。
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
-from . import card, live, logic, qqbot
+from . import card, live, logic, outbox, qqbot
 from .auth import Session, hash_secret
 from .logging_conf import get_logger
 from .security import require_event, require_event_owned, require_server
@@ -128,8 +129,9 @@ async def api_qqbot_status(_: Session = Depends(require_event)) -> dict[str, Any
         "hasKey": bool(settings.get("apiKey")),
         "umo": qqbot.resolved_umo(settings),
         "atMode": settings.get("atMode"),
-        # 真 @ 试出来的结果：``qq`` / ``data`` 生效、``unsupported`` 不支持、空 = 还没试过
-        "at": qqbot.at_mode(),
+        # 真 @ 的通道：插件最近还在取件吗（在线 → 召集能真的 @ 到人；不在线 → 只能写进文本）
+        "pluginAlive": await outbox.plugin_alive(),
+        "pluginSeenAt": await outbox.seen_at(),
         "maxChars": settings.get("maxChars"),
         "ready": ready,
         # 限流额度（预览不占额度，所以赛事管理员看到的就是真实可用额度）
@@ -145,6 +147,9 @@ async def api_qqbot(_: Session = Depends(require_server)) -> dict[str, Any]:
         "ok": True,
         "settings": qqbot.public_settings(settings),
         "kinds": list(qqbot.KINDS),
+        # 真 @ 通道（插件）的状态：面板据此提示「@ 能不能真的 @ 到人」
+        "pluginAlive": await outbox.plugin_alive(),
+        "pluginSeenAt": await outbox.seen_at(),
         "limit": await qqbot.limiter.snapshot(settings),
     }
 
@@ -191,11 +196,12 @@ async def api_qqbot_test(
     payload: dict[str, Any] | None = Body(default=None),  # noqa: B008
     _: Session = Depends(require_server),
 ) -> dict[str, Any]:
-    """发一条测试消息（默认 @ 你自己，用来验证「真 @」到底行不行）。
+    """发一条测试消息（默认 @ 你自己）：验证「地址 / Key / 目标会话」通不通。
 
-    真 @ 先试消息段、不行再退回文本写法（见 :func:`app.qqbot.send_parts`），
-    所以这条既是「地址 / Key / 会话通不通」的测试，也是「能不能真 @」的测试——
-    返回里的 ``at`` 说明用的是哪种段写法（空 = 这个 AstrBot 收不了，已退回文本）。
+    真 @ **不在这条里**：AstrBot 的 OpenAPI 没有 at 段，站点从外面发不出真 @
+    （见 :mod:`app.outbox`）——真 @ 由**插件**用 ``At`` 组件发。所以这里一并回报
+    「插件投递通道」的状态：``pluginAlive`` = 插件最近还在取件（那它就能真 @），
+    ``pluginSeenAt`` = 最后一次取件时间（从没来过是空串）。
     """
     settings = store.qqbot_settings()
     # 测试发送也会真的发消息，所以同样吃限流额度（预览不吃）
@@ -205,15 +211,15 @@ async def api_qqbot_test(
     want_image = bool((payload or {}).get("image"))
     text = str((payload or {}).get("text") or "").strip()
     probe_qq = str((payload or {}).get("qq") or "10001")
-    # 测试连同**真 @**一起试：能不能 @ 到人，一试就知道（结果在返回的 at 字段里）
+    # @ 只按**文本写法**发（真 @ 由插件发，见 app/outbox.py）：这条测的是「通不通」
     mentions = [probe_qq] if str(settings.get("atMode") or "cq") != "none" else []
     mention_text = qqbot.at_text(mentions, settings)
     if not text:
         text = (
             "【NTE 比赛】这是一条测试消息。\n"
-            "若你看到这条消息，说明地址 / API Key / 目标会话都通了；"
-            "看到真的 @ 说明真 @ 这条通道也通。\n"
-            "（真 @ 发不出去时会自动退回文本写法，消息照样送达）"
+            "看到它说明地址 / API Key / 目标会话都通了。\n"
+            "真 @ 由群里的机器人插件发（AstrBot 的 OpenAPI 没有 at 段）："
+            "插件在线时「召集」会真的 @ 到人。"
         )
     if want_image:
         info = await card.card_for_event(store.snapshot(), store.current_id, site=_site(request))
@@ -234,16 +240,16 @@ async def api_qqbot_test(
             filename=f"card-{info.get('hash') or 'preview'}.png",
         )
         return {"ok": bool(image.get("ok")), "detail": image.get("detail") or "", "umo": image.get("umo") or "", "image": True, "shape": image.get("shape") or "", "sent": 1 if image.get("ok") else 0}
-    result = await qqbot.send_parts(
-        [text], settings=settings, mentions=mentions, mention_text=mention_text
-    )
+    full = "\n".join(part for part in (mention_text, text) if part)
+    result = await qqbot.send_parts([full], settings=settings)
     return {
         "ok": result["ok"],
         "detail": result["detail"],
         "umo": result["umo"],
         "sent": result.get("sent") or 0,
-        # 真 @ 用的是哪种写法（"" = 没走真 @ / 这个 AstrBot 收不了 at 段 → 已退回文本）
-        "at": result.get("at") or "",
+        # 真 @ 通道（插件）的状态：它不在线时，@ 只能写进文本
+        "pluginAlive": await outbox.plugin_alive(),
+        "pluginSeenAt": await outbox.seen_at(),
     }
 
 
@@ -334,10 +340,11 @@ async def api_qqbot_preview(
         "page": result["page"],
         "imageAvailable": card.available(),
         "settings": qqbot.public_settings(store.qqbot_settings()),
-        # 召集：要 @ 的 QQ 与「真 @ 发不出去时」的文本写法（预览据此说明会怎么发）
+        # 召集：要 @ 的 QQ、退回时用的文本写法，以及「真 @ 通道（插件）在不在线」
         "mentions": list(result.get("mentions") or []),
         "mentionText": str(result.get("mentionText") or ""),
-        "atSupported": qqbot.at_mode(),
+        "pluginAlive": await outbox.plugin_alive(),
+        "pluginSeenAt": await outbox.seen_at(),
     }
 
 
@@ -349,10 +356,12 @@ async def api_qqbot_push(
 ) -> dict[str, Any]:
     """把消息发到群里（先发卡片图，再发文本；超长自动分段）。
 
-    两条「发不出去就退回」的兜底，都靠 HTTP 返回码判定，绝不因此丢消息：
+    两条通道，各管一段：
 
-    * **图**发不出去（没装 Pillow / AstrBot 不收图片段）→ 退回完整文本；
-    * 召集的**真 @** 发不出去（这个 AstrBot 不收 at 段）→ 退回 ``atMode`` 的文本写法。
+    * **文本 / 图**：走 AstrBot 的 OpenAPI（图发不出去就退回完整文本）；
+    * **召集的真 @**：OpenAPI 发不了（没有 at 段，见 :mod:`app.outbox`）——
+      交给**插件投递**：插件在线就排队等它用 ``At`` 组件真 @，不在线就按 ``atMode``
+      的文本写法当场发。两条路都不丢消息，返回里的 ``via`` 说明走了哪条。
     """
     await _require_push(session, str(payload.get("eventId") or ""))
     result, target, card_info = await _build(payload, request)
@@ -393,23 +402,53 @@ async def api_qqbot_push(
                 "请改用分页（比赛列表）、缩短内容，或在设置里调大上限。"
             ),
         )
-    # 召集：第一段先试**真 @**（消息段），这个 AstrBot 收不了就退回 atMode 的文本写法
+    # 召集：**真 @ 只能由插件发**（OpenAPI 没有 at 段）——交给投递队列。
+    # 插件不在线 / 没有可 @ 的 QQ 时，deliver 会当场按 atMode 的文本写法发出去。
     mentions = [str(qq) for qq in (result.get("mentions") or [])]
-    mention_text = str(result.get("mentionText") or "")
-    sent = await qqbot.send_parts(
-        parts, settings=settings, mentions=mentions, mention_text=mention_text
-    )
+    if str(payload.get("kind") or "").strip().lower() == "call" and mentions:
+        delivered = await outbox.deliver(
+            kind="call",
+            body=str(result.get("body") or ""),
+            mentions=mentions,
+            settings=settings,
+            umo=qqbot.resolved_umo(settings),
+            event_id=target or store.current_id,
+        )
+        if not delivered.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"召集发送失败：{delivered.get('detail') or '未知原因'}",
+            )
+        log.warning(
+            "已推送召集 | 届=%s | 通道=%s | @%d 人 | 操作者=%s",
+            target or store.current_id,
+            delivered.get("via"),
+            len(mentions),
+            session.name or session.uid or "?",
+        )
+        return {
+            "ok": True,
+            "via": delivered.get("via") or "",
+            "mentions": len(mentions),
+            "image": False,
+            "sent": delivered.get("sent") or 0,
+            "total": delivered.get("total") or 1,
+            "pages": result["pages"],
+            "page": result["page"],
+            "umo": delivered.get("umo") or "",
+            "preview": (parts[0] if parts else "")[:200],
+        }
+    sent = await qqbot.send_parts(parts, settings=settings)
     if not sent["ok"]:
         raise HTTPException(
             status_code=502,
             detail=f"发送失败（已发出 {sent.get('sent', 0)}/{sent.get('total', 1)} 条）：{sent['detail']}",
         )
     log.warning(
-        "已向群推送 | 类型=%s | 届=%s | 图片=%s | 真@=%s | 文本段=%d | 分页=%d/%d | 操作者=%s",
+        "已向群推送 | 类型=%s | 届=%s | 图片=%s | 文本段=%d | 分页=%d/%d | 操作者=%s",
         payload.get("kind"),
         target or store.current_id,
         "有" if image_sent else "无",
-        sent.get("at") or ("—" if not mentions else "退回文本"),
         sent.get("sent"),
         result["page"],
         result["pages"],
@@ -417,6 +456,8 @@ async def api_qqbot_push(
     )
     return {
         "ok": True,
+        # 这条通道永远是文本 / 图（真 @ 走插件，见上面 call 那一支）
+        "via": "webhook",
         "sent": sent.get("sent"),
         "total": sent.get("total"),
         "image": image_sent,
@@ -424,6 +465,4 @@ async def api_qqbot_push(
         "page": result["page"],
         "umo": sent.get("umo") or "",
         "preview": parts[0][:200],
-        # 召集：真 @ 用的是哪种段写法（"" = 没走真 @ / 这个 AstrBot 收不了 → 已退回文本）
-        "at": sent.get("at") or "",
     }

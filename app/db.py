@@ -318,10 +318,30 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid);
 CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 
+-- 待投递的群消息（**真 @ 只能由 AstrBot 里的插件发**，见 app/outbox.py）：
+-- 站点把「要 @ 谁的 QQ + 正文」放在这里，插件每隔几秒取走、用 At 组件发出去再回执
+-- （AstrBot 的 OpenAPI 没有 at 段，站点自己发不出真 @）。取不走就到期由站点
+-- 退回**纯文本**发送，所以这个东西是「加速通道」而不是「唯一通道」。
+CREATE TABLE IF NOT EXISTS push_outbox (
+  id         TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  kind       TEXT NOT NULL DEFAULT '',
+  event_id   TEXT NOT NULL DEFAULT '',
+  umo        TEXT NOT NULL DEFAULT '',
+  mentions   TEXT NOT NULL DEFAULT '[]',
+  body       TEXT NOT NULL DEFAULT '',
+  status     TEXT NOT NULL DEFAULT 'pending',
+  via        TEXT NOT NULL DEFAULT '',
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  detail     TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_players_event ON players(event_id, position);
 CREATE INDEX IF NOT EXISTS idx_members_stream ON members(stream_id);
 CREATE INDEX IF NOT EXISTS idx_rounds_event ON rounds(event_id, idx);
 CREATE INDEX IF NOT EXISTS idx_round_players_player ON round_players(event_id, player_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON push_outbox(status, created_at);
 """
 
 CURRENT_KEY = "current_event"
@@ -557,6 +577,110 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# --------------------------------------------------------------------------- #
+# 待投递的群消息（真 @ 由 AstrBot 里的插件发，见 app/outbox.py）
+# --------------------------------------------------------------------------- #
+_OUTBOX_PENDING = ("pending",)
+
+
+def _outbox_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "kind": row["kind"],
+        "eventId": row["event_id"],
+        "umo": row["umo"],
+        "mentions": json.loads(row["mentions"] or "[]") or [],
+        "body": row["body"],
+        "status": row["status"],
+        "via": row["via"],
+        "attempts": int(row["attempts"] or 0),
+        "detail": row["detail"],
+    }
+
+
+def insert_outbox(
+    conn: sqlite3.Connection,
+    *,
+    id: str,
+    kind: str,
+    umo: str,
+    mentions: list[str],
+    body: str,
+    event_id: str = "",
+    status: str = "pending",
+    detail: str = "",
+    created_at: str = "",
+) -> None:
+    conn.execute(
+        "INSERT INTO push_outbox"
+        " (id, created_at, updated_at, kind, event_id, umo, mentions, body, status, via, attempts, detail)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?)",
+        (
+            id,
+            created_at,
+            created_at,
+            kind,
+            event_id,
+            umo,
+            json.dumps(list(mentions or []), ensure_ascii=False),
+            body,
+            status,
+            detail,
+        ),
+    )
+
+
+def list_outbox(
+    conn: sqlite3.Connection, *, statuses: tuple[str, ...] = _OUTBOX_PENDING, limit: int = 20
+) -> list[dict[str, Any]]:
+    """取待投递的消息（老消息在前；``statuses`` 传空元组 = 什么都取，给诊断用）。"""
+    sql = "SELECT * FROM push_outbox"
+    params: list[Any] = []
+    if statuses:
+        sql += f" WHERE status IN ({','.join('?' for _ in statuses)})"
+        params.extend(statuses)
+    sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+    params.append(max(1, int(limit)))
+    return [_outbox_dict(row) for row in conn.execute(sql, params)]
+
+
+def get_outbox(conn: sqlite3.Connection, item_id: str) -> dict[str, Any] | None:
+    """按 id 取一条（插件回执说发不出去时，要拿它的正文与 @ 名单去退回重发）。"""
+    row = conn.execute("SELECT * FROM push_outbox WHERE id = ?", (item_id,)).fetchone()
+    return _outbox_dict(row) if row else None
+
+
+def finish_outbox(
+    conn: sqlite3.Connection,
+    item_id: str,
+    *,
+    status: str,
+    via: str,
+    detail: str = "",
+    updated_at: str = "",
+) -> bool:
+    """收尾一条（``sent`` / ``fallback`` / ``failed``）。**只动还是 pending 的那些**——
+    插件回执与站点超时退回可能同时发生，谁先落到库里就以谁为准，不覆盖已有结论。"""
+    cur = conn.execute(
+        "UPDATE push_outbox SET status = ?, via = ?, detail = ?, updated_at = ?,"
+        " attempts = attempts + 1 WHERE id = ? AND status = 'pending'",
+        (status, via, detail, updated_at, item_id),
+    )
+    return cur.rowcount > 0
+
+
+def prune_outbox(conn: sqlite3.Connection, keep: int = 50) -> int:
+    """只留最近 ``keep`` 条**已收尾**的记录（未投递的永远不清：宁可多留也不丢消息）。"""
+    cur = conn.execute(
+        "DELETE FROM push_outbox WHERE status != 'pending' AND id NOT IN"
+        " (SELECT id FROM push_outbox ORDER BY created_at DESC, id DESC LIMIT ?)",
+        (max(1, int(keep)),),
+    )
+    return cur.rowcount
 
 
 def next_event_id(conn: sqlite3.Connection) -> str:

@@ -33,5 +33,15 @@
     "description": "「比赛召集」每小时上限（同一会话，0 = 不限制）",
     "type": "int",
     "default": 6
+  },
+  "outbox_enabled": {
+    "description": "真 @ 投递：每隔几秒取一次站点排队的「要 @ 人」的消息（召集 / 赛前提醒），用 At 组件发出去。AstrBot 的 OpenAPI 没有 at 段，**只有插件能真 @**；关掉之后站点只能把 @ 写进文本（CQ 码）",
+    "type": "bool",
+    "default": true
+  },
+  "outbox_interval": {
+    "description": "取件间隔（秒，最小 2）：小一点更及时；站点那边有 45 秒超时兜底，慢一点也不会漏消息",
+    "type": "int",
+    "default": 5
   }
 }

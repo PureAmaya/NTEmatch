@@ -51,6 +51,7 @@ from . import (
     media,
     metrics,
     notices_api,
+    outbox,
     qqbot_api,
     remind,
     subs,
@@ -679,6 +680,9 @@ async def lifespan(app: FastAPI):
     # 打完一场就播报一场：录分那一刻发一次**这一场**的结果（见 app/announce.py）。
     # 结算时就会立刻试一次，这个巡检是兜底（重启 / 上次发失败）。
     announce_task = asyncio.create_task(announce.loop())
+    # 真 @ 投递巡检：站点排队、插件取走用 At 组件发（见 app/outbox.py）。
+    # 这里只干「排太久没人取 → 退回文本发出」这一件兜底的事。
+    outbox_task = asyncio.create_task(outbox.loop())
     # 直播常驻探测：**没人访问也一直在探**（间隔见 live.WATCH_INTERVAL），
     # 状态变了就通过 WebSocket 推给在线客户端；请求路径始终只读缓存、一秒都不等它。
     # 关停时由 live.stop_refresher() 统一收掉（见下面的 finally）。
@@ -741,6 +745,9 @@ async def lifespan(app: FastAPI):
         announce_task.cancel()
         with suppress(asyncio.CancelledError):
             await announce_task
+        outbox_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await outbox_task
         # 帮助图那次渲染跑在线程里（线程没法取消）：等它收尾，别留下「任务未结束」的噪音
         with suppress(asyncio.CancelledError):
             await help_task

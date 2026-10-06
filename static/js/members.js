@@ -512,7 +512,7 @@ function botTokenBlockHtml(q) {
     `它需要一个只读查询令牌：</div>` +
     `<dl class="kv" style="margin-top:10px">` +
     `<div class="kv__row"><dt>查询 API</dt><dd>${q.hasBotToken ? '已启用（令牌不可查看）' : '未启用'}</dd></div>` +
-    `<div class="kv__row"><dt>接口前缀</dt><dd><code>/api/bot/query</code> · <code>/api/bot/events</code> · <code>/api/bot/participants</code></dd></div>` +
+    `<div class="kv__row"><dt>接口前缀</dt><dd><code>/api/bot/query</code> · <code>/api/bot/events</code> · <code>/api/bot/participants</code> · <code>/api/bot/outbox</code></dd></div>` +
     `</dl>` +
     `<div class="tool-group" style="margin-top:10px">` +
     `<button class="btn btn--sm btn--primary" type="button" data-act="qqbot-token-new">` +
@@ -522,8 +522,9 @@ function botTokenBlockHtml(q) {
     `</div>` +
     `<div class="notice" style="margin-top:8px">把站点地址与令牌填进插件配置即可。` +
     `令牌<b>只显示一次</b>，重置后旧令牌立即失效。<br>` +
-    `插件的「比赛召集」用消息链发 <b>At 组件</b>，是<b>真正的 @</b>；` +
-    `而页面上「发送到群」受 AstrBot OpenAPI 限制只能把 @ 写进文本。</div>`
+    `<b>真 @ 只能由插件发</b>：AstrBot 的 OpenAPI 没有 at 段，所以「召集 / 赛前提醒」要 @ 人时，` +
+    `站点先把消息排进队列，插件每隔几秒取走、用 <b>At 组件</b>发出真 @。` +
+    `插件不在线时退回文本写法（CQ 码），消息照样送达。</div>`
   );
 }
 
@@ -629,6 +630,31 @@ function qqbotPushQuery() {
   };
 }
 
+/**
+ * 真 @ 通道的状态一行：插件最近来取过件没有。
+ *
+ * 为什么值得显眼地写出来：AstrBot 的 OpenAPI **没有 at 段**，「召集 / 赛前提醒」
+ * 要 @ 人就得靠插件取件代发（见 app/outbox.py）。插件不在线时站点退回文本写法
+ * ——@ 变成一串 CQ 码，群里不会真的提醒到人。管理员一眼要能看出是不是这台机器。
+ */
+function pluginChannelHtml() {
+  const q = App.server?.qqbot || {};
+  const seen = String(q.pluginSeenAt || '').replace('T', ' ').slice(0, 16);
+  if (q.pluginAlive) {
+    return (
+      `<div class="notice" style="margin-top:10px">真 @ 通道：<b>插件在线</b>` +
+      (seen ? `（最近取件 ${esc(seen)}）` : '') +
+      `——「召集 / 赛前提醒」会真的 @ 到人。</div>`
+    );
+  }
+  return (
+    `<div class="notice notice--warn" style="margin-top:10px">真 @ 通道：<b>插件没来取件</b>` +
+    (seen ? `（最后一次 ${esc(seen)}）` : '（从没来过）') +
+    `——@ 只能写进文本（CQ 码）。请在 AstrBot 里装好并启用 ` +
+    `<code>astrbot_plugin_nte_match</code>（1.2.0 起带「真 @ 投递」）。</div>`
+  );
+}
+
 /** QQ 机器人（AstrBot）推送设置：仅服务器管理员。 */
 function qqbotPanelHtml() {
   const q = App.server?.qqbot?.settings || {};
@@ -636,6 +662,7 @@ function qqbotPanelHtml() {
     `<div class="notice">把<b>比赛信息 / 赛程进度 / 召集参赛 / 比赛结果 / 比赛列表</b>推到 QQ 群。` +
     `对接的是 <b>AstrBot OpenAPI</b>：API Key 在 AstrBot 的「设置 → OpenAPI」里创建（形如 <code>abk_xxx</code>）。` +
     `Key 只存服务端，接口不回显、也不进「导出配置」。</div>` +
+    pluginChannelHtml() +
     `<form class="form form--2" data-form="qqbot" style="margin-top:10px">` +
     fieldSwitch('enabled', '启用群推送', q.enabled === true) +
     // 赛前提醒：站点侧定时巡检（app/remind.py），到点在群里 @ 举办者
@@ -1645,12 +1672,12 @@ export async function handleMemberAction(act, el) {
       try {
         const body = el.dataset.image === '1' ? { image: true } : {};
         const res = await api('/qqbot/test', { method: 'POST', auth: true, body });
-        // 文本测试顺带验证「真 @」：返回的 at 说明用的是哪种消息段写法
+        // 文本测试顺带回报「真 @ 通道（插件）在不在线」——真 @ 只能由插件发
         const atNote = res.image
           ? ''
-          : res.at
-            ? `（真 @ 生效：${res.at} 写法）`
-            : '（真 @ 不支持，已按退回写法发）';
+          : res.pluginAlive
+            ? '（真 @ 通道：插件在线，召集能真 @ 到人）'
+            : '（真 @ 通道：插件没来取件，召集只能把 @ 写进文本）';
         toast(
           res.ok
             ? `测试${res.image ? `图片（${res.shape === 'attachment_id' ? '先上传再引用' : `字段名 ${res.shape || '?'}`}）` : '消息'}已发送到 ${res.umo}${atNote}`
@@ -1682,12 +1709,14 @@ export async function handleMemberAction(act, el) {
         }
         const box = qs('#qqbotPreview');
         if (box) {
-          // 召集会**先试真 @**，所以先把这件事说清楚，再给「退回时发出去的样子」
+          // 召集的真 @ 只能由插件发：先把这件事说清楚，再给「退回时发出去的样子」
           const head =
             res.mentions && res.mentions.length
               ? `—— 真 @ 说明（不会发出去）——\n` +
-                `会先试真 @ ${res.mentions.length} 人（消息段）；这台 AstrBot 不支持时` +
-                `退回文本写法，下面就是退回时发出去的样子。\n\n`
+                `要 @ ${res.mentions.length} 人，真 @ 由群里的机器人插件发；` +
+                (res.pluginAlive
+                  ? '插件在线，会真的 @ 到人。下面这段是插件不在线时的样子。\n\n'
+                  : '插件现在没来取件，所以只能把 @ 写进文本（下面就是发出去的样子）。\n\n')
               : '';
           box.value =
             head +
@@ -1711,14 +1740,19 @@ export async function handleMemberAction(act, el) {
       if (!window.confirm('确认把这条消息发送到群里？')) return true;
       try {
         const res = await api('/qqbot/push', { method: 'POST', auth: true, body: q });
-        const atNote =
-          q.kind === 'call'
-            ? res.at
-              ? `，真 @ 生效（${res.at}）`
-              : '，真 @ 不支持（已退回文本写法）'
-            : '';
+        // 召集：真 @ 只能由插件发——说清这条走了哪条路（别的类型都是站点的文本 / 图通道）
+        if (q.kind === 'call') {
+          toast(
+            res.via === 'plugin'
+              ? `已交给插件真 @ ${res.mentions || 0} 人（插件取走后才会出现在群里）`
+              : '插件不在线：已把 @ 写进文本发出（CQ 码）',
+            'ok',
+            9000
+          );
+          return true;
+        }
         toast(
-          `已发送到群（${res.image ? '图片 + ' : ''}${res.sent}/${res.total} 段${atNote}）` +
+          `已发送到群（${res.image ? '图片 + ' : ''}${res.sent}/${res.total} 段）` +
             (res.image === false && q.kind === 'event' ? '（图没发出去，已改为完整文本）' : ''),
           'ok',
           6000

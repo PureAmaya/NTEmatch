@@ -997,6 +997,88 @@ class ConfigStore:
             conn.commit()
 
     # ------------------------------------------------------------------ #
+    # 群消息投递队列：**真 @** 只能由 AstrBot 里的插件发（见 app/outbox.py）
+    # ------------------------------------------------------------------ #
+    async def push_enqueue(
+        self, *, kind: str, body: str, mentions: list[str], umo: str = "", event_id: str = ""
+    ) -> dict[str, Any]:
+        """排队一条待投递的消息（``mentions`` = 要真 @ 的 QQ）。"""
+        stamp = now_iso()
+        item_id = f"n{secrets.token_hex(6)}"
+        item = {
+            "id": item_id,
+            "createdAt": stamp,
+            "updatedAt": stamp,
+            "kind": kind,
+            "eventId": event_id,
+            "umo": umo,
+            "mentions": [str(q) for q in (mentions or [])],
+            "body": body,
+            "status": "pending",
+            "via": "",
+            "attempts": 0,
+            "detail": "",
+        }
+        async with self._lock:
+            await asyncio.to_thread(self._outbox_insert_sync, item)
+        return item
+
+    def _outbox_insert_sync(self, item: dict[str, Any]) -> None:
+        with db.connect(self._db_path) as conn:
+            db.insert_outbox(
+                conn,
+                id=item["id"],
+                kind=item["kind"],
+                umo=item["umo"],
+                mentions=item["mentions"],
+                body=item["body"],
+                event_id=item["eventId"],
+                created_at=item["createdAt"],
+            )
+            conn.commit()
+
+    async def push_pending(self, limit: int = 20) -> list[dict[str, Any]]:
+        """待投递的消息（老消息在前）——插件每隔几秒来取一次。"""
+        return await asyncio.to_thread(self._outbox_pending_sync, limit)
+
+    def _outbox_pending_sync(self, limit: int) -> list[dict[str, Any]]:
+        with db.connect(self._db_path) as conn:
+            return db.list_outbox(conn, limit=limit)
+
+    async def push_item(self, item_id: str) -> dict[str, Any] | None:
+        """按 id 取一条（插件回执说发不出去时，要拿它的正文与 @ 名单去退回重发）。"""
+        return await asyncio.to_thread(self._outbox_item_sync, item_id)
+
+    def _outbox_item_sync(self, item_id: str) -> dict[str, Any] | None:
+        with db.connect(self._db_path) as conn:
+            return db.get_outbox(conn, item_id)
+
+    async def push_finish(self, item_id: str, *, status: str, via: str, detail: str = "") -> bool:
+        """给一条消息收尾（``sent`` / ``fallback`` / ``failed``）。
+
+        返回 ``False`` = 这条已经被别人收掉了（插件回执与站点超时可能同时发生）。
+        """
+        return await asyncio.to_thread(self._outbox_finish_sync, item_id, status, via, detail)
+
+    def _outbox_finish_sync(self, item_id: str, status: str, via: str, detail: str) -> bool:
+        with db.connect(self._db_path) as conn:
+            done = db.finish_outbox(
+                conn, item_id, status=status, via=via, detail=detail, updated_at=now_iso()
+            )
+            conn.commit()
+            return done
+
+    async def push_prune(self, keep: int = 50) -> int:
+        """清掉旧的已收尾记录（未投递的永不清）。"""
+        return await asyncio.to_thread(self._outbox_prune_sync, keep)
+
+    def _outbox_prune_sync(self, keep: int) -> int:
+        with db.connect(self._db_path) as conn:
+            count = db.prune_outbox(conn, keep=keep)
+            conn.commit()
+            return count
+
+    # ------------------------------------------------------------------ #
     # 服务器信息（站点级 Markdown）+ 公告（通知）
     # ------------------------------------------------------------------ #
     def server_info(self) -> str:
