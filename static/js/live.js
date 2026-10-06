@@ -2,8 +2,30 @@
  * 仅依赖核心层；对外暴露 Live 与事件委托安装函数。
  */
 
-import { App, LIVE_PROTO_KEY, api, copyText, esc, hooks, isAdmin, log, qs, toast } from './core.js';
+import {
+  App,
+  LIVE_MUTE_KEY,
+  LIVE_PROTO_KEY,
+  api,
+  copyText,
+  esc,
+  hooks,
+  isAdmin,
+  log,
+  qs,
+  toast,
+} from './core.js';
 import { PUSH_TIP_LINE, pushUrlOf, roomFor } from './ui.js';
+
+/**
+ * 信令超时（毫秒）：媒体服务器半死不活时**不能无限等**。
+ *
+ * 没有这个超时，一次卡住的 WHEP 请求会让「连接中…」永远停在那里，
+ * 观众看到的是「点哪个台都没反应」——这正是换台看起来坏掉的样子。
+ */
+const SIGNAL_TIMEOUT = 8000;
+/** hls.js 的 CDN 加载超时（毫秒）：CDN 被墙 / 抽风时不能让播放卡在这儿。 */
+const HLS_LOAD_TIMEOUT = 8000;
 
 /**
  * 当前线路对应的**观看地址**：HLS 给 8888 那条，否则给 8889 那条。
@@ -29,9 +51,19 @@ function loadHlsLib() {
     const script = document.createElement('script');
     script.src = HLS_CDN;
     script.async = true;
+    // CDN 拉不动（被墙 / 超时）时必须**失败**而不是永远挂着：否则播放器一直停在
+    // 「HLS 加载中…」，换台点谁都没反应（而且每次都会再挂一个未完成的加载）。
+    const timer = setTimeout(() => {
+      script.remove?.();
+      reject(new Error('hls.js 加载超时（CDN 不可达）'));
+    }, HLS_LOAD_TIMEOUT);
+    const done = (fn, arg) => {
+      clearTimeout(timer);
+      fn(arg);
+    };
     script.onload = () =>
-      window.Hls ? resolve(window.Hls) : reject(new Error('hls.js 未就绪'));
-    script.onerror = () => reject(new Error('hls.js 加载失败（网络不可达）'));
+      done(window.Hls ? resolve : reject, window.Hls || new Error('hls.js 未就绪'));
+    script.onerror = () => done(reject, new Error('hls.js 加载失败（网络不可达）'));
     document.head.appendChild(script);
   }).catch((err) => {
     hlsLoading = null; // 允许下次重试
@@ -113,6 +145,13 @@ function makePlayer(ids) {
     room: null, // 当前机位的地址集合（key_endpoints 结果）
     // 正在播的「机位 + 线路」：只有两者都没变、且画面确实还活着时才跳过重连
     playing: { key: '', mode: '' },
+    // 画面**到底连在哪个 <video> 上**：舞台一重建（换台、切线路、来一路新直播）元素就
+    // 被换掉了，而老 pc 还连着那个已经从文档里摘掉的旧元素。只看 pc.connectionState
+    // 会以为「还在播」，于是换台 / 再点播放都不再重连，观众看到封面一直挂着
+    // ——「播一会儿之后换台没反应」的根子就在这里。
+    attached: null,
+    // 正在连的目标（``机位key|线路``）：同一个目标正在连时别重复发信令（重绘很频繁）
+    pending: '',
     // 用户**主动**按过「停止」：此后不再自动开播（否则刚停掉、一次信号刷新又给放上了）。
     // 任何「用户自己想看」的动作（选台 / 点播放 / 换线路）都会把它清掉。
     stoppedByUser: false,
@@ -146,6 +185,95 @@ function makePlayer(ids) {
     if (video) video.hidden = false;
   },
 
+  /**
+   * 把用户上一次的音量选择套到这个 ``<video>`` 上。
+   *
+   * **默认不静音**（要听得到声音）：舞台重建会换一个新的 ``<video>``，不重新套一遍
+   * 就等于把观众刚调好的音量（以及「别静音」这个默认）丢掉。
+   */
+  applyAudio(video) {
+    if (!video) return;
+    video.muted = Boolean(App.liveMuted);
+    if (Number.isFinite(App.liveVolume) && App.liveVolume > 0) video.volume = App.liveVolume;
+  },
+
+  /** 记住观众在播放器上改的音量，并在流断掉时把「正在播」的标记清掉（好自动重连）。 */
+  bindVideo(video) {
+    if (!video || video.dataset.nteAudio === '1') return;
+    video.dataset.nteAudio = '1';
+    video.addEventListener('volumechange', () => {
+      App.liveMuted = video.muted;
+      App.liveVolume = video.volume;
+      try {
+        localStorage.setItem(LIVE_MUTE_KEY, video.muted ? '1' : '0');
+      } catch (err) {
+        log.debug('音量偏好写入失败（忽略）', err);
+      }
+    });
+    // 流结束 / 元素被清空：当作「没在播」，下一次重绘（或观众再点一次）就会重连。
+    // 不这么做的话，`playing` 会一直停在「正在播」，而画面其实是黑的。
+    video.addEventListener('ended', () => this.markDead(video));
+    video.addEventListener('emptied', () => this.markDead(video));
+  },
+
+  /**
+   * 起播；被自动播放策略拦下时**退回静音再试一次**，并告诉观众怎么开声音。
+   *
+   * 不静音是默认值，但 Chrome 会拦「带声音的自动播放」（尤其是刚打开页面、还没点过
+   * 这个站的时候）。这里不能就这么算了——否则观众看到的是「黑屏 + 什么都没发生」。
+   */
+  playSafely(video) {
+    if (!video) return;
+    video.play().catch((err) => {
+      if (err && err.name === 'NotAllowedError' && !video.muted) {
+        log.warn('带声音的自动播放被拦住，先静音起播', err);
+        video.muted = true;
+        App.liveMuted = true;
+        try {
+          localStorage.setItem(LIVE_MUTE_KEY, '1');
+        } catch (e) {
+          log.debug('音量偏好写入失败（忽略）', e);
+        }
+        video.play().catch((again) => log.warn('静音起播仍失败', again));
+        toast('浏览器拦了带声音的自动播放：点播放器上的音量图标即可开声音', 'warn', 9000);
+        return;
+      }
+      log.warn('自动播放被拦截', err);
+    });
+  },
+
+  /** 这一路已经没画面了：清掉「正在播」的标记，让下一次重绘（或观众再点一次）能重连。 */
+  markDead(video) {
+    if (video && this.attached && this.attached !== video) return;
+    this.attached = null;
+    this.playing = { key: '', mode: '' };
+  },
+
+  /**
+   * 把某个 ``<video>`` 认作「当前画面的落点」：记下来、套音量、揭开封面、起播。
+   *
+   * 三处（原生 HLS / hls.js / WebRTC 的 ontrack）都走它，免得漏掉哪一步——漏一步的
+   * 后果就是「有画面但没声音」或者「连上了还盖着封面」。
+   */
+  attach(video) {
+    if (!video) return;
+    this.attached = video;
+    this.bindVideo(video);
+    this.applyAudio(video);
+    this.hideCover();
+    this.playSafely(video);
+  },
+
+  /** 这个元素上现在真有我们要的画面吗（没有就当「没在播」，交给下面重连）。 */
+  isAlive(video) {
+    if (!video) return false;
+    // 元素必须还是当初连上的那一个：换了元素 = 舞台重建过，老连接对观众没有意义
+    if (this.attached !== video) return false;
+    if (this.pc) return this.pc.connectionState === 'connected' && Boolean(video.srcObject);
+    if (this.hlsInst || video.src) return Boolean(video.src);
+    return Boolean(video.srcObject);
+  },
+
   /** HLS：Safari 原生直放；其它浏览器临时取 hls.js（失败只能改用 WebRTC 线路）。 */
   async hls(url) {
     const video = this.el();
@@ -155,10 +283,9 @@ function makePlayer(ids) {
     }
     this.destroyHls();
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      this.hideCover();
       video.src = url;
+      this.attach(video);
       this.setState('HLS 播放中（原生）');
-      video.play().catch((err) => log.warn('HLS 自动播放被拦截', err));
       log.info('直播使用 HLS（原生）', url);
       return;
     }
@@ -182,6 +309,8 @@ function makePlayer(ids) {
         if (!data?.fatal) return;
         log.warn('HLS 播放出错', data.type, data.details);
         this.destroyHls();
+        // 这一路真没了：清掉「正在播」标记，否则下一次重绘会以为还在播、不再重连
+        this.markDead(video);
         this.setCover(
           'HLS 播放失败',
           `${data.details || data.type}；可在播放器上方把线路切到 WebRTC 再试`
@@ -190,9 +319,8 @@ function makePlayer(ids) {
       });
       inst.loadSource(url);
       inst.attachMedia(video);
-      this.hideCover();
+      this.attach(video);
       this.setState('HLS 播放中');
-      video.play().catch((err) => log.warn('HLS 自动播放被拦截', err));
       log.info('直播使用 HLS（hls.js）', url);
     } catch (err) {
       log.warn('hls.js 不可用', err);
@@ -217,14 +345,24 @@ function makePlayer(ids) {
   /** WebRTC 观看：向「8889 观看地址」POST 一次 SDP 换回 answer。 */
   async webrtc(url) {
     if (!url) throw new Error('缺少 WebRTC 观看地址');
-    const video = this.el();
-    if (!video) throw new Error('播放器尚未就绪');
+    if (!this.el()) throw new Error('播放器尚未就绪');
     this.hideCover();
     this.setState('WebRTC 协商中…');
 
     const pc = new RTCPeerConnection({ iceServers: [] });
     this.pc = pc;
     const myToken = ++this.token;
+    // 失败一律把这条 pc 收干净再抛：留着半截连接会让下一次连接/换台越来越难，
+    // 也会在媒体服务器上堆出一堆没人看的会话。
+    const fail = (err) => {
+      if (this.pc === pc) this.pc = null;
+      try {
+        pc.close();
+      } catch (e) {
+        log.debug('关闭 PeerConnection 异常', e);
+      }
+      throw err;
+    };
 
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -239,24 +377,34 @@ function makePlayer(ids) {
     });
     pc.ontrack = (ev) => {
       if (myToken !== this.token) return;
-      if (ev.streams && ev.streams[0]) {
-        video.srcObject = ev.streams[0];
-        video.play().catch((err) => log.warn('WebRTC 自动播放被拦截', err));
-      }
+      // 用**当前**元素而不是协商开始时抓的那个：协商期间舞台可能被重建过
+      // （换台 / 切线路 / 来了一路新直播），画面必须落到观众正看着的那个 <video> 上。
+      const live = this.el();
+      if (!live || !ev.streams || !ev.streams[0]) return;
+      live.srcObject = ev.streams[0];
+      this.attach(live);
+      this.setState('WebRTC 播放中');
     };
     pc.onconnectionstatechange = () => {
       if (myToken !== this.token) return;
       const st = pc.connectionState;
       log.debug('WebRTC 连接状态', st);
       if (st === 'connected') this.setState('WebRTC 已连接');
-      else if (st === 'failed') this.setState('WebRTC 连接失败');
-      else if (st === 'disconnected') this.setState('WebRTC 已断开');
+      else if (st === 'failed' || st === 'closed') {
+        this.setState('WebRTC 连接失败');
+        this.markDead();
+      } else if (st === 'disconnected') this.setState('WebRTC 已断开');
     };
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await waitIceComplete(pc);
-    if (myToken !== this.token) throw new Error('已取消');
+    let offer = null;
+    try {
+      offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIceComplete(pc);
+    } catch (err) {
+      return fail(err);
+    }
+    if (myToken !== this.token) return fail(new Error('已取消'));
 
     // 信令端点：MediaMTX 的**读流端点是 `<路径>/whep`**（它自带的播放页发的也是这个），
     // 而裸路径 `<路径>` 是那张**播放页**（只认 GET）——对它 POST 只会拿到 Go 路由的
@@ -266,11 +414,28 @@ function makePlayer(ids) {
     let res = null;
     const bodies = []; // 各端点的应答体：两种 404 意思不同，报错时要认出来（见 signalError）
     for (const endpoint of endpoints) {
-      res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: pc.localDescription.sdp,
-      });
+      // 每个端点各自计时：媒体服务器半死不活时**必须超时失败**，
+      // 不能永远停在「协商中…」——那就是观众眼里的「换台点了没反应」。
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), SIGNAL_TIMEOUT);
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: pc.localDescription.sdp,
+          signal: ctrl.signal,
+        });
+      } catch (err) {
+        if (myToken !== this.token) return fail(new Error('已取消'));
+        if (err && err.name === 'AbortError') {
+          return fail(
+            new Error(`信令超时（媒体服务器 ${SIGNAL_TIMEOUT / 1000} 秒没应答）：可改用 HLS 线路再试`)
+          );
+        }
+        return fail(new Error(`连不上媒体服务器：${err.message || err}`));
+      } finally {
+        clearTimeout(timer);
+      }
       if (res.ok) {
         url = endpoint;
         break;
@@ -280,9 +445,14 @@ function makePlayer(ids) {
       bodies.push(await res.text().catch(() => ''));
       log.warn('信令端点在媒体服务器上不存在，换下一个', endpoint, res.status);
     }
-    if (!res.ok) throw new Error(signalError(res.status, bodies));
-    await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
-    this.setState('WebRTC 播放中');
+    if (!res.ok) return fail(new Error(signalError(res.status, bodies)));
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+    } catch (err) {
+      return fail(err);
+    }
+    // 到这里只是「协商成功」，画面要等 ontrack 才算真的到了（那时才写「播放中」）
+    this.setState('WebRTC 已连接，等画面…');
     log.info('直播使用 WebRTC', url);
   },
 
@@ -307,17 +477,24 @@ function makePlayer(ids) {
     const st = App.state?.stream || {};
     // 观众手动选的线路优先（WebRTC 延迟低但 UDP 怕抖动；HLS 走 TCP 更稳）
     const mode = App.liveProto || st.mode || 'auto';
-    // 同一机位 + 同一条线路、而且确实还在播：只把暂停的画面恢复，不做重协商
+    const video = this.el();
+    // 同一机位 + 同一条线路、而且**画面确实还在眼前**：只把暂停恢复，不做重协商
     // （重连会把画面打断一下）。**换线路（WebRTC ↔ HLS）必须真的重连**，
     // 所以这里一定要比 mode——只比机位的话，点「HLS / WebRTC」会像没反应。
-    const video = this.el();
-    const alive =
-      this.pc?.connectionState === 'connected' ||
-      Boolean(video && video.src && !video.paused);
-    if (target && alive && this.playing.key === target.key && this.playing.mode === mode) {
-      if (video && video.paused) video.play().catch((err) => log.warn('恢复播放失败', err));
+    //
+    // 「还在眼前」由 isAlive 判：它要求画面连的**就是当前这个 <video>**。
+    // 舞台重建（换台 / 切线路 / 刚来一路新直播）之后元素换了新的、老 pc 还连着
+    // 早就被摘掉的旧元素——那种情况必须重连，否则封面一直挂着、点什么都没反应。
+    if (target && this.isAlive(video) && this.playing.key === target.key && this.playing.mode === mode) {
+      this.hideCover();
+      this.applyAudio(video);
+      if (video.paused) this.playSafely(video);
       return;
     }
+    // 同一个目标正在连：别重复发信令（重绘很频繁，重复连会把慢连接反复掐掉）。
+    // 换目标 / 换线路不算——那条路要立刻改道。
+    const ticket = `${target?.key || ''}|${mode}`;
+    if (target && this.pending === ticket) return;
     await this.stop(false);
     this.room = target;
     if (!this.room) {
@@ -341,6 +518,7 @@ function makePlayer(ids) {
       return;
     }
     this.setState(mode === 'hls' ? '切换到 HLS…' : '连接中…');
+    this.pending = ticket;
     try {
       // 源站地址直连：webrtc = 8889 观看地址，hls = 8888 观看地址
       if (mode === 'hls') await this.hls(this.room.hls);
@@ -354,9 +532,13 @@ function makePlayer(ids) {
           await this.hls(this.room.hls);
         }
       }
-      // 记下「现在播的是哪个机位、哪条线路」，供下一次复用判断
+      // 记下「现在播的是哪个机位、哪条线路」，供下一次复用判断。
+      // 这里只是记个意向：到底有没有真的接上，由 isAlive（画面落在哪个元素上）判——
+      // 协商成功但画面还没到（或 hls 那边只给了个失败封面）时，下一次重绘会重连。
       this.playing = { key: this.room.key, mode };
     } catch (err) {
+      // 失败必须收拾干净（pc / hls 实例 / 元素），否则残留会拖累后续的连接与换台
+      await this.stop(false);
       log.warn('直播播放失败', mode, err);
       if (mode === 'auto') {
         this.setCover(
@@ -367,6 +549,8 @@ function makePlayer(ids) {
         this.setCover('直播连接失败', err.message || String(err));
       }
       this.setState('未连接');
+    } finally {
+      if (this.pending === ticket) this.pending = '';
     }
   },
 
@@ -379,6 +563,8 @@ function makePlayer(ids) {
   async stop(manual) {
     this.token += 1;
     this.playing = { key: '', mode: '' };
+    this.attached = null; // 画面落点也清掉：下一次 playRoom 必须真的重连
+    this.pending = '';
     this.destroyHls();
     if (this.pc) {
       try {

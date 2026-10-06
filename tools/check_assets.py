@@ -196,6 +196,55 @@ def check_sync_tabs_fallback() -> list[str]:
     return []
 
 
+def check_logo_link() -> list[str]:
+    """顶栏那枚品牌 logo 必须是**能回主页的站内链接**。
+
+    它是全站最直觉的「回首页」入口（标题栏左边那枚六边形），但掉了不会报错、不会白屏，
+    只是「点了没反应」——没人会为此写 issue，只会觉得别扭。所以在这里钉住：是 ``<a>``、
+    ``href="/"``、并且带 ``data-route``（左键走客户端路由，中键 / ⌘+点击仍然是原生新标签）。
+    """
+    if not INDEX.exists():
+        return [f"缺少首页：{INDEX.relative_to(ROOT)}"]
+    block = INDEX.read_text(encoding="utf-8").split("hud__brand", 1)[-1].split("hud__titles", 1)[0]
+    logo = re.search(r'<a\b[^>]*class="logo-plate"[^>]*>', block)
+    if logo is None:
+        return ["顶栏的 .logo-plate 不再是 <a>：点 logo 回主页的入口会失效"]
+    tag = logo.group(0)
+    problems = []
+    if 'href="/"' not in tag:
+        problems.append('顶栏 logo 链接的 href 不是 "/"（回主页）')
+    if "data-route" not in tag:
+        problems.append("顶栏 logo 链接缺 data-route：左键会整页刷新，而不是走客户端路由")
+    if not problems:
+        print("  OK  顶栏 logo 是回主页的站内链接（a[data-route] → /）")
+    return problems
+
+
+def check_live_video_defaults() -> list[str]:
+    """播放器的 ``<video>`` **不许带 ``muted``**：默认要有声音。
+
+    舞台**每次重建都会换掉这个元素**，所以「静音」这件事必须在播放器里按用户的偏好
+    重新套（见 ``live.js`` 的 ``applyAudio``）；模板上再写死一个 ``muted``，就等于
+    把观众刚调好的音量、以及「默认不静音」这个约定一起丢掉。
+    浏览器拦住带声音的自动播放那种情况由 ``playSafely`` 兜（退回静音起播 + 提示）。
+
+    行为层面的检查在 ``tools/check_live_player.mjs``（要 node），这里只钉模板约定。
+    """
+    source = (JS_DIR / "views.js").read_text(encoding="utf-8")
+    problems: list[str] = []
+    for video_id in ("liveVideo", "channelVideo"):
+        match = re.search(rf"<video id=\"{video_id}\"[^>]*>", source)
+        if match is None:
+            problems.append(f"views.js 里找不到 {video_id} 的 <video> 模板（改结构了？请同步本脚本）")
+        elif re.search(r"\bmuted\b", match.group(0)):
+            problems.append(
+                f"{video_id} 的模板又写死了 muted：默认应当有声音（靠 live.js 的 applyAudio 记忆偏好）"
+            )
+    if not problems:
+        print("  OK  两个播放器的 <video> 都没写死 muted（默认不静音）")
+    return problems
+
+
 def _help_content():
     """加载帮助图的内容模块（零依赖；内容在 ``app/helpcard_content.py``）。"""
     path = ROOT / "app" / "helpcard_content.py"
@@ -252,6 +301,8 @@ def main() -> int:
         + check_icons()
         + check_index_assets()
         + check_sync_tabs_fallback()
+        + check_logo_link()
+        + check_live_video_defaults()
         + check_help_card_freshness()
     )
     for line in problems:

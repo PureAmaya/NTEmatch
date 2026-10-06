@@ -403,13 +403,25 @@ function renderTournamentOverview(s) {
   setPanel('rulesBoard', rulesPanelHtml(s));
 }
 
+/**
+ * 冠军队的成员（回公开状态里取选手对象）。
+ *
+ * 冠军横幅与树状图右端的冠军框都用它——两处必须**同一份口径**，
+ * 否则会出现「横幅有头像、树里没有」这种一处有一处没有的错觉。
+ */
+function champMembersOf(s) {
+  const champ = s.champion;
+  if (!champ) return [];
+  return (champ.playerIds || [])
+    .map((pid) => (s.players || []).find((p) => p.id === pid))
+    .filter(Boolean);
+}
+
 /** 总决赛结束后的冠军横幅。 */
 function championHtml(s) {
   const champ = s.champion;
   if (!champ) return '';
-  const members = (champ.playerIds || [])
-    .map((pid) => (s.players || []).find((p) => p.id === pid))
-    .filter(Boolean);
+  const members = champMembersOf(s);
   return (
     `<div class="champion">` +
     `<div class="champion__txt"><span class="champion__tag">总冠军</span>` +
@@ -593,6 +605,12 @@ const BT = {
   boxH: 118,      // 对阵框高（顶栏 + 两行「头像 + 队名」，留 1~2px 余量不裁切）
   gapX: 42,       // 列间距（连线走这里；收窄一点，八强双败常见宽度下刚好不用横向滚动）
   champ: 184,     // 冠军框宽
+  // 冠军框在「有成员头像」时额外留的高度：正好一行 `ava--xs`（30px）+ 一点间距。
+  // 布局那边按它把画布加高（见 layoutTree）——不加就会被 overflow 裁掉。
+  champAvatars: 36,
+  // 一行最多排几个头像：5×26 + 4×6 = 154，正好落在 184-24 的可用宽度里；
+  // 再多也不换行（换行要被裁），名字一律放悬停提示里。
+  champAvatarsMax: 5,
   head: 42,       // 每条带上方：带标题 + 列标题占用的纵向空间
   bandGap: 70,    // 胜者组与败者组之间的空隙
   labelH: 24,     // 列标题行高
@@ -645,8 +663,13 @@ function treeNodes({ wb, lb, gf, single }) {
 
 const mid = (list) => (list.length ? list.reduce((n, v) => n + v, 0) / list.length : NaN);
 
-/** 计算每列的 x 与每个节点的 y（叶子均分、父节点取两个孩子的中点）。 */
-function layoutTree(cols, single) {
+/**
+ * 计算每列的 x 与每个节点的 y（叶子均分、父节点取两个孩子的中点）。
+ *
+ * ``champExtra`` 是冠军框比自己高出来的部分（有成员头像时多一行）：画布高度必须
+ * **把它算进去**，否则框会超出容器被裁掉——那张图里最难发现的一类错。
+ */
+function layoutTree(cols, single, champExtra = 0) {
   const pitch = BT.box + BT.gapX;
   const gap = leafGapOf(cols);
   const bands = single ? ['main'] : ['wb', 'lb', 'gf'];
@@ -692,7 +715,8 @@ function layoutTree(cols, single) {
     champX,
     champY,
     width: champX + BT.champ + BT.pad,
-    height: Math.max(...nodes.map((n) => n.y + BT.boxH), 0) + BT.pad,
+    // 冠军框（可能比一个对阵框高）也要算进来，否则会被容器裁掉
+    height: Math.max(...nodes.map((n) => n.y + BT.boxH), champY + BT.boxH + champExtra, 0) + BT.pad,
   };
 }
 
@@ -704,7 +728,9 @@ const BT_BAND_META = {
 
 function bracketTreeHtml(s, { wb, lb, gf, single }) {
   const { cols } = treeNodes({ wb, lb, gf, single });
-  const geo = layoutTree(cols, single);
+  // 冠军框里要摆成员头像：先把「要不要多留一行」算出来交给布局（常量与 treeChampHtml 同一份）
+  const champExtra = champMembersOf(s).length ? BT.champAvatars : 0;
+  const geo = layoutTree(cols, single, champExtra);
   // 对阵图里的队伍只有 id / 缩写：颜色、头像、小组战绩都要回公开状态里取
   const colors = new Map((s.teams || []).map((t) => [t.id, t.color]));
   const players = new Map((s.players || []).map((p) => [p.id, p]));
@@ -781,7 +807,7 @@ function bracketTreeHtml(s, { wb, lb, gf, single }) {
     `viewBox="0 0 ${geo.width} ${geo.height}" aria-hidden="true">${paths.join('')}</svg>` +
     colLabels +
     geo.nodes.map((node) => treeBoxHtml(node, ctx)).join('') +
-    treeChampHtml(s, geo.champX, geo.champY) +
+    treeChampHtml(s, geo.champX, geo.champY, ctx) +
     `</div>`
   );
 }
@@ -845,16 +871,36 @@ function treeSideHtml(side, key, rnd, ctx) {
   );
 }
 
-/** 树状图最右端的冠军框（决赛没打完就只留框，不写占位名字）。 */
-function treeChampHtml(s, x, y) {
+/**
+ * 树状图最右端的冠军框（决赛没打完就只留框，不写占位名字）。
+ *
+ * **这里也要有头像**：总览顶部的冠军横幅有成员头像，树里只有队名，就成了「一处有一处
+ * 没有」。头像走和横幅同一份数据、同一套 ``avaHtml``（选手对象由 ``ctx.playerOf`` 取，
+ * 与对阵框里的头像完全同源）。
+ *
+ * 框只有 184px 宽，所以这一行**只排头像**（带上名字就会换行、被 overflow 裁掉）；
+ * 名字放在整框的悬停提示里，一个都不少。
+ */
+function treeChampHtml(s, x, y, ctx) {
   const champ = s.champion;
   const name = champ ? champ.short || champ.name || champ.id : '';
+  const members = (champ?.playerIds || []).map((pid) => ctx.playerOf(pid)).filter(Boolean);
+  const shown = members.slice(0, BT.champAvatarsMax);
+  const names = members.map((p) => p.name || p.id).filter(Boolean);
+  const tip = [name || '决赛打完后揭晓', names.join(' / ')].filter(Boolean).join(' · ');
+  // 有成员就比一个对阵框高一行头像；布局那边按**同一个常量**加高画布（见 layoutTree）
+  const height = BT.boxH + (members.length ? BT.champAvatars : 0);
+  const avas = shown.length
+    ? `<span class="btree__champ-members">${shown.map((p) => avaHtml(p, 'xs')).join('')}</span>`
+    : '';
   return (
     `<div class="btree__champ${champ ? ' btree__champ--on' : ''}" ` +
-    `style="left:${x}px;top:${y}px;width:${BT.champ}px;height:${BT.boxH}px" ` +
-    `title="${esc(name || '决赛打完后揭晓')}">` +
+    `style="left:${x}px;top:${y}px;width:${BT.champ}px;height:${height}px" ` +
+    `title="${esc(tip)}">` +
     `<span class="btree__champ-tag">CHAMPION</span>` +
-    `<b class="btree__champ-name">${esc(name)}</b></div>`
+    `<b class="btree__champ-name">${esc(name)}</b>` +
+    avas +
+    `</div>`
   );
 }
 
@@ -2059,7 +2105,9 @@ function stageHtml(s) {
       `title="${esc(`${App.livePicked.name} 的 B站 直播间`)}" frameborder="0" scrolling="no" ` +
       `allowfullscreen allow="autoplay; fullscreen; picture-in-picture" ` +
       `referrerpolicy="no-referrer"></iframe>`
-    : `<video id="liveVideo" playsinline autoplay controls muted></video>`;
+    // 不带 muted：**默认不静音**（要听声音）。浏览器可能拦住带声音的自动播放，
+    // 那种情况由播放器自行退回静音起播并提示怎么开声音（见 live.js 的 playSafely）。
+    : `<video id="liveVideo" playsinline autoplay controls></video>`;
   const bar = bili
     ? `<div class="stage-bar"><div class="stage-bar__left">` +
       `<a class="btn btn--primary btn--sm" href="${esc(bili.jump || '#')}" target="_blank" ` +
@@ -2371,7 +2419,8 @@ function channelStageHtml(s, picked) {
       `referrerpolicy="no-referrer"></iframe>` +
       `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
       `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>`
-    : `<video id="channelVideo" playsinline autoplay controls muted></video>` +
+    // 不带 muted：同比赛直播页，默认有声音（见 live.js 的 playSafely）
+    : `<video id="channelVideo" playsinline autoplay controls></video>` +
       `<div class="stage-frame__bars"><span></span><span></span><span></span><span></span></div>` +
       `<span class="stage-badge"><span class="chip chip--live"><i class="dot"></i><b>LIVE</b></span></span>` +
       `<span class="stage-state" id="channelState">待连接</span>` +

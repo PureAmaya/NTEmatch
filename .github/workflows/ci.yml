@@ -41,5 +41,13 @@ jobs:
       - name: 静态资源自检（CSS 配平 / 导入 / 引用）
         run: uv run python tools/check_assets.py
 
+      # 直播播放器那套状态机（换台 / 重连 / 音量）与对阵树「算出来的坐标」都在浏览器侧，
+      # pytest 够不着，由这两个纯 Node 的自检用最小桩把真实模块跑一遍（见文件顶部说明）。
+      - name: 直播播放器自检（换台 / 重连 / 音量）
+        run: node tools/check_live_player.mjs
+
+      - name: 对阵树自检（冠军框成员头像 / 框高与画布高度）
+        run: node tools/check_bracket_tree.mjs
+
       - name: 构建镜像
         run: docker build -t nte-match:ci .

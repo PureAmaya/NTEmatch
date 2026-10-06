@@ -25,9 +25,11 @@
 
 <header class="hud">
   <div class="hud__brand">
-    <span class="logo-plate" aria-hidden="true">
+    <!-- 品牌 logo = 回主页的入口：站内真链接（`data-route`）——左键走客户端路由，
+         中键 / ⌘+点击仍然是浏览器原生的「新标签打开 / 复制链接」，无 JS 也能用 -->
+    <a class="logo-plate" href="/" data-route title="回主页" aria-label="回主页">
       <!-- 品牌标记：渐变用主题变量而不是写死的颜色，换主题色 / 自定义色都会跟着变 -->
-      <svg class="mark" viewBox="0 0 48 48">
+      <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
         <defs>
           <linearGradient id="markGrad" x1="0" y1="1" x2="1" y2="0">
             <stop offset="0%" style="stop-color:var(--accent)"/>
@@ -39,7 +41,7 @@
         <circle cx="24" cy="24" r="9" fill="none" stroke="url(#markGrad)" stroke-width="2.6"/>
         <path d="M14.6 24h18.8M24 14.6c4.2 5.5 4.2 13.3 0 18.8M24 14.6c-4.2 5.5-4.2 13.3 0 18.8" fill="none" stroke="url(#markGrad)" stroke-width="1.8" opacity=".9"/>
       </svg>
-    </span>
+    </a>
     <div class="hud__titles">
       <h1 class="hud__title stroke" id="evtTitle" data-text="NTE 比赛">NTE 比赛</h1>
       <p class="hud__sub" id="evtSub">NEVERNESS TO EVERNESS · MATCH</p>

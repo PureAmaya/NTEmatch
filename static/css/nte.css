@@ -949,6 +949,14 @@ img { display: block; max-width: 100%; }
   clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
 }
 .mark { filter: drop-shadow(0 0 6px rgba(34, 224, 232, .45)); }
+/* 品牌 logo 是「回主页」的入口（见 index.html 的注释）：hover / 键盘聚焦给一点反馈。
+   注意 clip-path 会把 outline 连同外阴影一起裁掉，所以反馈做在**边框色 + 底色 + 图标辉光**上。 */
+.logo-plate:hover, .logo-plate:focus-visible { border-color: var(--cyan); background: #0a1322; }
+.logo-plate:hover .mark, .logo-plate:focus-visible .mark {
+  filter: drop-shadow(0 0 10px rgba(34, 224, 232, .8));
+}
+.logo-plate:focus-visible { outline: none; }   /* 用上面那圈边框色当聚焦环 */
+.logo-plate:active { transform: translate(1px, 1px); }
 .hud__title {
   font-style: italic; font-weight: 800; letter-spacing: .01em; color: #fff;
   text-shadow: 2px 2px 0 #05080e, 4px 4px 0 rgba(255, 47, 142, .5);
@@ -1651,6 +1659,9 @@ img { display: block; max-width: 100%; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .btree__champ--on .btree__champ-name { color: #fff; }
+/* 冠军成员头像：一行排开，不换行（框窄，换行会被 overflow 裁掉；名字在悬停提示里） */
+.btree__champ-members { display: flex; gap: 6px; margin-top: 6px; }
+.btree__champ-members .ava { flex: none; }
 
 /* 「对阵总览」里的分段标题（小组赛 / 淘汰赛） */
 .btree__sec {

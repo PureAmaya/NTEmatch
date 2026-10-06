@@ -114,6 +114,18 @@ function readValueInput(host, role, sc) {
   return parseVal(input ? input.value : '', sc);
 }
 
+/**
+ * 读回「细则分 / 小分」控件：**留空按 0 算**。
+ *
+ * 这一格没有「没有成绩」这一说（0 就是「没有小分 / 没有罚时」），而
+ * :func:`readValueInput` 对留空给的是「没有成绩」的哨兵（数值口径下是 -1）——
+ * 直接发过去会被接口按负分拒收，低胜口径下还会被当成「罚时最少」而排在前面。
+ */
+function readPointsInput(host, sc) {
+  const value = readValueInput(host, 'points', sc);
+  return value < 0 ? 0 : value;
+}
+
 /** 一行轮次：`第 N 轮  A 输入 : B 输入  ×`。 */
 function roundRowHtml(a, b, sc) {
   return (
@@ -186,7 +198,7 @@ function refreshResultPreview(bodyEl, sides, allowDraw) {
         key: side.key,
         label: side.label,
         score: readValueInput(host, 'score', sc),
-        points: readValueInput(host, 'points', sc),
+        points: readPointsInput(host, sc),
       };
     });
   } catch (err) {
@@ -341,11 +353,15 @@ function openResultModal(rnd) {
   const timeHint = sc.timeBased
     ? `时间按 <b>分:秒.毫秒</b> 填（如 <b>1:23.456</b>），也可以只写秒数（<b>83.45</b>）。`
     : '';
+  // 留空的含义（三种录入块都要用）：主成绩留空 = 没有成绩（垫底），细则分留空 = 0
+  const blankHint =
+    `成绩可以<b>留空</b>——留空 = 没有成绩（没跑完 / 未到场），一律排在最后；` +
+    `细则分留空按 0 算。`;
   const roundsBlock = multi
     ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按 <b>${esc(
         sc.label
       )}</b>（${esc(sc.betterLabel || sc.better)}）排名，第 1 名即为本场胜者，` +
-      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。${timeHint}</div>`
+      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。${timeHint}${blankHint}</div>`
     : `<div class="rsets"><div class="rsets__head"><b>轮次</b>` +
       `<span class="panel__hint">默认一轮；每轮 ${esc(sc.label)}，赢的轮数就是大比分` +
       `${sc.timeBased ? '（可写 1:23.456 或 83.45）' : ''}</span>` +
@@ -357,7 +373,7 @@ function openResultModal(rnd) {
     ? ''
     : `<div id="rq-manual"${initial.length ? ' hidden' : ''}>` +
       `<div class="notice" style="margin-top:10px">没有轮次时按下面这一组「本场成绩」判定；` +
-      `点上面的「添加一轮」就改用轮次录入。${timeHint}</div>` +
+      `点上面的「添加一轮」就改用轮次录入。${timeHint}${blankHint}</div>` +
       `<div class="rrows">${manualRows}</div></div>`;
   const foldOpen = Boolean(
     rnd.duration || rnd.startedAt || rnd.finishedAt || rnd.note || rnd.winner
@@ -472,7 +488,7 @@ function openResultModal(rnd) {
                   : readValueInput(host, 'score', sc),
                 points: derived
                   ? derived.totals[index]
-                  : readValueInput(host, 'points', sc),
+                  : readPointsInput(host, sc),
               };
             }),
             durationMinutes: Number(read('#rq-duration')) || 0,
@@ -2124,6 +2140,8 @@ const channelOf = (id) => channelRooms(App.state).find((c) => c.id === id) || nu
 /** 选中并播放某个成员频道（未开播时给一句说明，而不是去连一个空流）。 */
 function watchChannel(id) {
   App.channelId = id || null;
+  // 点某一台 = 就是想看：解除「别再自动播」的标记，否则按过停止之后换台会不自动开播
+  ChannelLive.stoppedByUser = false;
   const channel = channelOf(id);
   if (App.state) renderChannels(App.state);
   // 地址跟着换成 /channels/<流名>（用 replaceState，不新增历史）

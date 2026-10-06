@@ -18,6 +18,8 @@ export const TOKEN_KEY = 'nte:token';
 export const VIEW_KEY = 'nte:view';
 /** 观众自选播放线路的本地记忆键（WebRTC / HLS）。 */
 export const LIVE_PROTO_KEY = 'nte:liveProto';
+/** 播放器音量的本地记忆键：**默认不静音**，用户手动静音后记住这个选择。 */
+export const LIVE_MUTE_KEY = 'nte:liveMuted';
 
 /**
  * 状态指纹：届名 + 版本号。
@@ -386,6 +388,10 @@ export const App = {
   private: null,
   // 观众自选的播放线路：'' = 跟随服务端配置；'webrtc' | 'hls' = 手动指定
   liveProto: localStorage.getItem(LIVE_PROTO_KEY) || '',
+  // 播放器音量：**默认不静音**（要听声音）；用户手动静音过就记住那个选择，
+  // 换台 / 重绘 / 换页面都照旧（舞台重建会把 <video> 换掉，不记住就白调了）。
+  liveMuted: localStorage.getItem(LIVE_MUTE_KEY) === '1',
+  liveVolume: 1,
   // 选手 ID → 时间戳：点过「刷新头像」后给图片地址加参数，绕过浏览器缓存
   avatarBust: {},
   token: localStorage.getItem(TOKEN_KEY) || '',
