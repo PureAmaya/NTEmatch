@@ -84,11 +84,101 @@ def _fake_httpx(monkeypatch, client: _FakeClient) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _forget_image_shape():
-    """形态记忆是**进程内**的，用例之间必须隔离，否则请求顺序会跟着上一条变。"""
+def _forget_shape_memory():
+    """形态记忆是**进程内**的（图片段 / at 段各一份），用例之间必须隔离，
+    否则请求顺序会跟着上一条变。"""
     qqbot._IMAGE_SHAPE_HIT = None
+    qqbot._remember_at_mode("")
     yield
     qqbot._IMAGE_SHAPE_HIT = None
+    qqbot._remember_at_mode("")
+
+
+# --------------------------------------------------------------------------- #
+# 真 @：消息段（AstrBot 有的版本收、有的不收，只能试出来）
+# --------------------------------------------------------------------------- #
+async def test_send_at_parts_tries_each_shape(monkeypatch):
+    """两种段写法逐个试：平铺的 ``qq`` 被拒（400）就换 OneBot 风格的 ``data.qq``。"""
+    client = _FakeClient([400, 200])
+    _fake_httpx(monkeypatch, client)
+    result = await qqbot.send_at_parts("正文", mentions=["10001"], settings=_image_settings())
+    assert result["ok"] is True, result["detail"]
+    assert result["shape"] == "data"
+    assert client.bodies[0]["message"][0] == {"type": "at", "qq": "10001"}
+    assert client.bodies[1]["message"][0] == {"type": "at", "data": {"qq": "10001"}}
+    assert client.bodies[1]["message"][-1] == {"type": "plain", "text": "正文"}
+    assert qqbot.at_mode() == "data", "试出来的写法要记住，下次直接用"
+
+
+async def test_send_at_parts_remembers_that_at_is_unsupported(monkeypatch):
+    """两种写法都被拒 → 记住「这台 AstrBot 不收 at 段」，之后一个请求都不发。"""
+    client = _FakeClient([400, 400])
+    _fake_httpx(monkeypatch, client)
+    first = await qqbot.send_at_parts("正文", mentions=["10001"], settings=_image_settings())
+    assert first["ok"] is False
+    assert qqbot.at_mode() == "unsupported"
+    assert len(client.bodies) == 2
+
+    second = await qqbot.send_at_parts("正文", mentions=["10001"], settings=_image_settings())
+    assert second["ok"] is False and "at 消息段" in second["detail"]
+    assert len(client.bodies) == 2, "已经知道不支持了，别再白撞一遍"
+
+
+async def test_send_parts_uses_the_real_at_and_drops_the_text_form(monkeypatch):
+    """真 @ 成功：@ 行从正文里摘掉——否则群里既真 @ 了一行、又跟着一串 CQ 码。"""
+    seen: list[dict] = []
+
+    async def fake_at(text, *, mentions, settings=None, umo=""):
+        seen.append({"text": text, "mentions": list(mentions)})
+        return {"ok": True, "status": 200, "detail": "", "umo": umo, "shape": "qq"}
+
+    async def never(text, *, settings=None, umo=""):  # pragma: no cover - 走到就是错
+        raise AssertionError("真 @ 成功后不该再发文本")
+
+    monkeypatch.setattr(qqbot, "send_at_parts", fake_at)
+    monkeypatch.setattr(qqbot, "send_text", never)
+    result = await qqbot.send_parts(
+        ["[CQ:at,qq=10001]\n集合啦！"],
+        settings=_image_settings(),
+        mentions=["10001"],
+        mention_text="[CQ:at,qq=10001]",
+    )
+    assert result["ok"] is True and result["at"] == "qq"
+    assert seen == [{"text": "集合啦！", "mentions": ["10001"]}]
+
+
+async def test_send_parts_falls_back_to_the_text_form(monkeypatch):
+    """这个 AstrBot 不收 at 段：@ 行**原样拼回第一段**，消息照旧送达。
+
+    「@ 不到人」只是少了个提醒，绝不能让整条召集发不出去——所以退回必须可靠，
+    而且不能把 @ 行拼两遍（群里出现两串 CQ 码比不 @ 更糟）。
+    """
+
+    async def reject(text, *, mentions, settings=None, umo=""):
+        return {
+            "ok": False,
+            "status": 400,
+            "detail": "unsupported message part type: at",
+            "umo": umo,
+            "shape": "",
+        }
+
+    sent: list[str] = []
+
+    async def fake_text(text, *, settings=None, umo=""):
+        sent.append(text)
+        return {"ok": True, "status": 200, "detail": "", "umo": umo}
+
+    monkeypatch.setattr(qqbot, "send_at_parts", reject)
+    monkeypatch.setattr(qqbot, "send_text", fake_text)
+    result = await qqbot.send_parts(
+        ["[CQ:at,qq=10001]\n集合啦！"],
+        settings=_image_settings(),
+        mentions=["10001"],
+        mention_text="[CQ:at,qq=10001]",
+    )
+    assert result["ok"] is True and result["at"] == ""
+    assert sent == ["[CQ:at,qq=10001]\n集合啦！"]
 
 
 # --------------------------------------------------------------------------- #
@@ -390,6 +480,77 @@ async def test_test_endpoint_says_why_when_it_cannot_draw(admin_client, bot_read
     assert res.status_code == 200, res.text
     assert res.json()["ok"] is False
     assert "Pillow" in res.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# 召集：真 @ 走不走得通，以及走不通时的退回
+# --------------------------------------------------------------------------- #
+async def _with_one_participant() -> dict:
+    """把本届名单换成一个「有 QQ 的选手」，返回恢复用的快照。"""
+    saved = store.snapshot().dump()
+    await store.update(
+        {"players": [{"id": "p01", "name": "甲", "qq": "10001"}], "participants": []}
+    )
+    return saved
+
+
+async def _restore_roster(saved: dict) -> None:
+    await store.update({"players": saved["players"], "participants": saved["participants"]})
+
+
+async def test_push_call_tries_the_real_at(admin_client, bot_ready, pushed, monkeypatch):
+    """召集**先试真 @**：要 @ 的就是参与名单里能对上的 QQ；成功时不再发一遍 CQ 码。"""
+    calls: list[dict] = []
+
+    async def fake_at(text, *, mentions, settings=None, umo=""):
+        calls.append({"text": text, "mentions": list(mentions)})
+        return {"ok": True, "status": 200, "detail": "", "umo": umo, "shape": "qq"}
+
+    monkeypatch.setattr(qqbot, "send_at_parts", fake_at)
+    saved = await _with_one_participant()
+    try:
+        res = await admin_client.post("/api/qqbot/push", json={"kind": "call"})
+    finally:
+        await _restore_roster(saved)
+
+    assert res.status_code == 200, res.text
+    assert res.json()["at"] == "qq"
+    assert calls and calls[0]["mentions"] == ["10001"]
+    assert calls[0]["text"].startswith("【NTE 比赛】"), "真 @ 发的是正文（@ 行已摘掉）"
+    assert pushed["text"] == [], "真 @ 成功时不该再发文本"
+
+
+async def test_push_call_falls_back_to_the_text_form(admin_client, bot_ready, pushed, monkeypatch):
+    """真 @ 发不出去：退回文本写法，@ 行照样发出去（消息不会因为 @ 丢了）。"""
+
+    async def reject(text, *, mentions, settings=None, umo=""):
+        return {"ok": False, "status": 400, "detail": "unsupported", "umo": umo, "shape": ""}
+
+    monkeypatch.setattr(qqbot, "send_at_parts", reject)
+    saved = await _with_one_participant()
+    try:
+        res = await admin_client.post("/api/qqbot/push", json={"kind": "call"})
+    finally:
+        await _restore_roster(saved)
+
+    assert res.status_code == 200, res.text
+    assert res.json()["at"] == ""
+    assert pushed["text"] and pushed["text"][0].startswith("[CQ:at,qq=10001]")
+
+
+async def test_preview_explains_the_real_at(admin_client, bot_ready, pushed):
+    """预览要说清「会先试真 @」，并给出**退回时**发出去的样子（管理员先看再决定）。"""
+    saved = await _with_one_participant()
+    try:
+        res = await admin_client.get("/api/qqbot/preview", params={"kind": "call"})
+    finally:
+        await _restore_roster(saved)
+
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["mentions"] == ["10001"]
+    assert data["mentionText"] == "[CQ:at,qq=10001]"
+    assert data["parts"] and data["parts"][0].startswith("[CQ:at,qq=10001]")
 
 
 async def test_bot_query_event_returns_the_card_for_the_plugin(bot_ready, pushed):

@@ -13,11 +13,13 @@
 * **设置存在数据库 meta（``qqbot``）**：跟着备份 / 还原一起走，还原后不用重配；
   API Key 只进不出——接口只回 ``hasKey`` 布尔，绝不回明文；
 * **消息分段**：单条有长度上限，超长自动按行切成多条依次发送；比赛列表额外支持翻页；
-* **@ 人**：AstrBot 的 OpenAPI 目前**没有 at 消息段**（只有
-  plain / reply / image / record / file / video），所以「@」做成三种写法可切换：
-  ``cq``（默认，按 OneBot v11 惯例把 ``[CQ:at,qq=…]`` 写进文本）、
-  ``text``（退化成 ``@QQ号`` 纯文本）、``none``（只列名字，不 @）；
-  设置页有「发送测试」按钮，一试就知道你的适配器吃哪种。
+* **@ 人**：AstrBot 的公开文档里**没有 at 消息段**（只有 plain / reply / image /
+  record / file / video），但实际版本有的收、有的不收——所以做法是**先试真 @**：
+  平铺的 ``{"type": "at", "qq": …}`` 与 OneBot 风格的 ``data.qq`` 两种写法各试一次，
+  试出来的记住（进程内）；被拒就退回**文本写法**，由 ``atMode`` 决定落地的样子：
+  ``cq``（默认，``[CQ:at,qq=…]``）/ ``text``（``@QQ号``）/ ``none``（不 @，只列名字）。
+  **退回是兜底，消息绝不会因为「@ 发不出去」而丢**；设置页「发送测试消息」会回报
+  这次真 @ 用的是哪种写法（``at`` 字段）。
 """
 
 from __future__ import annotations
@@ -53,7 +55,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "platform": "aiocqhttp",
     # 发送接口路径（不同版本可能不同，留默认即可）
     "path": "/api/v1/im/message",
-    # @ 的写法：cq / text / none
+    # 真 @ 段发不出去时的**退回写法**：cq（CQ 码）/ text（@QQ号）/ none（不 @，只列名字）。
+    # 能用真 @ 就用真 @（见 send_at_parts），这个设置只决定「退回时长什么样」。
     "atMode": "cq",
     # 单条消息上限（字符），超出自动分段
     "maxChars": 1200,
@@ -248,6 +251,39 @@ def merge_settings(stored: dict[str, Any] | None) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 发送
 # --------------------------------------------------------------------------- #
+def _prepare(
+    settings: dict[str, Any], umo: str
+) -> tuple[dict[str, Any] | None, str, str, dict[str, str]]:
+    """发送前的公共部分：``(错误结果, 目标 UMO, url, 请求头)``（错误结果非空就别发）。
+
+    地址必须显式检查：留空时 httpx 抛的是 ``UnsupportedProtocol``，它**不是**
+    ``HTTPError``，漏接就变成 500。文本 / 真 @ 段两条路共用这一份判断与文案。
+    """
+    target = umo or resolved_umo(settings)
+    rejected: dict[str, Any] = {"ok": False, "status": 0, "detail": "", "umo": target}
+    if not settings.get("enabled"):
+        return {**rejected, "detail": "未启用 QQ 机器人推送"}, target, "", {}
+    if not settings.get("apiKey"):
+        return {**rejected, "detail": "未配置 AstrBot API Key"}, target, "", {}
+    base = str(settings.get("baseUrl") or "").strip()
+    if not base:
+        return (
+            {**rejected, "detail": "未配置 AstrBot 地址（到「服务器 → QQ 机器人」填写）"},
+            target,
+            "",
+            {},
+        )
+    if not target:
+        return {**rejected, "detail": "未配置目标会话（群号 / UMO）"}, target, "", {}
+    path = str(settings.get("path") or "/api/v1/im/message")
+    headers = {
+        "Authorization": f"Bearer {settings['apiKey']}",
+        "X-API-Key": str(settings["apiKey"]),
+        "Content-Type": "application/json",
+    }
+    return None, target, f"{base.rstrip('/')}{path}", headers
+
+
 async def send_text(
     text: str,
     *,
@@ -259,31 +295,10 @@ async def send_text(
     出站前统一过一次 :func:`to_plain_text`——QQ 不认 Markdown，这一步是最后一道闸。
     """
     text = to_plain_text(text)
-    target = umo or resolved_umo(settings)
+    rejected, target, url, headers = _prepare(settings, umo)
+    if rejected is not None:
+        return rejected
     result: dict[str, Any] = {"ok": False, "status": 0, "detail": "", "umo": target}
-    if not settings.get("enabled"):
-        result["detail"] = "未启用 QQ 机器人推送"
-        return result
-    if not settings.get("apiKey"):
-        result["detail"] = "未配置 AstrBot API Key"
-        return result
-    # 地址必须显式检查：留空时 httpx 会抛 UnsupportedProtocol（**不是** HTTPError，
-    # 不会被下面的 except 接住），最后变成 500。宁可在这里给一句人话。
-    base = str(settings.get("baseUrl") or "").strip()
-    if not base:
-        result["detail"] = "未配置 AstrBot 地址（到「服务器 → QQ 机器人」填写）"
-        return result
-    if not target:
-        result["detail"] = "未配置目标会话（群号 / UMO）"
-        return result
-
-    path = str(settings.get("path") or "/api/v1/im/message")
-    url = f"{base.rstrip('/')}{path}"
-    headers = {
-        "Authorization": f"Bearer {settings['apiKey']}",
-        "X-API-Key": str(settings["apiKey"]),
-        "Content-Type": "application/json",
-    }
     timeout = float(settings.get("timeout") or 10)
     # 先按「纯文本」发；万一该版本只收消息段数组，再退回数组形态重试一次
     bodies: list[Any] = [
@@ -431,17 +446,160 @@ class PushLimiter:
 limiter = PushLimiter()
 
 
-async def send_parts(parts: list[str], *, settings: dict[str, Any], umo: str = "") -> dict[str, Any]:
-    """依次发送多段；任一段失败即停止并回报失败原因。"""
+#: 「真 @」消息段的两种写法：AstrBot 的公开文档里**没有 at 段**（只有
+#: plain / reply / image / record / file / video），能不能用只能试出来——与图片段同一套路。
+_AT_SHAPES = ("qq", "data")
+
+#: 进程内记忆：哪种写法生效；``"unsupported"`` = 这个 AstrBot 的接口不吃 at 段，
+#: 之后直接走文本兜底，不再每次白撞一遍。
+_AT_MODE: str | None = None
+
+
+def _remember_at_mode(mode: str) -> None:
+    global _AT_MODE
+    _AT_MODE = mode or None
+
+
+def at_mode() -> str:
+    """真 @ 试出来的结果：``qq`` / ``data`` 生效；``unsupported`` = 不支持；``""`` = 还没试过。"""
+    return _AT_MODE or ""
+
+
+def _at_segments(qqs: list[str], shape: str) -> list[dict[str, Any]]:
+    """@ 消息段：平铺的 ``qq`` 与 OneBot 风格的 ``data.qq`` 两种写法都试。"""
+    if shape == "data":
+        return [{"type": "at", "data": {"qq": qq}} for qq in qqs]
+    return [{"type": "at", "qq": qq} for qq in qqs]
+
+
+async def send_at_parts(
+    text: str,
+    *,
+    mentions: list[str],
+    settings: dict[str, Any],
+    umo: str = "",
+) -> dict[str, Any]:
+    """发**一段**文字，前面带上 ``mentions`` 的**真 @ 消息段**。
+
+    返回 ``{ok, status, detail, shape}``；``shape`` 说明这次生效的写法。
+    被 ``400 / 415 / 422`` 拒掉说明「这个版本不认这个段」，换下一种写法重试；
+    全被拒就记住 ``unsupported``（:func:`at_mode`），调用方据此改用文本写法——
+    上一次失败**不影响消息送到群里**，这是这条路的底线。
+    """
+    rejected, target, url, headers = _prepare(settings, umo)
+    if rejected is not None:
+        return {**rejected, "shape": ""}
+    result: dict[str, Any] = {"ok": False, "status": 0, "detail": "", "umo": target, "shape": ""}
+    if not text:
+        return {**result, "detail": "没有要发的内容"}
+    if not mentions:
+        return {**result, "detail": "没有要 @ 的人"}
+    if _AT_MODE == "unsupported":
+        return {**result, "detail": "这个 AstrBot 的接口不收 at 消息段（已经试过一次了）"}
+    timeout = float(settings.get("timeout") or 10)
+    shapes = [_AT_MODE] if _AT_MODE else list(_AT_SHAPES)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for shape in shapes:
+            body = {
+                "umo": target,
+                "message": [*_at_segments(mentions, shape), {"type": "plain", "text": text}],
+            }
+            try:
+                resp = await client.post(url, headers=headers, json=body)
+            except httpx.HTTPError as exc:
+                result["detail"] = f"请求 AstrBot 失败：{exc}"
+                log.warning("QQ 真 @ 推送失败 | %s | %s", url, exc)
+                return result
+            result["status"] = resp.status_code
+            if resp.status_code < 400:
+                result["ok"] = True
+                result["shape"] = shape
+                _remember_at_mode(shape)
+                log.info(
+                    "QQ 真 @ 推送成功 | umo=%s | 段写法=%s | @ %d 人",
+                    target,
+                    shape,
+                    len(mentions),
+                )
+                return result
+            result["detail"] = _error_text(resp)
+            if resp.status_code not in (400, 415, 422):
+                break
+    if not result["ok"]:
+        if result["status"] in (400, 415, 422):
+            # 只有「段类型不被认」才是「这台 AstrBot 不支持 at」；500 之类的偶发错误
+            # 不能记成「不支持」，否则一次抽风之后真 @ 就再也不会被尝试了。
+            _remember_at_mode("unsupported")
+        log.warning("QQ 真 @ 推送失败（改用文本写法）| umo=%s | %s", target, result["detail"])
+    return result
+
+
+async def _send_sequence(parts: list[str], *, settings: dict[str, Any], umo: str) -> dict[str, Any]:
+    """把若干段依次发出去（段间停 0.5 秒，别把群刷屏 / 触发风控）；任一段失败即停。"""
     sent = 0
     for part in parts:
         res = await send_text(part, settings=settings, umo=umo)
         if not res["ok"]:
-            return {**res, "sent": sent, "total": len(parts)}
+            return {**res, "sent": sent, "total": len(parts), "at": ""}
         sent += 1
         if sent < len(parts):
-            await asyncio.sleep(0.5)  # 别把群刷屏 / 触发风控
-    return {"ok": True, "status": 200, "detail": "", "sent": sent, "total": len(parts), "umo": umo}
+            await asyncio.sleep(0.5)
+    return {
+        "ok": True,
+        "status": 200,
+        "detail": "",
+        "sent": sent,
+        "total": len(parts),
+        "umo": umo,
+        "at": "",
+    }
+
+
+async def send_parts(
+    parts: list[str],
+    *,
+    settings: dict[str, Any],
+    umo: str = "",
+    mentions: list[str] | None = None,
+    mention_text: str = "",
+) -> dict[str, Any]:
+    """依次发送多段；任一段失败即停止并回报失败原因。
+
+    ``mentions`` 非空时，**第一段先试真 @**（见 :func:`send_at_parts`）：能 @ 到人就真 @；
+    这个 AstrBot 收不了 at 段时，把 ``mention_text``（CQ 码 / ``@QQ号`` 文本）拼回第一段，
+    照旧用文本发出去——**@ 只是锦上添花，消息绝不能因此发不出去**。
+    返回里的 ``at`` 说明这次真 @ 用的是哪种写法（``""`` = 没走真 @ / 不支持）。
+    """
+    body = [str(part) for part in parts]
+    total = len(body)
+    if mentions and body:
+        if mention_text and body[0].startswith(mention_text):
+            # parts 是「@ 行 + 正文」拼好的（预览与兜底都靠它）：先把 @ 行摘出来，
+            # 能真 @ 就用真 @；不能的话下面会把这一行**原样拼回去**（只拼一次）。
+            body[0] = body[0][len(mention_text) :].lstrip("\n")
+        attempt = await send_at_parts(body[0], mentions=mentions, settings=settings, umo=umo)
+        if attempt.get("ok"):
+            shape = str(attempt.get("shape") or "")
+            rest = await _send_sequence(body[1:], settings=settings, umo=umo)
+            if rest["ok"]:
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "detail": "",
+                    "sent": total,
+                    "total": total,
+                    "umo": umo,
+                    "at": shape,
+                }
+            return {
+                **rest,
+                "sent": 1 + int(rest.get("sent") or 0),
+                "total": total,
+                "at": shape,
+            }
+    if mention_text and body:
+        body[0] = f"{mention_text}\n{body[0]}"
+    return await _send_sequence(body, settings=settings, umo=umo)
 
 
 #: 图片消息段里「图在哪」的字段名（老版本直接把地址塞进消息段，逐个试）
@@ -1410,6 +1568,8 @@ def dispatch(
     """
     limit = int(settings.get("maxChars") or 1200)
     pages = 1
+    mentions: list[str] = []
+    mention_text = ""
     if kind == "list":
         text, pages = build_events_message(
             events or [], page=page, per_page=max(3, min(20, limit // 90))
@@ -1422,6 +1582,12 @@ def dispatch(
         text = build_progress_message(cfg, state or {})
     elif kind == "call":
         text = build_call_message(cfg, state or {}, settings, members)
+        # **真 @ 由发送端用消息段试**（见 send_parts / send_at_parts）：这里把「要 @ 谁的 QQ」
+        # 与「这个 AstrBot 收不了 at 段时的文本写法」一起交出去。atMode=none 时两者都空
+        # ——那本来就是「不 @，只列名字」。
+        if str(settings.get("atMode") or "cq") != "none":
+            mentions = participant_qqs(cfg, members)
+            mention_text = at_text(mentions, settings)
     elif kind == "result":
         text = build_result_message(cfg, state or {})
     elif kind == "detail":
@@ -1440,4 +1606,10 @@ def dispatch(
         raise ValueError(f"未知的推送类型：{kind}")
     # 先纯文本化再分段：否则「按 Markdown 长度切的段」和「纯文本化后的实际长度」对不上
     plain = to_plain_text(text)
-    return {"parts": split_message(plain, limit), "pages": pages, "page": max(1, int(page or 1))}
+    return {
+        "parts": split_message(plain, limit),
+        "pages": pages,
+        "page": max(1, int(page or 1)),
+        "mentions": mentions,
+        "mentionText": mention_text,
+    }

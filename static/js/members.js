@@ -598,10 +598,14 @@ export async function refreshQqbotStatusBox() {
         : ` · 本小时已推 <b>${st.limit.usedLastHour}</b>／${st.limit.maxPerHour} 次`
       : '';
     if (st.ready) {
+      const at =
+        st.at === 'unsupported'
+          ? '真 @ <b>不支持</b>（已退回文本写法）'
+          : st.at
+            ? `真 @ 生效（写法 <b>${esc(st.at)}</b>）`
+            : `真 @ 未试过（发一条就会试）；退回写法 <b>${esc(st.atMode || 'cq')}</b>`;
       box.className = 'notice';
-      box.innerHTML =
-        `已就绪 · 目标会话 <code>${esc(st.umo)}</code> · @ 方式 <b>${esc(st.atMode || 'cq')}</b>` +
-        quota;
+      box.innerHTML = `已就绪 · 目标会话 <code>${esc(st.umo)}</code> · ${at}` + quota;
       return;
     }
     const missing = [
@@ -660,14 +664,14 @@ function qqbotPanelHtml() {
     }) +
     fieldSelect(
       'atMode',
-      '@ 的方式',
+      '真 @ 发不出去时的写法',
       q.atMode || 'cq',
       [
-        ['cq', 'CQ 码 [CQ:at,qq=…]（OneBot v11 推荐）'],
+        ['cq', 'CQ 码 [CQ:at,qq=…]（OneBot v11 常用）'],
         ['text', '纯文本 @QQ号'],
         ['none', '不 @，只列名字'],
       ],
-      { hint: 'AstrBot 的 OpenAPI 没有 at 消息段，所以 @ 写在文本里；点「发送测试消息」一试就知道哪种生效' }
+      { hint: '召集会**先试真 @**（消息段，两种写法各试一次并记住）；这个只决定退回时长什么样' }
     ) +
     fieldNum('maxChars', '单条上限（字符）', q.maxChars ?? 1200, { hint: '超出自动分段发送' }) +
     fieldNum('timeout', '请求超时（秒）', q.timeout ?? 10) +
@@ -1639,9 +1643,15 @@ export async function handleMemberAction(act, el) {
       try {
         const body = el.dataset.image === '1' ? { image: true } : {};
         const res = await api('/qqbot/test', { method: 'POST', auth: true, body });
+        // 文本测试顺带验证「真 @」：返回的 at 说明用的是哪种消息段写法
+        const atNote = res.image
+          ? ''
+          : res.at
+            ? `（真 @ 生效：${res.at} 写法）`
+            : '（真 @ 不支持，已按退回写法发）';
         toast(
           res.ok
-            ? `测试${res.image ? `图片（${res.shape === 'attachment_id' ? '先上传再引用' : `字段名 ${res.shape || '?'}`}）` : '消息'}已发送到 ${res.umo}`
+            ? `测试${res.image ? `图片（${res.shape === 'attachment_id' ? '先上传再引用' : `字段名 ${res.shape || '?'}`}）` : '消息'}已发送到 ${res.umo}${atNote}`
             : `发送失败：${res.detail || '未知原因'}`,
           res.ok ? 'ok' : 'err',
           8000
@@ -1670,9 +1680,18 @@ export async function handleMemberAction(act, el) {
         }
         const box = qs('#qqbotPreview');
         if (box) {
-          box.value = parts
-            .map((part, i) => (parts.length > 1 ? `— 第 ${i + 1} 段 —\n${part}` : part))
-            .join('\n\n');
+          // 召集会**先试真 @**，所以先把这件事说清楚，再给「退回时发出去的样子」
+          const head =
+            res.mentions && res.mentions.length
+              ? `—— 真 @ 说明（不会发出去）——\n` +
+                `会先试真 @ ${res.mentions.length} 人（消息段）；这台 AstrBot 不支持时` +
+                `退回文本写法，下面就是退回时发出去的样子。\n\n`
+              : '';
+          box.value =
+            head +
+            parts
+              .map((part, i) => (parts.length > 1 ? `— 第 ${i + 1} 段 —\n${part}` : part))
+              .join('\n\n');
         }
         const notes = [];
         if (res.card) notes.push('1 张卡片图');
@@ -1690,8 +1709,14 @@ export async function handleMemberAction(act, el) {
       if (!window.confirm('确认把这条消息发送到群里？')) return true;
       try {
         const res = await api('/qqbot/push', { method: 'POST', auth: true, body: q });
+        const atNote =
+          q.kind === 'call'
+            ? res.at
+              ? `，真 @ 生效（${res.at}）`
+              : '，真 @ 不支持（已退回文本写法）'
+            : '';
         toast(
-          `已发送到群（${res.image ? '图片 + ' : ''}${res.sent}/${res.total} 段）` +
+          `已发送到群（${res.image ? '图片 + ' : ''}${res.sent}/${res.total} 段${atNote}）` +
             (res.image === false && q.kind === 'event' ? '（图没发出去，已改为完整文本）' : ''),
           'ok',
           6000
