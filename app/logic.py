@@ -1362,7 +1362,8 @@ def validate_config(cfg: Config) -> list[str]:
     if blank:
         names = "、".join((r.label or r.code) for r in blank[:4])
         issues.append(
-            f"{names} 有一方没有{sc.label_text}（没有成绩 = 退赛）：确认是退赛，还是漏填了。"
+            f"{names} 有一方没有{sc.label_text}（没有成绩 = 退赛 / 没跑完，名次垫底）："
+            f"确认是退赛，还是漏填了。"
         )
     return issues
 

@@ -523,11 +523,19 @@ class RoundStatusPayload(NTEModel):
 
 
 class SideResultPayload(NTEModel):
-    """一方（一支队伍）的比赛结果。``key`` 留空则按数组顺序取 A/B/C/D。"""
+    """一方（一支队伍）的比赛结果。``key`` 留空则按数组顺序取 A/B/C/D。
+
+    **不写成绩 = 没有成绩（垫底）**，这是所有人（含直接调接口的脚本）都能依赖的一条：
+
+    * ``score`` 省略 / 写 ``MISSING`` → 「没有成绩」——**不是 0 分**。数值型的 0 是合法
+      读数（0 分照样参与排名），所以「没填」只能靠哨兵表达；否则数值低胜下漏填的 0
+      会被当成**最好**的成绩判第 1（见 app/metrics.py 的两条约定）。
+    * ``points``（小分 / 累计成绩 / 罚时）没有「没有成绩」这一说，留空一律按 0。
+    """
 
     key: str = ""
-    score: int = 0            # 比分（2 队 = 局分；多队同场 = 该场得分）
-    points: int = 0           # 小分 / 细则分（可选）
+    score: int = metrics.MISSING  # 省略 = 没有成绩（垫底），不是 0 分
+    points: int = 0               # 小分 / 细则分（可选）
     team_id: str = ""
     player_ids: list[str] = Field(default_factory=list)
 
@@ -3082,8 +3090,13 @@ async def api_round_result(
     # 负数只有两个来源：真填错了，或者 metrics.MISSING（「没有成绩」的哨兵）。
     # 数值型的 0 是合法读数，所以「没填」必须走哨兵这条路，不能靠 0 兼职。
     for item in payload.sides:
-        if (item.score < 0 and item.score != metrics.MISSING) or item.points < 0:
+        if item.score < 0 and item.score != metrics.MISSING:
             raise HTTPException(status_code=400, detail="比分与得分不能为负数")
+    for item in payload.sets:
+        # 一整轮都没填的一方写 MISSING；别的负数就是填错了
+        for value in (item.a, item.b):
+            if value < 0 and value != metrics.MISSING:
+                raise HTTPException(status_code=400, detail="各轮成绩不能为负数")
     for legacy in (payload.score_a, payload.score_b):
         if legacy is not None and legacy < 0 and legacy != metrics.MISSING:
             raise HTTPException(status_code=400, detail="比分不能为负数")
@@ -3114,7 +3127,9 @@ async def api_round_result(
             if not 0 <= index < len(raw):
                 continue
             raw[index]["score"] = int(item.score)
-            raw[index]["points"] = int(item.points)
+            # 小分 / 累计成绩 / 罚时没有「没有成绩」这一说：前端留空时发来的哨兵
+            # （以及任何负数）一律按 0 记——它是「没有小分 / 没有罚时」，不是负分
+            raw[index]["points"] = max(0, int(item.points))
             if item.team_id:
                 raw[index]["teamId"] = item.team_id
             if item.player_ids:
@@ -3156,9 +3171,22 @@ async def api_round_result(
             model.winner = winner
         if not winner:
             if ranked:
-                tied_text = f"{scoring.label_text}相同"
-                who = "并列第一" if side_count > 2 else tied_text
-                hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
+                # 「谁都没登记成绩」和「真的并列」是两回事：前者压根没有可比的成绩
+                # （允许留空按垫底，但全都留空就等于没录），提示要说清去哪一步
+                blank = not any(
+                    scoring.has_total(
+                        model.sides[i].score, model.sides[i].points, has_rounds=bool(model.sets)
+                    )
+                    or model.sides[i].points
+                    for i in range(len(model.sides))
+                )
+                if blank:
+                    who = "谁都没登记成绩"
+                    hint = "至少填一方的成绩，或直接指定胜方"
+                else:
+                    tied_text = f"{scoring.label_text}相同"
+                    who = "并列第一" if side_count > 2 else tied_text
+                    hint = "请直接指定胜方" if not allow_draw else "请直接指定胜方或标记为平局"
                 raise HTTPException(status_code=400, detail=f"{who}，无法判定晋级：{hint}")
             # 娱乐模式：分不出胜负就直接记平局，绝不因为「没点胜方」而卡住记录
             winner = "DRAW"

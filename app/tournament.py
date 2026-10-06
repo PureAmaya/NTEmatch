@@ -250,6 +250,12 @@ def judge_round(rnd: Round, *, allow_draw: bool = False, scoring: object = metri
     for i in range(count):
         if sides[i].forfeit:
             sides[i].rank = len(playing) + 1
+    # 没有成绩的一方**名次钉在最后一位**（垫底），与「有成绩但并列」区分开：
+    # 并列是「成绩一样」（按并列那一位算名次分），没成绩是「压根没成绩」——4 队里 3 队
+    # 没跑完时，他们不该占到「并列第 2」那份名次分（那和跑完拿了第 2 一样多）。
+    for i in playing:
+        if not sc.has_result(sides[i].score) and not sides[i].points:
+            sides[i].rank = count
 
     if not any(
         sc.has_total(sides[i].score, sides[i].points, has_rounds=bool(rnd.sets))
@@ -274,13 +280,49 @@ def round_is_decided(rnd: Round) -> bool:
 
 
 def source_text(ref: str) -> str:
-    """把席位引用翻译成展示文案。"""
+    """把席位引用翻译成展示文案（**兜底**，见下）。
+
+    ``seed:N`` 里 N 是**种子号**，不是「小组赛第 N 名」：首轮是交叉配对
+    （见 :func:`bracket_seeds`），种子 3 完全可能是「A 组第 2」。有小组赛时
+    真正的出处由 :func:`seed_sources` 给（「A 组第 2」），这里只在拿不到时兜底——
+    没有小组赛（队伍太少）时种子号就等于队伍顺序。
+    """
     if not ref:
         return ""
     if ref.startswith("seed:"):
-        return f"小组赛第 {ref[5:]} 名"
+        return f"{ref[5:]} 号种子"
     code, _, flag = ref.rpartition(":")
     return f"{code} {'胜者' if flag == 'W' else '败者'}"
+
+
+def seed_sources(
+    teams: list[Team],
+    rounds: list[Round],
+    scoring: object,
+    seeds: list[str],
+) -> dict[str, str]:
+    """每个种子席位的**出处文案**：``{"seed:3": "A 组第 2", …}``。
+
+    「抽到哪个位置」与「从哪来」是两回事：交叉配对后，种子里装的是各组第几名
+    并不固定，所以席位文案要按**队伍真正的出处**写；没有小组赛时回落到
+    :func:`source_text` 的「N 号种子」。
+    """
+    if not seeds:
+        return {}
+    if not any(r.stage == "group" for r in rounds):
+        return {}
+    tables = group_tables(teams, rounds, scoring)
+    where = {
+        str(row["teamId"]): (str(row.get("group") or "A"), int(row.get("rank") or 0))
+        for rows in tables.values()
+        for row in rows
+    }
+    out: dict[str, str] = {}
+    for pos, team_id in enumerate(seeds, start=1):
+        group, rank = where.get(str(team_id), ("", 0))
+        if group and rank:
+            out[f"seed:{pos}"] = f"{group} 组第 {rank}"
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -610,6 +652,9 @@ def overall_ranking(
     """小组赛总排名：先所有小组第 1 名（按战绩），再所有第 2 名，依此类推。
 
     这样「前 B 名晋级」等价于：各组名次靠前者优先，保证各组头名稳进淘汰赛。
+
+    **它是「谁晋级」的依据，不是「怎么配对」的依据**——直接拿它填对阵表会让同组两队
+    在首轮相遇，配对要用 :func:`bracket_seeds`。
     """
     sc = metrics.as_scoring(scoring)
     depth = max((len(rows) for rows in tables.values()), default=0)
@@ -619,6 +664,75 @@ def overall_ranking(
         chunk.sort(key=lambda row: table_sort_key(row, sc))
         ranking.extend(row["teamId"] for row in chunk)
     return ranking
+
+
+def bracket_seeds(
+    tables: dict[str, list[dict[str, Any]]], size: int, scoring: object = metrics.INTEGER
+) -> list[str]:
+    """把出线队排成**淘汰赛种子顺序**（``[0]`` = 1 号种子，长度 = ``size``）。
+
+    「总排名」与「种子顺序」不是一回事：总排名是「先列各组第 1 名、再列第 2 名…」，
+    而首轮配对是「1 号对 8 号、3 号对 6 号…」。照总排名直接填表就会**让同组两队在
+    首轮相遇**——3 个小组出线 8 队时种子 3 与 6 恰好同为 C 组（C 组第 1 打 C 组第 2）；
+    两个小组各出线 4 队时，第 1 名甚至会碰到本组第 3 名。
+
+    这里按通行做法**交叉配对**，并保住「1 号与 2 号只可能在决赛相遇」：
+
+    1. 排名前一半为**强侧**（各组名次靠前者），后一半为**弱侧**；
+    2. 强侧按战绩顺序（1 → 4 → 2 → 3，就是 ``bracket_order`` 的强侧位序）去弱侧挑对手，
+       **从最弱的开始挑，但优先挑不同组的**；
+    3. 实在挑不出不同组的（某一组的出线队超过总数一半，数学上躲不开）才允许同组相遇。
+
+    出线队不是偶数（理论上不会：淘汰赛规模恒为 2 的幂）时按总排名原样返回——
+    交叉配对的前提是上下半区一样大。
+    """
+    count = max(2, int(size))
+    ranking = overall_ranking(tables, scoring)[:count]
+    if len(ranking) != count or count % 2:
+        return ranking
+    group_of = {
+        str(row["teamId"]): str(row.get("group") or "A")
+        for rows in tables.values()
+        for row in rows
+    }
+    half = count // 2
+    strong, weak = ranking[:half], ranking[half:]
+    pool = list(weak)
+    pairs: list[tuple[str, str]] = []
+    for slot in bracket_order(half):
+        top = strong[slot - 1]
+        # 从最弱的开始挑：战绩最好的先挑，挑走的还是弱侧里最弱的那个
+        rival = next(
+            (cand for cand in reversed(pool) if group_of.get(cand) != group_of.get(top)), ""
+        )
+        if not rival and pool:
+            rival = pool[-1]  # 躲不开同组了（一组出线太多）
+        if rival:
+            pool.remove(rival)
+        pairs.append((top, rival))
+    order = bracket_order(count)
+    seeds: list[str] = [""] * count
+    for i, (top, rival) in enumerate(pairs):
+        seeds[order[2 * i] - 1] = top
+        if rival:
+            seeds[order[2 * i + 1] - 1] = rival
+    return [team_id for team_id in seeds if team_id]
+
+
+def knockout_started(rounds: list[Round], scoring: object = metrics.INTEGER) -> bool:
+    """淘汰赛是否**已经开打**：有场次不是「未开始」，或者已经录过成绩。
+
+    这个标记决定要不要重排配对（见 :func:`advance_seeds`）。种子算法改过一版
+    （从「总排名直接当种子」改成「交叉配对，同组首轮不相遇」），但**已经打下来的
+    届必须保持原样**：对阵是当初生成、并且已经被打过的，拿新算法重排等于把已录的
+    成绩作废（对阵一变，按规矩就得重打）。所以只对「还没开打」的届生效。
+    """
+    sc = metrics.as_scoring(scoring)
+    return any(
+        rnd.stage in ("wb", "lb", "gf")
+        and (rnd.status != "pending" or round_has_result(rnd, sc))
+        for rnd in rounds
+    )
 
 
 def group_stage_done(rounds: list[Round]) -> bool:
@@ -790,10 +904,18 @@ def _build_single_elim(size: int, start_index: int = 1) -> list[Round]:
     return rounds
 
 
-def resolve_rounds(rounds: list[Round], seeds: list[str], teams: list[Team]) -> list[Round]:
+def resolve_rounds(
+    rounds: list[Round],
+    seeds: list[str],
+    teams: list[Team],
+    *,
+    seed_texts: dict[str, str] | None = None,
+) -> list[Round]:
     """按已有结果推导淘汰赛双方（纯函数，可反复调用）。
 
     ``seeds`` 是晋级队伍的 ``team_id`` 顺序（1 号种子在前）。
+    ``seed_texts`` 是每个种子席位的出处文案（``{"seed:3": "A 组第 2"}``，见
+    :func:`seed_sources`）——给了就用它，没有就退回 :func:`source_text`。
     当前向遍历发现某场双方与已保存的不一致时，该场（以及其后所有对局）
     的比分与状态会被清空——上游结果改了，下游自然重来。
     """
@@ -839,7 +961,7 @@ def resolve_rounds(rounds: list[Round], seeds: list[str], teams: list[Team]) -> 
                 replaced = True
             side.team_id = tid
             side.label = label
-            side.source = source_text(ref)
+            side.source = (seed_texts or {}).get(ref) or source_text(ref)
             if not decided or replaced:
                 side.player_ids = players
         if replaced and decided:
@@ -985,21 +1107,35 @@ def size_from_rounds(rounds: list[Round]) -> int:
 def advance_seeds(
     teams: list[Team], rounds: list[Round], scoring: object = metrics.INTEGER
 ) -> list[str]:
-    """当前晋级淘汰赛的种子顺序（小组赛未结束时返回空列表）。"""
+    """当前晋级淘汰赛的**种子顺序**（小组赛未结束时返回空列表）。
+
+    * 还没开打：走 :func:`bracket_seeds`（交叉配对，同组首轮不相遇）；
+    * **已经开打**：按小组赛总排名原样排（即当初生成这版对阵时用的老算法）——
+      算法升级不许回溯改写已经打下来的比赛，否则一次普通写入就会把已录的淘汰赛成绩
+      作废。想换算法就把淘汰赛场次重置（冻结随之解除，见 :func:`knockout_started`）；
+    * 没有小组赛（队伍太少，直接淘汰赛）时按队伍顺序排。
+    """
     size = size_from_rounds(rounds) or bracket_size(len(teams))
     if not any(r.stage == "group" for r in rounds):
         return [t.id for t in teams][:size]
     if not group_stage_done(rounds):
         return []
     tables = group_tables(teams, rounds, scoring)
-    return overall_ranking(tables, scoring)[:size]
+    if knockout_started(rounds, scoring):
+        return overall_ranking(tables, scoring)[:size]
+    return bracket_seeds(tables, size, scoring)
 
 
 def resolve_tournament(
     teams: list[Team], rounds: list[Round], scoring: object = metrics.INTEGER
 ) -> list[Round]:
     """按当前进程重算整份赛程（小组赛阵容保持原样，淘汰赛按结果推导）。"""
-    return resolve_rounds(rounds, advance_seeds(teams, rounds, scoring), teams)
+    seeds = advance_seeds(teams, rounds, scoring)
+    # 席位文案跟着**种子顺序**走：交叉配对后「种子 3」不等于「小组赛第 3 名」，
+    # 得按球队真正的出处写（A 组第 2 / C 组第 1）
+    return resolve_rounds(
+        rounds, seeds, teams, seed_texts=seed_sources(teams, rounds, scoring, seeds)
+    )
 
 
 def phase_of(rounds: list[Round]) -> str:

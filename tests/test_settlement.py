@@ -10,8 +10,8 @@
 
 from __future__ import annotations
 
-from app import tournament
-from app.models import SetScore
+from app import metrics, tournament
+from app.models import Round, Rules, SetScore, Side, Team
 
 
 def test_three_rounds_by_round_wins(make_config):
@@ -93,6 +93,202 @@ def test_forfeit_loses(make_config):
     rnd = make_config().rounds[0]
     rnd.sides[0].forfeit = True
     assert tournament.judge_round(rnd) == "B"
+
+
+# --------------------------------------------------------------------------- #
+# 小组赛 → 淘汰赛：谁跟谁打
+#
+# 这一组盯的是「出线之后第一轮碰上谁」：名次算对了，配对配错了照样是错。
+# --------------------------------------------------------------------------- #
+def _played_tournament(team_count: int, per_match: int = 2, kind: str = "integer"):
+    """造一届、把小组赛全部打完（每场按出场顺序给成绩，第一方最优）。"""
+    teams = [
+        Team(id=f"t{i}", label=f"{i} 队", short=f"{i}", player_ids=[f"p{i}"])
+        for i in range(1, team_count + 1)
+    ]
+    rules = Rules(
+        teams_per_match=per_match,
+        value_type="time" if kind == "time" else "integer",
+        value_label="用时" if kind == "time" else "得分",
+        better="low" if kind == "time" else "high",
+    )
+    rounds, _warnings, summary = tournament.build_tournament(teams, rules)
+    sc = rules.scoring
+    for rnd in rounds:
+        if rnd.stage != "group":
+            continue
+        for idx, side in enumerate(rnd.sides):
+            side.score = (600_000 + idx * 1000) if kind == "time" else (10 - idx)
+        rnd.winner = tournament.judge_round(rnd, allow_draw=False, scoring=sc)
+        rnd.status = "done"
+    return teams, rounds, sc, summary
+
+
+def _legacy_pairing(teams, rounds, scoring, size):
+    """按**老算法**（总排名直接当种子）排一遍对阵。
+
+    用来造「升级之前库里就是这些对阵」的样子：新版改成交叉配对之后，
+    已经打下来的届必须**照旧**，不能回溯改写。
+    """
+    tables = tournament.group_tables(teams, rounds, scoring)
+    seeds = tournament.overall_ranking(tables, scoring)[:size]
+    return tournament.resolve_rounds(rounds, seeds, teams)
+
+
+def test_knockout_first_round_does_not_park_one_group_against_itself():
+    """出线后首轮**不能让同组两队相遇**（能避开就必须避开）。
+
+    「总排名」是「先列各组第 1 名、再列第 2 名」，而首轮配对是「1 对 8、3 对 6」——
+    直接拿总排名填对阵表，3 个小组时 3 号与 6 号同为 C 组，8 强首轮就自己人打自己人；
+    两个小组各出线 4 队时，A 组第 1 甚至会碰上本组第 3。
+    """
+    for count, per_match in ((6, 2), (8, 2), (9, 2), (10, 4), (12, 4)):
+        for kind in ("integer", "time"):
+            teams, rounds, sc, _summary = _played_tournament(count, per_match, kind)
+            group_of = {t.id: t.group for t in teams}
+            resolved = tournament.resolve_tournament(teams, rounds, sc)
+            first = [r for r in resolved if r.stage == "wb" and r.bracket_round == 1]
+            assert first, f"{count} 队应当有淘汰赛首轮"
+            for rnd in first:
+                left, right = (side.team_id for side in rnd.sides)
+                assert left and right
+                assert group_of[left] != group_of[right], (
+                    f"{count} 队 / 同场 {per_match} / {kind}：{rnd.code} 让 "
+                    f"{group_of[left]} 组自己人打起来了"
+                )
+
+
+def test_top_two_seeds_can_only_meet_in_the_final():
+    """1 号与 2 号种子分处上下半区：只可能在决赛相遇。"""
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    seeds = tournament.advance_seeds(teams, rounds, sc)
+    assert len(seeds) == summary["size"] and len(set(seeds)) == len(seeds)
+    resolved = tournament.resolve_tournament(teams, rounds, sc)
+    slots = {
+        side.team_id: rnd.slot
+        for rnd in resolved
+        if rnd.stage == "wb" and rnd.bracket_round == 1
+        for side in rnd.sides
+    }
+    boundary = len(seeds) // 4  # 首轮场次的前一半 = 上半区
+    assert (slots[seeds[0]] <= boundary) != (slots[seeds[1]] <= boundary)
+
+
+def test_seed_slots_say_where_the_team_came_from():
+    """席位文案写**真正的出处**（「A 组第 2」），不能写「小组赛第 3 名」。
+
+    交叉配对之后种子号 ≠ 小组赛总排名，按种子号写名次就是骗人
+    （「第 3 名」点进去却是 A 组第 2）。
+    """
+    teams, rounds, sc, _summary = _played_tournament(9, 2)
+    tables = tournament.group_tables(teams, rounds, sc)
+    where = {r["teamId"]: (r["group"], r["rank"]) for rows in tables.values() for r in rows}
+    resolved = tournament.resolve_tournament(teams, rounds, sc)
+    for rnd in resolved:
+        if rnd.stage != "wb" or rnd.bracket_round != 1:
+            continue
+        for side in rnd.sides:
+            group, rank = where[side.team_id]
+            assert side.source == f"{group} 组第 {rank}"
+    # 没有小组赛（队伍太少）时退回「N 号种子」——那时种子号就等于队伍顺序
+    assert tournament.source_text("seed:3") == "3 号种子"
+
+
+def test_knockout_that_already_started_keeps_its_pairing():
+    """**算法升级不许回溯改写已经打下来的比赛**。
+
+    这一版把种子算法从「总排名直接当种子」改成了交叉配对。已经开打的届必须保持原样：
+    否则一次普通写入（每次写入都会重算淘汰赛阵容）就会把已录的淘汰赛成绩作废
+    ——对阵变了按规矩要重打，那可是已经打过的比赛。
+    """
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    stored = _legacy_pairing(teams, rounds, sc, summary["size"])
+    played = next(r for r in stored if r.code == "WB-1-2")
+    played.status, played.winner = "done", "A"
+    played.sides[0].score, played.sides[1].score = 3, 2
+    played.sides[0].rank, played.sides[1].rank = 1, 2
+
+    assert tournament.knockout_started(stored), "已经打完一场 → 判定为「开打」"
+    legacy_seeds = tournament.overall_ranking(
+        tournament.group_tables(teams, stored, sc), sc
+    )[: summary["size"]]
+    assert tournament.advance_seeds(teams, stored, sc) == legacy_seeds, "冻结要沿用老的名次顺序"
+
+    after = tournament.resolve_tournament(teams, stored, sc)
+    same = next(r for r in after if r.code == "WB-1-2")
+    assert [side.team_id for side in same.sides] == [side.team_id for side in played.sides]
+    assert (same.status, same.winner) == ("done", "A"), "已录的成绩不能被作废"
+    assert (same.sides[0].score, same.sides[1].score) == (3, 2)
+
+
+def test_knockout_not_started_gets_the_fixed_pairing():
+    """还没开打：交叉配对照旧生效（这正是这次要修的那件事），一场都不该丢。"""
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    stored = _legacy_pairing(teams, rounds, sc, summary["size"])
+    assert not tournament.knockout_started(stored)
+
+    after = tournament.resolve_tournament(teams, stored, sc)
+    group_of = {t.id: t.group for t in teams}
+    first = [r for r in after if r.stage == "wb" and r.bracket_round == 1]
+    assert first
+    for rnd in first:
+        left, right = (side.team_id for side in rnd.sides)
+        assert group_of[left] != group_of[right], f"{rnd.code} 又让同组两队碰上了"
+
+
+def test_resetting_the_knockout_unfreezes_the_pairing():
+    """把淘汰赛退回未开始：冻结解除，重新按新算法排——想换算法不必重建整届。"""
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    stored = _legacy_pairing(teams, rounds, sc, summary["size"])
+    played = next(r for r in stored if r.code == "WB-1-2")
+    played.status, played.winner = "done", "A"
+
+    assert tournament.knockout_started(stored)
+    tournament.reset_round_result(played)
+    assert not tournament.knockout_started(stored), "重置之后这一届不再算「开打」"
+    assert tournament.advance_seeds(teams, stored, sc) == tournament.bracket_seeds(
+        tournament.group_tables(teams, stored, sc), summary["size"], sc
+    ), "冻结解除后按新算法（交叉配对）排"
+
+
+# --------------------------------------------------------------------------- #
+# 不写成绩 = 没有成绩 = 垫底
+# --------------------------------------------------------------------------- #
+def test_blank_sides_share_the_last_place_not_a_middle_tie():
+    """多队同场里几队都没成绩：他们并列**最后一名**，不是「并列第 2」。
+
+    名次分按并列的那一位算（4 队 = 4/3/2/1）：3 队没跑完却按「并列第 2」计，
+    等于和跑完拿了第 2 的队伍拿一样多的分——漏填反倒占了便宜。
+    """
+    sc = metrics.Scoring.resolve(value_type="time", better="low")
+    rnd = Round(
+        code="G-A-1-1",
+        stage="group",
+        sides=[Side(team_id=f"t{i}") for i in range(1, 5)],
+    )
+    for side, ms in zip(rnd.sides, [25000, 0, 0, 0]):  # 只有 A 跑完，其余三方没成绩
+        side.score = ms
+    assert tournament.judge_round(rnd, allow_draw=False, scoring=sc) == "A"
+    assert [side.rank for side in rnd.sides] == [1, 4, 4, 4]
+    assert [tournament.placement_points(4, side.rank) for side in rnd.sides] == [4, 1, 1, 1]
+
+
+def test_a_real_zero_is_a_score_but_blank_is_not():
+    """有成绩的 0 分与「没填」必须分开：低胜下 0 分是最好的成绩，没填的一方永远垫底。
+
+    这正是「不写成绩按垫底」最容易出事的地方——把漏填当成 0 分，它会直接判第 1。
+    """
+    sc = metrics.Scoring.resolve(value_type="integer", better="low")
+    rnd = Round(
+        code="G-A-1-1",
+        stage="group",
+        sides=[Side(team_id=f"t{i}") for i in range(1, 5)],
+    )
+    for side, value in zip(rnd.sides, [25, metrics.MISSING, 0, 18]):  # B 留空、C 真 0 分
+        side.score = value
+    assert tournament.judge_round(rnd, allow_draw=False, scoring=sc) == "C", "0 分是最好的成绩"
+    assert [side.rank for side in rnd.sides] == [3, 4, 1, 2], "留空的一方垫底"
+    assert metrics.as_scoring(sc).format(rnd.sides[1].score) == "—"
 
 
 def test_shared_first_place_needs_decider(make_config):
