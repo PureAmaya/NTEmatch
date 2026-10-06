@@ -20,6 +20,15 @@ async def _card(cfg, event_id: str = "e001"):
     return await card.card_for_event(cfg, event_id, site="http://nte.test")
 
 
+def _cjk_font():
+    """这台机器上实际用来画卡片的 CJK 字体（没装就跳过字体检查）。"""
+    from app import fonts
+
+    if fonts.resolve("cjk") is None:
+        pytest.skip("这台机器上没装 CJK 字体（Linux 上 apt install fonts-noto-cjk 即可）")
+    return fonts.load("cjk", 26)
+
+
 # --------------------------------------------------------------------------- #
 # 内容（纯函数，不需要 Pillow）
 # --------------------------------------------------------------------------- #
@@ -37,6 +46,66 @@ def test_payload_adapts_to_every_heat_size(make_config, teams, expect):
     assert dict(payload["meta"])["每场"] == expect
     rules = " ".join(item for section in payload["sections"] for item in section["items"])
     assert expect in rules
+
+
+def test_card_text_has_no_missing_glyphs(make_config):
+    """卡片上的**每一段文字**都要能被实际用的字体画出来——缺字形就是图里的空心方块。
+
+    真踩过：副标题那行（``e902 · 筹备中 · 第 1 届…``）用的是等宽**西文**字体，
+    而它含中文，于是一整行都成了方块。这条用例把「内容 ↔ 字体」对一遍，
+    以后谁把中文塞给西文字体，这里就会红。
+    """
+    from app import fonts
+
+    font = _cjk_font()
+    payload = card.payload_for(make_config(teams=4), "e001")
+    texts = [
+        str(payload.get("title") or ""),
+        str(payload.get("id") or ""),
+        str(payload.get("status") or ""),
+        str(payload.get("headline") or ""),
+        str(payload.get("note") or ""),
+        str(payload.get("noteTitle") or ""),
+        str(payload.get("caption") or ""),
+    ]
+    texts += [f"{key}{value}" for key, value in (payload.get("meta") or [])]
+    for section in payload.get("sections") or []:
+        texts.append(str(section.get("title") or ""))
+        texts += [str(item) for item in (section.get("items") or [])]
+    missing = sorted({ch for text in texts for ch in text if not fonts.has_glyph(font, ch)})
+    assert not missing, f"这些字符画不出来（会变成方块）：{missing}"
+
+
+def test_latin_font_cannot_draw_chinese():
+    """顺带把「为什么会有方块」钉住：西文字体没有中文字形，所以含中文的行必须走 CJK。"""
+    from app import fonts
+
+    if fonts.resolve("latin") in (None, fonts.resolve("cjk")):
+        pytest.skip("这台机器上没有独立的西文字体（latin 兜到了 CJK，测不出差别）")
+    latin = fonts.load("latin", 24)
+    assert fonts.has_glyph(latin, "A")
+    assert not fonts.has_glyph(latin, "筹"), "西文字体居然有中文字形？那这条判断的前提变了"
+    assert fonts.has_glyph(_cjk_font(), "筹")
+
+
+def test_digest_changes_when_the_font_changes(tmp_path, monkeypatch):
+    """换字体 → 指纹必须变。
+
+    不然会一直发着用旧字体画的那张图（真踩过：中文是一排方块的那版；
+    换上中文字体后，内容没变、指纹也没变，群里照旧是方块图）。
+    """
+    from app import fonts
+
+    payload = {"title": "同一份内容"}
+    before = card.digest(payload)
+    other = tmp_path / "SomeOtherFont.ttf"
+    other.write_bytes(b"x")
+    monkeypatch.setattr(fonts, "CJK_PATHS", (str(other),))
+    fonts.reset()
+    try:
+        assert card.digest(payload) != before
+    finally:
+        fonts.reset()
 
 
 def test_payload_carries_the_generated_rules(make_config):

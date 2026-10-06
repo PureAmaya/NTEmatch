@@ -119,7 +119,10 @@ def wedge(img: Image.Image) -> None:
 
 def text_block(img: Image.Image, title: str, tagline: str, note: str) -> None:
     f_title = fonts.load("cjk", 84)
-    f_tag = fonts.load("latin", 27)
+    # 副标题默认是西文（NEVERNESS TO EVERNESS），用西文字体的等宽观感更好；
+    # 但有人会传中文（`--tagline "S2 · 秋季赛"`），那时**必须换 CJK 字体**——
+    # 西文字体画中文只会得到方块。
+    f_tag = fonts.load("latin" if tagline.isascii() else "cjk", 27)
     # 说明文案默认是中文：必须用中文字体（西文字体在这里只会画出方框）
     f_note = fonts.load("cjk", 22)
 

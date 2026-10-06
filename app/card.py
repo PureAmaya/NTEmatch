@@ -238,9 +238,18 @@ def digest(payload: dict[str, Any]) -> str:
 
     ``sort_keys`` + ``ensure_ascii=False``：两边算出来的必须一模一样，
     否则「同样的内容」会被当成两份，缓存也就白做了。
+
+    **字体也算进指纹**：图是拿当时的字体画出来的——换了字体（或者这台机器从
+    「没装中文字体」变成「装了」），同一份内容画出来就是另一张图。不算进去的话
+    会一直发着旧那张（真踩过：中文是一排方块的那版）。
     """
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return hashlib.sha256((blob + _font_signature()).encode("utf-8")).hexdigest()
+
+
+def _font_signature() -> str:
+    """画这张图用的字体文件（找不到就是 ``-``）：并入指纹，换字体就自动重画。"""
+    return "|" + "|".join(str(fonts.resolve(kind) or "-") for kind in ("cjk", "latin", "mono"))
 
 
 # --------------------------------------------------------------------------- #
@@ -312,7 +321,9 @@ def render(payload: dict[str, Any], *, site: str = "") -> bytes | None:
         img = Image.new("RGBA", (WIDTH, MAX_HEIGHT), (*PANEL, 255))
         draw = ImageDraw.Draw(img)
         f_title = fonts.load("cjk", 56)
-        f_sub = fonts.load("mono", 24)
+        # 副标题那行是「编号 · 状态 · 一句话」，**含中文**（「筹备中」「第 1 届」…）：
+        # 必须用 CJK 字体。曾经这里用等宽西文字体（bahnschrift），中文全成了空心方块。
+        f_sub = fonts.load("cjk", 24)
         f_key = fonts.load("cjk", 24)
         f_val = fonts.load("cjk", 26)
         f_body = fonts.load("cjk", 26)

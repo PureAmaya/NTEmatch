@@ -182,7 +182,12 @@ def resolve(kind: str = "cjk") -> Path | None:
 
 
 def load(kind: str, size: int):
-    """拿一个指定字号的字体对象（没有可用字体时退回 Pillow 内置位图字体）。"""
+    """拿一个指定字号的字体对象（没有可用字体时退回 Pillow 内置位图字体）。
+
+    **``mono`` / ``latin`` 只能用来画纯西文**——它们没有中文字形，画中文只会得到
+    空心方块（真踩过：卡片副标题「e902 · 筹备中 · 第 1 届」被等宽西文字体画成了
+    一排方块）。拿不准就用 ``cjk``：它也含西文与数字，只是不那么「科技感」。
+    """
     key = (kind, int(size))
     hit = _fonts.get(key)
     if hit is not None:
@@ -200,3 +205,22 @@ def load(kind: str, size: int):
         font = ImageFont.load_default(int(size))
     _fonts[key] = font
     return font
+
+
+def has_glyph(font, char: str) -> bool:
+    """这支字体画得出 ``char`` 吗（画不出就会变成空心方块）。
+
+    做法：把它与一个「必定不存在」的私用区字符各画一遍，比对位图——缺字形时
+    FreeType 画的都是同一个 ``.notdef`` 方块，位图逐字节相同。
+
+    用途是自检：「我选的这支字体能不能画这句话」。卡片副标题那次的方块就是这么
+    查出来的，``tests/test_card.py`` 用它在真实内容上跑一遍。
+    """
+    from PIL import Image, ImageDraw
+
+    def mask(text: str) -> bytes:
+        img = Image.new("L", (64, 64), 0)
+        ImageDraw.Draw(img).text((8, 8), text, font=font, fill=255)
+        return img.tobytes()
+
+    return mask(char) != mask("\ue000")  # U+E000 是私用区，正常字体都没有这个字形
