@@ -43,9 +43,7 @@ import {
   fieldText,
   isChannelLive,
   privateOf,
-  pushTipsHtml,
   roundHasResult,
-  roundStreamsOf,
 } from './ui.js';
 import { refreshDiagnostics, renderAdmin, startReadiness } from './admin.js';
 import { resetClock, toggleClock } from './clock.js';
@@ -870,92 +868,6 @@ function openGroupPairingModal() {
           toast(err.message, 'err', 8000);
         }
       };
-    },
-  });
-}
-
-/**
- * 本场直播地址：**只提供推流 / 播放地址**（不放直播开关，也没有比赛编号的地址）。
- *
- * 推流标识只有**选手自己的唯一流名**（``tom``）：整届赛事都是同一个地址，
- * 换比赛不用重推。这里按「本场有哪些选手」列出他们各自的地址。
- */
-function openRoundLiveModal(rnd) {
-  const rs = roundStreamsOf(rnd.code);
-  const fallback = rnd.streams || {};
-  const sets = App.private?.protocols || [];
-  const cast = rs?.cast || fallback.cast || [];
-  // 每位选手一行，各带他自己的完整地址表（推流地址只按选手区分）
-  const rows = cast.map((item) => ({
-    name: item.name || item.playerId,
-    endpoints: item.endpoints || item.play || {},
-  }));
-
-  // 推流格的复制按钮带 data-tip="push"：复制后由统一动作再提醒一次「别开 B 帧」
-  const cell = (url, kind = 'play') =>
-    url
-      ? `<span class="streams__url"><span class="streams__val">${esc(url)}</span>` +
-        `<button class="btn btn--sm" type="button" data-act="copy" data-copy="${esc(url)}"` +
-        `${kind === 'play' ? '' : ' data-tip="push"'}` +
-        ` title="${esc(
-          kind === 'play' ? '复制播放地址' : `复制推流地址 · ${PUSH_TIP_LINE}`
-        )}">复制</button></span>`
-      : `<span class="streams__url"><i>—</i></span>`;
-
-  // 一套协议一张表：列由后端下发（只列已配置的协议）
-  const block = (set) => {
-    const cols = set.columns || [];
-    const grid = `style="grid-template-columns:minmax(0,.85fr) repeat(${cols.length}, minmax(0,1.7fr))"`;
-    return (
-      `<div class="streams streams--${esc(set.id)}">` +
-      `<div class="streams__title"><b>${esc(set.label)}</b>` +
-      (set.badge
-        ? `<span class="streams__badge streams__badge--${esc(set.id)}">${esc(set.badge)}</span>`
-        : '') +
-      `<span>${esc(set.note || '')}</span></div>` +
-      `<div class="streams__row streams__row--head" ${grid}><span>对象</span>` +
-      cols
-        .map(
-          (col) =>
-            `<span class="streams__col" title="${esc(col.hint || '')}">` +
-            `${esc(col.label)}</span>`
-        )
-        .join('') +
-      `</div>` +
-      rows
-        .map(
-          (row) =>
-            `<div class="streams__row" ${grid}><span class="streams__who">${esc(row.name)}</span>` +
-            cols.map((col) => cell(row.endpoints?.[col.key] || '', col.kind)).join('') +
-            `</div>`
-        )
-        .join('') +
-      `</div>`
-    );
-  };
-
-  const tables = sets.length
-    ? sets.map(block).join('')
-    : `<div class="notice notice--warn">还没有配置直播根地址（WebRTC / HLS），` +
-      `请到「直播配置」里填写。</div>`;
-
-  Modal.open({
-    title: `直播地址 · ${rnd.label || rnd.code}`,
-    body:
-      // 推流地址就在下面：先把「WHIP / 关掉 B 帧」讲清楚
-      pushTipsHtml() +
-      tables +
-      (cast.length
-        ? `<div class="notice" style="margin-top:10px">本场有 ${cast.length} 路选手机位：` +
-          `<b>推流用 WHIP</b>（WebRTC / UDP，延迟最低）；观看有 WebRTC 与 HLS 两条线路，` +
-          `观众可自行切换。选手的地址整届固定，换比赛不用重推。</div>`
-        : `<div class="notice notice--warn" style="margin-top:10px">本场选手都还没有推流流名，` +
-          `可在「选手」页点该选手的「编辑」填推流流名（每位必须唯一），填好后这里会自动生成推流与播放地址。</div>`) +
-      `<div class="notice" style="margin-top:10px">推流地址只在管理端显示，观众只会拿到播放地址；` +
-      `观众在直播页按<b>比赛</b>筛选机位。</div>`,
-    footer: `<button class="btn btn--sm btn--ghost" type="button" data-close>关闭</button>`,
-    onMount(bodyEl, footEl) {
-      footEl.querySelector('[data-close]').onclick = () => Modal.close();
     },
   });
 }
@@ -2615,10 +2527,25 @@ export async function handleAction(act, el) {
       if (rnd) openRoundTimesModal(rnd);
       return;
     }
-    case 'round-live': {
+    case 'round-call': {
+      // 召集这一场/这一局：让 QQ 机器人 @ **上场的人**（带场次与比赛名称）。
+      // 权限在服务端：服务器管理员任意届，赛事管理员只能召集自己创建的届。
       const rnd = roundOf(el.dataset.code);
-      if (rnd) openRoundLiveModal(rnd);
-      return;
+      if (!rnd) return;
+      const who = rnd.label || rnd.code;
+      if (!window.confirm(`在群里召集「${who}」的上场选手？`)) return true;
+      try {
+        const res = await api('/qqbot/push', {
+          method: 'POST',
+          auth: true,
+          body: { kind: 'call', ref: rnd.code },
+        });
+        const atNote = res.at ? `真 @ 生效（${res.at}）` : '真 @ 不支持（已退回文本写法）';
+        toast(`已召集「${who}」：${res.sent}/${res.total} 段，${atNote}`, 'ok', 9000);
+      } catch (err) {
+        toast(err.message, 'err', 9000);
+      }
+      return true;
     }
     case 'round-walkover': {
       const rnd = roundOf(el.dataset.code);

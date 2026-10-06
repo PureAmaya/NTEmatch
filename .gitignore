@@ -35,6 +35,7 @@ coverage.xml
 # 数据库内含管理 KEY 与全部赛事数据，绝不能入库
 config/
 data/
+cards/
 logs/
 # 数据备份同样含密钥与全部数据（见「备份」面板），绝不入库
 backups/

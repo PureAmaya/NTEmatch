@@ -83,6 +83,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 只在【提前量 - 1 小时, 提前量】这个窗口内发——服务器中途重启，
     # 不会把「明天开赛」这条补发成「还有 3 小时开赛」。
     "remindLeads": "1440,120",
+    # ---- 打完后自动播报（见 app/announce.py）----
+    # 开关：每打完一轮自动往群里发一次「比赛结果」（能画图就带结果图）。
+    # 同样需要「已启用推送」；一轮只播一次（标记记在 meta），发失败自动重试。
+    "autoResultEnabled": True,
 }
 SETTINGS_KEYS = tuple(DEFAULT_SETTINGS)
 # 这些键不接受前端回填（避免把「已配置」的 Key 用空串覆盖掉）
@@ -179,7 +183,7 @@ def normalize_settings(patch: dict[str, Any], current: dict[str, Any]) -> dict[s
             if internal:
                 clean[key] = str(value or "")
             continue
-        if key in ("enabled", "remindEnabled", "imageCards"):
+        if key in ("enabled", "remindEnabled", "imageCards", "autoResultEnabled"):
             # 注意：**别让布尔键落到下面的 else**——那里会把 False 存成字符串 "False"，
             # 而字符串恒为真，开关就再也关不掉了。
             clean[key] = bool(value)
@@ -1044,21 +1048,53 @@ def build_progress_message(cfg: Config, state: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _qq_of(player: Any, by_uid: dict[str, Any]) -> str:
+    """这位选手能用的 QQ：优先**成员资料**里的，其次选手自己填的；都不可用就空串。
+
+    「选手就是成员」，所以成员那份是权威（成员资料改了各届选手跟着更新，见
+    ``store.propagate_member``）；选手自填的那份只作为没有成员时的兜底。
+    """
+    member = by_uid.get(str(getattr(player, "member_uid", "") or ""))
+    for raw in ((member.qq if member is not None else ""), getattr(player, "qq", "")):
+        clean = "".join(ch for ch in str(raw or "") if ch.isdigit())
+        if len(clean) >= 5:
+            return clean
+    return ""
+
+
 def participant_qqs(cfg: Config, members: list[Any] | None = None) -> list[str]:
     """参与名单里各位的 QQ：优先成员关联的 QQ，其次选手自己填的 QQ，去重保序。"""
     by_uid = {m.uid: m for m in (members or [])}
     out: list[str] = []
     for player in logic.joined_players(cfg):
-        candidates = []
-        member = by_uid.get(player.member_uid)
-        if member is not None:
-            candidates.append(member.qq)
-        candidates.append(player.qq)
-        for qq in candidates:
-            clean = "".join(ch for ch in str(qq or "") if ch.isdigit())
-            if len(clean) >= 5 and clean not in out:
-                out.append(clean)
-                break
+        qq = _qq_of(player, by_uid)
+        if qq and qq not in out:
+            out.append(qq)
+    return out
+
+
+def round_qqs(cfg: Config, ref: str, members: list[Any] | None = None) -> list[str]:
+    """**某一场上场的人**的 QQ（按出场顺序、去重）。
+
+    「@ 这一轮的人」要的就是它：只看这一场有谁，不把整届名单都 @ 一遍
+    （4 队同场时，只 @ 这 4 位的 4 个 QQ）。
+    """
+    rnd = next(
+        (r for r in cfg.rounds if (r.code or str(r.index)) == str(ref or "").strip()), None
+    )
+    if rnd is None:
+        return []
+    players = {p.id: p for p in cfg.players}
+    by_uid = {m.uid: m for m in (members or [])}
+    out: list[str] = []
+    for side in rnd.sides:
+        for pid in side.player_ids:
+            player = players.get(pid)
+            if player is None:
+                continue
+            qq = _qq_of(player, by_uid)
+            if qq and qq not in out:
+                out.append(qq)
     return out
 
 
@@ -1145,24 +1181,58 @@ def build_remind_message(
     return "\n".join(lines)
 
 
+def _call_round(state: dict[str, Any], ref: str) -> dict[str, Any] | None:
+    """状态里找这一场（``ref`` = 场次编号，如 ``G-A-1-1``）；找不到回 ``None``。"""
+    want = str(ref or "").strip()
+    if not want:
+        return None
+    return next(
+        (r for r in (state.get("rounds") or []) if str(r.get("code") or "") == want), None
+    )
+
+
 def build_call_message(
-    cfg: Config, state: dict[str, Any], settings: dict[str, Any], members: list[Any] | None = None
+    cfg: Config,
+    state: dict[str, Any],
+    settings: dict[str, Any],
+    members: list[Any] | None = None,
+    ref: str = "",
 ) -> str:
-    """召集参赛：@ 参与名单里的人 + 比赛名称，请他们到场准备。"""
+    """召集参赛：@ 出场的人 + 比赛名称，请他们到场准备。
+
+    * 不给 ``ref``：@ **整届参与名单**里能对上的 QQ（赛前总召集）；
+    * 给了 ``ref``（场次编号）：只 @ **这一场上场的人**，并把这一场的信息一起说清
+      （第几轮 / 第几场 + 对阵 + 时间）——赛事管理端在赛程里点某一场的「召集」走的就是它。
+    """
     name = cfg.event.name or cfg.event.title or "比赛"
-    qqs = participant_qqs(cfg, members)
+    rnd = _call_round(state, ref)
+    qqs = round_qqs(cfg, ref, members) if rnd is not None else participant_qqs(cfg, members)
     mention = at_text(qqs, settings)
-    start = _fmt_dt(cfg.event.start_time)
-    lines = []
+    lines: list[str] = []
     if mention:
         lines.append(mention)
-    lines.append(f"【NTE 比赛】{name} 集合啦！")
-    if start:
-        lines.append(f"时间：{start}（{_human_delta(cfg.event.start_time)}）")
-    lines.append(f"赛制：{_format_label(cfg)} · 每方 {cfg.rules.team_size} 人")
-    lines.append("请以上选手按时到场、提前调试好设备；未能到场请提前说明。")
+    if rnd is not None:
+        label = str(rnd.get("label") or ref)
+        lines.append(f"【NTE 比赛】{name} · {label} 集合啦！")
+        sides = [logic.side_label(side) for side in (rnd.get("sides") or [])]
+        if sides:
+            lines.append(f"对阵：{' vs '.join(sides)}")
+        when = _fmt_dt(rnd.get("scheduledAt") or rnd.get("startedAt") or "")
+        lines.append(f"时间：{when}" if when else "时间：待定（到场后由组织者统一开始）")
+        lines.append("请以上选手按时到场、提前调试好设备；未能到场请提前说明。")
+    else:
+        start = _fmt_dt(cfg.event.start_time)
+        lines.append(f"【NTE 比赛】{name} 集合啦！")
+        if start:
+            lines.append(f"时间：{start}（{_human_delta(cfg.event.start_time)}）")
+        lines.append(f"赛制：{_format_label(cfg)} · 每方 {cfg.rules.team_size} 人")
+        lines.append("请以上选手按时到场、提前调试好设备；未能到场请提前说明。")
     if not qqs:
-        lines.append("（提示：参与名单里没有可 @ 的 QQ，先在成员资料里补上 QQ）")
+        lines.append(
+            "（提示：这场还没有可 @ 的 QQ，先在成员资料里补上 QQ）"
+            if rnd is not None
+            else "（提示：参与名单里没有可 @ 的 QQ，先在成员资料里补上 QQ）"
+        )
     return "\n".join(lines)
 
 
@@ -1188,8 +1258,14 @@ def build_result_message(cfg: Config, state: dict[str, Any]) -> str:
                 )
     else:
         ranking = state.get("ranking") or []
+        # 小组赛没打完就不是「最终排名」：名次还在变，也**不谈谁晋级 / 谁淘汰**
+        # （晋级标记由 app/logic.py 统一按「小组赛是否结束」给，这里跟着用）
         if ranking:
-            lines.append("最终排名：")
+            lines.append(
+                "最终排名："
+                if (state.get("format") or {}).get("groupStageDone")
+                else "小组赛当前排名（还没打完）："
+            )
             for row in ranking[:8]:
                 team = row.get("team") or {}
                 lines.append(
@@ -1581,12 +1657,14 @@ def dispatch(
     elif kind == "progress":
         text = build_progress_message(cfg, state or {})
     elif kind == "call":
-        text = build_call_message(cfg, state or {}, settings, members)
+        # ref = 只召集这一场（赛程里某一场的「召集」按钮）；不给就是整届总召集
+        ref = str(ref or "").strip()
+        text = build_call_message(cfg, state or {}, settings, members, ref)
         # **真 @ 由发送端用消息段试**（见 send_parts / send_at_parts）：这里把「要 @ 谁的 QQ」
         # 与「这个 AstrBot 收不了 at 段时的文本写法」一起交出去。atMode=none 时两者都空
         # ——那本来就是「不 @，只列名字」。
         if str(settings.get("atMode") or "cq") != "none":
-            mentions = participant_qqs(cfg, members)
+            mentions = round_qqs(cfg, ref, members) if ref else participant_qqs(cfg, members)
             mention_text = at_text(mentions, settings)
     elif kind == "result":
         text = build_result_message(cfg, state or {})

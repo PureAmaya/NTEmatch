@@ -361,6 +361,31 @@ async def test_result_card_is_a_real_image(make_config):
         assert 400 < img.height < card.MAX_HEIGHT
 
 
+def test_group_stage_not_done_hides_advancing():
+    """小组赛没打完：**不显示谁晋级、也不显示谁淘汰**。
+
+    「晋级 #N」「最终排名」都是打完才谈得上的结论；提前给出来就是误导（名次还在变，
+    而且没人知道最后谁出线）。网站总览与机器人推送共用 ``groupStageDone`` 这一个标记，
+    这里盯住推送那一侧（结果图的内容）。
+    """
+    import json
+
+    from app import tournament
+
+    cfg = _played_tournament()
+    group = next(rnd for rnd in cfg.rounds if rnd.stage == "group")
+    tournament.reset_round_result(group)  # 把小组赛退回「还没打完」
+    state = logic.build_state(cfg)
+    assert state["format"]["groupStageDone"] is False
+    assert all(row["advanced"] is False for row in state["ranking"])
+
+    payload = card.payload_for_result(cfg, "e001", state)
+    # 每一行都没有「晋级 #N」徽标，组说明里也不再写「前 N 名晋级」
+    assert all(row["seed"] == 0 for group_rows in payload["groups"] for row in group_rows["rows"])
+    assert all("晋级" not in (group_rows["note"] or "") for group_rows in payload["groups"])
+    assert "最终排名" not in json.dumps(payload, ensure_ascii=False)
+
+
 def test_result_card_and_info_card_do_not_share_a_cache_entry(make_config):
     """同一届的「信息卡」与「结果卡」内容不同 → 指纹必须不同（否则发出去的是错的那张）。"""
     cfg = _played_tournament()

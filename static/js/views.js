@@ -1297,7 +1297,10 @@ function leagueOpsHtml(rnd) {
   }
   ops.push(
     `<button class="btn btn--sm" type="button" data-act="round-times" data-code="${esc(rnd.code)}">时间</button>` +
-      `<button class="btn btn--sm" type="button" data-act="round-result" data-code="${esc(rnd.code)}">录入比分</button>`
+      `<button class="btn btn--sm" type="button" data-act="round-result" data-code="${esc(rnd.code)}">录入比分</button>` +
+      // 召集：让 QQ 机器人 @ 这一局上场的人（赛事管理员只能召集自己创建的届）
+      `<button class="btn btn--sm" type="button" data-act="round-call" data-code="${esc(rnd.code)}" ` +
+      `title="在群里 @ 这一局上场的人（QQ 机器人推送，带局次与比赛名称）">召集</button>`
   );
   if (rnd.status !== 'pending') {
     ops.push(
@@ -1496,12 +1499,7 @@ function matchOpsHtml(rnd) {
   if (!canEdit()) return '';
   const sides = rnd.sides || [];
   if (!sides.every((side) => side.teamId)) {
-    return (
-      `<div class="round__ops">` +
-      `<span class="panel__hint">对阵确定后自动出现在这里</span>` +
-      `<button class="btn btn--sm" type="button" data-act="round-live" data-code="${esc(rnd.code)}" ` +
-      `title="查看 / 复制本场的推流与播放地址">直播地址</button></div>`
-    );
+    return `<div class="round__ops"><span class="panel__hint">对阵确定后自动出现在这里</span></div>`;
   }
   const ops = [];
   if (rnd.status === 'pending') {
@@ -1515,9 +1513,9 @@ function matchOpsHtml(rnd) {
       `<button class="btn btn--sm" type="button" data-act="round-result" data-code="${esc(rnd.code)}">录入比分</button>` +
       `<button class="btn btn--sm" type="button" data-act="round-walkover" data-code="${esc(rnd.code)}" ` +
       `title="长期没人 / 人数不足：判一方弃权，对方直接晋级">弃权</button>` +
-      // 这里只提供推流地址，不放直播开关（开关在「直播配置」的总开关上）
-      `<button class="btn btn--sm" type="button" data-act="round-live" data-code="${esc(rnd.code)}" ` +
-      `title="查看 / 复制本场的推流与播放地址">直播地址</button>`
+      // 召集：让 QQ 机器人 @ **这一场上场的人**（赛事管理员只能召集自己创建的届）
+      `<button class="btn btn--sm" type="button" data-act="round-call" data-code="${esc(rnd.code)}" ` +
+      `title="在群里 @ 这一场上场的人（QQ 机器人推送，带场次与比赛名称）">召集</button>`
   );
   if (rnd.status !== 'pending') {
     ops.push(

@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
@@ -318,11 +317,14 @@ def round_player_ids(rnd: Round) -> list[str]:
 def side_label(side: dict[str, Any]) -> str:
     """一方的显示名：有队名 / 标签就用它，否则列出出场选手；都没有 = 「待定」。
 
-    ``round_view`` 会给没有队伍的席位兜一个「A 队 / B 队」的占位标签（那是给
-    只看两队对阵的兼容路径用的），它不是真队名，不能直接显示。
+    ``round_view`` 会给**没有队伍的席位**兜一个「A 队 / B 队 / C 队 / D 队」的占位标签
+    （给只看两队对阵的兼容路径用），它不是真队名，不能直接显示——占位标签的形状就是
+    「自己的 key + 队」，所以按 key 精确比对（只按「两个字 + 队」去猜，四队同场时
+    C / D 两侧就会显示成「C 队」）。
     """
     label = str(side.get("label") or "").strip()
-    if label and not re.fullmatch(r"[AB]\s*队", label):
+    key = str(side.get("key") or "")
+    if label and not (key and label == f"{key} 队"):
         return label
     names = [str(p.get("name") or p.get("id") or "") for p in (side.get("players") or [])]
     names = [name for name in names if name]
@@ -1098,6 +1100,9 @@ def _tournament_state(cfg: Config) -> dict[str, Any]:
     ranking = T.overall_ranking(tables, cfg.rules.scoring)
     size = T.size_from_rounds(rounds) or (T.bracket_size(len(teams)) if teams else 0)
     champion = T.champion_of(teams, rounds)
+    # 小组赛没打完之前**不谈谁晋级 / 谁淘汰**：排名还在变，早说就是误导
+    # （网站总览与机器人推送共用这一个标记，避免两处各判一次）。
+    stage_done = T.group_stage_done(rounds)
     return {
         "phase": T.phase_of(rounds),
         "format": {
@@ -1109,11 +1114,11 @@ def _tournament_state(cfg: Config) -> dict[str, Any]:
             "groupCount": len(tables),
             "groupMatches": sum(1 for r in rounds if r.stage == "group"),
             "knockoutMatches": sum(1 for r in rounds if r.stage != "group"),
-            "groupStageDone": T.group_stage_done(rounds),
+            "groupStageDone": stage_done,
         },
         "groups": [{"key": key, "rows": rows} for key, rows in tables.items()],
         "ranking": [
-            {"seed": pos + 1, "team": by_id[tid].dump(), "advanced": pos < size}
+            {"seed": pos + 1, "team": by_id[tid].dump(), "advanced": stage_done and pos < size}
             for pos, tid in enumerate(ranking)
             if tid in by_id
         ],

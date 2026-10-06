@@ -541,7 +541,7 @@ const PUSH_KINDS = [
   ['event', '比赛信息', '名字 / 赛制 / 时间 / 人数 / 简介 / 是否排名'],
   ['live', '当前直播', '主直播间是否开播 + 正在推流的选手 / 成员机位（全局信息，不挑届次）'],
   ['progress', '赛程进度', '已赛多少、正在打谁 vs 谁'],
-  ['call', '召集参赛', '@ 参与名单里的 QQ，请他们到场准备'],
+  ['call', '召集参赛', '在群里 @ 人：选定场次 = 只 @ 这一场上场的人（带场次与比赛名称）；不选 = 整届参与名单'],
   ['result', '比赛结果', '结果图：每场小组赛比分 + 淘汰赛树状图'],
   ['uuids', '选手 UUID', '参赛选手的游戏 UUID：每行一个「名字 UUID」，可整段复制'],
   ['detail', '单届详情', '信息 + 进度 + 结果（选定场次就细说那一场）'],
@@ -566,7 +566,7 @@ export function qqbotPushPanelHtml(s) {
     rounds
       .map((r) => `<option value="${esc(r.code)}">${esc(r.label || r.code)}</option>`)
       .join('') +
-    `</select><span class="field__hint">选「单届详情」时用它细说某一场</span></div>` +
+    `</select><span class="field__hint">「单届详情」细说这一场；「召集参赛」只 @ 这一场上场的人</span></div>` +
     `<div class="field"><label for="qqbotPage">列表页码</label>` +
     `<input id="qqbotPage" type="number" min="1" value="1">` +
     `<span class="field__hint">仅「全部比赛列表」用</span></div>` +
@@ -644,6 +644,8 @@ function qqbotPanelHtml() {
     fieldText('remindLeads', '提前量（分钟，逗号分隔）', q.remindLeads || '1440,120', {
       hint: '默认「前一天 + 前 2 小时」；只在【提前量 − 1 小时, 提前量】窗口内发，避免服务重启后把「明天开赛」补发成错话',
     }) +
+    // 打完后自动播报：站点侧巡检（app/announce.py），每打完一轮发一次比赛结果
+    fieldSwitch('autoResultEnabled', '打完后自动播报（每打完一轮发一次比赛结果）', q.autoResultEnabled !== false) +
     // 出厂**不预填**任何地址：别人的 AstrBot 地址留在这里，新装的人会「看着配好了、
     // 其实把消息推给了别人」，与直播地址同一个坑。
     fieldText('baseUrl', 'AstrBot 地址', q.baseUrl || '', {

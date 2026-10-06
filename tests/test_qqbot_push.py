@@ -495,7 +495,65 @@ async def _with_one_participant() -> dict:
 
 
 async def _restore_roster(saved: dict) -> None:
-    await store.update({"players": saved["players"], "participants": saved["participants"]})
+    patch = {"players": saved["players"], "participants": saved["participants"]}
+    if "rounds" in saved:
+        patch["rounds"] = saved["rounds"]
+    await store.update(patch)
+
+
+async def _with_two_players_and_a_match() -> dict:
+    """本届放三位选手 + 一场小组赛（第一场只有前两位上场）。"""
+    saved = store.snapshot().dump()
+    await store.update(
+        {
+            "players": [
+                {"id": "p01", "name": "甲", "qq": "10001"},
+                {"id": "p02", "name": "乙", "qq": "10002"},
+                {"id": "p03", "name": "丙", "qq": "10003"},
+            ],
+            "participants": [],
+            "rounds": [
+                {
+                    "index": 1,
+                    "code": "G-A-1-1",
+                    "stage": "group",
+                    "label": "A 组 · 第 1 轮 · 第 1 场",
+                    "bracketRound": 1,
+                    "slot": 1,
+                    "sides": [
+                        {"playerIds": ["p01", "p02"], "score": 0},
+                        {"playerIds": ["p03"], "score": 0},
+                    ],
+                }
+            ],
+        }
+    )
+    return saved
+
+
+async def test_push_call_with_a_ref_mentions_only_that_match(admin_client, bot_ready, pushed, monkeypatch):
+    """赛程页某一场的「召集」：只 @ 这一场上场的人，并带上场次与比赛名称。"""
+    calls: list[dict] = []
+
+    async def fake_at(text, *, mentions, settings=None, umo=""):
+        calls.append({"text": text, "mentions": list(mentions)})
+        return {"ok": True, "status": 200, "detail": "", "umo": umo, "shape": "qq"}
+
+    monkeypatch.setattr(qqbot, "send_at_parts", fake_at)
+    saved = await _with_two_players_and_a_match()
+    try:
+        res = await admin_client.post(
+            "/api/qqbot/push", json={"kind": "call", "ref": "G-A-1-1"}
+        )
+    finally:
+        await _restore_roster(saved)
+
+    assert res.status_code == 200, res.text
+    assert res.json()["at"] == "qq"
+    assert calls and calls[0]["mentions"] == ["10001", "10002", "10003"]
+    text = calls[0]["text"]
+    assert "A 组 · 第 1 轮 · 第 1 场" in text, "要把这一场说清楚"
+    assert "对阵：" in text
 
 
 async def test_push_call_tries_the_real_at(admin_client, bot_ready, pushed, monkeypatch):

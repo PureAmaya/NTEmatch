@@ -156,6 +156,76 @@ def test_uuids_message_is_one_line_per_player():
     assert "1 人还没登记 UUID" in lines[-1]
 
 
+# --------------------------------------------------------------------------- #
+# 召集：可以只召集「这一场」（赛程页某一场的「召集」按钮）
+# --------------------------------------------------------------------------- #
+def _call_fixture():
+    """两场小组赛、四位选手（每场只该 @ 到自己那几位）。"""
+    from app import logic
+    from app.models import Config, Player, Round, Side
+
+    cfg = Config.model_validate(default_config())
+    cfg.event.name = "轮次召集用例"
+    cfg.players = [
+        Player(id="p1", name="甲", qq="10001"),
+        Player(id="p2", name="乙", qq="10002"),
+        Player(id="p3", name="丙", qq="10003"),
+        Player(id="p4", name="丁", qq="10004"),
+    ]
+    cfg.participants = []
+    cfg.rounds = [
+        Round(
+            index=1,
+            code="G-A-1-1",
+            stage="group",
+            label="A 组 · 第 1 轮 · 第 1 场",
+            bracket_round=1,
+            slot=1,
+            sides=[Side(player_ids=["p1", "p2"]), Side(player_ids=["p3"])],
+        ),
+        Round(
+            index=2,
+            code="G-A-2-1",
+            stage="group",
+            label="A 组 · 第 2 轮 · 第 1 场",
+            bracket_round=2,
+            slot=1,
+            sides=[Side(player_ids=["p4"]), Side()],
+        ),
+    ]
+    return cfg, logic.build_state(cfg)
+
+
+def test_round_call_mentions_only_this_match_s_players():
+    """按场次召集：只 @ **这一场上场的人**，并把届名 + 场次信息一起说清。"""
+    cfg, state = _call_fixture()
+    text = qqbot.build_call_message(cfg, state, {"atMode": "cq"}, None, "G-A-1-1")
+    assert "[CQ:at,qq=10001]" in text and "[CQ:at,qq=10002]" in text
+    assert "[CQ:at,qq=10003]" in text
+    assert "10004" not in text, "下一场的选手不该被 @ 到"
+    assert "轮次召集用例 · A 组 · 第 1 轮 · 第 1 场" in text
+    assert "对阵：" in text and "时间：" in text
+
+
+def test_whole_event_call_still_mentions_everyone():
+    """不给场次就是整届总召集（原行为不变）。"""
+    cfg, state = _call_fixture()
+    text = qqbot.build_call_message(cfg, state, {"atMode": "cq"})
+    for qq in ("10001", "10002", "10003", "10004"):
+        assert qq in text
+    assert "集合啦！" in text
+
+
+def test_round_call_without_known_qq_says_so():
+    """这一场谁都没登记 QQ：不静默发一条空 @，要说清去哪儿补。"""
+    cfg, state = _call_fixture()
+    for player in cfg.players:
+        player.qq = ""
+    text = qqbot.build_call_message(cfg, state, {"atMode": "text"}, None, "G-A-1-1")
+    assert "@" not in text.splitlines()[0]
+    assert "先在成员资料里补上 QQ" in text
+
+
 def test_list_message_hint_points_to_a_real_command():
     """列表翻页提示必须让用户发**真实存在**的命令（以前写「发送「下一页」」）。"""
     events = [
