@@ -44,7 +44,10 @@ MIN_TEAMS_PER_MATCH = 2
 # 比赛简介的字数上限（按字符计，中英文同规）：界面用 maxlength 挡，服务端再截一次兜底
 MAX_BRIEF_CHARS = 30
 RoundStatus = Literal["pending", "live", "done"]
-WinnerCode = Literal["", "A", "B", "DRAW"]
+# 胜方编号：**空 = 还没判定**、``DRAW`` = 平局，其余是各方的编号。
+# 必须与 SideKey / MAX_SIDES 对齐：3~4 队同场时胜方可能是 C / D，
+# 只写 A / B 会让「4 队那场由 C 赢」在落库时被判非法（Input should be '', 'A', 'B' or 'DRAW'）。
+WinnerCode = Literal["", "A", "B", "C", "D", "DRAW"]
 # 观众的观看线路：webrtc = 8889（UDP，延迟最低）；hls = 8888（TCP，抗抖动）
 StreamMode = Literal["auto", "webrtc", "hls"]
 # league=积分制常规局；group=小组赛；wb=胜者组；lb=败者组；gf=总决赛（胜者组冠军 vs 败者组冠军）

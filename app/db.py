@@ -345,7 +345,6 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status ON push_outbox(status, created_at);
 """
 
 CURRENT_KEY = "current_event"
-SIDES = ("A", "B")
 
 
 @contextmanager

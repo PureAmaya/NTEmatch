@@ -3009,7 +3009,8 @@ async def api_round_times(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    settled = target.winner in ("A", "B", "DRAW")
+    # 「已经有结果」= 有胜方编号（含 DRAW）。**别写死 A / B**：3~4 队同场时胜方可能是 C / D
+    settled = bool(target.winner)
     has_start, has_end = logic.parse_time(start) is not None, logic.parse_time(end) is not None
     next_status = target.status
     warnings: list[str] = []

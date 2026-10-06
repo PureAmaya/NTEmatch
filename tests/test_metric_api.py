@@ -46,6 +46,85 @@ async def _seed_league_round(
     return play.code
 
 
+async def _seed_multi_side_heat() -> str:
+    """铺一场 **4 队同场**的小组赛（时间型：用时最短的是第 1）。
+
+    胜方可能是 C / D —— 这正是「只认 A / B」那套假设会崩的地方：4 队那场由 C 赢时，
+    落库会被判非法（``Input should be '', 'A', 'B' or 'DRAW'``，见 app/models.py 的 WinnerCode）。
+    """
+    heat = Round(
+        code="G-A-1-1",
+        label="A 组 · 第 1 轮 · 第 1 场",
+        stage="group",
+        bracket_round=1,
+        slot=1,
+        sides=[
+            Side(key=key, team_id=f"t{i}", player_ids=[f"m{i}"])
+            for i, key in enumerate(("A", "B", "C", "D"), start=1)
+        ],
+    )
+    await store.update(
+        {
+            "rules": {
+                "format": "tournament",
+                "valueType": "time",
+                "valueLabel": "用时",
+                "better": "low",
+                "metric": "",
+            },
+            "teams": [
+                {"id": f"t{i}", "name": f"{i} 队", "short": f"{i}队", "playerIds": [f"m{i}"], "group": "A"}
+                for i in range(1, 5)
+            ],
+            "players": [Player(id=f"m{i}", name=f"选手{i}").dump() for i in range(1, 5)],
+            "participants": [f"m{i}" for i in range(1, 5)],
+            "rounds": [heat.dump()],
+        },
+        actor="test",
+    )
+    return heat.code
+
+
+async def test_multi_side_winner_can_be_c(admin_client):
+    """4 队同场、用时最短的是 C：结算与落库都要认 C。"""
+    code = await _seed_multi_side_heat()
+    res = await admin_client.post(
+        f"/api/rounds/{code}/result",
+        json={
+            "sets": [],
+            "sides": [
+                {"key": "A", "score": metrics.parse_time("1:30.000")},
+                {"key": "B", "score": metrics.parse_time("1:25.000")},
+                {"key": "C", "score": metrics.parse_time("1:20.000")},
+                {"key": "D", "score": metrics.parse_time("1:35.000")},
+            ],
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["winner"] == "C", "用时最短的 C 该是第 1"
+    settled = next(r for r in store.snapshot().rounds if r.code == code)
+    assert settled.winner == "C", "胜方编号要原样落库（C / D 也是合法值）"
+    assert [side.rank for side in settled.sides] == [3, 2, 1, 4]
+
+
+async def test_multi_side_explicit_winner_accepts_d(admin_client):
+    """人工指定第 1 名是 D（几方成绩一样时由管理员定）：同样要存得下去。"""
+    code = await _seed_multi_side_heat()
+    same = metrics.parse_time("1:30.000")
+    res = await admin_client.post(
+        f"/api/rounds/{code}/result",
+        json={
+            "sets": [],
+            "winner": "D",
+            "sides": [{"key": key, "score": same} for key in ("A", "B", "C", "D")],
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["winner"] == "D"
+    settled = next(r for r in store.snapshot().rounds if r.code == code)
+    assert settled.winner == "D" and settled.sides[3].rank == 1
+
+
 async def test_config_round_trips_scoring(admin_client):
     """PUT /api/config 里的三件套要真的生效并读得回来。"""
     res = await admin_client.put(
