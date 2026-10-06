@@ -203,7 +203,15 @@ async def api_qqbot_test(
                 "正常情况下 uv sync / 镜像里就带着，缺了说明环境没装全）",
                 "image": True,
             }
-        image = await qqbot.send_image(f"{_site(request)}{info['url']}", settings=settings)
+        # 图片字节一并带上：新版 AstrBot 要先把图传上去换 attachment_id，
+        # 而缓存命中时 card_for_event 不带字节，所以从磁盘补读一份。
+        blob = info.get("bytes") or card.card_bytes(str(info.get("hash") or ""))
+        image = await qqbot.send_image(
+            f"{_site(request)}{info['url']}",
+            settings=settings,
+            blob=blob,
+            filename=f"card-{info.get('hash') or 'preview'}.png",
+        )
         return {"ok": bool(image.get("ok")), "detail": image.get("detail") or "", "umo": image.get("umo") or "", "image": True, "shape": image.get("shape") or "", "sent": 1 if image.get("ok") else 0}
     result = await qqbot.send_text(text, settings=settings)
     return {"ok": result["ok"], "detail": result["detail"], "umo": result["umo"], "sent": 1 if result["ok"] else 0}
@@ -325,7 +333,11 @@ async def api_qqbot_push(
     # 先发图：图是这次推送的主角（信息 + 规则都在里面）
     image_sent = False
     if card_info:
-        image = await qqbot.send_image(card_info["url"], settings=settings)
+        # 字节从卡片缓存里读（新版 AstrBot 要上传换 attachment_id 才肯收图）
+        blob = card.card_bytes(str(card_info.get("hash") or ""))
+        image = await qqbot.send_image(
+            card_info["url"], settings=settings, blob=blob, filename=f"card-{card_info.get('hash')}.png"
+        )
         image_sent = bool(image.get("ok"))
         if not image_sent:
             log.warning("卡片推送失败，退回纯文本 | %s", image.get("detail"))

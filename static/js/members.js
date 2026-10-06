@@ -1638,7 +1638,7 @@ export async function handleMemberAction(act, el) {
         const res = await api('/qqbot/test', { method: 'POST', auth: true, body });
         toast(
           res.ok
-            ? `测试${res.image ? `图片（字段名 ${res.shape || '?'}）` : '消息'}已发送到 ${res.umo}`
+            ? `测试${res.image ? `图片（${res.shape === 'attachment_id' ? '先上传再引用' : `字段名 ${res.shape || '?'}`}）` : '消息'}已发送到 ${res.umo}`
             : `发送失败：${res.detail || '未知原因'}`,
           res.ok ? 'ok' : 'err',
           8000

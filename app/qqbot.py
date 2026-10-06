@@ -444,18 +444,136 @@ async def send_parts(parts: list[str], *, settings: dict[str, Any], umo: str = "
     return {"ok": True, "status": 200, "detail": "", "sent": sent, "total": len(parts), "umo": umo}
 
 
-#: 图片消息段里「图在哪」的字段名（各版本叫法不一，逐个试，见 send_image）
+#: 图片消息段里「图在哪」的字段名（老版本直接把地址塞进消息段，逐个试）
 _IMAGE_KEYS = ("file", "url", "image")
 
+#: 附件上传接口：新版 AstrBot 的图片段**只认 attachment_id**，而这个 id 只能
+#: 「先上传文件」换回来。老写法（消息段里直接给 ``file`` / ``url``）会被回
+#: ``400 image part missing attachment_id``，所以图片推送变成两步。
+_UPLOAD_PATH = "/api/v1/file"
 
-async def send_image(url: str, *, settings: dict[str, Any], umo: str = "") -> dict[str, Any]:
-    """发一张图（就是本站生成的比赛卡片，``url`` 由 :mod:`app.card` 给出）。
+#: multipart 表单里「文件」这个字段叫什么。AstrBot 文档没写死（只在
+#: ``openapi.json`` 的 schema 里），版本之间可能不一样——逐个试；
+#: 猜错的代价只是几次毫秒级的请求，猜死一个就等于图片永远发不出去。
+_UPLOAD_FIELDS = ("file", "files", "attachment", "data", "upload")
 
-    与 :func:`send_text` 同一条规矩：**逐个形态试**，谁被接受就用谁——
-    AstrBot 各版本对图片段的字段名不完全一致（``file`` / ``url`` / ``image``），
-    而这里没法像文本那样「等价替换」（发不出图就是发不出），所以只能试完再说。
+#: 消息段里引用附件时那个字段的名字
+_ATTACHMENT_KEYS = ("attachment_id", "attachmentId")
+
+#: 上次成功的形态（**进程内记忆**）：新版第一次会一路试到「上传」那条路，
+#: 记住之后就直接走它，不必每次推送都先白撞几个 400 再上传。
+_IMAGE_SHAPE_HIT: str | None = None
+
+
+def _remember_image_shape(shape: str) -> None:
+    global _IMAGE_SHAPE_HIT
+    _IMAGE_SHAPE_HIT = shape or None
+
+
+def _find_attachment_id(payload: Any) -> str:
+    """从上传响应里挖出 ``attachment_id``。
+
+    返回结构没有公开契约（文档只说「会返回 attachment_id」，没说在哪一层），
+    所以**从任意层级找**：先找 ``attachment_id`` / ``attachmentId``，都没有再退
+    一步认 ``id``（有的版本就叫这个）；只取非空字符串。
+    """
+    exact: list[str] = []
+    loose: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and value.strip():
+                    if key in _ATTACHMENT_KEYS:
+                        exact.append(value.strip())
+                    elif key == "id":
+                        loose.append(value.strip())
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return (exact or loose or [""])[0]
+
+
+def _message_paths(path: str) -> list[str]:
+    """发消息的路径候选：官方文档里单数（``/im/message``）与复数（``/im/messages``）都在用。"""
+    clean = str(path or "/api/v1/im/message")
+    if clean.endswith("/im/message"):
+        return [clean, clean + "s"]
+    if clean.endswith("/im/messages"):
+        return [clean, clean[:-1]]
+    return [clean]
+
+
+async def _upload_attachment(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    blob: bytes,
+    filename: str,
+) -> tuple[str, str]:
+    """把图片字节传给 AstrBot，返回 ``(attachment_id, 错误说明)``（两者只一个非空）。
+
+    ``Content-Type`` 交给 httpx 自己写：multipart 必须带 boundary，写死反而坏。
+    ``403`` = 这个 API Key 没勾 ``file`` 权限（换字段名也没用，直接说清）；
+    ``404`` = 这个版本没有上传接口；``400/415/422`` = 大概还是不认字段名，换下一个。
+    """
+    url = f"{base.rstrip('/')}{_UPLOAD_PATH}"
+    plain = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+    last = ""
+    for field in _UPLOAD_FIELDS:
+        try:
+            resp = await client.post(
+                url, headers=plain, files={field: (filename, blob, "image/png")}
+            )
+        except httpx.HTTPError as exc:
+            return "", f"上传图片到 AstrBot 失败：{exc}"
+        if resp.status_code < 400:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {}
+            attachment = _find_attachment_id(payload)
+            if attachment:
+                return attachment, ""
+            # 传上去了却没拿到 id：把原文带出来，不然只能干瞪眼
+            return "", f"图片已上传但没拿到 attachment_id（AstrBot 回的是 {(resp.text or '')[:200]}）"
+        last = _error_text(resp)
+        if resp.status_code == 403:
+            return "", (
+                f"{last}——这个 API Key 缺少「file」权限：到 AstrBot → WebUI → 设置 → OpenAPI "
+                "编辑这个 Key，勾上 file（上传附件）再试"
+            )
+        if resp.status_code not in (400, 415, 422):
+            break
+    return "", last or "上传图片到 AstrBot 失败"
+
+
+async def send_image(
+    url: str,
+    *,
+    settings: dict[str, Any],
+    umo: str = "",
+    blob: bytes | None = None,
+    filename: str = "card.png",
+) -> dict[str, Any]:
+    """发一张图（``url`` / ``blob`` 都是同一张图，由 :mod:`app.card` 给出）。
+
+    **两条路，先老后新**：
+
+    1. *老形态*：图片段里直接带地址（``file`` / ``url`` / ``image`` 逐个试）。
+       早期 AstrBot 与部分适配器吃这一套，成功就到此为止；
+    2. *新形态*：新版 AstrBot 的图片段只认 ``attachment_id``，必须先用
+       ``POST /api/v1/file`` 把文件传上去换回来（``blob`` 就是为此传进来的——
+       调用方直接从卡片缓存读字节，不用服务端 HTTP 回源自己）。老形态被
+       ``400/415/422`` 拒掉后自动走这里，成功一次就**记住**（:data:`_IMAGE_SHAPE_HIT`），
+       以后不再白撞。
 
     失败**不抛异常**，只回 ``ok=False``：调用方据此退回纯文本推送（信息一条不少）。
+    返回里的 ``shape`` 说明这次用的是哪条路（``url`` / ``attachment_id`` …），
+    管理端「测试发图」会把它显示出来，排障时一眼就知道走的是哪条。
     """
     target = umo or resolved_umo(settings)
     result: dict[str, Any] = {"ok": False, "status": 0, "detail": "", "umo": target}
@@ -476,33 +594,73 @@ async def send_image(url: str, *, settings: dict[str, Any], umo: str = "") -> di
         result["detail"] = "未配置目标会话（群号 / UMO）"
         return result
 
-    path = str(settings.get("path") or "/api/v1/im/message")
-    endpoint = f"{base.rstrip('/')}{path}"
     headers = {
         "Authorization": f"Bearer {settings['apiKey']}",
         "X-API-Key": str(settings["apiKey"]),
         "Content-Type": "application/json",
     }
     timeout = float(settings.get("timeout") or 10)
+    keys = list(_IMAGE_KEYS)
+    if _IMAGE_SHAPE_HIT in keys:  # 上次生效的那个先试（省掉两次注定失败的请求）
+        keys.remove(_IMAGE_SHAPE_HIT)
+        keys.insert(0, _IMAGE_SHAPE_HIT)
+    direct_first = _IMAGE_SHAPE_HIT != "attachment_id" or blob is None
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for key in _IMAGE_KEYS:
-            body = {"umo": target, "message": [{"type": "image", key: url}]}
-            try:
-                resp = await client.post(endpoint, headers=headers, json=body)
-            except httpx.HTTPError as exc:
-                result["detail"] = f"请求 AstrBot 失败：{exc}"
-                log.warning("QQ 图片推送失败 | %s | %s", endpoint, exc)
-                return result
-            result["status"] = resp.status_code
-            if resp.status_code < 400:
-                result["ok"] = True
-                result["shape"] = key
-                log.info("QQ 图片推送成功 | umo=%s | 字段=%s", target, key)
-                return result
-            result["detail"] = _error_text(resp)
-            # 只有「请求体格式不对」才值得换个字段名重试
-            if resp.status_code not in (400, 415, 422):
-                break
+        for candidate in _message_paths(str(settings.get("path") or "")):
+            endpoint = f"{base.rstrip('/')}{candidate}"
+            # ---- 路 1：图片段直接给地址（老版本） ----
+            if direct_first:
+                for key in keys:
+                    body = {"umo": target, "message": [{"type": "image", key: url}]}
+                    try:
+                        resp = await client.post(endpoint, headers=headers, json=body)
+                    except httpx.HTTPError as exc:
+                        result["detail"] = f"请求 AstrBot 失败：{exc}"
+                        log.warning("QQ 图片推送失败 | %s | %s", endpoint, exc)
+                        return result
+                    result["status"] = resp.status_code
+                    if resp.status_code < 400:
+                        result["ok"] = True
+                        result["shape"] = key
+                        _remember_image_shape(key)
+                        log.info("QQ 图片推送成功 | umo=%s | 形态=%s", target, key)
+                        return result
+                    result["detail"] = _error_text(resp)
+                    # 只有「请求体格式不对 / 路径不对」才值得换形态、换路径重试
+                    if resp.status_code not in (400, 404, 415, 422):
+                        log.warning(
+                            "QQ 图片推送失败 | umo=%s | HTTP %s | %s",
+                            target,
+                            result["status"],
+                            result["detail"],
+                        )
+                        return result
+            # ---- 路 2：上传换 attachment_id 再发引用（新版） ----
+            if blob:
+                attachment, upload_error = await _upload_attachment(
+                    client, base, headers, blob, filename
+                )
+                if attachment:
+                    body = {"umo": target, "message": [{"type": "image", "attachment_id": attachment}]}
+                    try:
+                        resp = await client.post(endpoint, headers=headers, json=body)
+                    except httpx.HTTPError as exc:
+                        result["detail"] = f"请求 AstrBot 失败：{exc}"
+                        return result
+                    result["status"] = resp.status_code
+                    if resp.status_code < 400:
+                        result["ok"] = True
+                        result["shape"] = "attachment_id"
+                        _remember_image_shape("attachment_id")
+                        log.info("QQ 图片推送成功 | umo=%s | 形态=attachment_id", target)
+                        return result
+                    result["detail"] = _error_text(resp)
+                    if resp.status_code not in (400, 404, 415, 422):
+                        return result
+                elif upload_error:
+                    # 上传这一步就失败了：这一条比「消息段格式不对」更接近真因
+                    result["detail"] = upload_error
+                    return result
     log.warning("QQ 图片推送失败 | umo=%s | HTTP %s | %s", target, result["status"], result["detail"])
     return result
 

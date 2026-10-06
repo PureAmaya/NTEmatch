@@ -34,28 +34,43 @@ def _image_settings() -> dict:
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, payload: dict | None = None):
         self.status_code = status_code
+        self._payload = payload if payload is not None else {"detail": "bad shape"}
 
     def json(self) -> dict:
-        return {"detail": "bad shape"}
+        return self._payload
 
     @property
     def text(self) -> str:
-        return ""
+        import json
+
+        return json.dumps(self._payload, ensure_ascii=False)
 
 
 class _FakeClient:
-    """假的 ``httpx.AsyncClient``：记下每个请求体，按预设状态码序列回应。"""
+    """假的 ``httpx.AsyncClient``：按预设状态码 / 响应体序列回应，并记下请求。
 
-    def __init__(self, statuses: list[int]):
+    ``bodies`` 只记 JSON 请求（发消息），``uploads`` 只记 multipart（上传附件）——
+    两条路分开放，断言时一眼能看出走的是哪条。
+    """
+
+    def __init__(self, statuses: list[int], payloads: list[dict | None] | None = None):
         self.statuses = list(statuses)
+        self.payloads = list(payloads or [])
         self.bodies: list[dict] = []
+        self.uploads: list[dict] = []
+        self.urls: list[str] = []
 
-    async def post(self, url, headers=None, json=None):
-        self.bodies.append(json or {})
+    async def post(self, url, headers=None, json=None, files=None):
+        self.urls.append(url)
+        if files is not None:
+            self.uploads.append(files)
+        else:
+            self.bodies.append(json or {})
         status = self.statuses.pop(0) if self.statuses else 200
-        return _FakeResponse(status)
+        payload = self.payloads.pop(0) if self.payloads else None
+        return _FakeResponse(status, payload)
 
     async def __aenter__(self):
         return self
@@ -66,6 +81,14 @@ class _FakeClient:
 
 def _fake_httpx(monkeypatch, client: _FakeClient) -> None:
     monkeypatch.setattr(qqbot.httpx, "AsyncClient", lambda **kwargs: client)
+
+
+@pytest.fixture(autouse=True)
+def _forget_image_shape():
+    """形态记忆是**进程内**的，用例之间必须隔离，否则请求顺序会跟着上一条变。"""
+    qqbot._IMAGE_SHAPE_HIT = None
+    yield
+    qqbot._IMAGE_SHAPE_HIT = None
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +145,104 @@ async def test_send_image_refuses_empty_url():
 
 
 # --------------------------------------------------------------------------- #
+# send_image：新版 AstrBot 只认 attachment_id（先上传，再发引用）
+# --------------------------------------------------------------------------- #
+_PNG = b"\x89PNG\r\n\x1a\n" + b"fake-card-bytes"
+
+
+async def test_send_image_uploads_when_the_api_demands_attachment_id(monkeypatch):
+    """老形态全被拒（``400 image part missing attachment_id``）→ 上传换 id 再发。
+
+    这是新版 AstrBot 的规矩：图片段只认 ``attachment_id``，而它必须先上传才拿得到。
+    """
+    client = _FakeClient(
+        [400, 400, 400, 200, 200],
+        payloads=[None, None, None, {"data": {"attachment_id": "att-1"}}, None],
+    )
+    _fake_httpx(monkeypatch, client)
+    result = await qqbot.send_image(
+        "https://nte.test/api/cards/abc.png", settings=_image_settings(), blob=_PNG
+    )
+    assert result["ok"] is True, result["detail"]
+    assert result["shape"] == "attachment_id"
+    assert len(client.bodies) == 4, "3 次老形态 + 1 次带 id 的发送"
+    assert len(client.uploads) == 1
+    assert client.urls[3] == "http://astrbot.test/api/v1/file", "上传要打到 /api/v1/file"
+    assert "file" in client.uploads[0], "multipart 字段名先试 file"
+    assert client.bodies[-1]["message"] == [{"type": "image", "attachment_id": "att-1"}]
+    assert client.bodies[-1]["umo"] == "aiocqhttp:GroupMessage:123456"
+
+
+async def test_send_image_remembers_the_path_that_worked(monkeypatch):
+    """第一条试出来是「上传」那条路，第二条就别再白撞三次 400 了。"""
+    client = _FakeClient(
+        [400, 400, 400, 200, 200, 200, 200],
+        payloads=[
+            None,
+            None,
+            None,
+            {"attachment_id": "att-2"},
+            None,
+            {"attachment_id": "att-3"},
+            None,
+        ],
+    )
+    _fake_httpx(monkeypatch, client)
+    settings = _image_settings()
+    first = await qqbot.send_image("https://nte.test/a.png", settings=settings, blob=_PNG)
+    assert first["ok"] is True
+    assert len(client.bodies) == 4 and len(client.uploads) == 1
+
+    second = await qqbot.send_image("https://nte.test/b.png", settings=settings, blob=_PNG)
+    assert second["ok"] is True
+    assert len(client.bodies) == 5, "第二次只多发一条消息，不再有老形态那三次"
+    assert len(client.uploads) == 2
+    assert client.bodies[-1]["message"] == [{"type": "image", "attachment_id": "att-3"}]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"attachment_id": "flat"}, {"data": {"attachment_id": "nested"}}, {"id": "loose"}],
+)
+def test_attachment_id_is_found_wherever_it_is(payload):
+    """返回结构没有公开契约：平铺 / 嵌套 / 干脆就叫 id，都要认出来。"""
+    assert qqbot._find_attachment_id(payload)
+
+
+async def test_upload_without_file_scope_says_so(monkeypatch):
+    """API Key 没勾 file 权限时，403 要说清「去哪儿勾」，而不是甩一句英文了事。"""
+    client = _FakeClient([400, 400, 400, 403])
+    _fake_httpx(monkeypatch, client)
+    result = await qqbot.send_image(
+        "https://nte.test/a.png", settings=_image_settings(), blob=_PNG
+    )
+    assert result["ok"] is False
+    assert "file" in result["detail"] and "权限" in result["detail"]
+
+
+async def test_upload_result_without_attachment_id_reports_the_body(monkeypatch):
+    """传上去了却没拿到 id：把 AstrBot 回的原文带出来，别让人只看到「发送失败」。"""
+    client = _FakeClient([400, 400, 400, 200], payloads=[None, None, None, {"ok": True}])
+    _fake_httpx(monkeypatch, client)
+    result = await qqbot.send_image(
+        "https://nte.test/a.png", settings=_image_settings(), blob=_PNG
+    )
+    assert result["ok"] is False
+    assert "attachment_id" in result["detail"] and "ok" in result["detail"]
+
+
+async def test_direct_url_still_wins_when_the_server_accepts_it(monkeypatch):
+    """老版本 AstrBot 直接吃地址：那就别多此一举去上传（老部署的行为与开销不变）。"""
+    client = _FakeClient([200])
+    _fake_httpx(monkeypatch, client)
+    result = await qqbot.send_image(
+        "https://nte.test/a.png", settings=_image_settings(), blob=_PNG
+    )
+    assert result["ok"] is True and result["shape"] == "file"
+    assert client.uploads == [], "地址能用就不该上传"
+
+
+# --------------------------------------------------------------------------- #
 # card_parts：有图时正文只留一行
 # --------------------------------------------------------------------------- #
 def test_card_parts_keeps_detail_text_but_trims_event():
@@ -161,15 +282,16 @@ async def bot_ready():
 @pytest.fixture
 def pushed(monkeypatch):
     """把「真的发消息」换成记录器，并让限流永远放行（测的是内容，不是额度）。"""
-    calls: dict[str, list] = {"text": [], "image": []}
+    calls: dict[str, list] = {"text": [], "image": [], "blob": []}
 
     async def fake_text(text, *, settings=None, umo=""):
         calls["text"].append(text)
         return {"ok": True, "status": 200, "detail": "", "umo": umo}
 
-    async def fake_image(url, *, settings=None, umo=""):
+    async def fake_image(url, *, settings=None, umo="", blob=None, filename="card.png"):
         calls["image"].append(url)
-        # 与真 send_image 同一份契约：成功时回报「用了哪个字段名」
+        calls["blob"].append(blob)
+        # 与真 send_image 同一份契约：成功时回报「用了哪条路」
         return {"ok": True, "status": 200, "detail": "", "umo": umo, "shape": "url"}
 
     async def allow(settings=None):
@@ -188,6 +310,8 @@ async def test_push_event_sends_the_card_then_one_line(admin_client, bot_ready, 
     assert res.json()["image"] is True
     assert len(pushed["image"]) == 1
     assert "/api/cards/" in pushed["image"][0] and pushed["image"][0].startswith("http")
+    # 图**字节**也要一起交给 send_image：新版 AstrBot 得先上传换 attachment_id
+    assert pushed["blob"] and pushed["blob"][0], "推送时要把卡片字节带上（缓存命中就从磁盘读）"
     assert len(pushed["text"]) == 1, "有图时不该再补一屏文字"
     assert "完整赛制与规则见图" in pushed["text"][0]
 
@@ -195,7 +319,7 @@ async def test_push_event_sends_the_card_then_one_line(admin_client, bot_ready, 
 async def test_push_event_falls_back_to_the_full_text(admin_client, bot_ready, pushed, monkeypatch):
     """图发不出去：**完整文本**顶上（连比赛规则摘要一起），信息一条不少。"""
 
-    async def fail(url, *, settings=None, umo=""):
+    async def fail(url, *, settings=None, umo="", blob=None, filename="card.png"):
         return {"ok": False, "status": 415, "detail": "no image support", "umo": umo}
 
     monkeypatch.setattr(qqbot, "send_image", fail)
@@ -223,7 +347,7 @@ async def test_preview_shows_the_card_and_both_texts(admin_client, bot_ready, pu
     assert data["card"] and data["card"]["url"].startswith("http://nte.test/api/cards/")
     assert data["imageAvailable"] is True
     assert data["parts"] and data["cardText"] == [data["card"]["caption"]]
-    assert pushed == {"text": [], "image": []}, "预览绝不能真的发出去"
+    assert pushed == {"text": [], "image": [], "blob": []}, "预览绝不能真的发出去"
 
 
 async def test_image_switch_off_skips_the_card(admin_client, bot_ready, pushed):

@@ -476,6 +476,27 @@ def resolve(name: str) -> Path | None:
     return path if path.exists() else None
 
 
+def card_bytes(name: str) -> bytes | None:
+    """读回一张已签发卡片的 PNG 字节；读不到（名字非法 / 文件没了）回 ``None``。
+
+    给推送用：新版 AstrBot 要「先把图传上去换 attachment_id」，而
+    :func:`card_for_event` 缓存命中时不带字节（省一次读盘），那就从磁盘补读。
+
+    ``name`` 既可以是文件名（``<哈希>.png``）也可以只给哈希——
+    :func:`card_for_event` 返回的就是后者，别让调用方自己拼后缀。
+    """
+    clean = str(name or "").strip()
+    if clean and not clean.endswith(".png"):
+        clean += ".png"
+    path = resolve(clean)
+    if path is None:
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
 def stats() -> dict[str, Any]:
     """卡片缓存占用（管理端展示用）。"""
     files = list(CARD_ROOT.glob("*.png")) if CARD_ROOT.exists() else []

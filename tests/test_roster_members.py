@@ -22,6 +22,30 @@ from app.store import store
 
 
 @pytest.fixture(autouse=True)
+async def _own_event():
+    """这组用例跑在**自己新建的一届**上。
+
+    参与名单是「每届一份」，而单场比赛需要几个人由赛制决定（``need = 每队人数 × 2``，
+    出厂默认 4 人）。别的用例会把当前届改得**带赛程**——那时再勾一位成员就会触发
+    「按名单重排未结算对局」，撞上「可用选手 1 人，少于单场所需的 4 人」这种与
+    本题无关的 400（单独跑这组时是绿的，全量跑就红：典型的测试互相污染）。
+    自己建一届（出厂赛制、空赛程），谁来跑都一样。
+    """
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("名单用例专用届")
+    mine = store.current_id
+    try:
+        yield
+    finally:
+        if previous and previous != mine:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
+
+
+@pytest.fixture(autouse=True)
 async def _clean_members():
     """用例造的成员用完删掉，别留给别的用例（成员是跨届共享的测试数据）。"""
     db.init_db(store._db_path)
