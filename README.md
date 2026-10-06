@@ -2208,6 +2208,36 @@ docker compose logs -f nte    # 第一次启动会自动创建服务器管理员
 > **那个 extra 已经删掉了**：图片推送不是可选功能。老的构建脚本里若还留着那个参数，
 > 现在会报「unknown extra」，去掉它即可。
 
+### 服务器上要装中文字体（卡片图 / 帮助图用它画中文）
+
+卡片图与帮助图是服务器**用 Pillow 画**出来的，画中文必须有 CJK 字体（思源黑体就是
+Google 那份 **Noto Sans CJK**）；没有的话图里的中文会变成方框。Docker 镜像里已经装好了
+（`Dockerfile` 里 `apt-get install fonts-noto-cjk`），**裸机部署**要自己装一份：
+
+| 发行版 | 命令 |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt install -y fonts-noto-cjk` |
+| RHEL / AlmaLinux / Rocky / Fedora | `sudo dnf install -y google-noto-sans-cjk-fonts` |
+| Arch / Manjaro | `sudo pacman -S --noconfirm noto-fonts-cjk` |
+| Alpine | `apk add --no-cache font-noto-cjk` |
+
+装完**不用重启服务**（字体是画图那一刻才去读的）。自检三步：
+
+```bash
+fc-list | grep -i -E "noto.*cjk|source han"          # 系统认到了没
+uv run python -c "from app import fonts; print(fonts.resolve('cjk'))"   # 本站找到哪一支
+uv run python tools/make_help_card.py --out /tmp/help.jpg             # 出一张看看中文对不对
+```
+
+查找顺序是「环境变量 → 常见路径 → **扫字体目录**（按文件名认，发行版塞在哪一层都行）
+→ 内置兜底」，所以多数情况下装完就能用；放在奇怪位置、或想指定某一支时直接点名：
+
+```bash
+NTE_FONT_CJK=/opt/fonts/SourceHanSansSC-Regular.otf uv run python -m app
+```
+
+（另有 `NTE_FONT_MONO`（卡片顶部编号用的西文）、`NTE_FONT_LATIN`（帮助图上的西文小标签）。）
+
 想在容器里也用**热更新**（见上一节）：镜像里得有 `git`，启动命令换成守护
 （`CMD ["uv", "run", "--no-sync", "python", "-m", "app", "hotrun"]`）——
 零中断交接在 Linux 上是原生的。**不换也完全没问题**：容器重建=重启，

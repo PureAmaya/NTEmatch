@@ -16,8 +16,13 @@ WORKDIR /app
 # 所以这里不需要任何 build arg（早期版本的 NTE_CARDS 开关已经删掉了，
 # 见 README「图片推送：比赛卡片」）。
 COPY pyproject.toml uv.lock README.md ./
+# 依赖按 uv.lock 装；**再装一份中文字体**：比赛卡片图与机器人帮助图是服务器上画出来的，
+# 而 slim 镜像里一个 CJK 字体都没有——不装的话图里的中文全是方框（见 app/fonts.py）。
 RUN pip install --no-cache-dir uv \
-    && uv sync --frozen --no-dev --no-install-project
+    && uv sync --frozen --no-dev --no-install-project \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY app ./app
 COPY static ./static

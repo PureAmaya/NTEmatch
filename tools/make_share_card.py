@@ -14,9 +14,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+# 让脚本能 import 到仓库里的 app 包（``python tools/xxx.py`` 时 sys.path[0] 是 tools/）
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from PIL import Image, ImageDraw, ImageFilter
+
+from app import fonts
 
 W, H = 1200, 630
 ACCENT = (34, 224, 232)
@@ -24,28 +32,9 @@ ACCENT_2 = (255, 47, 142)
 DIM = (147, 167, 193)
 TXT = (230, 240, 255)
 
-# 站点字体栈里就是这几支：Bahnschrift 负责「科技感」的西文与数字，中文走微软雅黑。
-_LATIN_CANDIDATES = (
-    r"C:\Windows\Fonts\bahnschrift.ttf",
-    r"C:\Windows\Fonts\seguisb.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
-)
-_CJK_CANDIDATES = (
-    r"C:\Windows\Fonts\msyhbd.ttc",
-    r"C:\Windows\Fonts\msyh.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-)
-
-
-def _font(candidates: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont:
-    for path in candidates:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    print(f"! 没有可用的字体，退回内置位图字体（观感会差）：{candidates[0]}")
-    return ImageFont.load_default(size)
+# 字体不在这里写死：中文字体装在哪各发行版都不一样（Debian 是
+# /usr/share/fonts/opentype/noto，RHEL 是 google-noto-cjk，Arch 是 noto-cjk…），
+# 统一走 app/fonts 的四层查找（环境变量 → 常见路径 → 扫字体目录 → 内置兜底）。
 
 
 def _lerp(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
@@ -129,10 +118,10 @@ def wedge(img: Image.Image) -> None:
 
 
 def text_block(img: Image.Image, title: str, tagline: str, note: str) -> None:
-    f_title = _font(_CJK_CANDIDATES, 84)
-    f_tag = _font(_LATIN_CANDIDATES, 27)
+    f_title = fonts.load("cjk", 84)
+    f_tag = fonts.load("latin", 27)
     # 说明文案默认是中文：必须用中文字体（西文字体在这里只会画出方框）
-    f_note = _font(_CJK_CANDIDATES, 22)
+    f_note = fonts.load("cjk", 22)
 
     x, y = 316, 196
     glow = Image.new("RGBA", img.size, (0, 0, 0, 0))

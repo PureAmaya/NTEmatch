@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import logic, markdown
+from . import fonts, logic, markdown
 from .logging_conf import get_logger
 from .models import Config
 from .store import DATA_ROOT
@@ -82,21 +82,8 @@ TXT = (230, 240, 255)
 LINE = (34, 224, 232, 60)
 WARN = (255, 196, 92)
 
-#: 字体候选：站点字体栈里就是这几支（中文必须走 CJK 字体，西文字体只会画出方框）
-_CJK_CANDIDATES = (
-    r"C:\Windows\Fonts\msyhbd.ttc",
-    r"C:\Windows\Fonts\msyh.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/System/Library/Fonts/PingFang.ttc",
-)
-_MONO_CANDIDATES = (
-    r"C:\Windows\Fonts\bahnschrift.ttf",
-    r"C:\Windows\Fonts\consola.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/System/Library/Fonts/Menlo.ttc",
-)
+# 字体不在本模块里写死：中文必须是 CJK 字体，而「它装在哪」各发行版都不一样，
+# 统一由 app/fonts.py 分四层去找（环境变量 → 常见路径 → 扫字体目录 → 内置兜底）。
 
 #: 已签发的卡片（哈希 → 签发信息）。只读内存，见模块说明。
 _ISSUED: dict[str, dict[str, Any]] = {}
@@ -259,19 +246,6 @@ def digest(payload: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # 渲染（Pillow）—— 所有函数都在线程里跑，见 card_for_event
 # --------------------------------------------------------------------------- #
-def _font(candidates: tuple[str, ...], size: int):
-    """按候选顺序找一支可用字体；一个都没有就用内置位图字体（观感差，但别崩）。"""
-    _Image, _Draw, _Filter, ImageFont = _pil()
-    for path in candidates:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:  # 字体损坏 / 不是 TrueType：换下一支
-                continue
-    log.warning("没有可用的中文字体，卡片退回内置位图字体（观感会明显变差）")
-    return ImageFont.load_default(size)
-
-
 #: 不该出现在**行首**的标点：折行时它们要跟着前一个字走（「。」独占一行很难看）
 _TRAILING_PUNCT = "。，、；：？！）】》」』”’…%,.;:?!)]}"
 
@@ -337,13 +311,13 @@ def render(payload: dict[str, Any], *, site: str = "") -> bytes | None:
     try:
         img = Image.new("RGBA", (WIDTH, MAX_HEIGHT), (*PANEL, 255))
         draw = ImageDraw.Draw(img)
-        f_title = _font(_CJK_CANDIDATES, 56)
-        f_sub = _font(_MONO_CANDIDATES, 24)
-        f_key = _font(_CJK_CANDIDATES, 24)
-        f_val = _font(_CJK_CANDIDATES, 26)
-        f_body = _font(_CJK_CANDIDATES, 26)
-        f_tab = _font(_CJK_CANDIDATES, 26)
-        f_note = _font(_CJK_CANDIDATES, 22)
+        f_title = fonts.load("cjk", 56)
+        f_sub = fonts.load("mono", 24)
+        f_key = fonts.load("cjk", 24)
+        f_val = fonts.load("cjk", 26)
+        f_body = fonts.load("cjk", 26)
+        f_tab = fonts.load("cjk", 26)
+        f_note = fonts.load("cjk", 22)
         inner = WIDTH - PAD * 2
 
         y = PAD

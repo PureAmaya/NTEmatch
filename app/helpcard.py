@@ -26,6 +26,7 @@ import io
 from pathlib import Path
 from typing import Any
 
+from . import fonts
 from .helpcard_content import (
     FOOTER_NOTE,
     FOOTER_TITLE,
@@ -65,20 +66,8 @@ ROW_H = 54  # 一行命令的高度（说明跟在后面）
 DESC_H = 34  # 说明被折到下一行时，每行的高度
 LIST_H = 36  # 「先看这三步 / 群里 vs 私信」那种成对列表的行高
 
-# 站点字体栈里就是这几支：Bahnschrift 负责「科技感」的西文与数字，中文走微软雅黑。
-_LATIN_CANDIDATES = (
-    r"C:\Windows\Fonts\bahnschrift.ttf",
-    r"C:\Windows\Fonts\seguisb.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
-)
-_CJK_CANDIDATES = (
-    r"C:\Windows\Fonts\msyhbd.ttc",
-    r"C:\Windows\Fonts\msyh.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/System/Library/Fonts/PingFang.ttc",
-)
+# 字体不在本模块里写死（站点字体栈里是 Bahnschrift + 微软雅黑 / Noto Sans CJK）：
+# 各发行版把中文字体装在不同的目录，统一由 app/fonts.py 分四层去找。
 
 #: 产物与指纹文件名（``static/`` 下；两个都不入库）
 ART_NAME = "help.jpg"
@@ -108,18 +97,6 @@ def default_path() -> Path:
 # --------------------------------------------------------------------------- #
 # 画布与基础件
 # --------------------------------------------------------------------------- #
-def _font(candidates: tuple[str, ...], size: int):
-    _Image, _Draw, _Filter, ImageFont = _pil()
-    for path in candidates:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:  # 字体损坏 / 不是 TrueType：换下一支
-                continue
-    log.warning("没有可用的中文字体，帮助图退回内置位图字体（观感会明显变差）")
-    return ImageFont.load_default(size)
-
-
 def _lerp(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
     return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))  # type: ignore[return-value]
 
@@ -280,21 +257,21 @@ def list_block(img, draw, xy: tuple[int, int], title: str, rows, fonts) -> int:
 def render():
     Image, ImageDraw, ImageFilter, _Font = _pil()
     img = background()
-    f_label = _font(_LATIN_CANDIDATES, 22)
-    f_title = _font(_CJK_CANDIDATES, 66)
-    f_sub = _font(_CJK_CANDIDATES, 25)
-    f_notice = _font(_CJK_CANDIDATES, 25)
-    f_small = _font(_CJK_CANDIDATES, 21)
-    f_tab = _font(_CJK_CANDIDATES, 28)
-    f_cmd = _font(_CJK_CANDIDATES, 25)
-    f_desc = _font(_CJK_CANDIDATES, 23)
-    f_tip_h = _font(_CJK_CANDIDATES, 26)
-    f_tip = _font(_CJK_CANDIDATES, 22)
-    f_foot = _font(_CJK_CANDIDATES, 26)
+    f_label = fonts.load("latin", 22)
+    f_title = fonts.load("cjk", 66)
+    f_sub = fonts.load("cjk", 25)
+    f_notice = fonts.load("cjk", 25)
+    f_small = fonts.load("cjk", 21)
+    f_tab = fonts.load("cjk", 28)
+    f_cmd = fonts.load("cjk", 25)
+    f_desc = fonts.load("cjk", 23)
+    f_tip_h = fonts.load("cjk", 26)
+    f_tip = fonts.load("cjk", 22)
+    f_foot = fonts.load("cjk", 26)
     list_fonts = {
-        "head": _font(_CJK_CANDIDATES, 27),
-        "label": _font(_CJK_CANDIDATES, 23),
-        "text": _font(_CJK_CANDIDATES, 22),
+        "head": fonts.load("cjk", 27),
+        "label": fonts.load("cjk", 23),
+        "text": fonts.load("cjk", 22),
     }
     draw = ImageDraw.Draw(img)
 
