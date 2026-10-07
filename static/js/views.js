@@ -2658,7 +2658,7 @@ export function renderDenied() {
   const d = App.denied || {};
   host.innerHTML =
     `<div class="deny">` +
-    // 一句「锁住的门」的 HUD 插画：stroke 直接用主题色变量，所以换主题 / 自定义色都会跟着变
+    // 一句「锁住的门」的 HUD 插画：stroke 直接用主色变量，所以跟着主色走
     `<svg class="deny__art" viewBox="0 0 96 64" aria-hidden="true" fill="none" ` +
     `stroke="var(--accent)" stroke-linecap="round" stroke-linejoin="round">` +
     `<path d="M48 8 67 19v22L48 52 29 41V19z" stroke-width="2.6" opacity=".8"/>` +

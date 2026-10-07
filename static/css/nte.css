@@ -47,6 +47,15 @@
   --glow: 0 0 0 2px rgba(34, 224, 232, 0.4);
   --glow-2: 0 0 0 2px rgba(125, 92, 255, 0.42);
 
+  /* 卡片 / 按钮的「金属厚度」倒角。带 clip-path 的元素**画不出外侧投影**（clip-path 会把
+     box-shadow、outline 这类外侧绘制一并裁掉），offset 投影原先只能靠 `filter: drop-shadow()`
+     硬凑；而 filter 要求元素先渲染到自己的表面上再合成，几十上百张卡片就是同样多的离屏合成。
+     倒角画在**内侧**：clip-path 裁不到，也没有额外表面。详见文件末尾「性能」一节。 */
+  --edge-hi: rgba(255, 255, 255, 0.13);
+  --edge-lo: rgba(0, 0, 0, 0.42);
+  --bevel: inset 0 1px 0 var(--edge-hi), inset -3px -3px 0 var(--edge-lo);
+  --bevel-sm: inset 0 1px 0 var(--edge-hi), inset -2px -2px 0 var(--edge-lo);
+
   --font-ui: "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system, sans-serif;
   --font-disp: "Bahnschrift SemiCondensed", "Oswald", "DIN Alternate", "HarmonyOS Sans SC", "PingFang SC", sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -140,7 +149,8 @@ img { display: block; max-width: 100%; }
   opacity: .65;
 }
 .hud__brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.mark { width: 36px; height: 36px; flex: none; filter: drop-shadow(0 0 8px rgba(56, 232, 255, 0.5)); }
+/* 尺寸 / 弹性在这里定，辉光在 21.1（那边会按顶栏配色重写一次 filter） */
+.mark { width: 36px; height: 36px; flex: none; }
 .hud__titles { min-width: 0; }
 .hud__title {
   font-family: var(--font-disp);
@@ -508,7 +518,6 @@ img { display: block; max-width: 100%; }
 .ava--sm { width: 34px; height: 39px; }
 .ava--md { width: 46px; height: 53px; }
 .ava--lg { width: 74px; height: 85px; }
-.ava--muted { filter: grayscale(.7) brightness(.72); }
 .ava--placeholder { display: grid; place-items: center; font-family: var(--font-disp); font-size: 13px; color: var(--txt-mute); background: #0d131e; }
 
 /* ---------- 11. 赛程卡片 ---------- */
@@ -520,8 +529,8 @@ img { display: block; max-width: 100%; }
   clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, var(--cut) 100%, 0 calc(100% - var(--cut)));
   transition: border-color .18s, transform .18s, box-shadow .18s;
 }
-.round:hover { transform: translateY(-2px); border-color: var(--line-2); box-shadow: 0 14px 34px rgba(0, 0, 0, .5); }
-.round--live { border-color: rgba(255, 77, 134, .55); box-shadow: 0 0 30px rgba(255, 77, 134, .18); }
+.round:hover { transform: translateY(-2px); border-color: var(--line-2); }
+.round--live { border-color: rgba(255, 77, 134, .55); }
 .round--live::after {
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(120deg, transparent 30%, rgba(255, 77, 134, .12), transparent 70%);
@@ -594,7 +603,7 @@ img { display: block; max-width: 100%; }
   clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
   transition: transform .18s, border-color .18s, box-shadow .18s;
 }
-.pcard:hover { transform: translateY(-3px); border-color: var(--line-2); box-shadow: 0 16px 36px rgba(0, 0, 0, .5); }
+.pcard:hover { transform: translateY(-3px); border-color: var(--line-2); }
 .pcard--sub { border-color: rgba(255, 200, 87, .3); }
 .pcard--inactive { opacity: .5; }
 .pcard__band {
@@ -831,7 +840,8 @@ img { display: block; max-width: 100%; }
   padding: 4px 10px; border-radius: 2px; color: var(--ink);
   border: 1px solid var(--accent); background: var(--accent);
 }
-.toast__act:hover { filter: brightness(1.12); }
+/* 悬停变亮直接换底色：`filter: brightness()` 同样要给元素单开一张滤镜表面，不划算 */
+.toast__act:hover { background: #fff; }
 
 /* ---------- 16.1 热更新面板（服务器页） ---------- */
 .hot__row { display: flex; gap: 10px; font-size: 12.5px; padding: 3px 0; }
@@ -985,17 +995,23 @@ img { display: block; max-width: 100%; }
   background: linear-gradient(180deg, var(--cyan), var(--accent-2));
 }
 
-/* 21.3 按钮：实心亮块 + 黑色偏移投影
-   注：.btn 自带 clip-path，box-shadow 会被裁掉，因此用 drop-shadow 呈现硬偏移。 */
+/* 21.3 按钮：实心亮块 + 内侧「键帽」倒角
+   注：.btn 自带 clip-path，外侧的 box-shadow / outline 会被一并裁掉，硬偏移投影原先只能
+   用 `filter: drop-shadow()` 画；那会让每个按钮单开一张绘制表面（一屏几十个按钮就是几十次
+   离屏合成）。现在换成内侧倒角：裁不到、零额外开销，手感靠位移 + 倒角深浅表达。 */
 .btn {
   border-width: 2px; border-color: rgba(34, 224, 232, .45); font-weight: 700;
-  box-shadow: none; filter: drop-shadow(3px 3px 0 rgba(0, 0, 0, .7));
+  box-shadow: var(--bevel-sm);
 }
 .btn:hover {
-  border-color: var(--accent); color: #fff; box-shadow: none;
-  filter: drop-shadow(5px 5px 0 rgba(0, 0, 0, .75)); transform: translate(-1px, -1px);
+  border-color: var(--accent); color: #fff; transform: translate(-1px, -1px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22), inset -2px -2px 0 rgba(0, 0, 0, .5);
 }
-.btn:active { transform: translate(1px, 1px); box-shadow: none; filter: drop-shadow(1px 1px 0 rgba(0, 0, 0, .7)); }
+/* 按下：倒角翻到左上（像真的被按进去），比单纯位移更有手感 */
+.btn:active {
+  transform: translate(1px, 1px);
+  box-shadow: inset 2px 2px 0 rgba(0, 0, 0, .45), inset 0 1px 0 rgba(255, 255, 255, .08);
+}
 .btn--primary { background: var(--accent); color: #06121a; border-color: #06121a; }
 .btn--primary:hover { background: #fff; color: #06121a; border-color: #06121a; }
 .btn--danger { background: var(--bad); color: #12040a; border-color: #12040a; }
@@ -1013,7 +1029,7 @@ img { display: block; max-width: 100%; }
 /* 21.5 KPI */
 .kpi__card {
   border: 2px solid rgba(34, 224, 232, .22);
-  box-shadow: none; filter: drop-shadow(4px 4px 0 rgba(0, 0, 0, .55));
+  box-shadow: var(--bevel);
 }
 .kpi__card::after {
   width: 96px; height: 96px; right: -14px; top: -14px; filter: none;
@@ -1044,9 +1060,9 @@ img { display: block; max-width: 100%; }
 .ava__ring { box-shadow: inset 0 0 0 2px rgba(34, 224, 232, .7); }
 
 /* 21.8 赛程卡片 */
-.round { border: 2px solid rgba(34, 224, 232, .2); box-shadow: none; filter: drop-shadow(5px 5px 0 rgba(0, 0, 0, .5)); }
-.round:hover { border-color: var(--accent); box-shadow: none; filter: drop-shadow(6px 6px 0 rgba(0, 0, 0, .55)); }
-.round--live { border-color: var(--magenta); box-shadow: none; filter: drop-shadow(5px 5px 0 rgba(255, 47, 142, .45)); }
+.round { border: 2px solid rgba(34, 224, 232, .2); box-shadow: var(--bevel); }
+.round:hover { border-color: var(--accent); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), inset -4px -4px 0 rgba(0, 0, 0, .5); }
+.round--live { border-color: var(--magenta); box-shadow: inset 0 1px 0 var(--edge-hi), inset -3px -3px 0 rgba(255, 47, 142, .42); }
 .round__head {
   background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .07) 0 9px, transparent 9px 20px);
   border-bottom: 2px solid rgba(34, 224, 232, .2);
@@ -1061,8 +1077,8 @@ img { display: block; max-width: 100%; }
 .round__ops { background: rgba(6, 10, 16, .6); }
 
 /* 21.9 选手卡 */
-.pcard { border: 2px solid rgba(34, 224, 232, .2); box-shadow: none; filter: drop-shadow(5px 5px 0 rgba(0, 0, 0, .5)); }
-.pcard:hover { box-shadow: none; filter: drop-shadow(6px 6px 0 rgba(0, 0, 0, .55)); }
+.pcard { border: 2px solid rgba(34, 224, 232, .2); box-shadow: var(--bevel); }
+.pcard:hover { box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), inset -4px -4px 0 rgba(0, 0, 0, .5); }
 .pcard__band { height: 6px; background: repeating-linear-gradient(115deg, var(--cyan) 0 10px, var(--accent-2) 10px 20px); }
 .pcard__name { font-style: italic; }
 .pcard__rate { height: 5px; }
@@ -1509,7 +1525,9 @@ img { display: block; max-width: 100%; }
 /* 未勾选 = 不参与本届 */
 .pick--off { border-style: dashed; border-color: var(--line); background: rgba(9, 13, 21, .35); }
 .pick--off .who__name { color: var(--txt-mute); }
-.pick--off .ava { filter: grayscale(1); opacity: .5; }
+/* 未勾选：只压暗。原先还叠了一层 `filter: grayscale(1)`——那要给**每个**头像单开一张滤镜
+   表面（名单长的时候就是几百次离屏合成）；压暗本来就够「灰」，行上还有虚线框与灰字兜语义。 */
+.pick--off .ava { opacity: .5; }
 /* 已停用的选手不可勾选 */
 .pick--disabled { cursor: not-allowed; }
 .pick--disabled .who__name { text-decoration: line-through; }
@@ -2133,9 +2151,12 @@ img { display: block; max-width: 100%; }
 }
 .pcard { contain-intrinsic-size: auto 208px; }
 
-/* 弹窗打开时暂停背景漂移：背景不再逐帧变化，弹窗的全屏 backdrop-filter
-   就不必每帧重新采样（不支持 :has 的浏览器会忽略这条，行为不变）。 */
-body:has(.modal:not([hidden])) .fx__grid { animation-play-state: paused; }
+/* 卡片与按钮**不再用 `filter: drop-shadow()` 画投影**，两个原因：
+   ① filter 要求元素先渲染到自己的表面上再合成——几十上百张卡片就是同样多的离屏合成，
+      滚动到哪儿就在哪儿发生，是列表页 GPU 占用的大头；
+   ② 这些元素都带 clip-path，而 clip-path 会把**外侧**的 box-shadow / outline 一并裁掉，
+      所以外侧投影本来也只能靠 filter 硬凑。
+   厚度的表达因此挪到**内侧**（`--bevel`）：clip-path 裁不到它，也不产生额外表面。 */
 
 /* 系统开了「减弱动效」就关掉纯装饰动画：省电，也更跟手 */
 @media (prefers-reduced-motion: reduce) {
@@ -2155,8 +2176,8 @@ body:has(.modal:not([hidden])) .fx__grid { animation-play-state: paused; }
    ========================================================================== */
 
 /* 在播的频道卡：描边与色带都换成品红，和比赛的「直播中」保持一致 */
-.pcard--live { border-color: var(--magenta); filter: drop-shadow(5px 5px 0 rgba(255, 47, 142, .45)); }
-.pcard--live:hover { filter: drop-shadow(6px 6px 0 rgba(255, 47, 142, .5)); }
+.pcard--live { border-color: var(--magenta); box-shadow: inset 0 1px 0 var(--edge-hi), inset -3px -3px 0 rgba(255, 47, 142, .42); }
+.pcard--live:hover { box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), inset -4px -4px 0 rgba(255, 47, 142, .5); }
 .pcard--live .pcard__band {
   background: repeating-linear-gradient(115deg, var(--magenta) 0 10px, #05080e 10px 20px);
 }
@@ -2613,7 +2634,7 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 
 /* ==========================================================================
    41. Markdown：编辑器、内容排版、通知卡片
-   （图标、编辑器、渲染结果都走 currentColor / 主题变量，换主题色自动跟随）
+   （图标、编辑器、渲染结果都走 currentColor / 主题变量，跟着主色走）
    ========================================================================== */
 .ic { display: inline-flex; width: 1em; height: 1em; align-items: center; justify-content: center; }
 .ic svg { width: 100%; height: 100%; display: block; }
@@ -2915,9 +2936,9 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 /* ==========================================================================
    43. 图标（Feather，MIT）+ 细节打磨
    --------------------------------------------------------------------------
-   `.ic` 是 1em 方块：**字号决定图标大小**，颜色走 currentColor（跟随主题色，
-   含管理员自定义的主题色）。这里只补「由容器给定尺寸」的几处：按钮、底栏页签、
-   面板头、首页入口、搜索框——其余地方不用逐处写样式。
+   `.ic` 是 1em 方块：**字号决定图标大小**，颜色走 currentColor（跟着主色走）。
+   这里只补「由容器给定尺寸」的几处：按钮、底栏页签、面板头、首页入口、搜索框
+   ——其余地方不用逐处写样式。
    ========================================================================== */
 .btn .ic { width: 16px; height: 16px; }
 .btn--sm .ic { width: 14px; height: 14px; }
