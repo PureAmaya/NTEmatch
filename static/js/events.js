@@ -156,16 +156,20 @@ function eventCardHtml(e, admin = false, index = 0) {
   const owner = e.ownerName
     ? `<div class="evt-card__owner">${ownerHtml(e.ownerName, e.ownerAvatar)}</div>`
     : '';
-  const ops =
-    admin && ownedByMe(e)
-      ? `<div class="evt-card__ops">` +
-        `<button class="btn btn--sm" type="button" data-act="event-rename" data-id="${esc(e.id)}">重命名</button>` +
-        (e.status === 'closed'
-          ? `<button class="btn btn--sm" type="button" data-act="event-reopen" data-id="${esc(e.id)}">恢复进行</button>`
-          : `<button class="btn btn--sm" type="button" data-act="event-close" data-id="${esc(e.id)}">标记结束</button>`) +
-        `<button class="btn btn--sm btn--danger" type="button" data-act="event-delete" data-id="${esc(e.id)}">删除</button>` +
-        `</div>`
-      : '';
+  // 复制**不要求这一届是你办的**（源届本来就人人可看，谁能看谁就能照着办下一届），
+  // 所以它对每个能看到这届的管理员都在；重命名 / 结束 / 删除仍旧只看自己的届。
+  const ops = admin
+    ? `<div class="evt-card__ops">` +
+      `<button class="btn btn--sm" type="button" data-act="event-copy" data-id="${esc(e.id)}">复制</button>` +
+      (ownedByMe(e)
+        ? `<button class="btn btn--sm" type="button" data-act="event-rename" data-id="${esc(e.id)}">重命名</button>` +
+          (e.status === 'closed'
+            ? `<button class="btn btn--sm" type="button" data-act="event-reopen" data-id="${esc(e.id)}">恢复进行</button>`
+            : `<button class="btn btn--sm" type="button" data-act="event-close" data-id="${esc(e.id)}">标记结束</button>`) +
+          `<button class="btn btn--sm btn--danger" type="button" data-act="event-delete" data-id="${esc(e.id)}">删除</button>`
+        : '') +
+      `</div>`
+    : '';
   return (
     `<article class="evt-card evt-card--act" style="--i:${index}">` +
     `<div class="evt-card__head">` +
@@ -366,7 +370,7 @@ export async function renderEventsView() {
     `<section class="home-hero home-hero--slim">` +
     `<p class="home-hero__kicker">管理</p>` +
     `<h1 class="home-hero__title">全部赛事</h1>` +
-    `<p class="home-hero__desc">共 ${App.events.length} 届 · 新建 / 重命名 / 封存 / 删除都在这里；` +
+    `<p class="home-hero__desc">共 ${App.events.length} 届 · 新建 / 复制 / 重命名 / 封存 / 删除都在这里；` +
     `点卡片进入那一届，或在它自己的页面里编辑。</p>` +
     `<div class="home-tools">` +
     (admin

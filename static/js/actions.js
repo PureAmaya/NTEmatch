@@ -1938,6 +1938,56 @@ function openEventNewModal() {
   });
 }
 
+/**
+ * 复制一届：配置 / 名单 / 赛程骨架照抄，成绩与时间清空，新届是**筹备中**。
+ *
+ * 弹窗里把「照抄什么、不带走什么」写清楚：复制最容易误会的就是「比分也会跟着来」——
+ * 真带了比分，新届要么一出生就是已结束，要么顶着筹备中却已经有冠军。另外**源届一个字不动**，
+ * 复制完**直接进入新届**（不这样就还得自己去列表里找）。
+ */
+function openEventCopyModal(id) {
+  const event = App.events.find((e) => e.id === id);
+  const base = String(event?.name || id).trim();
+  Modal.open({
+    title: `复制 · ${base}`,
+    body:
+      `<div class="form"><div class="field"><label for="f-copy-name">新届名</label>` +
+      `<input id="f-copy-name" value="${esc(`${base} 副本`)}" placeholder="例如 2026 秋季联赛"></div></div>` +
+      `<div class="notice" style="margin-top:10px"><b>照抄</b>：赛制与规则、选手与参与名单、队伍、` +
+      `赛程对阵（含席位来源）、比赛类型、直播与界面配置。<br>` +
+      `<b>不带走</b>：比分与胜负（每一场回到「未开始」）、开赛与场次时间、替补登记、公告。<br>` +
+      `新届状态是<b>筹备中</b>，复制完直接进入这一届；源届一个字节都不动。</div>`,
+    footer:
+      `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>` +
+      `<button class="btn btn--sm btn--primary" type="button" data-submit>复制并切换</button>`,
+    onMount(bodyEl, footEl) {
+      footEl.querySelector('[data-close]').onclick = () => Modal.close();
+      footEl.querySelector('[data-submit]').onclick = async () => {
+        const name = qs('#f-copy-name', bodyEl).value.trim();
+        if (!name) {
+          toast('请填写届名', 'warn');
+          return;
+        }
+        try {
+          const res = await api(`/events/${encodeURIComponent(id)}/copy`, {
+            method: 'POST',
+            auth: true,
+            body: { name },
+          });
+          Modal.close();
+          toast(`已复制为「${res.name}」（筹备中，${res.rounds} 场 / ${res.players} 人），正在进入`, 'ok', 5000);
+          await refreshEventsUI(true);
+          // 复制出来的届同时成了后端「当前届」，所以进去就能编辑
+          if (hooks.goto) await hooks.goto(res.eventId || '', 'overview');
+          else if (hooks.refreshState) await hooks.refreshState();
+        } catch (err) {
+          toast(err.message, 'err');
+        }
+      };
+    },
+  });
+}
+
 function openEventRenameModal(id) {
   const event = App.events.find((e) => e.id === id);
   Modal.open({
@@ -2442,6 +2492,8 @@ export async function handleAction(act, el) {
       return refreshEventsUI(true);
     // 注：届次卡片已是**真链接**（`<a data-route>` + 拉伸覆盖整张卡），
     // 「进入这一届 / 新窗口打开」都由浏览器自己处理，这里不再需要对应的动作。
+    case 'event-copy':
+      return openEventCopyModal(el.dataset.id);
     case 'event-rename':
       return openEventRenameModal(el.dataset.id);
     case 'event-close':

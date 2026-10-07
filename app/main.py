@@ -604,6 +604,12 @@ class EventMetaPayload(NTEModel):
     hidden: bool | None = None
 
 
+class EventCopyPayload(NTEModel):
+    """复制一届：新届名（留空自动取「<源届名> 副本」）。"""
+
+    name: str = ""
+
+
 class ParticipantsPayload(NTEModel):
     """本届参与名单。
 
@@ -1216,6 +1222,45 @@ async def api_set_format(payload: FormatPayload, _: Session = Depends(require_cu
         "changed": True,
         "revision": cfg.revision,
         "state": build_public_state(cfg),
+    }
+
+
+@app.post("/api/events/{event_id}/copy")
+async def api_event_copy(
+    event_id: str, payload: EventCopyPayload, session: Session = Depends(require_event)
+) -> dict[str, Any]:
+    """复制一届：配置 / 名单 / 赛程骨架照抄，**成绩与时间清空**，新届是「筹备中」。
+
+    复制**不要求你是源届的创建者**：源届本来就是人人可看的（公开的往届列表），
+    谁能看谁就能照着办下一届；复制出来的届归操作者（与新建一致），并立刻切过去。
+    唯一的例外是**隐藏的届**：它对别人等于不存在，只有服务器管理员能复制（与查看一致）。
+
+    不复制**公告**（挂在外面的通知带时间与作者，照抄过来是误导）——要留的文字在新届重发一条。
+    """
+    entry = next((e for e in await store.list_events() if e["id"] == event_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"第 {event_id} 届不存在")
+    if entry.get("hidden") and not session.is_server:
+        raise HTTPException(status_code=404, detail=f"第 {event_id} 届不存在")
+    try:
+        cfg = await store.duplicate_event(event_id, payload.name, owner_uid=session.uid)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    log.warning(
+        "已复制届次 | 源=%s | 新=%s | 名称=%s | 归属=%s",
+        event_id,
+        store.current_id,
+        cfg.event.name,
+        session.uid or "(服务器)",
+    )
+    return {
+        "ok": True,
+        "sourceId": event_id,
+        "eventId": store.current_id,
+        "name": cfg.event.name,
+        "format": cfg.rules.format,
+        "rounds": len(cfg.rounds),
+        "players": len(cfg.players),
     }
 
 

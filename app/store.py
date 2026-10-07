@@ -253,6 +253,38 @@ def _write_roster(data: dict[str, Any], chosen: list[str]) -> dict[str, Any]:
     return merged
 
 
+#: 复制一届时，对局里**要抹掉**的字段：这些是「这一场真的打过」的痕迹。
+#: 注意是**删字段**（回模型默认）而不是写 0：侧方成绩的默认值是 ``metrics.MISSING``
+#: （= 没有成绩），而 0 是合法读数（0 分）——手写 0 会把「没打」写成「拿了 0 分」。
+_ROUND_RESULT_KEYS = (
+    "status",          # 回到 pending
+    "winner",
+    "sets",            # 各轮成绩
+    "durationMinutes",
+    "startedAt",
+    "finishedAt",
+    "scheduledAt",     # 上一届的日程；新届的日期还没定
+    "locked",
+)
+_SIDE_RESULT_KEYS = ("score", "points", "rank", "forfeit")
+
+
+def _round_without_result(round_data: dict[str, Any]) -> dict[str, Any]:
+    """把一场对局**抹回「一场都还没打」**：留对阵、清成绩。
+
+    留下的是**赛程骨架**：``stage`` / ``code`` / ``label`` / 席位来源（``srcA`` /
+    ``srcB``）与两边的**人和队伍**；抹掉的是成绩、胜者、用时、时间戳与锁定。
+    于是复制出来的届既有完整对阵表，又不会带着上一届的比分——带着比分只会有两种下场：
+    要么一出生就被「打完自动结束本届」判成已结束，要么顶着「筹备中」却已经有冠军。
+    """
+    out = {k: v for k, v in round_data.items() if k not in _ROUND_RESULT_KEYS}
+    out["sides"] = [
+        {k: v for k, v in side.items() if k not in _SIDE_RESULT_KEYS}
+        for side in round_data.get("sides") or []
+    ]
+    return out
+
+
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     """递归合并：字典逐层合并，列表与标量整体替换。"""
     result = dict(base)
@@ -2010,6 +2042,76 @@ class ConfigStore:
             self._config = cfg
             log.warning("新建赛事届 | id=%s | 名称=%s | 沿用名单=%s", event_id, clean_name, copy_roster)
         await self._notify(cfg, "event:create")
+        return cfg
+
+    async def duplicate_event(self, source_id: str, name: str = "", owner_uid: str = "") -> Config:
+        """复制一届：**配置与名单照抄，成绩与时间清空**，新届是「筹备中」。
+
+        为什么成绩必须清：新届要能重新打（复制过来的届就是拿来再办一届的）。带着上一届的
+        比分复制只会有两种下场——要么一出生就被「打完自动结束本届」判成已结束，要么顶着
+        「筹备中」却已经有冠军，两种都自相矛盾。所以：
+
+        * **照抄**：赛制与规则、选手与参与名单（连「名单是显式指定的」这一点一起）、队伍、
+          赛程骨架（对阵、席位来源、每场的人与队伍）、比赛类型与排名开关、直播与界面配置、
+          届名之外的展示信息（简介 / 场馆 / 主办 / 副标题 / 规则文案 / logo 文字）；
+        * **清空**：每一场回到「未开始」（比分 / 胜者 / 各轮成绩 / 名次 / 弃权 / 用时 /
+          起止时间 / 锁定）、开赛与结束时间、场次计划时间、**替补登记**（它按对局编号生效，
+          而新届一场都没打）、开赛锁定（``locked``，否则新届一进来就是只读的）；
+        * **不带过来**：届上的**公告**（挂在外面的通知带时间与作者，照抄是误导——要留在
+          新届重发一条）；
+        * 新届**归属操作者**（与新建一致），建完**立刻切换过去**，省得用户自己去列表里找。
+
+        源届**一个字节都不改**（只读它）。
+        """
+        self._check_id(source_id)
+        async with self._lock:
+            if source_id == self._current:
+                src = self._config
+            else:
+                src = await asyncio.to_thread(self._load_sync, source_id)
+            data = src.dump()
+            event = dict(data.get("event") or {})
+            source_name = str(event.get("name") or "").strip()
+            clean_name = (name or "").strip() or f"{source_name or source_id} 副本"
+            # 标题若是「跟着届名自动填的」（新建时就是这么填的），就跟着新届名走；
+            # 手工起过标题的（与届名不同）原样保留——那是用户特意写的文案。
+            if not str(event.get("title") or "").strip() or event.get("title") == source_name:
+                event["title"] = clean_name
+            event.update(
+                {
+                    "name": clean_name,
+                    # 筹备中：与报名闸门认的是同一个状态（见 SIGNUP_EVENT_STATUS）
+                    "status": "draft",
+                    "ownerUid": owner_uid,
+                    "hidden": False,
+                    "startTime": "",
+                    "endTime": "",
+                    "locked": False,
+                    "lockedAt": "",
+                }
+            )
+            data.update(
+                {
+                    "event": event,
+                    "rounds": [_round_without_result(row) for row in data.get("rounds") or []],
+                    "substitutions": [],
+                    "revision": 0,
+                    "updatedAt": now_iso(),
+                }
+            )
+            cfg = Config.model_validate(data)
+            event_id = await asyncio.to_thread(self._insert_sync, cfg)
+            self._current = event_id
+            self._config = cfg
+            log.warning(
+                "已复制届次 | 源=%s | 新=%s | 名称=%s | 场次=%d | 选手=%d",
+                source_id,
+                event_id,
+                clean_name,
+                len(cfg.rounds),
+                len(cfg.players),
+            )
+        await self._notify(cfg, "event:copy")
         return cfg
 
     async def switch_event(self, event_id: str) -> Config:

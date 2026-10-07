@@ -329,6 +329,7 @@ function membersPanelHtml() {
 function eventAdminCard(e) {
   const ops =
     `<div class="evt-card__ops">` +
+    `<button class="btn btn--sm" type="button" data-act="event-copy" data-id="${esc(e.id)}">复制</button>` +
     `<button class="btn btn--sm" type="button" data-act="event-rename" data-id="${esc(e.id)}">重命名</button>` +
     (e.status === 'closed'
       ? `<button class="btn btn--sm" type="button" data-act="event-reopen" data-id="${esc(e.id)}">恢复进行</button>`
@@ -364,7 +365,7 @@ function eventsPanelHtml() {
     `<div class="tool-group" style="margin-bottom:10px">` +
     `<button class="btn btn--sm btn--primary" type="button" data-act="event-new">新建一届</button>` +
     `<button class="btn btn--sm" type="button" data-act="event-refresh">刷新届次</button>` +
-    `<span class="panel__hint">全部届次（含进行中与未来）：可封存 / 隐藏 / 重命名 / 删除</span>` +
+    `<span class="panel__hint">全部届次（含进行中与未来）：可复制 / 封存 / 隐藏 / 重命名 / 删除</span>` +
     `</div>` +
     (events.length
       ? `<div class="evt-grid">${events.map(eventAdminCard).join('')}</div>`
@@ -1099,6 +1100,7 @@ const ACTIVITY_PATH_LABEL = [
   [/^\/api\/config$/, '保存配置'],
   [/^\/api\/events$/, '新建届次'],
   [/^\/api\/events\/[^/]+\/switch$/, '切换届次'],
+  [/^\/api\/events\/[^/]+\/copy$/, '复制届次'],
   [/^\/api\/events\/[^/]+$/, '修改 / 删除届次'],
   [/^\/api\/format$/, '切换赛制'],
   [/^\/api\/event\/(start|unlock)$/, '开赛 / 解锁'],
