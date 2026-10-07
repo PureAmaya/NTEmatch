@@ -690,6 +690,10 @@ async def lifespan(app: FastAPI):
     await hub.broadcast_state(build_public_state(store.snapshot()))
     # 周期性自动备份：常驻巡检，到点才真的打包（没开启时只是每 5 分钟看一眼设置）
     backup_task = asyncio.create_task(backup.auto_backup_loop())
+    # 补记「其实已经打完」的届：隔一会儿看一眼，把状态从「进行中」改成「已结束」。
+    # **只写状态、不发任何消息**（与删掉的播报巡检完全不同），也幂等；
+    # 只挂在启动上是不够的——「代码更新了、进程没换」时用户看到的就是「改了但还是不行」。
+    close_task = asyncio.create_task(store.close_finished_loop())
     # 赛前提醒：开赛前一天 / 前两小时在群里 @ 举办者（见 app/remind.py）。
     # 只在「聊天机器人推送开着」且举办者登记了 QQ 时才真的发得出去。
     remind_task = asyncio.create_task(remind.loop())
@@ -755,6 +759,9 @@ async def lifespan(app: FastAPI):
         backup_task.cancel()
         with suppress(asyncio.CancelledError):
             await backup_task
+        close_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await close_task
         remind_task.cancel()
         with suppress(asyncio.CancelledError):
             await remind_task
@@ -1556,6 +1563,10 @@ async def api_update_config(
                 status_code=400,
                 detail="本届已结束：赛事信息只能查看；要发布内容请改用「赛事通知」",
             )
+        # 手动把届状态改成「进行中」= 明确要它继续开着：钉住，别再被自动结束
+        # （改成已结束 / 筹备中则放开；口径与届次管理里的按钮完全一致，见 EventInfo.keep_open）
+        if "status" in kept and kept["status"] != current.status:
+            kept["keepOpen"] = kept["status"] == "active"
         clean["event"] = {**kept, "startTime": start, "endTime": end}
     # 娱乐模式（排名开关关闭）不判胜负：强制允许平局，录分时不必指定胜方
     if clean.get("event", {}).get("ranked") is False:

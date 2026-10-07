@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS events (
   end_time      TEXT NOT NULL DEFAULT '',
   locked        INTEGER NOT NULL DEFAULT 0,
   locked_at     TEXT NOT NULL DEFAULT '',
+  keep_open     INTEGER NOT NULL DEFAULT 0,
   rules_text    TEXT NOT NULL DEFAULT '',
   logo_text     TEXT NOT NULL DEFAULT '',
   created_at    TEXT NOT NULL DEFAULT '',
@@ -399,6 +400,8 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         "end_time": "TEXT NOT NULL DEFAULT ''",
         "locked": "INTEGER NOT NULL DEFAULT 0",
         "locked_at": "TEXT NOT NULL DEFAULT ''",
+        # 手动「恢复进行」过：别再自动结束（见 models.EventInfo.keep_open）
+        "keep_open": "INTEGER NOT NULL DEFAULT 0",
         # 届次归属与可见性（见 models.EventInfo.owner_uid / hidden）
         "owner_uid": "TEXT NOT NULL DEFAULT ''",
         "hidden": "INTEGER NOT NULL DEFAULT 0",
@@ -819,16 +822,17 @@ def save_event(
         """
         INSERT INTO events (
             id, name, status, title, subtitle, brief, venue, organizer, start_time, end_time,
-            locked, locked_at, rules_text, logo_text, owner_uid, hidden, sport, ranked,
+            locked, locked_at, keep_open, rules_text, logo_text, owner_uid, hidden, sport, ranked,
             participants_set,
             created_at, updated_at, revision, players_count, rounds_count, played_count, champion
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, status = excluded.status, title = excluded.title,
             subtitle = excluded.subtitle, brief = excluded.brief,
             venue = excluded.venue, organizer = excluded.organizer,
             start_time = excluded.start_time, end_time = excluded.end_time,
             locked = excluded.locked, locked_at = excluded.locked_at,
+            keep_open = excluded.keep_open,
             rules_text = excluded.rules_text, logo_text = excluded.logo_text,
             owner_uid = excluded.owner_uid, hidden = excluded.hidden,
             sport = excluded.sport, ranked = excluded.ranked,
@@ -850,6 +854,7 @@ def save_event(
             event.get("endTime", ""),
             int(bool(event.get("locked", False))),
             event.get("lockedAt", ""),
+            int(bool(event.get("keepOpen", False))),
             event.get("rulesText", ""),
             event.get("logoText", ""),
             event.get("ownerUid", ""),
@@ -1301,6 +1306,8 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             # 比赛是否已开始（赛制与参赛名单锁定）
             "locked": bool(ev["locked"]),
             "lockedAt": ev["locked_at"],
+            # 手动「恢复进行」过：别再自动结束（见 models.EventInfo.keep_open）
+            "keepOpen": bool(ev["keep_open"]),
             "ownerUid": ev["owner_uid"],
             "hidden": bool(ev["hidden"]),
             "sport": ev["sport"],

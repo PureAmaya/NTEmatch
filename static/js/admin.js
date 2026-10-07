@@ -539,17 +539,23 @@ export function adminPanelHtml(s) {
 
   const rulesForm = isLeague(s) ? leagueRulesForm(rules) : tournamentRulesForm(rules, s);
 
-  // 已完结的届只留只读信息：编辑面板整体上锁，只放行「恢复进行」
+  // 已完结的届：**不再整片锁死**。
+  // 真正只读的只有「赛事信息」正文（服务端把关，见 main.api_config）；比分、名单、组队、
+  // 赛程、通知、推送到群照旧可用——用户报的就是「一结束整页都动不了，连发通知、
+  // 推比赛结果都找不到入口」。要收尾 / 继续都用得起，才谈得上「管得住」。
   const finished = isFinished(s);
+  // 手动「恢复进行」过的届：不会再被自动结束（见 models.EventInfo.keep_open），这里明说
+  const keepOpen = Boolean(s.event?.keepOpen);
   const editing =
     // 开赛状态放在最前：下面哪些面板会被冻结，一眼可见
     lockPanelHtml(s) +
+    // 赛事通知：发布后打开本届的人会自动弹窗；**赛前赛后都能发**（它从来不进只读区）
+    `<div class="panel" id="adminNotices"></div>` +
     formatPanelHtml(s) +
     panelHtml('赛事信息', '公开展示 · Markdown', eventForm) +
-    // 赛事通知：发布后打开本届的人会自动弹窗；赛后仍可发（只有赛事信息会转为只读）
-    `<div class="panel" id="adminNotices"></div>` +
-    // 推送到群：赛事管理员（自己创建的届）与服务器管理员都能用
-    (canManageEvents() && !finished ? qqbotPushPanelHtml(s) : '') +
+    // 推送到群（走机器人）：赛事管理员（自己创建的届）与服务器管理员都能用；
+    // **赛后照样能用**——「比赛结果」这条恰恰是赛后最常推的
+    (canManageEvents() ? qqbotPushPanelHtml(s) : '') +
     panelHtml(
       '比赛规则',
       isLeague(s) ? '积分制' : '双败淘汰制',
@@ -570,17 +576,24 @@ export function adminPanelHtml(s) {
 
   return (
     panelHtml('系统状态', '实时诊断', `<div id="diagBox" class="kv"><div class="kv__row"><dt>加载中</dt><dd>…</dd></div></div>`) +
+    (keepOpen && !finished
+      ? `<div class="panel"><div class="panel__body"><div class="notice">这一届是你手动<b>恢复进行</b>过的：` +
+        `<b>不会再被自动结束</b>，下面的面板照旧可用。要收尾就点「标记结束」（或登记结束时间），` +
+        `那会解除这个状态。</div></div></div>`
+      : '') +
     (finished
       ? `<div class="panel"><div class="panel__head"><h2>已结束</h2>` +
-        `<span class="panel__hint">${esc(s.eventId || '')} · 只读</span></div>` +
-        `<div class="panel__body"><div class="notice notice--warn">这一届已经结束（锦标赛制的总冠军决出后会自动结束），` +
-        `下面的编辑面板全部停用（只读）。要赛后补改，点「恢复进行」再改即可。</div>` +
+        `<span class="panel__hint">${esc(s.eventId || '')}</span></div>` +
+        `<div class="panel__body"><div class="notice notice--warn">这一届已标记结束（冠军决出 / ` +
+        `积分制全部打完时会自动结束）。<b>下面的面板照旧能用</b>：比分、名单、组队、赛程、` +
+        `赛事通知、推送到群；只有「赛事信息」正文是只读的。<br>` +
+        `点「恢复进行」还会<b>顺手钉住它</b>——恢复之后不会再被自动结束关一次。</div>` +
         `<div class="tool-group" style="margin-top:10px">` +
         `<button class="btn btn--sm btn--primary" type="button" data-act="event-reopen" ` +
-        `data-id="${esc(s.eventId || '')}">恢复进行</button>` +
+        `data-id="${esc(s.eventId || '')}">恢复进行（不再自动结束）</button>` +
         `</div></div></div>`
       : '') +
-    lockedWrap(editing, finished, '这一届已经结束：只读。要改动先点上面的「恢复进行」。')
+    editing
   );
 }
 

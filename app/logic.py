@@ -234,11 +234,16 @@ def close_on_champion(data: dict[str, Any]) -> dict[str, Any]:
     上下游阵容重算都完成之后，所以不需要前端再手动点一次「标记结束」
     （两套赛制都适用，见 :func:`season_finished`）。
 
-    只做「未结束 → 已结束」这一件事：已经结束的届原样返回（幂等），手动
-    「恢复进行」之后只要不再产生新结果，就不会被重新关上。
+    只做「未结束 → 已结束」这一件事：已经结束的届原样返回（幂等）；
+    **手动「恢复进行」过的届一律不动**（见 :attr:`app.models.EventInfo.keep_open`）——
+    自动结束只该做一次，管理员明确要它继续开着就听他的：他再被关一次，
+    看到的就是「我恢复了你又给我掐了」，管理界面再次变回不可用。
     """
     event = dict(data.get("event") or {})
     if (event.get("status") or "active") == "closed":
+        return data
+    if event.get("keepOpen"):
+        log.info("本届被手动恢复进行过，不自动结束（要结束请手动「标记结束」）")
         return data
     try:
         cfg = Config.model_validate(data)

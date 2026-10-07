@@ -163,6 +163,10 @@ def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()  # noqa: DTZ005
 
 
+#: 补记巡检的间隔（秒）：只做「把已经打完的届标成已结束」这一件事，
+#: 一轮就是几次纯读 + 至多一次状态写入，所以间隔小一点没有代价。
+CLOSE_SWEEP_SECONDS = 30.0
+
 #: 报名 / 取消报名的闸门：只有**筹备中**的届能自助改名单。
 #: 文案在 :func:`signup_blocked` 里现算（要说清卡在哪一条，而不是统一回一句「不允许」）。
 SIGNUP_EVENT_STATUS = "draft"
@@ -1565,7 +1569,7 @@ class ConfigStore:
         # 正在看当前届的人只会错位——``update_event_meta`` 对非当前届也是这个取舍。
         return fresh
 
-    async def close_finished_events(self, actor: str = "startup:close-finished") -> list[str]:
+    async def close_finished_events(self, actor: str = "sweep:close-finished") -> list[str]:
         """把「其实已经打完、状态却还停在进行中」的届补记成「已结束」。
 
         为什么需要这一步：自动结束挂在**写入**上（见 :func:`app.logic.close_on_champion`），
@@ -1575,9 +1579,11 @@ class ConfigStore:
           赛程 10/10 场」，而届状态下拉里还写着「进行中」，自相矛盾）；
         * 升级上来的老数据（最后一笔结果早写完了）。
 
-        启动时跑一次即可，**幂等**：只碰「非已结束且赛程确实打完」的届。
+        **两处调用**：启动时一次（:meth:`start`），以及 :meth:`close_finished_loop`
+        那条常驻巡检——只挂在启动上要等人重启，而实际情况往往是「代码更新了、进程没换」，
+        于是「改了但还是不行」。都是**幂等**的：只碰「非已结束且赛程确实打完」的届。
 
-        个别情况下管理员手动「恢复进行」想把这一届留着，再重启时又会被补回「已结束」
+        个别情况下管理员手动「恢复进行」想把这一届留着，之后又会被补回「已结束」
         ——这与「录一笔新结果也会自动关上」是同一条口径（赛程确实打完了）。
         真要留着进行状态，动一下赛程或名单即可（那样它就不算「打完」了）。
         """
@@ -1592,6 +1598,10 @@ class ConfigStore:
                 cfg = await self.read_event(event_id)
             except (FileNotFoundError, ValueError):
                 continue
+            if cfg.event.keep_open:
+                # 管理员手动「恢复进行」过的届：不再自动给它盖上（见 EventInfo.keep_open）。
+                # 这里先跳过只是省一次写入——真正的闸门在 close_on_champion 里（录分那条路也要过）。
+                continue
             if not logic.season_finished(cfg):
                 continue
             await self.mutate_event(event_id, logic.close_on_champion, actor=actor)
@@ -1599,6 +1609,32 @@ class ConfigStore:
         if closed:
             log.warning("已补记「已结束」的届 | %s", ", ".join(closed))
         return closed
+
+    async def close_finished_loop(self, interval: float = CLOSE_SWEEP_SECONDS) -> None:
+        """常驻巡检：隔一会儿补记一次「其实已经打完」的届（**只改状态、不发任何消息**）。
+
+        为什么不能只靠「写入那一刻」与「启动那一刻」：
+
+        * 写入那一刻只在**最后一笔结果落库时**生效——在补上这条规则之前就打完了的届、
+          升级上来的老数据，永远等不到（用户报的正是这个：页面上 12/12 场全打完、
+          冠军都在，届状态还写着「进行中」）；
+        * 启动那一刻要等人**重启**——而真实情况往往是「代码更新了、进程没换」，
+          于是「改了但还是不行」。
+
+        所以留一条常驻巡检兜底，把「已经打完」这个事实在几十秒内落到状态上。
+
+        两条边界要说清：它**不发消息**（与删掉的播报巡检完全不同——那个会往群里刷历史
+        场次），也**幂等**（只碰非已结束且赛程确实打完的届，没事发生时不写库）。
+        单轮出错不让任务死掉（记一行日志，下一轮再试）。
+        """
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.close_finished_events()
+            except asyncio.CancelledError:  # 关停：老实退出，别吞掉取消
+                raise
+            except Exception:  # 巡检不许把自己打死
+                log.warning("补记巡检出错（忽略，下一轮再试）", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 本届参与名单 / 组队 / 赛程
@@ -2138,6 +2174,10 @@ class ConfigStore:
         }
         if not clean:
             raise ValueError("没有需要修改的字段")
+        if "status" in clean:
+            # 手动改状态就给「还要不要自动结束」定调：改成**进行中** = 钉住（别再自动关）；
+            # 改成已结束 / 筹备中 = 放开（见 EventInfo.keep_open）。
+            clean["keepOpen"] = clean["status"] == "active"
         if event_id == self._current:
             await self.update({"event": clean}, actor="web:event-meta")
         else:

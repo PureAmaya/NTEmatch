@@ -97,6 +97,117 @@ async def test_startup_sweep_closes_events_that_were_already_finished():
         await store.delete_event(mine)
 
 
+async def test_close_finished_loop_keeps_sweeping(monkeypatch):
+    """补记不能只挂在「启动」与「写入」上，还要有一条**常驻巡检**兜底。
+
+    用户第二次说「还是不行」，就是栽在这里：补记逻辑本身是对的（拿他库的副本一启动就
+    正确补上了），但它只在启动那一刻跑——而他跑着的进程启动时还没有这段代码，
+    于是永远等不到。「代码更新了、进程没换」这种事，只能靠常驻巡检兜住。
+
+    这里只验「巡检真的在一轮一轮地跑」：把补记本身换成一个计数器，不碰任何数据。
+    """
+    import asyncio
+    from contextlib import suppress
+
+    from app.store import store
+
+    called: list[str] = []
+
+    async def fake(actor: str = "test") -> list[str]:
+        called.append(actor)
+        return []
+
+    monkeypatch.setattr(store, "close_finished_events", fake)
+    task = asyncio.create_task(store.close_finished_loop(0.01))
+    try:
+        await asyncio.sleep(0.06)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    assert len(called) >= 2, f"补记巡检要一轮一轮地跑（现在只跑了 {len(called)} 次）"
+
+
+def test_close_on_champion_respects_a_manual_reopen(make_config):
+    """手动「恢复进行」过的届，**不许**再被自动结束。
+
+    自动结束只该做一次。管理员点「恢复进行」就是明确要它继续开着——再被关一次，
+    他看到的就是「我恢复了你又给我掐了」，管理界面又一次变回只读。
+    """
+    cfg = make_config(teams=2)
+    cfg.event.status = "active"
+    cfg.event.keep_open = True  # 相当于管理端点过「恢复进行」
+    cfg.rounds[0].stage = "gf"
+    cfg.rounds[0].status = "done"
+    cfg.rounds[0].winner = "A"
+    out = logic.close_on_champion(cfg.dump())
+    assert out["event"]["status"] == "active", "手动恢复过的届不该被自动关掉"
+    assert not out["event"].get("endTime"), "结束时间也不该被顺手补上"
+
+
+async def test_manual_reopen_pins_the_event_against_the_sweep(admin_client):
+    """端到端：打完自动结束 → 点「恢复进行」→ 巡检扫过 → 状态仍是「进行中」。
+
+    这是用户投诉里最狠的一句的回归测试。顺带把「恢复进行要能落库」也钉住：
+    ``keepOpen`` 存在 ``events`` 表的列里（这张表按列读写），漏了列就会「当场有效、
+    重启就没了」——所以这里每次都从库里重读。
+    """
+    from app import db
+    from app.store import store
+
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("恢复进行用例届")
+    mine = store.current_id
+    try:
+        await store.update(
+            {
+                "event": {"status": "active"},
+                "rules": {"format": "league", "totalRounds": 1},
+                "players": [{"id": "p01", "name": "甲"}],
+                "participants": ["p01"],
+                "participantsSet": True,
+                "rounds": [
+                    {
+                        "index": 1,
+                        "code": "L-1",
+                        "stage": "league",
+                        "label": "第 1 局",
+                        "status": "done",
+                        "winner": "A",
+                        "sides": [{"playerIds": ["p01"], "score": 1}, {"playerIds": ["p01"], "score": 2}],
+                    }
+                ],
+            }
+        )
+        # ① 打完 → 自动结束（补记与「写入那一刻」是同一条口径）
+        assert mine in await store.close_finished_events()
+        assert (await store.read_event(mine)).event.status == "closed"
+
+        # ② 管理员点「恢复进行」（界面上就是这个 PATCH）
+        res = await admin_client.patch(f"/api/events/{mine}", json={"status": "active"})
+        assert res.status_code == 200, res.text
+        after = await store.read_event(mine)
+        assert after.event.status == "active", "恢复进行要真的把状态改回进行中"
+        assert after.event.keep_open is True, "恢复进行要顺手钉住（存进库里，重启也在）"
+
+        # ③ 巡检再扫一遍：不许把它关回去
+        assert await store.close_finished_events() == []
+        assert (await store.read_event(mine)).event.status == "active"
+
+        # ④ 手动「标记结束」则解除钉住（下次真打完还会自动结束）
+        res = await admin_client.patch(f"/api/events/{mine}", json={"status": "closed"})
+        assert res.status_code == 200, res.text
+        final = await store.read_event(mine)
+        assert final.event.status == "closed" and final.event.keep_open is False
+    finally:
+        if previous:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
+
+
 def test_closing_is_idempotent_and_the_end_time_is_kept(make_config):
     """已经结束的届原样返回：不重复写结束时间，也不会把管理员填的时间改掉。"""
     cfg = make_config(teams=2)
