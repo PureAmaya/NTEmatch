@@ -388,7 +388,9 @@ async def page_meta(path: str, base_url: str = "") -> dict[str, str]:
                     if item.get("champion"):
                         bits.append(f"榜首 {item['champion']}")
                     title = f"{name} | {site}"
-                    desc = str(item.get("brief") or "").strip() or " · ".join(b for b in bits if b)
+                    # meta 描述是**单行**的：简介可以多行，这里先压平再截
+                    brief = " ".join(str(item.get("brief") or "").split())
+                    desc = brief[:120] or " · ".join(b for b in bits if b)
                     break
         except Exception:
             # 取不到就退回默认文案：首页是必经之路，绝不能让 meta 读失败把整页拖挂
@@ -685,9 +687,9 @@ async def lifespan(app: FastAPI):
     # 赛前提醒：开赛前一天 / 前两小时在群里 @ 举办者（见 app/remind.py）。
     # 只在「聊天机器人推送开着」且举办者登记了 QQ 时才真的发得出去。
     remind_task = asyncio.create_task(remind.loop())
-    # 打完一场就播报一场：录分那一刻发一次**这一场**的结果（见 app/announce.py）。
-    # 结算时就会立刻试一次，这个巡检是兜底（重启 / 上次发失败）。
-    announce_task = asyncio.create_task(announce.loop())
+    # 打完一场就播报一场：**只在录分那一刻**由接口起个任务发这一场（见 app/announce.py）。
+    # 这里**故意不起任何巡检**：一巡检就会扫出「有结果、但没播报标记」的历史场次，
+    # 升级 / 重启 / 打开一次网站就把整届打过的场次重发一遍进群。
     # 真 @ 投递巡检：站点排队、插件取走用 At 组件发（见 app/outbox.py）。
     # 这里只干「排太久没人取 → 退回文本发出」这一件兜底的事。
     outbox_task = asyncio.create_task(outbox.loop())
@@ -750,9 +752,6 @@ async def lifespan(app: FastAPI):
         remind_task.cancel()
         with suppress(asyncio.CancelledError):
             await remind_task
-        announce_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await announce_task
         outbox_task.cancel()
         with suppress(asyncio.CancelledError):
             await outbox_task
@@ -2960,7 +2959,11 @@ async def api_round_walkover(
         if stamp not in existing:
             rnd["note"] = f"{stamp}｜{existing}" if existing else stamp
 
-    cfg = await store.mutate(_round_mutator(ref, apply), actor="web:round-walkover")
+    # 判弃权也可能**直接决定冠军**（总决赛对手弃权就是这种情况）：走同一个收尾器，
+    # 否则这种届会永远停在「进行中」（与录分那条路一致）
+    cfg = await store.mutate(
+        _round_mutator(ref, apply), actor="web:round-walkover", final=logic.close_on_champion
+    )
     settled = _find_round(cfg, ref)
     log.warning(
         "对局 %s 判定弃权 | 方=%s | 原因=%s | winner=%s",
@@ -2969,8 +2972,9 @@ async def api_round_walkover(
         reason,
         settled.winner if settled else "",
     )
-    # 弃权就是给这一场判了结果（两方对阵直接结算），与录分走同一条自动播报
-    asyncio.create_task(announce.after_settle())
+    # 弃权就是给这一场判了结果（两方对阵直接结算），与录分走同一条自动播报：
+    # 只播**这一场**，且只在判弃权的这一刻（见 app/announce.py）
+    asyncio.create_task(announce.after_settle(ref, cfg))
     return {
         "ok": True,
         "revision": cfg.revision,
@@ -3228,8 +3232,8 @@ async def api_round_result(
         payload.duration_minutes,
     )
     # 立刻播报**这一场**的结果（见 app/announce.py）：**起个任务就跑、不等它**——
-    # 发消息要几百毫秒，不该让人录完分还等在那里；出错也只记日志，巡检会再兜一次。
-    asyncio.create_task(announce.after_settle())
+    # 发消息要几百毫秒，不该让人录完分还等在那里；出错只记日志（这场下次录分会再试）。
+    asyncio.create_task(announce.after_settle(ref, cfg))
     return {
         "ok": True,
         "revision": cfg.revision,

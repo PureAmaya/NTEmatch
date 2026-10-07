@@ -6,11 +6,14 @@
 
 三条硬规矩：
 
+* **只由录分触发，绝不补发**：录分 / 判弃权那一刻发**这一场**，没有定时巡检，
+  也不去扫「哪些场次有结果但还没发过」。扫历史是个坑：升级一次（标记键格式变过）、
+  重启一次、打开一次网站，就会把**整届打过的场次**一条条重发进群
+  （用户明确要的是「录完分才发」这一件事，不是「有结果就发」）。
 * **一场只播一次**：标记记在 ``meta``（键 ``announce:<届>:<场次编号>``），重启也不重发；
-  把这一场**重置**之后标记会清掉，改完重新录分能再播一次；
-* **发失败不记标记**：下一轮巡检会重试——宁可晚一点，也不能漏一条；
-* **结算那一刻就发**：录分 / 判弃权之后立刻起个后台任务试一次（**不等它**，别拖慢录分），
-  巡检（60 秒）只是兜底（进程重启、上次发失败、一场分两次录）。
+  把这一场**重置**之后标记会清掉，改完重新录分能再播一次。
+* **发失败当场再试两次就作罢**：不写标记、只记日志——**这场**下次录分（或重置后重录）
+  还会再试。要人工补一条就用「推送到群 → 比赛结果」，不必靠后台补发。
 
 与手工推送的区别：自动播报**不占推送限流额度**（它由录入节奏天然限流：一场一条），
 但同样要在「服务器 → QQ 机器人」里开着推送、且开着「打完后自动播报」。
@@ -29,10 +32,11 @@ from .store import store
 
 log = get_logger("announce")
 
-#: 巡检间隔（秒）。结算那一刻会立刻试一次，这里是**兜底**：进程重启、上次发失败。
-TICK_SECONDS = 60
 #: 去重标记前缀（meta 表里的键：``announce:<届 id>:<场次编号>``）
 MARK_PREFIX = "announce:"
+#: 发失败之后**当场**再试的间隔（秒）。只发生在录分那一刻的这一次调用里，
+#: 不做任何后台补发（见模块说明）；测试里可覆盖成 ``(0, 0)`` 免得白等。
+RETRY_DELAYS: tuple[float, ...] = (2.0, 6.0)
 
 
 def _now() -> str:
@@ -49,17 +53,17 @@ def settled(rnd: Round) -> bool:
     return rnd.status == "done" and bool(rnd.winner)
 
 
-async def due(cfg: Any, event_id: str = "") -> list[Round]:
-    """现在该播报哪几场：已有结果、且还没播报过（按赛程顺序）。"""
-    target = event_id or store.current_id
-    out: list[Round] = []
-    for rnd in cfg.rounds:
-        if not settled(rnd):
-            continue
-        if (await store.meta(mark_of(target, rnd.code or str(rnd.index)))).strip():
-            continue
-        out.append(rnd)
-    return out
+def find_round(cfg: Any, ref: str) -> Round | None:
+    """按对局编号（``code``，如 WB-1-2）或全局序号定位一场比赛。
+
+    与接口定位对局是同一套规则（``app/main.py`` 的 ``_find_round``）。
+    """
+    target = str(ref or "").strip()
+    if not target:
+        return None
+    return next((r for r in cfg.rounds if str(r.code or "") == target), None) or next(
+        (r for r in cfg.rounds if str(r.index) == target), None
+    )
 
 
 async def forget(cfg: Any, ref: str, event_id: str = "") -> bool:
@@ -75,72 +79,65 @@ async def forget(cfg: Any, ref: str, event_id: str = "") -> bool:
     return True
 
 
-async def tick(cfg: Any = None, *, event_id: str = "") -> list[dict[str, Any]]:
-    """巡检一次，返回这次**真的播报出去**的那几场（测试与日志用）。
+async def announce_round(cfg: Any, rnd: Round, *, event_id: str = "") -> dict[str, Any] | None:
+    """把**这一场**的结果发出去；没有结果 / 已经播报过 / 开关没开 → 返回 ``None``。
 
-    一条都没发是常态（没开开关 / 没有刚打完的场 / 已经播报过都不算异常）。
+    ``cfg`` 必须是**已经落库的那一份**（调用方从 ``store.mutate`` 拿到的就是），
+    这样正文里的比分与刚录进去的完全一致。
     """
     settings = store.qqbot_settings()
     if not settings.get("enabled") or not settings.get("autoResultEnabled", True):
-        return []
-    current = cfg if cfg is not None else store.snapshot()
-    pending = await due(current, event_id)
-    if not pending:
-        return []
+        return None
+    if not settled(rnd):
+        return None
     target = event_id or store.current_id
-    sent: list[dict[str, Any]] = []
-    for rnd in pending:
-        # 只这一场：整届结果图不在这里发（见模块说明）
-        view = logic.round_view(current, rnd)
-        text = qqbot.to_plain_text(qqbot.build_match_result_message(current, view))
-        parts = qqbot.split_message(text, int(settings.get("maxChars") or 1200))
+    ref = rnd.code or str(rnd.index)
+    mark = mark_of(target, ref)
+    if (await store.meta(mark)).strip():
+        return None  # 这一场播报过了（改比分不重发；重置之后标记会清掉）
+    # 只这一场：整届结果图不在这里发（见模块说明）
+    view = logic.round_view(cfg, rnd)
+    text = qqbot.to_plain_text(qqbot.build_match_result_message(cfg, view))
+    parts = qqbot.split_message(text, int(settings.get("maxChars") or 1200))
+    result: dict[str, Any] = {"ok": False, "detail": ""}
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        if attempt:
+            await asyncio.sleep(RETRY_DELAYS[attempt - 1])
         result = await qqbot.send_parts(parts, settings=settings)
-        if not result.get("ok"):
-            # 不记标记：下一轮巡检还会再试（机器人恢复后照样播报得上）
-            log.warning(
-                "自动播报失败（稍后重试）| 场=%s | %s",
-                rnd.code or rnd.index,
-                result.get("detail"),
-            )
-            continue
-        await store.set_meta(mark_of(target, rnd.code or str(rnd.index)), _now())
+        if result.get("ok"):
+            break
+    if not result.get("ok"):
+        # 不记标记：这场下次录分还会再试（没有后台巡检来补，见模块说明）
         log.warning(
-            "已自动播报比赛结果 | 届=%s | 场=%s | %s",
-            target,
-            rnd.code or rnd.index,
-            view.get("label") or "",
+            "自动播报失败（这场不记标记，下次录分会再试）| 场=%s | %s",
+            ref,
+            result.get("detail"),
         )
-        sent.append(
-            {
-                "ref": rnd.code or str(rnd.index),
-                "label": view.get("label") or "",
-                "text": text,
-            }
-        )
-    return sent
+        return None
+    await store.set_meta(mark, _now())
+    log.warning(
+        "已自动播报比赛结果 | 届=%s | 场=%s | %s",
+        target,
+        ref,
+        view.get("label") or "",
+    )
+    return {"ref": ref, "label": view.get("label") or "", "text": text}
 
 
-async def after_settle() -> None:
-    """结算之后立刻试播一次（**fire-and-forget**，由录分接口起个任务就跑）。
+async def after_settle(ref: str, cfg: Any = None) -> dict[str, Any] | None:
+    """录分 / 判弃权那一刻的入口：**只发 ``ref`` 这一场**（fire-and-forget）。
 
-    绝不抛异常：它挂在录分请求后面，出错也不能影响录分本身；漏掉的那次由巡检兜。
+    绝不抛异常：它挂在录分请求后面，出错也不能影响录分本身。也**不看别的场次**——
+    哪怕库里还躺着十场有结果、没播报过的历史成绩，这一次也只说刚录的这场。
     """
     try:
-        await tick()
+        current = cfg if cfg is not None else store.snapshot()
+        rnd = find_round(current, ref)
+        if rnd is None:
+            return None
+        return await announce_round(current, rnd)
     except asyncio.CancelledError:
         raise
     except Exception:  # 附加动作出错不该把录分请求带崩
-        log.warning("自动播报出错（已忽略，巡检会重试）", exc_info=True)
-
-
-async def loop() -> None:
-    """常驻巡检：每隔 :data:`TICK_SECONDS` 秒看一眼有没有刚打完、还没播报的场。"""
-    log.info("自动播报已启动 | 每 %d 秒巡检一次", TICK_SECONDS)
-    while True:
-        try:
-            await tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # 巡检不能因为一次异常就停摆（下一轮继续）
-            log.warning("自动播报巡检出错（已忽略，下一轮继续）", exc_info=True)
-        await asyncio.sleep(TICK_SECONDS)
+        log.warning("自动播报出错（已忽略，这场下次录分还会再试）", exc_info=True)
+        return None
