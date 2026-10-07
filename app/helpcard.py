@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import time
 from pathlib import Path
 from typing import Any
 
@@ -376,3 +377,55 @@ def refresh(*, out: Path | None = None, quality: int = 92) -> bool:
         log.info("这台机器上没装 Pillow，跳过帮助图生成（插件会改用文字说明；重装依赖即可）")
         return False
     return bool(write(out=out, quality=quality)["ok"])
+
+
+def stamp_path(out: Path | None = None) -> Path:
+    """指纹文件路径（图**旁边**那一份，见 :func:`write`）。"""
+    target = Path(out) if out else default_path()
+    return target.with_name(target.name + STAMP_SUFFIX)
+
+
+def is_stale(out: Path | None = None) -> bool:
+    """这一份帮助图是不是**比出图代码旧**（或者压根没有）→ 该重画。
+
+    两条判据：图不在 → 该画；指纹对不上 :func:`app.helpcard_content.source_digest`
+    （它把**文案与排版代码**都算进去）→ 该重画。
+    """
+    target = Path(out) if out else default_path()
+    if not target.is_file():
+        return True
+    stamp = stamp_path(target)
+    if not stamp.is_file():
+        return True
+    return stamp.read_text(encoding="utf-8").strip() != source_digest()
+
+
+#: 「上次画失败」的指纹与时刻：画不出来时冷一会儿再试，别让每个请求都重画一遍
+_LAST_FAIL: tuple[str, float] = ("", 0.0)
+
+
+def ensure_fresh(*, out: Path | None = None, cooldown: float = 60.0) -> bool:
+    """图旧了就**当场重画**一份；返回「手上这份能不能用」。**阻塞**，调用方放线程里。
+
+    为什么不能只靠启动时那次重画：运维的常态是**代码更新了、进程没换**。启动那一刻
+    一次性重画的图会一直挂在 ``/help.jpg`` 上，于是「排版修好了、群里看到的还是旧图」，
+    用户只能得出「修了没用」的结论（真踩过）。所以真正的闸门放在**服务端发这张图的
+    时候**，见 ``main.help_image``：旧了就现画，画不动就拿旧的顶着。
+
+    失败**不抛异常**：拿旧图顶着也比 404 / 500 强。同一个指纹连续失败会冷却一分钟，
+    免得每次请求都白画一遍（画一次约半秒）。
+    """
+    global _LAST_FAIL
+    target = Path(out) if out else default_path()
+    if not is_stale(target):
+        return True
+    if not available():
+        return False
+    digest = source_digest()
+    if _LAST_FAIL[0] == digest and time.monotonic() - _LAST_FAIL[1] < cooldown:
+        return False
+    if write(out=target)["ok"]:
+        _LAST_FAIL = ("", 0.0)
+        return True
+    _LAST_FAIL = (digest, time.monotonic())
+    return False

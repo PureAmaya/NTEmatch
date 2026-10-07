@@ -14,6 +14,35 @@ from app.store import store
 
 
 # --------------------------------------------------------------------------- #
+# 帮助图：发之前要自查「这张图是不是比出图代码旧」
+# --------------------------------------------------------------------------- #
+async def test_help_image_is_regenerated_before_serving(client):
+    """``/help.jpg`` 发出去之前，旧图要**当场重画**（不能等重启）。
+
+    踩过的坑：帮助图的排版修好了，可运维的常态是**代码更新了、进程没换**——启动那一刻
+    的重画没发生，``/help.jpg`` 一直挂着旧排版，用户在群里看到的还是压在一起的那张，
+    只会觉得「修了没用」。所以闸门放在**发这张图的时候**。
+    """
+    import pytest
+
+    from app import helpcard
+
+    if not helpcard.available():
+        pytest.skip("没装 Pillow：帮助图本来就不生成（插件退回文字说明）")
+    target = helpcard.default_path()
+    stamp = helpcard.stamp_path(target)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text("0" * 64 + "\n", encoding="utf-8")  # 伪造成「旧图」
+
+    res = await client.get("/help.jpg")
+    assert res.status_code == 200, res.text
+    assert target.exists(), "发过这张图之后本地就该有一份"
+    assert stamp.read_text(encoding="utf-8").strip() == helpcard.source_digest(), (
+        "发图之前应当重画并更新指纹"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 赛程预览接口（「快速创建分组」弹窗的实时预览）
 # --------------------------------------------------------------------------- #
 async def test_tournament_preview_still_works(admin_client):

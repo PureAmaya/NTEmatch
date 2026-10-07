@@ -3573,6 +3573,14 @@ async def help_image() -> Response:
     没放图时回 404 并说清放哪儿，而不是给一张空白图：群友看到的是插件的文字说明兜底，
     站长在日志/调试里能立刻知道是「图还没放」而不是「配置填错了」。
     """
+    # 站点自建的那张（help.jpg）是**服务端生成**的（见 app/helpcard.py）：发之前先看一眼
+    # 它是不是比出图代码旧，旧了就**当场重画**。为什么不只靠启动那一刻：运维的常态是
+    # 「代码更新了、进程没换」——那次重画没发生，/help.jpg 就会一直挂着旧排版，
+    # 用户在群里看到的还是压在一起的那张，只会得出「修了没用」（真踩过）。
+    # 画不动就拿旧图顶着，绝不因此 404 / 500。
+    builtin = STATIC_DIR / HELP_IMAGE_NAMES[0]
+    if builtin.exists() or not any((STATIC_DIR / name).exists() for name in HELP_IMAGE_NAMES):
+        await asyncio.to_thread(helpcard.ensure_fresh, out=builtin)
     for name in HELP_IMAGE_NAMES:
         art = STATIC_DIR / name
         if art.exists():
