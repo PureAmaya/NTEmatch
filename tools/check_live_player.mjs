@@ -14,7 +14,7 @@
  * 5. 浏览器拦住带声音的自动播放时，退回静音起播并提示怎么开声音（而不是黑屏）；
  * 6. HLS 线路同样要认出「画面落在哪个元素上」并按音量偏好起播。
  *
- * 用法：``node tools/check_live_player.mjs``（也可在 CI 里与 check_assets.py 一起跑）。
+ * 用法：``node tools/check_live_player.mjs``（提交前与 check_assets.py 一起跑）。
  */
 
 import { installBrowserStub } from './_browser_stub.mjs';

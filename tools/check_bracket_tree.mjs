@@ -13,7 +13,7 @@
  * 3. 队伍人多时头像**不换行**（框只有 184px 宽），名字一个不少地进悬停提示；
  * 4. 还没决出冠军时：框里没有头像、高度回到一个对阵框。
  *
- * 用法：``node tools/check_bracket_tree.mjs``（与 check_live_player.mjs 一样进 CI）。
+ * 用法：``node tools/check_bracket_tree.mjs``（与 check_live_player.mjs 一样，提交前跑一遍）。
  */
 
 import { installBrowserStub } from './_browser_stub.mjs';

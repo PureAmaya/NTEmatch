@@ -1,7 +1,7 @@
 """接口层冒烟：分享卡片标签、默认分享图、操作日志的权限与过滤。
 
 用 ``httpx.ASGITransport`` 直接跑 ASGI 应用（不启端口），所以它足够快，
-可以在 CI 里当门禁用。
+提交前跑一遍就能当门禁用。
 """
 
 from __future__ import annotations
