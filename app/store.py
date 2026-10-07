@@ -336,6 +336,9 @@ class ConfigStore:
             # 顺便刷新 events 表缓存的选手数（往届列表会读它）
             self._demo_purged = False
             await self.mutate(lambda data: data, actor="purge-demo-roster", resolve=False)
+        # 补记「其实已经打完」的届（升级上来的老数据 / 在自动结束生效之前打完的届）：
+        # 不然届状态会一直停在进行中，而页面上又写着「已结束 · 赛程 10/10 场」
+        await self.close_finished_events()
         self._running = True
 
         cfg = self._config
@@ -1529,6 +1532,41 @@ class ConfigStore:
         # **不广播**：广播用的状态取自当前届（``main.build_public_state``），把别的届推给
         # 正在看当前届的人只会错位——``update_event_meta`` 对非当前届也是这个取舍。
         return fresh
+
+    async def close_finished_events(self, actor: str = "startup:close-finished") -> list[str]:
+        """把「其实已经打完、状态却还停在进行中」的届补记成「已结束」。
+
+        为什么需要这一步：自动结束挂在**写入**上（见 :func:`app.logic.close_on_champion`），
+        只在「最后一笔结果落库的那一刻」生效。于是两种情况会漏：
+
+        * 在补上这条规则**之前**就打完了的届（用户报的就是这个：页面上「已结束 ·
+          赛程 10/10 场」，而届状态下拉里还写着「进行中」，自相矛盾）；
+        * 升级上来的老数据（最后一笔结果早写完了）。
+
+        启动时跑一次即可，**幂等**：只碰「非已结束且赛程确实打完」的届。
+
+        个别情况下管理员手动「恢复进行」想把这一届留着，再重启时又会被补回「已结束」
+        ——这与「录一笔新结果也会自动关上」是同一条口径（赛程确实打完了）。
+        真要留着进行状态，动一下赛程或名单即可（那样它就不算「打完」了）。
+        """
+        from . import logic  # 局部导入，避免模块级循环依赖
+
+        closed: list[str] = []
+        for entry in await self.list_events():
+            event_id = str(entry.get("id") or "")
+            if not event_id or str(entry.get("status") or "") == "closed":
+                continue
+            try:
+                cfg = await self.read_event(event_id)
+            except (FileNotFoundError, ValueError):
+                continue
+            if not logic.season_finished(cfg):
+                continue
+            await self.mutate_event(event_id, logic.close_on_champion, actor=actor)
+            closed.append(event_id)
+        if closed:
+            log.warning("已补记「已结束」的届 | %s", ", ".join(closed))
+        return closed
 
     # ------------------------------------------------------------------ #
     # 本届参与名单 / 组队 / 赛程

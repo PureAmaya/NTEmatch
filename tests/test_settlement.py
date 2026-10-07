@@ -49,6 +49,54 @@ def test_league_closes_only_after_every_round_is_played(make_config):
     assert logic.close_on_champion(cfg.dump())["event"]["status"] == "active"
 
 
+async def test_startup_sweep_closes_events_that_were_already_finished():
+    """启动时补记：**在自动结束生效之前就打完了**的届，重启一次就该是「已结束」。
+
+    用户报的正是这个：页面上写着「已结束 · 赛程 10/10 场」，而届状态下拉里还是
+    「进行中」——自动结束挂在「最后一笔结果落库那一刻」，早打完的老数据永远等不到。
+    """
+    from app import db
+    from app.store import store
+
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("补记用例届")
+    mine = store.current_id
+    try:
+        await store.update(
+            {
+                "event": {"status": "active"},
+                "rules": {"format": "league", "totalRounds": 1},
+                "players": [{"id": "p01", "name": "甲"}],
+                "participants": ["p01"],
+                "participantsSet": True,
+                "rounds": [
+                    {
+                        "index": 1,
+                        "code": "L-1",
+                        "stage": "league",
+                        "label": "第 1 局",
+                        "status": "done",
+                        "winner": "A",
+                        "sides": [{"playerIds": ["p01"], "score": 1}, {"playerIds": ["p01"], "score": 2}],
+                    }
+                ],
+            }
+        )
+        assert (await store.read_event(mine)).event.status == "active", "模拟「早打完的老数据」"
+
+        assert mine in await store.close_finished_events()
+        after = await store.read_event(mine)
+        assert after.event.status == "closed" and after.event.end_time
+        assert mine not in await store.close_finished_events(), "已经结束了就不再动它（幂等）"
+    finally:
+        if previous:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
+
+
 def test_closing_is_idempotent_and_the_end_time_is_kept(make_config):
     """已经结束的届原样返回：不重复写结束时间，也不会把管理员填的时间改掉。"""
     cfg = make_config(teams=2)
