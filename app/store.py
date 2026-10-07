@@ -163,6 +163,96 @@ def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()  # noqa: DTZ005
 
 
+#: 报名 / 取消报名的闸门：只有**筹备中**的届能自助改名单。
+#: 文案在 :func:`signup_blocked` 里现算（要说清卡在哪一条，而不是统一回一句「不允许」）。
+SIGNUP_EVENT_STATUS = "draft"
+_EVENT_STATUS_CN = {"draft": "筹备中", "active": "进行中", "closed": "已结束"}
+
+
+def signup_blocked(cfg: Config) -> str:
+    """报名 / 取消报名现在能不能做；返回**不能做的原因**（空串 = 可以做）。
+
+    两条闸门，理由各不一样，所以文案要分开：
+
+    * **只有筹备中的届**：开赛之后名单就该冻住（谁上场、谁替补已经定了），
+      赛后更不用说了——报名 / 取消报名都是「赛前那件事」；
+    * **已经组队或生成过赛程的届也不行**：名单一改，队伍与对阵里引用的选手就对不上，
+      这种改动得让管理员在网站上看着办（先清空组队 / 赛程，再改名单）。
+    """
+    if cfg.event.status != SIGNUP_EVENT_STATUS:
+        state = _EVENT_STATUS_CN.get(cfg.event.status, cfg.event.status)
+        # 文案会原样发到群里（插件直接回显），所以**不写 Markdown 记号**
+        return (
+            f"这一届现在是「{state}」：报名只对「筹备中」的比赛开放"
+            f"（管理员在网站上把状态改回「筹备中」才能继续报名）。"
+        )
+    if cfg.teams or cfg.rounds:
+        return "这一届已经组队 / 生成赛程了：名单不能再自助改，请联系管理员在网站上处理。"
+    return ""
+
+
+def _ensure_player(data: dict[str, Any], member: Member) -> tuple[str, bool]:
+    """让这一届里有这个成员的选手档案；返回 ``(选手 id, 是否新建)``。
+
+    报名（:meth:`ConfigStore.sign_up`）与「从成员列表勾人」（:meth:`ConfigStore.adopt_members`）
+    **共用这一份**：id 怎么分配（``pNN``）、同步哪几个字段（姓名 / QQ / 头像 / 游戏 UUID），
+    两处各写一遍迟早会漂移——用户看到的就成了「同样一个人，报名进来的和勾进来的不一样」。
+    """
+    players = data.setdefault("players", [])
+    for row in players:
+        if str(row.get("memberUid") or "") != member.uid:
+            continue
+        patch: dict[str, Any] = {}
+        if member.name and row.get("name") != member.name:
+            patch["name"] = member.name
+        if row.get("qq") != member.qq:
+            patch["qq"] = member.qq
+        if member.avatar and row.get("avatar") != member.avatar:
+            patch["avatar"] = member.avatar
+        if member.game_uuid and row.get("uuid") != member.game_uuid:
+            patch["uuid"] = member.game_uuid
+        if patch:  # 只补有变化的，免得白改一遍 revision
+            row.update(patch)
+        return str(row.get("id") or ""), False
+    used = {str(p.get("id") or "") for p in players}
+    seq = 1
+    while f"p{seq:02d}" in used:
+        seq += 1
+    pid = f"p{seq:02d}"
+    players.append(
+        {
+            "id": pid,
+            "name": member.name,
+            "uuid": member.game_uuid or "",
+            "qq": member.qq,
+            "avatar": member.avatar or "",
+            "memberUid": member.uid,
+        }
+    )
+    return pid, True
+
+
+def _roster_ids(cfg: Config) -> list[str]:
+    """这一届**实际会在场上的人**（显式名单为空时 = 全员参与）。"""
+    from .logic import joined_players  # 局部导入，避免模块级循环依赖
+
+    return [p.id for p in joined_players(cfg)]
+
+
+def _write_roster(data: dict[str, Any], chosen: list[str]) -> dict[str, Any]:
+    """把 ``chosen`` 写成显式参赛名单（``participantsSet=True``）。
+
+    「未显式定过名单 = 全员参与」这个语义在自助报名里很危险：第一个人报名时若从空名单
+    起算，原来「全员参与」的人会被集体挤出名单。所以报名 / 取消报名这两条路径都先落到
+    **当前实际参与的人**上，再增删一个人。
+    """
+    from .logic import normalize_participants  # 局部导入，避免模块级循环依赖
+
+    merged = {**data, "participants": [], "participantsSet": True}
+    merged["participants"] = normalize_participants(Config.model_validate(merged), chosen)
+    return merged
+
+
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     """递归合并：字典逐层合并，列表与标量整体替换。"""
     result = dict(base)
@@ -1411,6 +1501,35 @@ class ConfigStore:
         await self._notify(cfg, f"update:{actor}")
         return cfg
 
+    async def mutate_event(
+        self, event_id: str, mutator: Mutator, actor: str = "api", *, resolve: bool = False
+    ) -> Config:
+        """在**指定届**上做一次事务式修改（不必是当前届，也不会挪走「当前届」指针）。
+
+        群里的报名 / 取消报名按命令里写的届次写入（`比赛报名 e003`），与「谁最近打开过
+        就是当前届」那个指针无关：走 :meth:`switch_event` 会把所有人的视图一起切走，
+        副作用太大，不能用在「给某一届报个名」上。当前届则直接复用 :meth:`mutate`。
+        """
+        self._check_id(event_id)
+        if event_id == self._current:
+            return await self.mutate(mutator, actor=actor, resolve=resolve)
+        async with self._lock:
+            cfg = await asyncio.to_thread(self._load_sync, event_id)
+            data = cfg.dump()
+            updated = mutator(data)
+            if resolve:
+                updated = self._resolve(updated)
+            updated["revision"] = int(data.get("revision", 0)) + 1
+            updated["updatedAt"] = now_iso()
+            fresh = Config.model_validate(updated)
+            await asyncio.to_thread(self._save_sync, event_id, fresh, False)
+        log.warning(
+            "届次已更新（非当前届）| 届=%s | actor=%s | revision=%d", event_id, actor, fresh.revision
+        )
+        # **不广播**：广播用的状态取自当前届（``main.build_public_state``），把别的届推给
+        # 正在看当前届的人只会错位——``update_event_meta`` 对非当前届也是这个取舍。
+        return fresh
+
     # ------------------------------------------------------------------ #
     # 本届参与名单 / 组队 / 赛程
     # ------------------------------------------------------------------ #
@@ -1461,7 +1580,7 @@ class ConfigStore:
 
         返回 ``(配置, 新建的选手 ID, 提示)``。
         """
-        from .logic import joined_players, normalize_participants  # 局部导入，避免模块级循环
+        from .logic import joined_players  # 局部导入，避免模块级循环
 
         by_uid = {m.uid: m for m in self._members}
         warnings: list[str] = []
@@ -1470,52 +1589,17 @@ class ConfigStore:
         def _mutate(data: dict[str, Any]) -> dict[str, Any]:
             cfg = Config.model_validate(data)
             before = {p.id for p in joined_players(cfg)}
-            players = data.setdefault("players", [])
-            index = {str(p.get("memberUid") or ""): p for p in players if p.get("memberUid")}
-            used = {str(p.get("id") or "") for p in players}
             chosen = [pid for pid in player_ids if pid]
             for uid in dict.fromkeys(member_uids):
                 member = by_uid.get(uid)
                 if member is None:
                     continue
-                hit = index.get(uid)
-                if hit is None:
-                    seq = 1
-                    while f"p{seq:02d}" in used:
-                        seq += 1
-                    pid = f"p{seq:02d}"
-                    used.add(pid)
-                    players.append(
-                        {
-                            "id": pid,
-                            "name": member.name,
-                            "uuid": member.game_uuid or "",
-                            "qq": member.qq,
-                            "avatar": member.avatar or "",
-                            "memberUid": uid,
-                        }
-                    )
+                pid, is_new = _ensure_player(data, member)
+                if is_new:
                     created.append(pid)
-                    chosen.append(pid)
-                    continue
-                chosen.append(str(hit.get("id") or ""))
-                patch: dict[str, Any] = {}
-                if member.name and hit.get("name") != member.name:
-                    patch["name"] = member.name
-                if hit.get("qq") != member.qq:
-                    patch["qq"] = member.qq
-                if member.avatar and hit.get("avatar") != member.avatar:
-                    patch["avatar"] = member.avatar
-                if member.game_uuid and hit.get("uuid") != member.game_uuid:
-                    patch["uuid"] = member.game_uuid
-                if patch:  # 只补有变化的，免得白改一遍 revision
-                    hit.update(patch)
+                chosen.append(pid)
             # 名单要按**新建之后的**报名池校验与排序（拿旧 cfg 会把刚建的人当不存在丢掉）
-            merged = {**data, "participants": [], "participantsSet": True}
-            merged["participants"] = normalize_participants(
-                Config.model_validate(merged), chosen
-            )
-            return _follow_roster_change(cfg, merged, before, warnings)
+            return _follow_roster_change(cfg, _write_roster(data, chosen), before, warnings)
 
         cfg = await self.mutate(_mutate, actor=actor, resolve=False)
         log.warning(
@@ -1527,6 +1611,116 @@ class ConfigStore:
             len(cfg.players),
         )
         return cfg, created, warnings
+
+    async def sign_up(self, event_id: str, member: Member, *, actor: str = "bot:signup") -> dict[str, Any]:
+        """把成员加进**指定届**的参赛名单（机器人自助报名 / 网站报名共用这一份）。
+
+        **只定「谁来打」**：不动成员档案、不组队、不生成赛程——组队与赛制留给管理员
+        在网站上做（报名期本来就只该定名单，见 :func:`signup_blocked` 的两条闸门）。
+
+        返回 ``{"cfg", "playerId", "already", "created", "warnings"}``：
+        ``already=True`` 表示他本来就在名单里（这一次一个字都没写，revision 也不动）。
+        """
+        from .logic import joined_players  # 局部导入，避免模块级循环
+
+        self._check_id(event_id)
+        before_cfg = await self.read_event(event_id)
+        blocked = signup_blocked(before_cfg)
+        if blocked:
+            raise ValueError(blocked)
+        hit = next((p for p in before_cfg.players if p.member_uid == member.uid), None)
+        if hit is not None and hit.id in _roster_ids(before_cfg):
+            return {
+                "cfg": before_cfg,
+                "playerId": hit.id,
+                "already": True,
+                "created": False,
+                "warnings": [],
+            }
+
+        warnings: list[str] = []
+        made: dict[str, Any] = {"playerId": "", "created": False}
+
+        def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+            cfg = Config.model_validate(data)
+            before = {p.id for p in joined_players(cfg)}
+            pid, is_new = _ensure_player(data, member)
+            made["playerId"], made["created"] = pid, is_new
+            # 从未显式定过名单 = 「全员参与」：先把现有的人落成显式名单，再加报名的人
+            # （否则第一个人报名会把原来的全员挤出名单——见 _write_roster）
+            roster = [p.id for p in joined_players(cfg)]
+            return _follow_roster_change(cfg, _write_roster(data, [*roster, pid]), before, warnings)
+
+        cfg = await self.mutate_event(event_id, _mutate, actor=actor)
+        log.warning(
+            "已报名 | 届=%s | 成员=%s | 选手=%s | 新建档案=%s | 参与=%d/%d 人",
+            event_id,
+            member.uid,
+            made["playerId"],
+            made["created"],
+            len(cfg.participants),
+            len(cfg.players),
+        )
+        return {
+            "cfg": cfg,
+            "playerId": made["playerId"],
+            "already": False,
+            "created": made["created"],
+            "warnings": warnings,
+        }
+
+    async def cancel_signup(
+        self, event_id: str, member: Member, *, actor: str = "bot:cancel-signup"
+    ) -> dict[str, Any]:
+        """把成员从**指定届**的参赛名单里去掉（机器人取消报名）。
+
+        **只取消这一届的参赛资格**：成员档案留着，本届的选手档案也留着（名字 / 头像 /
+        游戏 UUID 这些资料不是报名的一部分），队伍与赛程一个字都不动。
+
+        返回与 :meth:`sign_up` 同构；``already=True`` 表示他本来就不在名单里。
+        """
+        from .logic import joined_players  # 局部导入，避免模块级循环
+
+        self._check_id(event_id)
+        before_cfg = await self.read_event(event_id)
+        blocked = signup_blocked(before_cfg)
+        if blocked:
+            raise ValueError(blocked)
+        hit = next((p for p in before_cfg.players if p.member_uid == member.uid), None)
+        roster = _roster_ids(before_cfg)
+        if hit is None or hit.id not in roster:
+            return {
+                "cfg": before_cfg,
+                "playerId": hit.id if hit else "",
+                "already": True,
+                "created": False,
+                "warnings": [],
+            }
+
+        warnings: list[str] = []
+
+        def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+            cfg = Config.model_validate(data)
+            before = {p.id for p in joined_players(cfg)}
+            keep = [pid for pid in _roster_ids(cfg) if pid != hit.id]
+            return _follow_roster_change(cfg, _write_roster(data, keep), before, warnings)
+
+        cfg = await self.mutate_event(event_id, _mutate, actor=actor)
+        log.warning(
+            "已取消报名 | 届=%s | 成员=%s | 选手=%s | 参与=%d/%d 人",
+            event_id,
+            member.uid,
+            hit.id,
+            len(cfg.participants),
+            len(cfg.players),
+        )
+        return {
+            "cfg": cfg,
+            "playerId": hit.id,
+            "already": False,
+            "created": False,
+            "warnings": warnings,
+        }
 
     async def form_teams(
         self,

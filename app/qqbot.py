@@ -82,9 +82,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # 不会把「明天开赛」这条补发成「还有 3 小时开赛」。
     "remindLeads": "1440,120",
     # ---- 打完后自动播报（见 app/announce.py）----
-    # 开关：每打完一轮自动往群里发一次「比赛结果」（能画图就带结果图）。
-    # 同样需要「已启用推送」；一轮只播一次（标记记在 meta），发失败自动重试。
+    # 开关：**录完一场的比分**就在群里发一条**这一场**的比赛结果。
+    # 只在录分 / 判弃权那一刻发——**没有任何后台巡检，也不补发历史**（补发会把整届
+    # 打过的场次重刷一遍进群）；一场只播一次（标记记在 meta），发失败当场再试两次就作罢。
     "autoResultEnabled": True,
+    # ---- 自助报名白名单（见 app/bot_api.py 的 POST /api/bot/signup）----
+    # 逗号分隔的**群号**（也接受完整 UMO）：这些群里的人发「比赛报名」时，**即使还不是
+    # 成员也能报上**——站点会顺手把他加成成员（只看这一类人，成员照旧走正常路径）。
+    # 留空 = 只有已经是成员的人能自助报名（出厂值，最保险）。
+    "signupGroups": "",
 }
 SETTINGS_KEYS = tuple(DEFAULT_SETTINGS)
 # 这些键不接受前端回填（避免把「已配置」的 Key 用空串覆盖掉）
@@ -197,6 +203,13 @@ def normalize_settings(patch: dict[str, Any], current: dict[str, Any]) -> dict[s
             clean[key] = ",".join(str(x) for x in sorted(parsed, reverse=True)) or str(
                 DEFAULT_SETTINGS[key]
             )
+        elif key == "signupGroups":
+            # 群号（或完整 UMO）清单：只留拼得出会话标识的字符，去重后按逗号存。
+            # 写错的值（比如直接填群名）宁可被剔掉——白名单里躺着一个永远匹配不上的值，
+            # 表现是「明明配了却不生效」，比少一行更难查。
+            raw = re.sub(r"[^0-9A-Za-z:_\-,，；;、\s]", "", str(value or "")).replace("，", ",")
+            rows = [part.strip() for part in re.split(r"[,;、\s]+", raw) if part.strip()]
+            clean[key] = ",".join(dict.fromkeys(rows))
         elif key == "maxChars":
             # 下限与 split_message 的硬下限一致（200），否则「每页几届」和
             # 「单条切多长」两处口径会打架，算出来的页反而塞不进一条消息
@@ -239,6 +252,27 @@ def resolved_umo(settings: dict[str, Any]) -> str:
         platform = str(settings.get("platform") or "aiocqhttp").strip() or "aiocqhttp"
         return f"{platform}:GroupMessage:{raw}"
     return raw
+
+
+def signup_group_allowed(settings: dict[str, Any], group: str) -> bool:
+    """这个群是不是**报名白名单**里的群（白名单群里的非成员也能自助报名）。
+
+    比对取**会话标识的最后一段**：管理员可能填群号（``123456789``），插件上报的也可能是
+    完整 UMO（``aiocqhttp:GroupMessage:123456789``）——两边写法不同也得算同一个群，
+    否则「配了不生效」会非常难查（这类问题只能靠日志一点点试）。
+
+    私聊（没有群号）永远不算白名单群：白名单是「哪个群放宽」，不是「谁放宽」。
+    """
+    raw = str(group or "").strip()
+    if not raw:
+        return False
+    wanted = {part.strip() for part in str(settings.get("signupGroups") or "").split(",")}
+    wanted.discard("")
+    if not wanted:
+        return False
+    return raw in wanted or raw.split(":")[-1].strip() in {
+        item.split(":")[-1].strip() for item in wanted
+    }
 
 
 def merge_settings(stored: dict[str, Any] | None) -> dict[str, Any]:
@@ -876,8 +910,11 @@ def build_event_message(cfg: Config, state: dict[str, Any]) -> str:
     extra = [x for x in (evt.venue, evt.organizer) if x]
     if extra:
         lines.append("场地/主办：" + " · ".join(extra))
-    if evt.brief:
-        lines.append(f"简介：{evt.brief}")
+    # 简介支持多行：第一行带「简介：」，后面的行缩进对齐（不然看着像另外一条信息）
+    brief_lines = [ln.strip() for ln in str(evt.brief or "").split("\n") if ln.strip()]
+    if brief_lines:
+        lines.append(f"简介：{brief_lines[0]}")
+        lines.extend(f"　　{ln}" for ln in brief_lines[1:])
     if cfg.event.status == "closed":
         lines.append("状态：已结束")
     # 比赛规则（摘要）：随赛制自动生成，见 rules_digest
@@ -1333,7 +1370,9 @@ def build_events_message(
             bits.append(f"榜首 {item['champion']}")
         line = f"{head} · " + " · ".join(b for b in bits if b)
         if item.get("brief"):
-            line += f"\n    {item['brief']}"
+            # 简介可以多行：每一行都缩进对齐（列表里不能有的行缩、有的行不缩）
+            for part in [ln.strip() for ln in str(item["brief"]).split("\n") if ln.strip()]:
+                line += f"\n    {part}"
         lines.append(line)
     if pages > 1:
         # 这里必须给**真实存在**的写法：以前写「发送「下一页」」，但「下一页」既不是

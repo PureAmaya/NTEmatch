@@ -15,6 +15,7 @@
 | `GET /api/bot/query` | 直接拿到**可以原样发到群里**的纯文本（分段已切好） |
 | `GET /api/bot/whoami` | 按 QQ 认人：这个人在站内是什么身份、有没有权限 |
 | `POST /api/bot/members` | 群里授权 / 添加成员（**仅服务器管理员**；新建成员时**站点直接把密钥私聊给本人**） |
+| `POST /api/bot/signup` | 群里**自助报名 / 取消报名**：成为某一届的参赛选手（只对**筹备中**的届开放；只改名单，不组队不定赛制；白名单群里的非成员会被自动建成成员） |
 | `GET /api/bot/my-links` | 本人的推流地址 + **站内**直播间地址 |
 | `POST /api/bot/credential` | 凭据重置：重置登录密钥 / 重置直播令牌 / 改推流码（默认改自己；服务器管理员可代改，**新值只私聊给被改的那个人**） |
 | `POST /api/bot/stream-setup` | **比赛直播注册**：缺什么补什么（没推流码就给一个、没令牌就发一把），结果只私聊给本人 |
@@ -25,9 +26,9 @@
 | `GET /api/bot/outbox` | **取走待发的群消息**（真 @ 只能由插件发：站点排队、插件用 `At` 组件发，见 `app/outbox.py`） |
 | `POST /api/bot/outbox/ack` | 投递回执（发成功收尾；发失败站点立刻退回文本写法重发） |
 
-前面几个 ``GET`` 是只读查询；``POST /members``、``POST /credential`` 与 ``POST /notify`` 会
-**写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，不是用户手输），权限判定在站点这一侧；
-密钥只走私聊、不授予 ``server_admin``。
+前面几个 ``GET`` 是只读查询；``POST /members``、``POST /credential``、``POST /signup`` 与
+``POST /notify`` 会**写库或发消息**：认人一律靠插件上报的 QQ（取自平台事件，不是用户手输），
+权限判定在站点这一侧；密钥只走私聊、不授予 ``server_admin``。
 
 **凭据永远不由接口回话**：轮换出来的密钥 / 令牌只在**站点发出的那条私聊**里出现，
 响应体里只有「发了没发出去」——插件拿不到明文，也就打不进群里。
@@ -56,7 +57,7 @@ from .auth import verify_secret
 from .logging_conf import get_logger
 from .members import ensure_stream_unique
 from .models import Member, NTEModel
-from .store import store
+from .store import signup_blocked, store
 
 log = get_logger("botapi")
 
@@ -77,6 +78,24 @@ class BotGrantPayload(NTEModel):
     target_qq: str = ""
     name: str = ""
     permission: str = "member"
+
+
+class BotSignupPayload(NTEModel):
+    """群里自助报名 / 取消报名（群命令「比赛报名」「比赛取消报名」）。
+
+    * ``qq``     —— 发命令那个人的 QQ（插件取自平台事件，不是用户手输的）；
+    * ``action`` —— ``join`` 报名 / ``cancel`` 取消报名；
+    * ``event``  —— 届次编号（插件已经把「e001 / 1 / 第2届 / 名称片段」解析成编号）；
+    * ``group``  —— 这次会话的群号（私聊为空）：**报名白名单**按它判定，
+      白名单群里的非成员也能报上（顺手建成成员）；
+    * ``name``   —— 群昵称，只在自动建成员时用。
+    """
+
+    qq: str = ""
+    action: str = "join"
+    event: str = ""
+    group: str = ""
+    name: str = ""
 
 
 class BotNotifyPayload(NTEModel):
@@ -385,6 +404,24 @@ async def api_bot_manifest(
                 "args": "@某人",
                 "alias": ["添加成员", "添加群友", "比赛添加成员", "设为成员"],
                 "note": "同上，权限为普通成员",
+            },
+            {
+                "command": "比赛报名",
+                "kind": "—",
+                "args": "届次（必填）",
+                "alias": ["我要报名", "报名", "比赛我要报名"],
+                "note": (
+                    "用 POST /api/bot/signup：把自己加进这一届的参赛名单（只对筹备中的届开放；"
+                    "只改名单，不组队不定赛制）。白名单群里的非成员也能报上——站点顺手建成员，"
+                    "登录密钥私聊给本人"
+                ),
+            },
+            {
+                "command": "比赛取消报名",
+                "kind": "—",
+                "args": "届次（必填）",
+                "alias": ["取消报名", "退赛", "我不打了"],
+                "note": "同一条接口的 action=cancel：只取消这一届的参赛资格，成员与选手档案都留着",
             },
             {
                 "command": "比赛帮助",
@@ -788,6 +825,145 @@ async def api_bot_member_grant(
         "keySent": bool(sent.get("ok")),
         "detail": sent.get("detail") or "",
         "note": "已新建成员；登录密钥只私聊给了 TA 本人",
+    }
+
+
+@router.post("/signup")
+async def api_bot_signup(
+    request: Request,
+    payload: BotSignupPayload,
+    settings: dict[str, Any] = Depends(require_bot_token),  # noqa: B008
+) -> dict[str, Any]:
+    """群里「比赛报名 / 比赛取消报名」：把自己加进某一届的参赛名单。
+
+    三条口径（都写进返回的人话里，插件原样发群即可）：
+
+    * **只对筹备中的届开放**（见 :func:`store.signup_blocked`）：开赛之后名单该冻住，
+      赛后更不该动——报名 / 取消报名都是「赛前那件事」；
+    * **只动参赛名单**：不组队、不定赛制，也不建赛程——那些等报名结束由管理员在网站上做
+      （报名期只该定「谁来打」）；
+    * **白名单群里连成员都不是也能报**：站点顺手建成员，并把登录密钥**私聊**给本人；
+      不在白名单群的陌生人会被挡（已经是成员的人照旧能报名，私聊也能）。
+
+    **取消报名只取消这一届的参赛资格**：成员档案与本届选手档案都留着（资料 / 头像 /
+    游戏 UUID 不是报名的一部分），队伍与赛程一个字都不动。
+    """
+    action = (payload.action or "join").strip().lower()
+    if action not in ("join", "cancel"):
+        raise HTTPException(status_code=400, detail="action 只能是 join（报名）或 cancel（取消报名）")
+    qq = _clean_qq(payload.qq)
+    if not qq:
+        raise HTTPException(status_code=400, detail="没识别到你的 QQ：请 @ 机器人之后再发命令")
+    event_id = (payload.event or "").strip()
+    if not event_id:
+        raise HTTPException(
+            status_code=400,
+            detail="要写明是「哪一届」：命令后面带上届的名称或编号（发「比赛届次」看全部届）。",
+        )
+    try:
+        cfg = await store.read_event(event_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=f"没有这一届：{event_id}") from exc
+    # 闸门先判一次：既是为了一句准确的人话，也是**避免白建成员**（下面会顺手建号）
+    blocked = signup_blocked(cfg)
+    if blocked:
+        raise HTTPException(status_code=400, detail=blocked)
+
+    member = store.member_by_qq(qq)
+    created_member = False
+    key_plain = ""
+    if member is None:
+        if not qqbot.signup_group_allowed(settings, payload.group):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "你还没有站内成员身份，自助报名只对成员开放。\n"
+                    "让管理员在网站上把你加成成员（群里由服务器管理员发「比赛添加 @你」），"
+                    "或让管理员把这个群加进「报名白名单」——白名单群里谁都能报名。"
+                ),
+            )
+        name = (payload.name or "").strip()[:24] or f"群友 {qq}"
+        member, key_plain, _bearer = await store.save_member(
+            Member(uid="", name=name, qq=qq, permission="member")
+        )
+        created_member = True
+        log.warning(
+            "自助报名顺带建成员 | qq=%s | 群=%s | uid=%s", qq, payload.group or "(私聊)", member.uid
+        )
+    elif not member.active:
+        raise HTTPException(status_code=403, detail="你的成员身份是「停用」状态：请联系管理员恢复")
+
+    try:
+        if action == "join":
+            result = await store.sign_up(event_id, member, actor=f"bot:signup:{qq}")
+        else:
+            result = await store.cancel_signup(event_id, member, actor=f"bot:cancel:{qq}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    after = result["cfg"]
+    event_name = after.event.name or after.event.title or event_id
+    joined = len(logic.joined_players(after))
+    player = next((p for p in after.players if p.id == result["playerId"]), None)
+    who = f"{player.display_name}（{result['playerId']}）" if player is not None else "你"
+
+    if action == "join":
+        if result["already"]:
+            text = (
+                f"你已经在「{event_name}」的报名名单里了（选手：{who}）。\n"
+                f"要退出就发「比赛取消报名 {event_name}」。"
+            )
+        else:
+            text = (
+                f"已报名：{event_name}（{event_id}）\n"
+                f"选手：{who}\n"
+                f"本届已报名 {joined} 人。\n"
+                f"退出：发「比赛取消报名 {event_name}」。组队与赛程等报名结束后由管理员安排。"
+            )
+    elif result["already"]:
+        text = f"你本来就不在「{event_name}」的报名名单里，无需取消。"
+    else:
+        text = (
+            f"已取消报名：{event_name}（{event_id}）\n"
+            f"本届还剩 {joined} 人。\n"
+            f"（成员身份与资料都还在；想回来就再发一次「比赛报名 {event_name}」）"
+        )
+
+    # 白名单群里顺手建号的成员：登录密钥只私聊给本人（群里一个字都不提），
+    # 与「比赛添加」同一条路——**接口不回明文**，插件也就没有把它打进群里的机会。
+    key_sent = False
+    if created_member and key_plain:
+        site = _site_base(request)
+        sent = await _send_private(
+            settings,
+            qq,
+            f"【NTE 比赛】你好 {member.display_name}，你刚用「比赛报名」报了「{event_name}」，"
+            f"顺便给你建好了站内成员身份。\n"
+            f"登录密钥（只显示这一次，请立即保存）：{key_plain}\n\n"
+            f"用法：打开 {site} 用这把密钥登录（{site}/user 改自己的资料）。\n"
+            + _secret_notice("key", site),
+        )
+        key_sent = bool(sent.get("ok"))
+        text += (
+            "\n（已顺手把你加为站内成员，登录密钥私聊发你了）"
+            if key_sent
+            else "\n（已顺手把你加为站内成员，但密钥没私聊发出去："
+            "加机器人好友后发「比赛重置密钥」可再取一把）"
+        )
+
+    return {
+        "ok": True,
+        "action": action,
+        "eventId": event_id,
+        "eventName": event_name,
+        "playerId": result["playerId"],
+        "already": result["already"],
+        "createdMember": created_member,
+        "keySent": key_sent,
+        "participants": joined,
+        "warnings": result["warnings"],
+        "parts": [text],
+        "text": text,
     }
 
 

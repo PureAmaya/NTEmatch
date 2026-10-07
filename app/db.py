@@ -405,6 +405,10 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
         # 比赛类型与排名开关（见 models.EventInfo.sport / ranked）
         "sport": "TEXT NOT NULL DEFAULT 'volleyball'",
         "ranked": "INTEGER NOT NULL DEFAULT 1",
+        # 「参与名单是显式指定过的」（见 models.Config.participants_set）：
+        # 以前这一位只活在内存里，重启后「全不选后保存」的空名单会变回「全员参与」，
+        # 自助报名取消到最后一个人时也一样——名单空了就等于没取消。
+        "participants_set": "INTEGER NOT NULL DEFAULT 0",
     },
     "event_rules": {
       "format": "TEXT NOT NULL DEFAULT 'tournament'",
@@ -816,8 +820,9 @@ def save_event(
         INSERT INTO events (
             id, name, status, title, subtitle, brief, venue, organizer, start_time, end_time,
             locked, locked_at, rules_text, logo_text, owner_uid, hidden, sport, ranked,
+            participants_set,
             created_at, updated_at, revision, players_count, rounds_count, played_count, champion
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, status = excluded.status, title = excluded.title,
             subtitle = excluded.subtitle, brief = excluded.brief,
@@ -827,6 +832,7 @@ def save_event(
             rules_text = excluded.rules_text, logo_text = excluded.logo_text,
             owner_uid = excluded.owner_uid, hidden = excluded.hidden,
             sport = excluded.sport, ranked = excluded.ranked,
+            participants_set = excluded.participants_set,
             updated_at = excluded.updated_at, revision = excluded.revision,
             players_count = excluded.players_count, rounds_count = excluded.rounds_count,
             played_count = excluded.played_count, champion = excluded.champion
@@ -850,6 +856,7 @@ def save_event(
             int(bool(event.get("hidden", False))),
             event.get("sport", "volleyball") or "volleyball",
             int(bool(event.get("ranked", True))),
+            int(bool(data.get("participantsSet", False))),
             created,
             data.get("updatedAt", ""),
             int(data.get("revision", 0)),
@@ -1356,6 +1363,8 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
         if stream
         else {},
         "participants": participants,
+        # 「名单是显式指定过的」：空名单也可能是一份**真正的名单**（见 models.Config）
+        "participantsSet": bool(ev["participants_set"]),
         "teams": teams,
         "players": players,
         "rounds": rounds,

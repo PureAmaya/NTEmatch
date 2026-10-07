@@ -673,10 +673,16 @@ async def test_event_commands_require_an_explicit_event(plugin_module):
 
 
 def test_help_text_explains_how_to_join(plugin_module):
-    """帮助里要有「怎么参加」——群里最常问的就是这个，答不上就没人接着问了。"""
+    """帮助里要有「怎么参加」——群里最常问的就是这个，答不上就没人接着问了。
+
+    现在这一节的两条路都得写清：**自己报名**（筹备中发「比赛报名」）与
+    **让管理员排名单**（白名单群里的新人也会被顺手建成成员）。
+    """
     text = plugin_module.HELP_TEXT
     assert "怎么参加" in text
-    assert "参赛不用自己注册" in text
+    assert "比赛报名" in text and "比赛取消报名" in text
+    assert "筹备中" in text, "报名只在筹备中的届开放，这一条得写进帮助里"
+    assert "不组队不定赛制" in text, "「报名只定名单」这件事最容易误会，必须写清"
 
 
 def test_help_doc_lists_every_command(plugin_module):
@@ -686,7 +692,7 @@ def test_help_doc_lists_every_command(plugin_module):
     """
     source = PLUGIN.read_text(encoding="utf-8")
     commands = re.findall(r'@filter\.command\(\s*"([^"]+)"', source)
-    assert len(commands) == 23, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
+    assert len(commands) == 25, f"命令数变了（现在 {len(commands)} 条）：请同步 HELP.md 与 README"
     doc = (PLUGIN.parent / "HELP.md").read_text(encoding="utf-8")
     for name in commands:
         assert name in plugin_module.HELP_TEXT, f"HELP_TEXT 里缺命令：{name}"
@@ -858,3 +864,64 @@ async def test_help_survives_site_probe_failure(plugin_module):
     plugin._http = _Boom
     out = await _help_output(plugin, _FakeEvent())
     assert out == [{"type": "plain", "text": plugin_module.HELP_TEXT}]
+
+
+# --------------------------------------------------------------------------- #
+# 自助报名（比赛报名 / 比赛取消报名）
+# --------------------------------------------------------------------------- #
+def _signup_plugin(plugin_module, calls: list[tuple], resolved: str = "e001"):
+    """造一个「届次已解析、站点调用被记下来」的插件实例。"""
+    plugin = plugin_module.NTEMatchPlugin(context=None)
+
+    async def fake_resolve(token):
+        assert token == "甲届", "届次要原样交给解析（用户可能写编号、也可能写名称片段）"
+        return resolved, ""
+
+    async def fake_post(path, payload=None):
+        calls.append((path, payload))
+        if resolved == "boom":
+            return {"ok": False, "error": "这一届已经组队 / 生成赛程了"}
+        return {"ok": True, "text": "已报名：甲届（e001）"}
+
+    plugin._resolve_event = fake_resolve
+    plugin._post = fake_post
+    return plugin
+
+
+async def test_signup_reports_the_group_for_the_whitelist(plugin_module):
+    """报名要把**这次会话的群号**一起报给站点：白名单就是按它判的。
+
+    少带这一个字段，白名单群里的新人会被站点按「非成员」挡掉——功能看着是好的，
+    只是永远用不上，最难查。私聊没有群号（报空串），站点按「只认成员」处理。
+    """
+    calls: list[tuple] = []
+    plugin = _signup_plugin(plugin_module, calls)
+    out = await _collect(plugin.cmd_signup(_FakeEvent(sender="10001", group="900001"), "甲届"))
+    path, payload = calls[0]
+    assert path == "signup"
+    assert payload == {
+        "qq": "10001",
+        "action": "join",
+        "event": "e001",
+        "group": "900001",
+        "name": "",
+    }
+    assert "已报名" in out[0]["text"], "站点回的那句话原样发群（闸门理由只在站点那一侧）"
+
+
+async def test_cancel_signup_is_the_same_endpoint_with_cancel(plugin_module):
+    """取消报名：同一条接口、`action=cancel`——两条命令只差这一个字。"""
+    calls: list[tuple] = []
+    plugin = _signup_plugin(plugin_module, calls)
+    out = await _collect(plugin.cmd_cancel_signup(_FakeEvent(sender="10001"), "甲届"))
+    assert calls[0][0] == "signup" and calls[0][1]["action"] == "cancel"
+    assert calls[0][1]["group"] == "", "私聊没有群号：站点按「只认成员」处理"
+    assert out[0]["text"]
+
+
+async def test_signup_shows_the_sites_reason_verbatim(plugin_module):
+    """被站点拒绝时，把站点的人话原样发群：插件不自己编理由（判两遍就会漂移）。"""
+    calls: list[tuple] = []
+    plugin = _signup_plugin(plugin_module, calls, resolved="boom")
+    out = await _collect(plugin.cmd_signup(_FakeEvent(sender="10001", group="g1"), "甲届"))
+    assert out[0]["text"] == "这一届已经组队 / 生成赛程了"

@@ -427,16 +427,28 @@ async def test_test_endpoint_says_why_when_it_cannot_draw(admin_client, bot_read
 # 召集：真 @ 走不走得通，以及走不通时的退回
 # --------------------------------------------------------------------------- #
 async def _with_one_participant() -> dict:
-    """把本届名单换成一个「有 QQ 的选手」，返回恢复用的快照。"""
+    """把本届名单换成一个「有 QQ 的选手」，返回恢复用的快照。
+
+    ``participantsSet`` 要显式写回 ``False``（= 未指定名单 → 全员参与）：
+    名单留空但这一位还是 True 时，语义是「一份空的显式名单」，那就一个人都没有。
+    """
     saved = store.snapshot().dump()
     await store.update(
-        {"players": [{"id": "p01", "name": "甲", "qq": "10001"}], "participants": []}
+        {
+            "players": [{"id": "p01", "name": "甲", "qq": "10001"}],
+            "participants": [],
+            "participantsSet": False,
+        }
     )
     return saved
 
 
 async def _restore_roster(saved: dict) -> None:
-    patch = {"players": saved["players"], "participants": saved["participants"]}
+    patch = {
+        "players": saved["players"],
+        "participants": saved["participants"],
+        "participantsSet": bool(saved.get("participantsSet")),
+    }
     if "rounds" in saved:
         patch["rounds"] = saved["rounds"]
     await store.update(patch)
@@ -453,6 +465,7 @@ async def _with_two_players_and_a_match() -> dict:
                 {"id": "p03", "name": "丙", "qq": "10003"},
             ],
             "participants": [],
+            "participantsSet": False,
             "rounds": [
                 {
                     "index": 1,

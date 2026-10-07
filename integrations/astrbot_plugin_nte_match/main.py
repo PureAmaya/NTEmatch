@@ -71,6 +71,35 @@ def _sender_id(event) -> str:
     return str(getattr(sender, "user_id", "") or "")
 
 
+def _group_id(event) -> str:
+    """这次会话的群号；**私聊回空串**。
+
+    自助报名要把它一起报给站点：站点按它判「报名白名单」（白名单群里的非成员也能报上）。
+    私聊没有群号 —— 那不是「哪个群放宽」的场合，站点会按「只认成员」处理。
+    """
+    try:
+        value = event.get_group_id()
+    except Exception:  # noqa: BLE001  (老版本没有这个方法)
+        value = ""
+    return str(value or "")
+
+
+def _sender_name(event) -> str:
+    """发消息者的昵称（只在站点顺手建成员时当名字用；取不到就回空串）。
+
+    取不到不是异常：站点会退回「群友 <QQ>」，本人之后能用「比赛资料 名字 xxx」改。
+    """
+    try:
+        value = event.get_sender_name()
+    except Exception:  # noqa: BLE001  (老版本没有这个方法)
+        value = ""
+    if value:
+        return str(value)
+    obj = getattr(event, "message_obj", None)
+    sender = getattr(obj, "sender", None) if obj is not None else None
+    return str(getattr(sender, "nickname", "") or "")
+
+
 def _chat_key(event) -> str:
     """这次会话的标识（群号优先，其次私聊对象），用于按会话计冷却。"""
     for getter in ("get_group_id", "get_sender_id"):
@@ -259,6 +288,8 @@ HELP_TEXT = (
     "· 比赛届次 [我的] [页码] —— 届次编号与名称（填参数前先发它；写「我的」只看自己创建的，\n"
     "  一页装不下时私聊发你）\n"
     "· 比赛召集 [届次] —— @ 参赛者到场（本届创建者＝举办者 / 服务器管理员，带冷却）\n"
+    "· 比赛报名 [届次] —— 报名参赛（只对筹备中的届开放；只定名单，不组队不定赛制）\n"
+    "· 比赛取消报名 [届次] —— 取消报名（只取消这一届的参赛资格，成员身份留着）\n"
     "· 比赛我的 —— 你的推流地址 + 直播间地址（私聊发你）\n"
     "· 比赛直播注册 [流名] [@某人] —— 开播要用的东西一次给全：缺推流码 / 令牌就补上，\n"
     "  连推流地址与注意事项一起私聊发本人\n"
@@ -274,7 +305,11 @@ HELP_TEXT = (
     "（不知道有哪些届就发「比赛届次」）；不带 [届次] 的命令不用填。\n"
     "比赛直播与比赛列表是全局信息，不用填届次。\n"
     "—— 怎么参加 ——\n"
-    "参赛不用自己注册：本届举办者在站点里把你排进名单就行，群里 @ 你就是要开打了。\n"
+    "自己报名：本届还没开赛（筹备中）时发「比赛报名 <届次>」——只定名单，不组队不定赛制，\n"
+    "组队与赛程都等报名结束由管理员在网站上安排；要退出就发「比赛取消报名 <届次>」。\n"
+    "开赛 / 结束后名单就冻住了，报名会被拒绝（会告诉你卡在哪一条）。\n"
+    "报名白名单群里的新人也能直接报名：站点顺手把你加成成员，登录密钥私聊发你；\n"
+    "别的群请先让管理员把你加为成员（服务器管理员发：比赛添加 @你）。\n"
     "想用「比赛我的」查自己的推流地址，得先成为成员（服务器管理员发：比赛添加 @你）。\n"
     "—— 你自己的东西 ——\n"
     "不知道从哪下手就发「比赛资料」：它会把你现在有什么、每一项怎么改都列出来。\n"
@@ -662,6 +697,57 @@ class NTEMatchPlugin(star.Star):
     async def cmd_add(self, event: AstrMessageEvent):
         """把 @ 到的群友添加为**普通成员**。只有服务器管理员能用。"""
         yield await self._grant(event, "member")
+
+    # ------------------------------------------------------------------ #
+    # 自助报名 / 取消报名（只改名单，不组队不定赛制；闸门与白名单都在站点侧判）
+    # ------------------------------------------------------------------ #
+    async def _signup(self, event, action: str, token: str):
+        """公共流程：解析届次 → 让站点改名单 → 把人话原样回群。
+
+        两条命令只差一个 ``action``：站点那边是同一条接口（``POST /api/bot/signup``）。
+
+        **群号要一起报上去**：站点用它判「报名白名单」——白名单群里的非成员也能报上
+        （站点顺手把他建成成员，登录密钥私聊给本人）。私聊没有群号，站点按「只认成员」处理。
+
+        插件这一侧**一条闸门都不自己判**（届次是不是筹备中、能不能取消、白名单），
+        全交给站点：判两遍迟早漂移，而「能不能报名」这件事只该有一个答案。
+        """
+        target, error = await self._resolve_event(token)
+        if error:
+            return event.plain_result(error)
+        data = await self._post(
+            "signup",
+            {
+                "qq": _sender_id(event),
+                "action": action,
+                "event": target,
+                "group": _group_id(event),
+                "name": _sender_name(event),
+            },
+        )
+        if not data.get("ok"):
+            return event.plain_result(str(data.get("error") or "操作失败"))
+        return event.plain_result(str(data.get("text") or "操作完成"))
+
+    @filter.command("比赛报名", alias={"我要报名", "报名", "比赛我要报名"})
+    async def cmd_signup(self, event: AstrMessageEvent, event_id: str = ""):
+        """报名成为某一届的参赛选手（**只对筹备中的届开放**）。
+
+        只把你加进这一届的参赛名单：**不组队、不定赛制**——那些等报名结束由管理员在
+        网站上安排。开赛 / 结束之后名单冻住，命令会被站点拒绝并说清原因。
+
+        白名单群里的新朋友也能直接报名：站点顺手建成员，登录密钥私聊发本人。
+        """
+        yield await self._signup(event, "join", event_id)
+
+    @filter.command("比赛取消报名", alias={"取消报名", "退赛", "我不打了"})
+    async def cmd_cancel_signup(self, event: AstrMessageEvent, event_id: str = ""):
+        """取消报名：只取消你在**这一届**的参赛资格。
+
+        成员身份与选手资料都留着（名字 / 头像 / 游戏 UUID 不是报名的一部分），
+        队伍与赛程一个字都不动——想回来再发一次「比赛报名」即可。
+        """
+        yield await self._signup(event, "cancel", event_id)
 
     @filter.command("比赛我的", alias={"我的推流", "我的直播间", "推流地址", "我的地址"})
     async def cmd_mine(self, event: AstrMessageEvent):

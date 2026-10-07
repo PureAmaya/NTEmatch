@@ -43,6 +43,30 @@ def test_rules_and_ui_columns_round_trip(tmp_path, make_config):
     assert back["ui"]["ogImage"] == "/static/share.png"
 
 
+def test_roster_flag_round_trips(tmp_path, make_config):
+    """「名单是显式指定过的」这一位要存得住（``participantsSet``）。
+
+    它只决定一件事：**空名单**到底是「一份空名单」还是「没指定 → 全员参与」。
+    以前这一位只活在内存里，于是重启之后「全不选后保存」会变回全员参与；
+    自助报名取消到最后一个人时也一样——名单空了就等于没取消。
+    """
+    from app.models import Config
+
+    path = tmp_path / "roster.sqlite"
+    db.init_db(path)
+    cfg = make_config()
+    cfg.participants = []
+    cfg.participants_set = True
+
+    with db.connect(path) as conn:
+        db.save_event(conn, "e001", cfg.dump())
+        conn.commit()
+        back = db.load_event(conn, "e001")
+
+    assert back["participantsSet"] is True
+    assert Config.model_validate(back).participants_set is True
+
+
 def test_old_database_gets_new_columns(tmp_path):
     """旧库升级路径：缺列 → 跑一次 init_db → 列补齐（不需要手工迁移）。"""
     path = tmp_path / "old.sqlite"
@@ -53,6 +77,7 @@ def test_old_database_gets_new_columns(tmp_path):
         conn.execute("ALTER TABLE event_rules DROP COLUMN better")
         conn.execute("ALTER TABLE event_ui DROP COLUMN accent_custom")
         conn.execute("ALTER TABLE event_ui DROP COLUMN og_image")
+        conn.execute("ALTER TABLE events DROP COLUMN participants_set")
         conn.commit()
 
     db.init_db(path)  # = 服务启动时走的那条路
@@ -60,8 +85,10 @@ def test_old_database_gets_new_columns(tmp_path):
     with db.connect(path) as conn:
         rules_cols = {row["name"] for row in conn.execute("PRAGMA table_info(event_rules)")}
         ui_cols = {row["name"] for row in conn.execute("PRAGMA table_info(event_ui)")}
+        event_cols = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
     assert {"value_type", "value_label", "better", "metric"} <= rules_cols
     assert {"accent_custom", "og_image"} <= ui_cols
+    assert "participants_set" in event_cols
 
 
 def test_retired_columns_are_dropped(tmp_path):
