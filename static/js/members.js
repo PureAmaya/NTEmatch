@@ -2016,23 +2016,13 @@ export async function handleMemberForm(formEl) {
       await api('/qqbot', {
         method: 'PUT',
         auth: true,
-        body: {
-          enabled: v.enabled === true,
-          baseUrl: v.baseUrl,
-          apiKey: v.apiKey,
-          umo: v.umo,
-          platform: v.platform,
-          atMode: v.atMode,
-          maxChars: Number(v.maxChars) || 1200,
-          timeout: Number(v.timeout) || 10,
-          cooldownSeconds: Number(v.cooldownSeconds) || 0,
-          maxPerHour: Number(v.maxPerHour) || 30,
-          maxParts: Number(v.maxParts) || 8,
-          // 赛前提醒：开关 + 提前量（分钟，逗号分隔）。服务端会再规整一次，
-          // 这里原样传字符串即可（写错了不会存成坏配置）。
-          remindEnabled: v.remindEnabled === true,
-          remindLeads: v.remindLeads,
-        },
+        // **整张表单原样提交**，别在这儿手写一份字段表。
+        //
+        // 踩过的坑：这里以前是手写的一串字段（enabled / baseUrl / … / remindLeads），
+        // 于是**面板上新加的设置项永远存不下来**——「报名白名单群号」「打完自动播报」
+        // 「图片推送」三处都填了、保存了、刷新就没了（服务端只认自己知道的键，
+        // 表单里多出来的字段会被忽略，所以整张表提交是安全的）。
+        body: v,
       });
       toast('群推送设置已保存', 'ok');
       await refreshServerData();

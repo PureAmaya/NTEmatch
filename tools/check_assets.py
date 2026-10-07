@@ -1,7 +1,7 @@
 """前端静态资源自检（stdlib，无依赖）。
 
 前端是原生 ESM + 手写 CSS，**没有打包器**——也就没有编译期帮我们抓错。这个脚本
-补上最容易踩的四类问题，CI 与本地都跑同一个：
+补上最容易踩的四类问题（提交前跑一遍）：
 
 1. ``nte.css`` 括号配平（写多一个 ``}`` 会让后面所有样式静默失效）；
 2. ``import ... from './x.js'`` 指向的文件真的存在（改名/挪文件后的漏网之鱼）；
@@ -292,6 +292,58 @@ def check_help_card_freshness() -> list[str]:
     return problems
 
 
+# 「QQ 机器人设置」面板里的控件（fieldText('x' / fieldSwitch('x' / fieldSelect('x' …）
+_QQBOT_FIELD_RE = re.compile(r"""field[A-Za-z]+\(\s*'([A-Za-z][\w]*)'""")
+
+
+def check_qqbot_settings_form() -> list[str]:
+    """QQ 机器人设置面板：**保存要提交整张表单**，字段名还得是服务端认识的。
+
+    踩过的坑：保存那一支以前手写了一串字段（enabled / baseUrl / … / remindLeads），
+    于是**面板上新加的设置项永远存不下来**——「报名白名单群号」「打完自动播报」
+    「图片推送」三处都是「填了、提示保存成功、刷新就没了」。字段名写错也是同一个症状
+    （服务端只认自己知道的键，多出来的会被静默忽略）。
+    """
+    path = JS_DIR / "members.js"
+    if not path.exists():
+        return ["缺少 static/js/members.js"]
+    text = path.read_text(encoding="utf-8")
+    start = text.find("function qqbotPanelHtml(")
+    end = text.find("\nfunction ", start + 1) if start >= 0 else -1
+    panel = text[start:end] if start >= 0 and end > start else ""
+    if not panel:
+        return ["members.js 里找不到「QQ 机器人设置」面板（改了结构就同步这条自检）"]
+
+    problems: list[str] = []
+    fields = sorted(set(_QQBOT_FIELD_RE.findall(panel)))
+    # ① 面板上每个字段，服务端都得认识（不认识 = 永久存不下来）
+    try:
+        from app.qqbot import DEFAULT_SETTINGS  # 自检脚本里按需导入（没装依赖就跳过）
+
+        unknown = [name for name in fields if name not in DEFAULT_SETTINGS]
+        if unknown:
+            problems.append(
+                "QQ 机器人面板里有服务端不认识的字段（填了也存不下）：" + "、".join(unknown)
+            )
+        else:
+            print(f"  OK  QQ 机器人面板 {len(fields)} 个字段都在服务端设置里")
+    except Exception as exc:  # noqa: BLE001  (没装依赖时跳过这一半，不影响别的自检)
+        print(f"  --  跳过后端字段比对（{exc}）")
+
+    # ② 保存那一支必须整张表单提交，不能手写字段表
+    bstart = text.find("if (name === 'qqbot')")
+    bend = text.find("if (name === '", bstart + 1) if bstart >= 0 else -1
+    branch = text[bstart:bend] if bstart >= 0 and bend > bstart else ""
+    if "body: v" in branch:
+        print("  OK  QQ 机器人设置保存时提交整张表单（新加的字段不会再被吞掉）")
+    else:
+        problems.append(
+            "「QQ 机器人」保存分支不是整张表单提交（body 应当是 collectForm 的结果 v）："
+            "手写字段表会让新加的设置项永远存不下来"
+        )
+    return problems
+
+
 def main() -> int:
     print("前端静态资源自检：")
     problems = (
@@ -304,6 +356,7 @@ def main() -> int:
         + check_logo_link()
         + check_live_video_defaults()
         + check_help_card_freshness()
+        + check_qqbot_settings_form()
     )
     for line in problems:
         print(f"  !! {line}")

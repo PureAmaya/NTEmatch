@@ -274,6 +274,42 @@ async def test_whitelist_matches_group_id_or_full_umo(bot, botclient, events):
     assert res.status_code == 200, res.text
 
 
+async def test_saving_the_whole_settings_form_keeps_every_field(admin_client):
+    """管理端「保存」现在**整张表单原样提交**：服务端要照单收下每个已知键、忽略多余的。
+
+    钉的是那个「填了、保存成功、刷新就没了」的 bug 的服务端侧契约——前端侧由
+    ``tools/check_assets.py`` 盯着（保存分支必须是整张表单，不许手写字段表）。
+    """
+    res = await admin_client.put(
+        "/api/qqbot",
+        json={
+            "enabled": True,
+            "baseUrl": "http://astrbot.test",
+            "apiKey": "abk_x",
+            "umo": "123456",
+            "platform": "aiocqhttp",
+            "atMode": "cq",
+            "maxChars": "1200",
+            "timeout": "10",
+            "cooldownSeconds": "20",
+            "maxPerHour": "30",
+            "maxParts": "8",
+            "remindEnabled": True,
+            "remindLeads": "1440,120",
+            "imageCards": False,
+            "autoResultEnabled": False,
+            "signupGroups": "900001,900002",
+            "前端多带的键": "应当被忽略",
+        },
+    )
+    assert res.status_code == 200, res.text
+    settings = store.qqbot_settings()
+    assert settings["signupGroups"] == "900001,900002", "白名单要真的存下来"
+    assert settings["imageCards"] is False, "图片推送开关要真的存下来"
+    assert settings["autoResultEnabled"] is False, "打完自动播报开关要真的存下来"
+    assert settings["remindLeads"] == "1440,120"
+
+
 def test_whitelist_setting_drops_what_can_never_match():
     """白名单里只留拼得出会话标识的字符：填群名这种永远匹配不上的值要被剔掉。"""
     clean = qqbot.normalize_settings(
