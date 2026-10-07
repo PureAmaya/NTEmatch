@@ -41,6 +41,22 @@ function isOut(pid) {
   return !joinedIds().has(pid);
 }
 
+/**
+ * 候选池里**该显示**的：本届参与、且还没被编进队伍的选手。
+ *
+ * 不在参与名单里的人一律不显示，也不计进池子的人数——他们本来就编不进队伍
+ * （拖进去也上不了场），列在池子里只会让人以为「拖一下就能打」。
+ * 要让他打，先去「参赛名单」把人加进来。
+ *
+ * 过滤放在**渲染**而不是载入：队员被挤出队伍、删掉分组、拖回候选池时都会往
+ * ``T.pool`` 里塞人（见 moveTo / dropTeam），入口有好几个，漏一个就会漏出来。
+ */
+const poolIds = () => T.pool.filter((pid) => playerOf(pid) && !isOut(pid));
+
+/** 还留在队伍里、但**已不在本届参与名单**里的人（要移出就把他们拖回候选池）。 */
+const strayIds = () =>
+  T.teams.flatMap((t) => t.playerIds).filter((pid) => playerOf(pid) && isOut(pid));
+
 /** 后端队伍数据的指纹：只有它变了才重新载入草案（否则保住正在拖的改动）。 */
 const sourceKey = () => `${App.state?.revision ?? 0}|${(App.state?.teams || []).length}`;
 let loadedFrom = '';
@@ -187,14 +203,14 @@ function teamCardHtml(team, index) {
 }
 
 function poolHtml() {
-  const ids = T.pool;
+  const ids = poolIds();
   const body = ids.length
     ? ids.map(chipHtml).join('')
     : `<div class="zone__empty">没有候补选手</div>`;
   return (
     `<div class="zone zone--pool" data-zone="pool">` +
     `<div class="zone__head"><b>候选池</b><span class="zone__count">${ids.length} 人</span></div>` +
-    `<div class="zone__sub">未编入队伍的选手</div>` +
+    `<div class="zone__sub">未编入队伍的本届选手</div>` +
     `<div class="zone__body">${body}</div></div>`
   );
 }
@@ -211,6 +227,10 @@ function boardHtml() {
 function shellHtml() {
   const size = teamSize();
   const count = T.teams.length;
+  // 队伍里可能留着「已经不在本届名单」的人（例如他取消了报名，但当时还在某支队伍里）。
+  // 这种人**不显示在候选池**，所以要在这里点名说一句，否则卡片上的人看着像幽灵：
+  // 他还在队里、却不在名单上。拖回候选池即可移出（移出后就彻底不显示了）。
+  const strays = strayIds();
   return (
     `<div class="group-bar">` +
     `<div class="tool-group">` +
@@ -225,6 +245,12 @@ function shellHtml() {
     `卡片上可<b>改队名（≤8 字，点「自动」按队员名拼：每人最多 8 ÷ 人数 个字）/ 缩写 / 主题色</b>、` +
     `<b>换组</b>（与另一组的队伍互换）、<b>删除分组</b>（队员回到候选池）；` +
     `保存时<b>没有成员的分组会被自动删除</b>，改完队伍需重新「生成赛程」。</div>` +
+    (strays.length
+      ? `<div class="notice notice--warn">有 <b>${strays.length}</b> 位队员` +
+        `<b>已不在本届参与名单里</b>：${strays.map((pid) => esc(nameOf(pid))).join('、')}。` +
+        `他们仍留在队伍中（候选池不显示这类人）；要把他们移出队伍，` +
+        `<b>拖回候选池</b>即可；要让他真能上场，先去「参赛名单」把人加回来。</div>`
+      : '') +
     `<div id="teamBoard">${boardHtml()}</div>`
   );
 }
