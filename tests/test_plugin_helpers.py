@@ -747,6 +747,55 @@ def test_help_card_renderer_builds_a_real_jpeg():
         assert 1200 < img.height < helpcard.CANVAS_H
 
 
+def test_help_card_text_never_overlaps_or_overflows(monkeypatch):
+    """图上的字**不许互相压**，也不许冲出安全边距。
+
+    补这条的原因：以前只查「有没有画到图片外」，而卡片的说明被画在了**排版循环残留**的
+    横坐标上——同一行带里两笔字压在一起，右边缘一点没越界：检查全绿，眼睛一眼看得出来。
+    """
+    from PIL import ImageDraw
+
+    from app import helpcard
+
+    if not helpcard.available():
+        pytest.skip("没装 Pillow：帮助图本身就不生成")
+
+    draws: list[tuple[float, float, float, float, str, tuple]] = []
+    real = ImageDraw.ImageDraw.text
+
+    def spy(self, xy, text, *args, **kwargs):
+        font = kwargs.get("font")
+        width = float(font.getlength(text)) if font is not None else 0.0
+        size = float(getattr(font, "size", 0) or 0)
+        fill = kwargs.get("fill") or ()
+        draws.append((float(xy[0]), float(xy[1]), width, size, str(text), tuple(fill)))
+        return real(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
+    helpcard.render()
+
+    # ① 不许冲出安全边距（右边刚好留出 PAD）
+    limit = helpcard.W - helpcard.PAD + 1
+    over = [text for x, _y, w, _s, text, _f in draws if x + w > limit]
+    assert not over, f"有文字冲出安全边距：{over[:3]}"
+
+    # ② 同一行带里，说明必须**从命令右边**起画（不是压在命令上）
+    accent, dim = helpcard.ACCENT, helpcard.DIM
+    problems: list[str] = []
+    inline_rows = 0
+    for x, y, _w, _size, text, fill in draws:
+        if not text.startswith("——") or fill[:3] != dim:
+            continue
+        for cx, cy, cw, _cs, ctext, cfill in draws:
+            if cfill[:3] != accent or abs(cy - y) > 18:
+                continue  # 换行到下一行起画的说明：这一行带里没有它的命令，正常
+            inline_rows += 1
+            if x < cx + cw:
+                problems.append(f"「{ctext}」的说明压在命令上（x={x:.0f} < {cx + cw:.0f}）：{text[:20]}")
+    assert not problems, "；".join(problems[:3])
+    assert inline_rows >= 5, "一条「同行说明」都没量到：检查本身失效了（排版改了要同步这里）"
+
+
 def test_help_card_lists_exactly_the_same_commands(plugin_module):
     """帮助图上的命令必须与 `HELP_TEXT` **完全一致**。
 

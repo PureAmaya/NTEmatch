@@ -292,24 +292,28 @@ def render():
     for title, rows in SECTIONS:
         y += tab(img, (PAD, y), title, f_tab) + 16
 
-        laid: list[tuple[str, list[str], int, bool]] = []
+        #: 说明**跟在大字号命令后面**时该从哪儿起画：这个横坐标必须**随每一行**一起带下去。
+        #: 踩过的坑：以前画的时候用了排版循环结束后残留的 `head_w`，于是所有说明都被画在
+        #: 「最后一条命令」的横坐标上，长命令的说明直接压在命令上（右边缘一点没越界，
+        #: 「有没有画到图片外」的检查全绿，眼睛却一眼看得出来）。
+        laid: list[tuple[str, list[str], int, bool, float]] = []
         for cmd, desc in rows:
             text = f"—— {desc}"
             head_w = cmd_x + f_cmd.getlength(cmd) + 14
             if f_desc.getlength(text) <= inner_right - head_w:
-                laid.append((cmd, [text], ROW_H, True))
+                laid.append((cmd, [text], ROW_H, True, head_w))
             else:
                 # 折到下一行（缩进在命令下面），行高按折了几行算
                 parts = wrap(text, f_desc, inner_right - (cmd_x + 22))
-                laid.append((cmd, parts, 34 + DESC_H * len(parts) + 10, False))
+                laid.append((cmd, parts, 34 + DESC_H * len(parts) + 10, False, head_w))
         # 分组小字也**先折行**：它是单行硬画的，说明一写长就冲出卡片右边缘
         note = SECTION_NOTES.get(title)
         note_lines = wrap(note, f_small, inner_right - (cmd_x + 22)) if note else []
-        body_h = 20 + sum(h for _c, _p, h, _i in laid) + (DESC_H * len(note_lines)) + 12
+        body_h = 20 + sum(h for _c, _p, h, _i, _x in laid) + (DESC_H * len(note_lines)) + 12
         panel(img, (PAD, y, W - PAD, y + body_h), cut=20)
 
         ry = y + 20
-        for cmd, parts, height, inline in laid:
+        for cmd, parts, height, inline, head_w in laid:
             draw.ellipse([PAD + 24, ry + 12, PAD + 31, ry + 19], fill=(*ACCENT, 255))
             draw.text((cmd_x, ry), cmd, font=f_cmd, fill=(*ACCENT, 255))
             if inline:
