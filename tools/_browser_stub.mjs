@@ -32,6 +32,9 @@ export function makeEl(id = '') {
       el.paused = false;
       return Promise.resolve();
     },
+    pause() {
+      el.paused = true;
+    },
     load() {},
     removeAttribute(name) {
       if (name === 'src') el.src = '';

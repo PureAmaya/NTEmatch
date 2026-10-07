@@ -446,10 +446,16 @@ function setView(view, { silent = false } = {}) {
 }
 
 /* --------------------------- 实时通道 --------------------------- */
+/** 心跳间隔：每这么久发一次 `ping`。 */
+const WS_PING_MS = 25000;
+/** 连着两个心跳周期都没收到**任何**消息（含 `pong`）就按「假死」处理，主动断开重连。 */
+const WS_DEAD_MS = WS_PING_MS * 2 + 10000;
 let ws = null;
 let wsRetry = 0;
 let wsTimer = null;
 let pingTimer = null;
+/** 上一次收到服务端任何消息的时刻（毫秒）：识别假死连接用的，见 connectWS 的心跳。 */
+let lastMsgAt = 0;
 /** 本页面启动时跑的静态资源版本号（见 checkAppVersion）。 */
 let bootAssets = '';
 /** 「站点已更新」只提示一次：提示多了就成了噪音。 */
@@ -522,12 +528,28 @@ function connectWS() {
     void checkAppVersion();
     // 连接握手时服务端会回放最近状态，无需再主动请求，省一次全量下发
     clearInterval(pingTimer);
+    lastMsgAt = Date.now();
     pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
-    }, 25000);
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // **假死检测**：手机锁屏回来、切了 Wi-Fi / 流量之后，这条连接往往早就断了，但
+      // `onclose` 不一定来（TCP 半开，浏览器自己还以为它是 OPEN）。这样页面就成了
+      // 「连着但什么都不更新」——新开播的人不出现、换台看着像没反应，全靠刷新页面才好。
+      // 所以连着两个周期没收到任何回包就主动断开，让 onclose 走正常重连。
+      if (Date.now() - lastMsgAt > WS_DEAD_MS) {
+        log.warn('实时通道长时间没有消息，按假死处理并重连', Date.now() - lastMsgAt);
+        try {
+          ws.close();
+        } catch (err) {
+          log.debug('关闭假死连接异常（忽略）', err);
+        }
+        return;
+      }
+      ws.send('ping');
+    }, WS_PING_MS);
   };
 
   ws.onmessage = (ev) => {
+    lastMsgAt = Date.now(); // 任何消息（含 pong）都算「这条连接还活着」
     let msg;
     try {
       msg = JSON.parse(ev.data);

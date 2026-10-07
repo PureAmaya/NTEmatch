@@ -2320,7 +2320,7 @@ export function channelRooms(s) {
  * 成员直播间**两条链路任一在播就算**：本站推流（MediaMTX 上报）或 B站 直播；
  * 传统频道只有 MediaMTX 那一条。
  */
-const roomLive = (room) =>
+export const roomLive = (room) =>
   room?.member
     ? isMemberLive(room.uid) || isBiliLive(room.uid)
     : isChannelLive(room?.id);
@@ -2430,10 +2430,42 @@ function channelChipsHtml(pool, picked) {
   );
 }
 
+/**
+ * 频道舞台下方那行状态。
+ *
+ * B站 那一路和**比赛直播页**用同一套口径（见 :func:`vsLineHtml` 的 ``vs-line--bili``）：
+ * 画面既然是直嵌 B站 的，就把对方的实况写出来——标题（在播时以 B站 同步来的为准）、
+ * 分区 · 在线人数 · 开播时间，右侧再给一条「在 B站打开」。
+ * 这些字段只有 B站 有，全在 ``picked.biliRoom`` 里（见 ui.js 的 ``biliRoomFor``）。
+ */
 function channelMetaHtml(picked) {
   if (!picked) return '';
   const live = roomLive(picked);
-  const tag = live ? (picked.bili ? 'B站直播中' : '直播中') : '未开播';
+  if (picked.bili) {
+    const room = picked.biliRoom || {};
+    // 「此刻在播什么」以 B站 的标题为准；成员自填的直播间名字退成兜底
+    const title = room.title || picked.title || '';
+    const meta = [
+      room.area ? esc(room.area) : '',
+      Number(room.online) > 0 ? `${Number(room.online)} 人在看` : '',
+      room.liveTime ? `${esc(fmtFull(room.liveTime))} 开播` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    const jump = room.jump || '';
+    return (
+      `<div class="vs-line${live ? ' vs-line--bili' : ' vs-line--idle'}">` +
+      `<span class="vs-line__tag">${live ? 'B站直播' : 'B站 · 未开播'}</span>` +
+      `<b class="vs-line__title">${esc(picked.name)}${title ? `：${esc(title)}` : ''}</b>` +
+      (meta ? `<span class="vs-line__meta">${meta}</span>` : '') +
+      (jump
+        ? `<a class="vs-line__link" href="${esc(jump)}" target="_blank" ` +
+          `rel="noopener noreferrer">在 B站打开 ↗</a>`
+        : '') +
+      `</div>`
+    );
+  }
+  const tag = live ? '直播中' : '未开播';
   return (
     `<div class="vs-line${live ? '' : ' vs-line--idle'}">` +
     `<span class="vs-line__tag">${tag}</span>` +

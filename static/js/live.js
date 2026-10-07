@@ -28,6 +28,14 @@ const SIGNAL_TIMEOUT = 8000;
 const HLS_LOAD_TIMEOUT = 8000;
 
 /**
+ * 「正在连」超过这么久就当作那次尝试已经僵住，允许重新发起（见 ``playRoom``）。
+ *
+ * 比信令超时（8 秒）宽出不少：正常的慢连接不该被误判成僵死，但真僵住时也不能把某一路
+ * 永久锁在「正在连」上——那表现出来就是「点它没反应」。
+ */
+const PENDING_STALE_MS = 15000;
+
+/**
  * 当前线路对应的**观看地址**：HLS 给 8888 那条，否则给 8889 那条。
  *
  * 两条都是「端口 + 流名」，直接打开就能看，也是播放器用的地址。
@@ -152,6 +160,8 @@ function makePlayer(ids) {
     attached: null,
     // 正在连的目标（``机位key|线路``）：同一个目标正在连时别重复发信令（重绘很频繁）
     pending: '',
+    //: 上面那次「正在连」是什么时候开始的（**毫秒时间戳**）：太久没结果就重来，见 PENDING_STALE_MS
+    pendingAt: 0,
     // 用户**主动**按过「停止」：此后不再自动开播（否则刚停掉、一次信号刷新又给放上了）。
     // 任何「用户自己想看」的动作（选台 / 点播放 / 换线路）都会把它清掉。
     stoppedByUser: false,
@@ -250,6 +260,35 @@ function makePlayer(ids) {
   },
 
   /**
+   * 把某个 ``<video>`` 从「正在播」里彻底摘出来：暂停、停轨道、清 ``src`` / ``srcObject``，
+   * 再 ``load()`` 一次，把已经缓冲的内容也丢掉。
+   *
+   * **必须也能作用在「已经被从文档里摘掉」的旧元素上**：换台 / 换人 / 换线路时舞台会重建
+   * （见 ``views.js`` 的 ``stage.innerHTML = channelStageHtml(…)``），老 ``<video>`` 当场
+   * 被换成新的。而媒体元素**离开 DOM 不会自己停下来**——它身上的 ``srcObject`` / HLS 源
+   * 照旧在响。所以清理必须点名做，认的就是「当初真正连上的那个元素」（``this.attached``）。
+   */
+  release(video) {
+    if (!video) return;
+    try {
+      video.pause();
+    } catch (err) {
+      log.debug('暂停旧播放器异常（忽略）', err);
+    }
+    const stream = video.srcObject;
+    if (stream && typeof stream.getTracks === 'function') {
+      stream.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+    }
+    video.removeAttribute('src');
+    try {
+      video.load();
+    } catch (err) {
+      log.debug('重置旧播放器异常（忽略）', err);
+    }
+  },
+
+  /**
    * 把某个 ``<video>`` 认作「当前画面的落点」：记下来、套音量、揭开封面、起播。
    *
    * 三处（原生 HLS / hls.js / WebRTC 的 ontrack）都走它，免得漏掉哪一步——漏一步的
@@ -257,6 +296,9 @@ function makePlayer(ids) {
    */
   attach(video) {
     if (!video) return;
+    // 换落点：上一个元素身上挂的流先收干净（正常路径上 stop() 已经清过，这里是道保险
+    // ——舞台重建之后没人调 stop 时，也不会留下一路还在响的音频）。
+    if (this.attached && this.attached !== video) this.release(this.attached);
     this.attached = video;
     this.bindVideo(video);
     this.applyAudio(video);
@@ -494,7 +536,10 @@ function makePlayer(ids) {
     // 同一个目标正在连：别重复发信令（重绘很频繁，重复连会把慢连接反复掐掉）。
     // 换目标 / 换线路不算——那条路要立刻改道。
     const ticket = `${target?.key || ''}|${mode}`;
-    if (target && this.pending === ticket) return;
+    // 同一路正在连就别重发信令（重绘很频繁，重复连会把慢连接反复掐掉）；
+    // 但**连太久还没结果**说明那一次尝试已经僵住（信令超时也才 8 秒），这时候再点
+    // 就该真的重连一次——否则这一路会被「正在连」永久锁住，怎么点都没反应。
+    if (target && this.pending === ticket && Date.now() - this.pendingAt < PENDING_STALE_MS) return;
     await this.stop(false);
     this.room = target;
     if (!this.room) {
@@ -519,6 +564,7 @@ function makePlayer(ids) {
     }
     this.setState(mode === 'hls' ? '切换到 HLS…' : '连接中…');
     this.pending = ticket;
+    this.pendingAt = Date.now();
     try {
       // 源站地址直连：webrtc = 8889 观看地址，hls = 8888 观看地址
       if (mode === 'hls') await this.hls(this.room.hls);
@@ -563,7 +609,6 @@ function makePlayer(ids) {
   async stop(manual) {
     this.token += 1;
     this.playing = { key: '', mode: '' };
-    this.attached = null; // 画面落点也清掉：下一次 playRoom 必须真的重连
     this.pending = '';
     this.destroyHls();
     if (this.pc) {
@@ -575,19 +620,13 @@ function makePlayer(ids) {
       }
       this.pc = null;
     }
-    const video = this.el();
-    if (video) {
-      if (video.srcObject) {
-        video.srcObject.getTracks().forEach((t) => t.stop());
-        video.srcObject = null;
-      }
-      video.removeAttribute('src');
-      try {
-        video.load();
-      } catch (err) {
-        log.debug('重置 video 异常', err);
-      }
-    }
+    // **两个都要清**：当初真正连上的那个元素（舞台重建后就落到它头上了，它多半已经不在
+    // 文档里）与当前 DOM 里那个。原来只清「当前 DOM 里那个」——换台换掉元素之后，老元素
+    // 身上的流没人管，它就带着上一路的音频继续响（听起来就是两路声音叠在一起）。
+    const current = this.el();
+    this.release(this.attached);
+    if (current && current !== this.attached) this.release(current);
+    this.attached = null; // 画面落点也清掉：下一次 playRoom 必须真的重连
     if (manual) {
       this.stoppedByUser = true; // 别再自动开播把他烦回来（见 stoppedByUser 注释）
       this.setState('已停止');
@@ -628,6 +667,7 @@ export const LIVE_HEALTH_MAX_FAILS = 3;
 const LIVE_HEALTH_INTERVAL = 20000;   // 有人在播：轮询兜底，别和推送抢活
 const LIVE_HEALTH_IDLE = 60000;       // 没人在播：更慢（服务端仍在常驻探测）
 const LIVE_HEALTH_RETRY = 3000;       // 失败后 / 等待后台探测结果时的重试间隔
+const LIVE_HEALTH_ERROR_RETRY = 30000; // 连续失败到上限后的**慢速重试**（不是停手，见 healthTick）
 
 let healthRunning = false;
 let healthTimer = null;
@@ -674,15 +714,21 @@ const anyoneStreaming = () =>
 async function healthTick(probe = false) {
   const ok = await refreshLiveHealth({ probe });
   if (!healthRunning) return ok;
-  // 连续失败到上限就停手：界面显示「获取失败，等待服务器修复」，等用户手动重试
-  if (App.liveHealthState === 'error') {
-    healthRunning = false;
-    return ok;
-  }
+  // 连续失败到上限：不再短间隔猛敲，但**不能就此停手**。停手之后就只剩「状态变了才推」的
+  // WebSocket 一条路——一旦它也没消息（手机锁屏 / 切网之后 socket 假死，`onclose` 不一定来），
+  // 页面会永远停在旧数据上：「新开播的人一直不出现」「换台点了没反应」都是这么来的。
+  // 慢速重试的成本可以忽略（本地几十字节的 HTTP），换来的是它会自己好。
+  const errored = App.liveHealthState === 'error';
   // 没人在播时把间隔拉长（服务端探测很轻，但没必要一直敲媒体服务器）；
   // 服务端后台还在探端口（pending）时短间隔催一下，避免面板一直显示「未探测」。
   const pending = ok && App.liveHealth?.pending === true;
-  const delay = !ok || pending ? LIVE_HEALTH_RETRY : anyoneStreaming() ? LIVE_HEALTH_INTERVAL : LIVE_HEALTH_IDLE;
+  const delay = errored
+    ? LIVE_HEALTH_ERROR_RETRY
+    : !ok || pending
+      ? LIVE_HEALTH_RETRY
+      : anyoneStreaming()
+        ? LIVE_HEALTH_INTERVAL
+        : LIVE_HEALTH_IDLE;
   clearTimeout(healthTimer);
   healthTimer = setTimeout(() => {
     healthTimer = null;
@@ -770,26 +816,20 @@ export async function refreshLiveHealth({ probe = false } = {}) {
   } catch (err) {
     log.warn('直播信号探测失败', err);
     App.liveHealthFails += 1;
-    // 连续失败到上限就停在 error：界面显示「获取失败，等待服务器修复」
     App.liveHealthState = App.liveHealthFails >= LIVE_HEALTH_MAX_FAILS ? 'error' : 'loading';
-    // 拿不到数据就不要挂「直播中」标记（宁可少显示，也不给假的）
+    // **保留上一份「谁在播」，只把这份数据标成取不到。**
+    // 「取不到」不等于「没人播」：原来把四个集合一起清空，会让整站瞬间变成「谁都没开播」
+    // ——正看着的那一路画面还在（它不由这份数据驱动），但**换台、点别的直播间全都点不动**
+    // （「在不在播」的判定用的就是这几个集合），而且这不是「少显示」，是**错显示**。
+    // 探测一恢复、或收到一次推送就会自动纠正（见 healthTick 的慢速重试）。
     App.liveHealth = {
+      ...(App.liveHealth || {}),
       ok: false,
       streamingKnown: false,
       reason: err.message,
-      streaming: [],
-      streamingChannels: [],
-      bili: { known: false, items: [] },
     };
-    changed =
-      App.liveMain !== null ||
-      (App.liveNow instanceof Set && App.liveNow.size > 0) ||
-      (App.liveChannelsNow instanceof Set && App.liveChannelsNow.size > 0) ||
-      (App.liveBiliNow instanceof Set && App.liveBiliNow.size > 0);
-    App.liveNow = new Set();
-    App.liveChannelsNow = new Set();
-    App.liveBiliNow = new Set();
-    App.liveMain = null;
+    // 只有「状态本身」变了才需要重绘（提示文案跟着换）；集合没动就不打扰正在播的画面
+    changed = prevState !== App.liveHealthState;
   } finally {
     healthInFlight = false;
   }

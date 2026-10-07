@@ -39,7 +39,6 @@ import {
   fieldSelect,
   fieldSwitch,
   fieldText,
-  isChannelLive,
   privateOf,
   roundHasResult,
 } from './ui.js';
@@ -63,7 +62,7 @@ import {
 } from './events.js';
 import { reset as resetTeamBoard, save as saveTeamBoard } from './teams.js';
 import { ChannelLive, Live, probeLiveHealth } from './live.js';
-import { channelRooms, focusLive, renderChannels, renderPublic } from './views.js';
+import { channelRooms, focusLive, renderChannels, renderPublic, roomLive } from './views.js';
 import { handleMemberAction, handleMemberForm, refreshMeData } from './members.js';
 
 /** 按对局编号（WB-1-2）或序号定位一场比赛。 */
@@ -2323,7 +2322,11 @@ function watchChannel(id) {
     ChannelLive.stop(false);
     return;
   }
-  if (isChannelLive(channel.id)) {
+  // 「在不在播」用**页面同一套口径**（``roomLive``）：成员直播间要看的是「这个成员在不在
+  // 推流」，而不是「这个房间 ID 在不在频道推流列表里」——后者装的是传统频道（``c01`` 这类），
+  // 成员房间的 ``m:<uid>`` 永远不在里面。口径用错的后果：点一个正在播的成员直播间，反而
+  // 把画面停掉、写上「当前未开播」，看起来就是「换不了台」。
+  if (roomLive(channel)) {
     ChannelLive.playRoom(channel.play || null);
   } else {
     ChannelLive.stop(false);
