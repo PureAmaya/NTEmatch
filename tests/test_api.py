@@ -14,6 +14,25 @@ from app.store import store
 
 
 # --------------------------------------------------------------------------- #
+# 赛程预览接口（「快速创建分组」弹窗的实时预览）
+# --------------------------------------------------------------------------- #
+async def test_tournament_preview_still_works(admin_client):
+    """``POST /api/tournament/preview`` 必须能跑通（前端那个按钮是唯一入口）。
+
+    这条是补的：``8ccd154`` 给 ``auto_form_teams`` 加了 ``allow_substitutes``，
+    而 ``611762d`` 把参数删掉时**没删调用点**——预览接口从那以后一直在
+    ``TypeError: auto_form_teams() got an unexpected keyword argument``，
+    而**没有任何测试碰过它**：参数活着、调用点没跟着改，只有「真的调一次」才发现。
+    """
+    res = await admin_client.post("/api/tournament/preview", json={"teamSize": 2})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert isinstance(body.get("ok"), bool), body
+    for key in ("players", "teams", "teamSize", "groupCount", "groupSizes", "total", "warnings"):
+        assert key in body, f"预览结果少了 {key}"
+
+
+# --------------------------------------------------------------------------- #
 # 小组赛对阵调整：跨组换队
 # --------------------------------------------------------------------------- #
 def _pairing_fixture() -> dict:

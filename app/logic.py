@@ -1197,7 +1197,6 @@ def tournament_plan(cfg: Config, **overrides: Any) -> dict[str, Any]:
             rules.team_size,
             overrides.get("seed"),
             merge_remainder=bool(overrides.get("merge_remainder")),
-            allow_substitutes=rules.format == "league",
         )
         _rounds, plan_warnings, summary = T.build_tournament(teams, rules)
     except ValueError as exc:
