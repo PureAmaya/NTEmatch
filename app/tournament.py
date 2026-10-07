@@ -198,11 +198,16 @@ def judge_round(rnd: Round, *, allow_draw: bool = False, scoring: object = metri
        每轮谁赢由**判断标准**决定（数值高胜或数值低胜，见 :mod:`app.metrics`）；
     2. 否则比较 ``score``（本场成绩）；
     3. 仍然相同再比 ``points``（小分 / 累计成绩）；
-    4. 还相同：2 队且允许平局 → ``DRAW``；多队并列第一 → 交回管理员指定。
+    4. 还相同再比 ``extras``（附加数值，如赛车的「距离」：越远越靠前）；
+    5. 还相同：2 队且允许平局 → ``DRAW``；多队并列第一 → 交回管理员指定。
 
-    **没有成绩**的一方（详见 :meth:`app.metrics.Scoring.has_result`）在任何口径下都垫底：
-    数值型的 0 是合法读数（0 分照样参与排名），时间型的 0 与数值型的 ``-1`` 才是没成绩——
-    否则时间型里 0 秒会被当成最快的人。
+    **没有成绩**的一方（详见 :meth:`app.metrics.Scoring.has_result`）在任何口径下都排在
+    有成绩的人后面：数值型的 0 是合法读数（0 分照样参与排名），时间型的 0 与数值型的
+    ``-1`` 才是没成绩——否则时间型里 0 秒会被当成最快的人。
+
+    而这些「没成绩的人」**彼此之间的先后按附加数值排**（赛车：没跑完的人按跑了多远排，
+    远的在前）。以前他们一律被钉在最后一名（并列垫底）：那时没有附加数值可用，
+    「压根没成绩」只能挤在一个名次上；现在有了距离，这些人也能分出先后。
     """
     sc = metrics.as_scoring(scoring)
     sides = rnd.sides
@@ -237,12 +242,15 @@ def judge_round(rnd: Round, *, allow_draw: bool = False, scoring: object = metri
     counted = count == 2 and bool(rnd.sets)
     order = sorted(
         playing,
-        key=lambda i: sc.judge_key(sides[i].score, sides[i].points, counted=counted),
+        key=lambda i: sc.judge_key(
+            sides[i].score, sides[i].points, counted=counted, extras=sides[i].extras
+        ),
     )
     rank = 0
-    previous: tuple[int, int] | None = None
+    previous: tuple | None = None
     for position, i in enumerate(order, start=1):
-        current = (sides[i].score, sides[i].points)
+        # 并列的判据要**连附加数值一起看**：只差距离的两个人不是并列，他们该拿到不同名次
+        current = (sides[i].score, sides[i].points, tuple(sides[i].extras))
         if current != previous:
             rank = position
             previous = current
@@ -250,12 +258,17 @@ def judge_round(rnd: Round, *, allow_draw: bool = False, scoring: object = metri
     for i in range(count):
         if sides[i].forfeit:
             sides[i].rank = len(playing) + 1
-    # 没有成绩的一方**名次钉在最后一位**（垫底），与「有成绩但并列」区分开：
-    # 并列是「成绩一样」（按并列那一位算名次分），没成绩是「压根没成绩」——4 队里 3 队
-    # 没跑完时，他们不该占到「并列第 2」那份名次分（那和跑完拿了第 2 一样多）。
+    # 没有成绩的人分两种，**必须分开处理**：
+    #
+    # * **记了附加数值（距离）**：上面排序已经把他们放在有成绩的人之后、并按距离排好先后
+    #   （见 metrics.extra_key）——「没跑完但跑了 800 米」该排在「只跑了 400 米」前面，
+    #   这正是赛车的用法；
+    # * **什么都没记**：名次一律钉在**最后一名**。他们不该占到「并列第 2」那份名次分——
+    #   4 队里 3 队没跑完、又没有任何距离可看时，「并列第 2」等于白送 3 个第二名。
     for i in playing:
-        if not sc.has_result(sides[i].score) and not sides[i].points:
-            sides[i].rank = count
+        if sc.has_result(sides[i].score) or sides[i].points or sides[i].extras:
+            continue
+        sides[i].rank = count
 
     if not any(
         sc.has_total(sides[i].score, sides[i].points, has_rounds=bool(rnd.sets))
@@ -267,8 +280,12 @@ def judge_round(rnd: Round, *, allow_draw: bool = False, scoring: object = metri
             return chr(ord("A") + playing[0])
         return ""
 
-    best = (sides[order[0]].score, sides[order[0]].points)
-    tied = [i for i in order if (sides[i].score, sides[i].points) == best]
+    best = (sides[order[0]].score, sides[order[0]].points, tuple(sides[order[0]].extras))
+    tied = [
+        i
+        for i in order
+        if (sides[i].score, sides[i].points, tuple(sides[i].extras)) == best
+    ]
     if len(tied) > 1:
         return "DRAW" if (count == 2 and allow_draw) else ""
     return chr(ord("A") + order[0])

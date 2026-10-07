@@ -475,6 +475,43 @@ def test_blank_sides_share_the_last_place_not_a_middle_tie():
     assert [tournament.placement_points(4, side.rank) for side in rnd.sides] == [4, 1, 1, 1]
 
 
+def test_no_result_sides_rank_by_distance():
+    """赛车：没跑完的人（没有用时）**按跑了多远排**——远的在前，完赛的人永远在前面。
+
+    这就是 ``Side.extras``（附加数值）存在的理由：``points`` 是「小分 / 罚时」，方向跟着
+    判断标准走（用时低胜时越小越好）；「跑了多远」永远是**越远越好**，方向正好相反，
+    混用一个字段必然出错。完全没记距离的人仍然并列垫底（见上一条）。
+    """
+    sc = metrics.Scoring.resolve(value_type="time", better="low")
+    rnd = Round(
+        code="G-A-1-1",
+        stage="group",
+        sides=[Side(team_id=f"t{i}") for i in range(1, 5)],
+    )
+    for side, ms, extra in zip(rnd.sides, [25000, 0, 0, 0], [[], [800], [400], [1200]]):
+        side.score = ms
+        side.extras = extra
+    assert tournament.judge_round(rnd, allow_draw=False, scoring=sc) == "A"
+    # A 完赛第 1；三个没跑完的按距离排：D(1200) → B(800) → C(400)
+    assert [side.rank for side in rnd.sides] == [1, 3, 4, 2]
+    assert [tournament.placement_points(4, side.rank) for side in rnd.sides] == [4, 2, 1, 3]
+
+
+def test_distance_never_beats_finishing_the_race():
+    """距离**不能**让没跑完的人压过完赛的人：有成绩就先比成绩。
+
+    「按距离排名」只发生在**同样没有成绩**的人之间；否则「跑了很远但没跑完」会赢过
+    「跑得很慢但跑完了」，那不是成绩排名该有的样子。
+    """
+    sc = metrics.Scoring.resolve(value_type="time", better="low")
+    rnd = Round(code="G-A-1-1", stage="group", sides=[Side(team_id="t1"), Side(team_id="t2")])
+    rnd.sides[0].score = 999_000  # 完赛，但慢得离谱
+    rnd.sides[1].score = 0        # 没跑完，可是跑了很远
+    rnd.sides[1].extras = [99_999]
+    assert tournament.judge_round(rnd, allow_draw=False, scoring=sc) == "A"
+    assert [side.rank for side in rnd.sides] == [1, 2]
+
+
 def test_a_real_zero_is_a_score_but_blank_is_not():
     """有成绩的 0 分与「没填」必须分开：低胜下 0 分是最好的成绩，没填的一方永远垫底。
 

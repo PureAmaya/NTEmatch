@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS round_sides (
   label     TEXT NOT NULL DEFAULT '',
   score     INTEGER NOT NULL DEFAULT 0,
   points    INTEGER NOT NULL DEFAULT 0,
+  extras    TEXT NOT NULL DEFAULT '[]',
   rank      INTEGER NOT NULL DEFAULT 0,
   forfeit   INTEGER NOT NULL DEFAULT 0,
   source    TEXT NOT NULL DEFAULT '',
@@ -471,6 +472,8 @@ _EXTRA_COLUMNS: dict[str, dict[str, str]] = {
     "round_sides": {
         "source": "TEXT NOT NULL DEFAULT ''",
         "points": "INTEGER NOT NULL DEFAULT 0",
+        # 附加数值（距离等）：JSON 数组，老库补列时给空数组——「没记」与「记了 0」分开
+        "extras": "TEXT NOT NULL DEFAULT '[]'",
         "rank": "INTEGER NOT NULL DEFAULT 0",
         "forfeit": "INTEGER NOT NULL DEFAULT 0",
     },
@@ -1055,6 +1058,9 @@ def save_event(
                     side.get("label", ""),
                     int(side.get("score", 0)),
                     int(side.get("points", 0)),
+                    json.dumps(
+                        [int(x or 0) for x in (side.get("extras") or [])], ensure_ascii=False
+                    ),
                     int(side.get("rank", 0) or 0),
                     int(bool(side.get("forfeit", False))),
                     side.get("source", ""),
@@ -1080,7 +1086,7 @@ def save_event(
         "round_sides",
         (
             "event_id", "round_idx", "side", "team_id", "label",
-            "score", "points", "rank", "forfeit", "source",
+            "score", "points", "extras", "rank", "forfeit", "source",
         ),
         side_rows,
     )
@@ -1240,6 +1246,7 @@ def load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None
             "label": meta["label"] if meta else "",
             "score": meta["score"] if meta else 0,
             "points": meta["points"] if meta else 0,
+            "extras": json.loads((meta["extras"] if meta else "") or "[]") or [],
             "rank": meta["rank"] if meta else 0,
             "forfeit": bool(meta["forfeit"]) if meta else False,
             "source": meta["source"] if meta else "",

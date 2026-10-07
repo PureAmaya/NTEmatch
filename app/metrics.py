@@ -74,6 +74,11 @@ DECIMAL_UNIT = 10**DECIMAL_SCALE
 #: 时间型不用它——时间型的合法值必然 > 0，``0`` 本身就是「没有成绩」（老数据也这么存）。
 MISSING = -1
 
+#: 附加数值（赛车里的「距离」）最多记几个。
+#: 排序键必须**定长**才能逐位比较（见 :meth:`Scoring.extra_key`），所以这里给个上限：
+#: 四位数已经够用（用时 / 距离 / 罚时 / 备注数），再多也不是「一个成绩」了。
+MAX_EXTRAS = 4
+
 # --------------------------------------------------------------------------- #
 # 判断标准
 # --------------------------------------------------------------------------- #
@@ -292,16 +297,35 @@ class Scoring:
         number = int(points or 0)
         return number if self.low_wins else -number
 
-    def order_key(self, value: Any, points: Any = 0) -> tuple[int, int, int]:
+    def extra_key(self, extras: Any = ()) -> tuple[int, ...]:
+        """附加数值（赛车里的「距离」）的排序键（小者在前，所以取负）。
+
+        **方向写死：数值大的靠前**（跑了多远，越远越好）。它和主成绩的方向**无关**——
+        时间低胜、得分高胜都可能是主口径，但「没跑完的人跑了多远」永远是越大越好；
+        所以这里不能用 :meth:`spare_key` 那套跟着判断标准翻转的写法。
+
+        定长（补 0）是有原因的：Python 里 ``(0,) < (0, 0)`` ——「短的更小」，
+        不定长会让少填一项的一方凭空排到前面。补 0 之后「没填」与「跑了 0」同分，
+        两种都排在「跑了一段」的后面。
+        """
+        items = [int(x or 0) for x in (extras or [])][:MAX_EXTRAS]
+        items += [0] * (MAX_EXTRAS - len(items))
+        return tuple(-x for x in items)
+
+    def order_key(self, value: Any, points: Any = 0, extras: Any = ()) -> tuple[int, ...]:
         """一套完整的名次排序键（小者在前）。
 
-        自然数 + 数值高胜与历史上的 ``(-score, -points)`` **完全等价**（含并列），
-        所以老数据的行为一字不变。
+        顺序：**主成绩 → 小分 → 附加数值（距离）**。自然数 + 数值高胜与历史上的
+        ``(-score, -points)`` **完全等价**（含并列），所以老数据的行为一字不变。
+
+        附加数值排在最后，于是「**没有主成绩**的人之间的先后**由它决定**」——
+        这正是赛车要的效果：没跑完的人按跑了多远排名，而完赛的人永远排在他们前面
+        （没有主成绩的一律进 :meth:`sort_key` 的第 1 组）。
         """
-        return (*self.sort_key(value), self.spare_key(points))
+        return (*self.sort_key(value), self.spare_key(points), *self.extra_key(extras))
 
     def judge_key(
-        self, value: Any, points: Any = 0, *, counted: bool = False
+        self, value: Any, points: Any = 0, *, counted: bool = False, extras: Any = ()
     ) -> tuple[Any, ...]:
         """判定名次用的排序键（小者在前）。
 
@@ -311,10 +335,13 @@ class Scoring:
 
         这个区分是必须的：时间型里如果把「2 : 1」当成时间比，赢家会被判输
         （1 < 2），而且看起来毫无破绽。
+
+        ``extras`` 是附加数值（距离），见 :meth:`extra_key`：填了轮次时它是最后的兜底，
+        没填轮次时它就是「没有主成绩的人」之间的排名依据。
         """
         if counted:
-            return (-int(value or 0), self.spare_key(points))
-        return self.order_key(value, points)
+            return (-int(value or 0), self.spare_key(points), *self.extra_key(extras))
+        return self.order_key(value, points, extras)
 
     def round_total(self, value: Any, points: Any, has_rounds: bool) -> int:
         """一场比赛的「总成绩」：填了轮次就是各轮合计（``points``），否则是 ``value``。

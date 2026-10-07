@@ -372,6 +372,12 @@ class Side(NTEModel):
     # 所以「没填」不能用 0 表示，见 app/metrics.MISSING。
     score: int = metrics.MISSING
     points: int = 0
+    # 附加数值（赛车里的「距离」就是它）：**主成绩没有时**用它排出这些人的先后
+    # ——数值大的靠前（「跑了多远」永远是越远越好，方向写死，见 metrics.extra_key）。
+    #
+    # 为什么不复用 ``points``：``points`` 是「小分 / 累计成绩 / 罚时」，方向跟着判断标准走
+    # （低胜口径下越小越靠前）。「距离」要的正好相反（越大越靠前），混用一个字段必然出错。
+    extras: list[int] = Field(default_factory=list)
     rank: int = 0
     forfeit: bool = False     # 弃权（长期没人 / 人数不足）：名次垫底，对方自动晋级
     source: str = ""          # 席位来源说明，如「A 组第 1」「WB-1-2 败者」

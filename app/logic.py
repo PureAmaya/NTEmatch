@@ -1003,6 +1003,11 @@ def rulebook(cfg: Config) -> dict[str, Any]:
         ),
         "直播：每场比赛可单独开启推流，并标注直播选手提示。",
     ]
+    # 记了「距离」的届才说这一条：不需要它的比赛看到只会犯迷糊（「距离是什么？」）
+    if any(side.extras for rnd in cfg.rounds for side in rnd.sides):
+        others.append(
+            "没成绩的人按「距离」排名（越远越靠前）；完赛的人永远排在没跑完的人前面。"
+        )
     if rules.target_score and not league and not sc.low_wins:
         others.append(f"单轮目标：{rules.target_score} 分。")
     sections.append(_rule_section("其他", others))

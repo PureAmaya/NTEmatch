@@ -114,6 +114,57 @@ function readValueInput(host, role, sc) {
   return parseVal(input ? input.value : '', sc);
 }
 
+//: 附加数值（赛车里的「距离」）那一列的表头
+const EXTRA_LABEL = '距离';
+
+/**
+ * 「距离」那一列的一格（默认**藏起来**：不记距离的项目一个框就够，多一列反而挡眼）。
+ *
+ * 它的用途只有一个：**没有主成绩的人按它排名**（没跑完但跑了 800 米的排在只跑了 400 米的前面，
+ * 完赛的人永远在前面）。方向写死为「数值大的靠前」，与判断标准无关——与后端
+ * ``metrics.extra_key`` 同一条规则。
+ */
+function extraFieldHtml(side, on) {
+  const value = (side.extras || [])[0] || '';
+  return (
+    `<label class="rrow__f" data-extra-f${on ? '' : ' hidden'}><span>${EXTRA_LABEL}</span>` +
+    `<span class="tvinput" data-role="extra"><input type="number" min="0" step="1" ` +
+    `placeholder="跑了多远" value="${esc(value === 0 ? '' : value)}"></span></label>`
+  );
+}
+
+/**
+ * 读回「距离」那一格。三种结果要分清楚：
+ *
+ * * ``null``：这一列没启用（藏着的）→ 调用方**沿用原有值**，别把老数据清掉；
+ * * ``[]``：启用着但留空 → 就是「清掉」；
+ * * ``[数值]``：记了个距离。
+ */
+function readExtraInput(host) {
+  if (!host) return null;
+  const box = qs('[data-role="extra"]', host);
+  if (!box || box.closest('[hidden]')) return null;
+  const input = qs('input', box);
+  const text = input ? input.value.trim() : '';
+  if (!text) return [];
+  const value = Number(text);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${EXTRA_LABEL}要填一个不小于 0 的数字（没跑完就填跑了多远）`);
+  }
+  return [Math.round(value)];
+}
+
+/**
+ * 「距离」的比较（小者在前，所以取负）：**数值大的靠前**。
+ *
+ * 方向写死，与判断标准无关——主成绩可能是「用时越低越好」，但「跑了多远」永远是越远越好；
+ * 与后端 ``metrics.extra_key`` 同一条规则。没有记录 = 0（排在跑了 0 米之后？不：
+ * 两者同分，都排在「跑了一段」的后面）。
+ */
+function cmpExtra(x, y) {
+  return ((y.extras || [])[0] || 0) - ((x.extras || [])[0] || 0);
+}
+
 /** 一行轮次：`第 N 轮  A 输入 : B 输入  ×`。 */
 function roundRowHtml(a, b, sc) {
   return (
@@ -182,12 +233,15 @@ function refreshResultPreview(bodyEl, sides, allowDraw) {
       const host = multi
         ? qs(`[data-sid="${side.key}"]`, bodyEl)
         : qs(`[data-sid="${side.key}"]`, manualHost);
+      const extra = readExtraInput(host);
       return {
         key: side.key,
         label: side.label,
         score: readValueInput(host, 'score', sc),
         // 「细则分 / 小分」的输入框已经去掉：**沿用已有值**（填了轮次时下面会被推导值覆盖）
         points: Number(side.points) || 0,
+        // 这一列没启用时沿用原有距离（null = 不动），启用着留空 = 清掉
+        extras: extra === null ? side.extras || [] : extra,
       };
     });
   } catch (err) {
@@ -234,7 +288,7 @@ function refreshResultPreview(bodyEl, sides, allowDraw) {
   const better = (x, y) =>
     counted
       ? y.score - x.score || cmpVal(x.points, y.points, sc)
-      : cmpVal(x.score, y.score, sc) || cmpVal(x.points, y.points, sc);
+      : cmpVal(x.score, y.score, sc) || cmpVal(x.points, y.points, sc) || cmpExtra(x, y);
   const order = [...entries].sort(better);
   const top = order[0];
   const tied = entries.filter((e) => !better(e, top) && !better(top, e));
@@ -280,6 +334,12 @@ function openResultModal(rnd) {
   const sides = rnd.sides || [rnd.sideA, rnd.sideB];
   const sc = scoringOf(App.state);
   const multi = sides.length > 2;
+  // 「距离」那一列：任何一方记过就默认展开，否则**藏起来**——不记距离的项目，
+  // 多一个永远空着的框只会让人问「这填什么」
+  const extraOn = sides.some((side) => (side.extras || []).length > 0);
+  const extraHint =
+    `没成绩时按<b>${EXTRA_LABEL}</b>排这些人的名次（越远越靠前）；` +
+    `完赛的人永远排在没跑完的人前面。`;
   const stored = rnd.sets || [];
   // 已经「直接填过成绩」的场次仍按原样编辑（想改用轮次就点「添加一轮」）
   // 「填过没填」看录入痕迹：数值型的 0 是合法读数，不能用真假值糊过去
@@ -309,7 +369,9 @@ function openResultModal(rnd) {
           head +
           `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
           valueInputHtml('score', side.score, sc) +
-          `</label></div>`
+          `</label>` +
+          extraFieldHtml(side, extraOn) +
+          `</div>`
         );
       }
       return (
@@ -334,7 +396,9 @@ function openResultModal(rnd) {
         `<span class="rrow__name">${esc(side.label)}</span>` +
         `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
         valueInputHtml('score', side.score, sc) +
-        `</label></div>`
+        `</label>` +
+        extraFieldHtml(side, extraOn) +
+        `</div>`
     )
     .join('');
 
@@ -344,11 +408,17 @@ function openResultModal(rnd) {
     : '';
   // 留空的含义（三种录入块都要用）：一个成绩框，留空 = 没有成绩（垫底）
   const blankHint = `成绩可以<b>留空</b>——留空 = 没有成绩（没跑完 / 未到场），一律排在最后。`;
+  // 「记距离」开关：默认把那一列藏起来（一个框就够的项目不必看见它），点一下才展开。
+  // 不刷新弹窗、只切 hidden：展开后输入框就在原位，不会把正在填的内容抖掉。
+  const extraToggle =
+    `<button class="btn btn--xs" type="button" data-extra-toggle>` +
+    `${extraOn ? `不记「${EXTRA_LABEL}」` : `+ 记「${EXTRA_LABEL}」`}</button>`;
   const roundsBlock = multi
     ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按 <b>${esc(
         sc.label
       )}</b>（${esc(sc.betterLabel || sc.better)}）排名，第 1 名即为本场胜者，` +
-      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。${timeHint}${blankHint}</div>`
+      `名次分按 ${sides.length}/${sides.length - 1}/…/1 计入小组赛。${timeHint}${blankHint}` +
+      `${extraHint}${extraToggle}</div>`
     : `<div class="rsets"><div class="rsets__head"><b>轮次</b>` +
       `<span class="panel__hint">默认一轮；每轮 ${esc(sc.label)}，赢的轮数就是大比分` +
       `${sc.timeBased ? '（可写 1:23.456 或 83.45）' : ''}</span>` +
@@ -360,7 +430,7 @@ function openResultModal(rnd) {
     ? ''
     : `<div id="rq-manual"${initial.length ? ' hidden' : ''}>` +
       `<div class="notice" style="margin-top:10px">没有轮次时按下面这一组「本场成绩」判定；` +
-      `点上面的「添加一轮」就改用轮次录入。${timeHint}${blankHint}</div>` +
+      `点上面的「添加一轮」就改用轮次录入。${timeHint}${blankHint}${extraHint}${extraToggle}</div>` +
       `<div class="rrows">${manualRows}</div></div>`;
   const foldOpen = Boolean(
     rnd.duration || rnd.startedAt || rnd.finishedAt || rnd.note || rnd.winner
@@ -439,6 +509,19 @@ function openResultModal(rnd) {
           refresh();
         };
       }
+      // 「+ 记距离」：只切 hidden，不重绘弹窗（重绘会把正在填的内容抖掉）
+      const extraBtn = bodyEl.querySelector('[data-extra-toggle]');
+      if (extraBtn) {
+        extraBtn.onclick = () => {
+          const fields = [...bodyEl.querySelectorAll('[data-extra-f]')];
+          const show = fields.some((field) => field.hidden);
+          fields.forEach((field) => {
+            field.hidden = !show;
+          });
+          extraBtn.textContent = show ? `不记「${EXTRA_LABEL}」` : `+ 记「${EXTRA_LABEL}」`;
+          refresh();
+        };
+      }
       bodyEl.addEventListener('input', (e) => {
         if (e.target.closest('[data-set-del]')) return;
         refresh();
@@ -475,6 +558,8 @@ function openResultModal(rnd) {
                   : readValueInput(host, 'score', sc),
                 // 「小分 / 细则分」的输入框已经去掉：没有轮次时沿用**已有值**（别把老数据清零）
                 points: derived ? derived.totals[index] : Number(side.points) || 0,
+                // 距离那一列没启用时沿用原有值（null = 不动），启用着留空 = 清掉
+                extras: readExtraInput(host) ?? (side.extras || []),
               };
             }),
             durationMinutes: Number(read('#rq-duration')) || 0,

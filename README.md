@@ -1106,6 +1106,26 @@ A 组 · 第 1 轮 · 第 1 场
 直接调接口时**整个不写 `score` 字段也是这个意思**（不是 `0` 分——数值低胜下 0 可是最好的成绩）。
 界面上**每方只有一个成绩框**（时间型那个框可以写 `1:23.456`、也可以留空；得分制同样一个框），
 「小分 / 细则分」不再是录入项：字段还在（轮次模式下它是各轮合计），没有轮次时沿用已有值不动。
+
+#### 没成绩的人按「距离」排名（赛车那类项目）
+
+赛车、跑酷这类项目常常出现「**没跑完**」：没有用时，但**跑了多远**是知道的。
+所以每个成绩旁边还可以记一个**附加数值**（默认标签「距离」，录分弹窗里点一下
+「+ 记「距离」」才展开那一列——默认只有一个框，不记距离的项目看不见它）：
+
+| 情形 | 名次 |
+| --- | --- |
+| 有成绩 | 正常按成绩排（附加数值不参与）——**完赛的人永远排在没跑完的人前面** |
+| 没成绩、记了距离 | 这些人**按距离排，越远越靠前**（跑了 1200 米的在 800 米前面） |
+| 没成绩、也没记距离 | 并列**最后一名**（与老行为一致：没成绩就不占他人的名次分） |
+
+* 方向是**写死的「越大越靠前」**，与判断标准无关——主成绩可能是「用时越低越好」，
+  而「跑了多远」永远是越远越好（`metrics.extra_key`）；这也是它**没有复用 `points`** 的原因：
+  `points`（小分 / 罚时）的方向跟着判断标准走，两者正好相反；
+* 接口字段是 `sides[].extras`（数组，最多 4 个）：`POST /api/rounds/{ref}/result` 里传
+  `{"sides": [{"key": "B", "score": -1, "extras": [800]}]}` 就是「B 没跑完、跑了 800 米」；
+  负数距离会被拒（多半是把主成绩填错了格子）；
+* 界面上距离会跟在名次旁边显示（「距离 800」），赛程里一眼能对上号。
 一场里**谁都没填**则不能结算（没有可比的成绩），接口会回「谁都没登记成绩：至少填一方的成绩，
 或直接指定胜方」。
 
@@ -1350,7 +1370,7 @@ A 组 · 第 1 轮 · 第 1 场
 | `PUT /api/teams` | 锦标赛 | 手动调整队伍（结构变化会清空赛程） |
 | `POST /api/tournament/preview` | 锦标赛 | **只读**预估结构 `{teamSize, groupCount, size, teamsPerMatch, loserBracket}` |
 | `POST /api/tournament/generate` | 锦标赛 | `{size, teamsPerMatch, loserBracket, reform, teamSize, groupCount, seed}` |
-| `POST /api/rounds/{ref}/result` | 两者 | `{sets, sides, winner, durationMinutes, startedAt, finishedAt}` |
+| `POST /api/rounds/{ref}/result` | 两者 | `{sets, sides, winner, durationMinutes, startedAt, finishedAt}`；`sides[].extras` = 附加数值（距离，没成绩时按它排名） |
 | `POST /api/rounds/{ref}/walkover` | 两者 | 判一方弃权 `{side, reason}`，其余各方自动晋级 |
 | `POST /api/rounds/{ref}/live` | 两者 | 本场直播开关 `{enabled, note}`（接口保留，界面不再暴露开关） |
 | `POST /api/rounds/{ref}/times` | 两者 | 计划 / 开始 / 结束时间 |

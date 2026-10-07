@@ -1458,6 +1458,11 @@ function matchSideHtml(side, key, rnd) {
     done && side.points
       ? `<span class="mside__pts">${pointsLabel} ${esc(fmtVal(side.points, sc))}</span>`
       : '';
+  // 附加数值（赛车里的「距离」）：没成绩的人就是按它排的名次，得让人看得见才对得上号
+  const extraValue = (side.extras || [])[0] || 0;
+  const extra = extraValue
+    ? `<span class="mside__pts">距离 ${esc(String(extraValue))}</span>`
+    : '';
   const members = (side.players || [])
     .map(
       (p) =>
@@ -1474,6 +1479,7 @@ function matchSideHtml(side, key, rnd) {
     (forfeit ? `<span class="mside__forfeit">弃权</span>` : '') +
     rank +
     points +
+    extra +
     `<span class="mside__score">${score}</span></div>` +
     `<div class="mside__members">${
       members || `<span class="panel__hint">${esc(side.source || '等待上游比赛结果')}</span>`

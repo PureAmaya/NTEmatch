@@ -533,11 +533,16 @@ class SideResultPayload(NTEModel):
       读数（0 分照样参与排名），所以「没填」只能靠哨兵表达；否则数值低胜下漏填的 0
       会被当成**最好**的成绩判第 1（见 app/metrics.py 的两条约定）。
     * ``points``（小分 / 累计成绩 / 罚时）没有「没有成绩」这一说，留空一律按 0。
+    * ``extras``（附加数值，例如赛车的**距离**）同样没有「没有成绩」这一说：留空 = 没记。
+      它的用途是**给「没有主成绩」的人排名次**——赛车没跑完的人没有用时，但跑了多远是知道的，
+      这些人之间就按距离分先后（远的在前，方向写死，见 ``metrics.extra_key``）。
+      完赛的人永远排在没跑完的人前面：有主成绩就先比主成绩。
     """
 
     key: str = ""
     score: int = metrics.MISSING  # 省略 = 没有成绩（垫底），不是 0 分
     points: int = 0               # 小分 / 细则分（可选）
+    extras: list[int] = Field(default_factory=list)  # 附加数值（距离）：没成绩时按它排名
     team_id: str = ""
     player_ids: list[str] = Field(default_factory=list)
 
@@ -3190,6 +3195,10 @@ async def api_round_result(
     for legacy in (payload.score_a, payload.score_b):
         if legacy is not None and legacy < 0 and legacy != metrics.MISSING:
             raise HTTPException(status_code=400, detail="比分不能为负数")
+    for item in payload.sides:
+        # 附加数值（距离）是「跑了多远」：负数没有意义，多半是把主力成绩填错了格子
+        if any(int(x or 0) < 0 for x in item.extras):
+            raise HTTPException(status_code=400, detail="附加数值（距离）不能为负数")
     if payload.duration_minutes is not None and payload.duration_minutes < 0:
         raise HTTPException(status_code=400, detail="用时不合法")
 
@@ -3220,6 +3229,13 @@ async def api_round_result(
             # 小分 / 累计成绩 / 罚时没有「没有成绩」这一说：前端留空时发来的哨兵
             # （以及任何负数）一律按 0 记——它是「没有小分 / 没有罚时」，不是负分
             raw[index]["points"] = max(0, int(item.points))
+            # 附加数值（距离）：留空的项直接丢掉，别留一串 0 在同一行里
+            # （没记 = 空数组，「跑了 0 米」是另一回事）
+            extras = [int(x or 0) for x in (item.extras or []) if int(x or 0) > 0]
+            if extras:
+                raw[index]["extras"] = extras
+            else:
+                raw[index].pop("extras", None)
             if item.team_id:
                 raw[index]["teamId"] = item.team_id
             if item.player_ids:
@@ -3252,7 +3268,10 @@ async def api_round_result(
                 others = sorted(
                     (i for i in range(len(model.sides)) if i != winner_index),
                     key=lambda i: scoring.judge_key(
-                        model.sides[i].score, model.sides[i].points, counted=counted
+                        model.sides[i].score,
+                        model.sides[i].points,
+                        counted=counted,
+                        extras=model.sides[i].extras,
                     ),
                 )
                 model.sides[winner_index].rank = 1
@@ -3268,6 +3287,8 @@ async def api_round_result(
                         model.sides[i].score, model.sides[i].points, has_rounds=bool(model.sets)
                     )
                     or model.sides[i].points
+                    # 只有距离也算「登记过」：全都退赛但记了跑了多远时，名次照样能排出来
+                    or model.sides[i].extras
                     for i in range(len(model.sides))
                 )
                 if blank:
