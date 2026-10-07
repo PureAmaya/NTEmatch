@@ -99,7 +99,9 @@ img { display: block; max-width: 100%; }
 /* ---------- 3. 背景特效层 ---------- */
 .fx { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
 .fx__grid {
-  position: absolute; inset: -8%;
+  /* inset: 0（原来是 -8%，给位移留余量）：动画去掉后不必再往外扩，
+     也就少光栅化约 35% 的像素（全屏纹理直接变小）。 */
+  position: absolute; inset: 0;
   background-image:
     radial-gradient(rgba(125, 92, 255, 0.55) 1.6px, transparent 1.7px),
     radial-gradient(rgba(34, 224, 232, 0.45) 1.6px, transparent 1.7px);
@@ -107,13 +109,11 @@ img { display: block; max-width: 100%; }
   background-position: 0 0, 9px 9px;
   opacity: 0.55;
   mask-image: radial-gradient(ellipse 92% 72% at 50% 18%, #000 0%, transparent 82%);
-  /* 用 transform 位移（只走合成）而不是 background-position（每帧重绘整屏）。
-     原来 background-position 在动 → 背景每帧重绘 → 上层所有面板要重新合成，
-     是「整页都卡」的根源。inset: -8% 留了余量，18px 位移不会露边。 */
-  animation: halftoneDrift 30s linear infinite;
-  will-change: transform;
+  /* **静态**（原来是 30s 无限位移 + `will-change: transform`）。
+     那两行会让这块**全屏**图层被永久提升、并永不停歇地走合成——占着一块全屏显存、
+     每帧都要合成一次，是「闲置时 GPU 也一直被占着」的主要来源；而位移只有 18px / 30s，
+     肉眼几乎看不出来。现在彻底静止。 */
 }
-@keyframes halftoneDrift { to { transform: translate3d(18px, 18px, 0); } }
 
 /* 光斑本身就是柔和径向渐变，再叠 90px 高斯模糊等于额外做一次大范围离屏渲染 */
 .fx__glow { position: absolute; border-radius: 50%; opacity: 0.42; }
@@ -124,11 +124,6 @@ img { display: block; max-width: 100%; }
   position: absolute; inset: 0; opacity: .22;
   background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .05) 0 10px, transparent 10px 26px);
 }
-.fx__noise {
-  position: absolute; inset: 0; opacity: .05;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
-}
-
 /* ---------- 4. HUD 顶栏 ---------- */
 .hud {
   position: sticky; top: 0; z-index: 40;
@@ -651,8 +646,9 @@ img { display: block; max-width: 100%; }
   font-family: var(--font-disp); font-size: clamp(18px, 4vw, 26px); font-weight: 700; letter-spacing: .16em; color: var(--txt);
 }
 .stage-cover__msg { font-family: var(--font-mono); font-size: 11.5px; color: var(--txt-mute); letter-spacing: .08em; max-width: 46ch; }
-.stage-cover__noise { position: absolute; inset: 0; opacity: .07; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E"); animation: noiseShift .6s steps(3) infinite; }
-@keyframes noiseShift { 0% { transform: translate(0, 0); } 33% { transform: translate(-3px, 2px); } 66% { transform: translate(2px, -3px); } 100% { transform: translate(0, 0); } }
+/* 静态噪点（原来是 0.6s steps(3) 的无限抖动）：opacity 只有 .07，肉眼看不出在动，
+   却一直让合成器干活。纹理保留，抖动去掉。 */
+.stage-cover__noise { position: absolute; inset: 0; opacity: .07; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E"); }
 
 .stage-bar {
   display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
@@ -763,8 +759,10 @@ img { display: block; max-width: 100%; }
    `@starting-style` 是这里的关键：元素从 `display:none` 变可见时，浏览器本来没有
    「起点」可插值，动画就会变成瞬间出现。它专门用来声明这种「首次显示」的起始状态——
    于是入场动画不依赖 JS 的时序（JS 那边还会再强制一次布局，两道保险）。 */
+/* 全屏 `backdrop-filter` 是**每帧都要重新采样并模糊背后整屏内容**——弹窗一开就持续吃 GPU。
+   这里改回纯色遮罩（略加深一点补观感），视觉差别很小。 */
 .modal__backdrop {
-  position: absolute; inset: 0; background: rgba(3, 6, 11, .78); backdrop-filter: blur(4px);
+  position: absolute; inset: 0; background: rgba(3, 6, 11, .86);
   opacity: 0; transition: opacity .2s ease;
 }
 .modal__box {
@@ -2958,4 +2956,21 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 @media (prefers-reduced-motion: reduce) {
   .home-entry__icon { transition: none; }
   .home-entry:hover .home-entry__icon { transform: none; }
+}
+
+/* 「减少动效」偏好下，把所有**装饰性无限动画**一并停掉：
+   它们不影响任何功能，却会一直占着合成器（每帧都要做一次合成）。 */
+@media (prefers-reduced-motion: reduce) {
+  .empty::before,
+  .round--live::after,
+  .ava--live::after,
+  .ava__live,
+  .live-tag__dot,
+  .ldg__bars i,
+  .nav-progress.is-on i,
+  .evt-card.is-busy,
+  .home-entry.is-busy,
+  .clock.is-on .clock__time::before {
+    animation: none !important;
+  }
 }
