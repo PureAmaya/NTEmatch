@@ -428,6 +428,40 @@ def test_group_table_low_wins_prefers_faster_total(make_config):
     assert rows["t1"]["rank"] == 1, "两场都完赛的队伍，名次应在退赛一场的队伍之前"
 
 
+def test_group_table_gives_a_distance_ranked_dnf_its_placement(make_config):
+    """只有距离、没有用时的队伍照样拿到名次分——**这正是「垫底也能出线」的前提**。
+
+    出线只按小组赛总排名取前 N（``advance_seeds`` → ``overall_ranking``），中间**没有任何**
+    「没成绩 / 垫底就不许晋级」的闸门。如果这里把它的名次分抹成 0，它就会永远出不了线，
+    哪怕它每场都比别人跑得远。
+    """
+    cfg = make_config(teams=4, value_type="time", better="low")
+    rnd = Round(
+        code="G-A-1-1",
+        label="A 组 · 第 1 轮 · 第 1 场",
+        stage="group",
+        sides=[Side(key=key, team_id=f"t{i}") for i, key in enumerate("ABCD", start=1)],
+    )
+    rnd.sides[0].score = 83450  # A 跑完了
+    for side, distance in zip(rnd.sides[1:], [800, 400, 1200]):
+        side.score = 0          # 没跑完：时间型的 0 就是「没有成绩」
+        side.extras = [distance]
+    rnd.status = "done"
+    rnd.winner = tournament.judge_round(rnd, scoring=cfg.rules.scoring)
+    assert rnd.winner == "A"
+
+    tables = tournament.group_tables(cfg.teams, [rnd], cfg.rules.scoring)
+    rows = {row["teamId"]: row for row in tables["A"]}
+    # 名次分 4/3/2/1：A 第 1、t4（1200 米）第 2、t2（800 米）第 3、t3（400 米）第 4
+    assert [rows[f"t{i}"]["placement"] for i in range(1, 5)] == [4, 2, 1, 3]
+    assert rows["t3"]["finished"] == 0, "一场都没跑完的人，完成场次就是 0"
+
+    # 出线名单就是总排名取前 N：全是「没跑完」的队伍也在里面（够名次就出线）
+    seeds = tournament.overall_ranking(tables, cfg.rules.scoring)
+    assert seeds[:4] == ["t1", "t4", "t2", "t3"]
+    assert "t3" in seeds, "没跑完不等于没有资格：只要名次分够就该能出线"
+
+
 def test_league_low_wins_breaks_tie_by_finish_and_total():
     """积分制平手时：数值低胜看「完成场次 → 总成绩」，而不是净胜分。
 
