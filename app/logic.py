@@ -207,33 +207,52 @@ def event_time_view(cfg: Config, progress: list[dict[str, Any]] | None = None) -
     }
 
 
+def season_finished(cfg: Config) -> str:
+    """这一届**打完没有**；打完了回一句「凭什么」，没打完回空串。
+
+    两条口径，因为两种赛制的「结束」不是一回事：
+
+    * **锦标赛制**：总决赛（``gf``）有了胜者 = 冠军决出；
+    * **积分制**：没有「总决赛」这一场——**所有对局都打完**（每场都有胜者或平局）
+      才算结束。以前只认锦标赛制，于是积分制打完永远停在「进行中」，
+      管理员得手动点一次「标记结束」（用户报的就是这个）。
+    """
+    if cfg.rules.format == "league":
+        total = len(cfg.rounds)
+        played = [r for r in cfg.rounds if r.status == "done" and r.winner]
+        if total and len(played) >= total:
+            return f"积分制 {total} 场全部打完"
+        return ""
+    champion = T.champion_of(cfg.teams, cfg.rounds)
+    return f"冠军 {champion.label}" if champion is not None else ""
+
+
 def close_on_champion(data: dict[str, Any]) -> dict[str, Any]:
-    """总冠军决出后自动把这一届标记为「已结束」（锦标赛制的收尾器）。
+    """比赛打完（冠军决出 / 积分制全部打完）后自动把这一届标记为「已结束」。
 
     在 :meth:`app.store.Store.mutate` 的 ``final`` 阶段执行——即所有比分写入与
-    上下游阵容重算都完成之后，所以不需要前端再手动点一次「标记结束」。
+    上下游阵容重算都完成之后，所以不需要前端再手动点一次「标记结束」
+    （两套赛制都适用，见 :func:`season_finished`）。
 
     只做「未结束 → 已结束」这一件事：已经结束的届原样返回（幂等），手动
     「恢复进行」之后只要不再产生新结果，就不会被重新关上。
     """
-    if data.get("rules", {}).get("format", "tournament") != "tournament":
-        return data
     event = dict(data.get("event") or {})
     if (event.get("status") or "active") == "closed":
         return data
     try:
         cfg = Config.model_validate(data)
-        champion = T.champion_of(cfg.teams, cfg.rounds)
+        reason = season_finished(cfg)
     except Exception:
         log.warning("自动结束本届的判断失败（忽略，不影响比分写入）", exc_info=True)
         return data
-    if champion is None:
+    if not reason:
         return data
     event["status"] = "closed"
     # 结束时间没登记就顺手补上：赛后「用时」与「已结束」的展示都靠它
     if not str(event.get("endTime") or "").strip():
         event["endTime"] = datetime.now().replace(second=0, microsecond=0).isoformat()  # noqa: DTZ005
-    log.info("总冠军已决出，自动结束本届 | 冠军=%s", champion.label)
+    log.info("本届已打完，自动结束 | %s", reason)
     return {**data, "event": event}
 
 

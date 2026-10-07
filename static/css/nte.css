@@ -323,19 +323,22 @@ img { display: block; max-width: 100%; }
   border: 1px solid var(--line); border-radius: 2px; background: var(--panel);
 }
 
-/* 比赛简介（往届卡片里的那一行；留空则整行不渲染） */
+/* 比赛简介（往届卡片里的那几行；留空则整行不渲染）。
+   white-space: pre-line = **保留用户敲的换行**（简介可以分行写地图 / 规则 / 注意事项） */
 .evt-card__brief {
   margin: 6px 0 2px; font-size: 12.5px; line-height: 1.5; color: var(--txt-dim);
-  border-left: 2px solid var(--line-2); padding-left: 8px;
+  border-left: 2px solid var(--line-2); padding-left: 8px; white-space: pre-line;
 }
 
-/* 比赛简介（总览页顶部，≤30 字；留空则整块不渲染） */
+/* 比赛简介（总览页顶部；支持换行，留空则整块不渲染） */
 .brief { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .brief__tag {
   flex: none; padding: 2px 8px; border: 1px solid var(--line-2); border-radius: 2px;
   font-size: 11px; font-weight: 700; letter-spacing: .12em; color: var(--accent);
 }
-.brief__text { margin: 0; font-size: 14px; line-height: 1.6; color: var(--txt); }
+.brief__text {
+  margin: 0; font-size: 14px; line-height: 1.6; color: var(--txt); white-space: pre-line;
+}
 
 /* 备份列表（/admin → 备份）：一行一份，文件名用等宽便于辨认 */
 .bak-list { display: flex; flex-direction: column; gap: 8px; }

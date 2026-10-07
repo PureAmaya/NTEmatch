@@ -544,10 +544,13 @@ export const fieldDateTime = (name, label, value, opts = {}) =>
   fieldText(name, label, toLocalInput(value), { ...opts, type: 'datetime-local' });
 
 export function fieldArea(name, label, value, opts = {}) {
+  const { ph = '', hint = '', rows = 3, maxlength = 0 } = opts;
+  const limit = Number(maxlength) || 0;
   return (
     `<div class="field"><label for="f-${name}">${esc(label)}</label>` +
-    `<textarea id="f-${name}" name="${name}" rows="3">${esc(value ?? '')}</textarea>` +
-    (opts.hint ? `<span class="field__hint">${esc(opts.hint)}</span>` : '') +
+    `<textarea id="f-${name}" name="${name}" rows="${Number(rows) || 3}"` +
+    ` placeholder="${esc(ph)}"${limit ? ` maxlength="${limit}"` : ''}>${esc(value ?? '')}</textarea>` +
+    (hint ? `<span class="field__hint">${esc(hint)}</span>` : '') +
     `</div>`
   );
 }

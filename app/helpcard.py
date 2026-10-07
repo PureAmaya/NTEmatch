@@ -28,18 +28,11 @@ from typing import Any
 
 from . import fonts
 from .helpcard_content import (
-    FOOTER_NOTE,
-    FOOTER_TITLE,
-    NOTICE_NOTE,
-    NOTICE_TITLE,
     PRIVACY,
     PRIVACY_TITLE,
     SECTION_NOTES,
     SECTIONS,
-    STEPS,
-    STEPS_TITLE,
     SUBTITLE,
-    TIPS,
     TITLE,
     TITLE_LABEL,
     source_digest,
@@ -260,14 +253,10 @@ def render():
     f_label = fonts.load("latin", 22)
     f_title = fonts.load("cjk", 66)
     f_sub = fonts.load("cjk", 25)
-    f_notice = fonts.load("cjk", 25)
     f_small = fonts.load("cjk", 21)
     f_tab = fonts.load("cjk", 28)
     f_cmd = fonts.load("cjk", 25)
     f_desc = fonts.load("cjk", 23)
-    f_tip_h = fonts.load("cjk", 26)
-    f_tip = fonts.load("cjk", 22)
-    f_foot = fonts.load("cjk", 26)
     list_fonts = {
         "head": fonts.load("cjk", 27),
         "label": fonts.load("cjk", 23),
@@ -293,46 +282,38 @@ def render():
     draw.text((PAD, y), SUBTITLE, font=f_sub, fill=DIM)
     y += 62
 
-    # —— 醒目提示条 ——
-    band_h = 104
-    panel(img, (PAD, y, W - PAD, y + band_h), cut=18)
-    draw.ellipse([PAD + 24, y + 26, PAD + 35, y + 37], fill=(*ACCENT, 255))
-    draw.text((PAD + 50, y + 16), NOTICE_TITLE, font=f_notice, fill=TXT)
-    draw.text((PAD + 50, y + 60), NOTICE_NOTE, font=f_small, fill=DIM)
-    y += band_h + 24
-
-    # —— 第一次用看这三步（新加的引导：只讲怎么做，不增加要记的命令）——
-    y += list_block(img, draw, (PAD, y), STEPS_TITLE, STEPS, list_fonts) + 24
-
     # —— 三张命令卡：**先排版再画面板**（折行会顶高卡片，先算好才不会被顶出框）——
+    #
+    # 说明放哪，只看**跟命令同一行放不放得下**：
+    # 放不下就整段落到下一行起画——以前这里还有一道「折出来只有一行就塞回同一行」的
+    # 判断，那正是「说明冲出图片右边缘」的根因（按整行宽度量，塞进半行位置当然溢出）。
     cmd_x = PAD + 44
+    inner_right = W - PAD - 24  # 卡片内右侧安全边（与面板留 24px）
     for title, rows in SECTIONS:
         y += tab(img, (PAD, y), title, f_tab) + 16
 
-        laid: list[tuple[str, list[str], int]] = []
+        laid: list[tuple[str, list[str], int, bool]] = []
         for cmd, desc in rows:
             text = f"—— {desc}"
-            room = W - PAD - 24 - (cmd_x + f_cmd.getlength(cmd) + 14)
-            if f_desc.getlength(text) <= room:
-                laid.append((cmd, [text], ROW_H))
+            head_w = cmd_x + f_cmd.getlength(cmd) + 14
+            if f_desc.getlength(text) <= inner_right - head_w:
+                laid.append((cmd, [text], ROW_H, True))
             else:
-                # 说明太长就折到下一行（缩进在命令下面），行高按折了几行算
-                parts = wrap(text, f_desc, W - PAD * 2 - 66)
-                laid.append((cmd, parts, 34 + DESC_H * len(parts) + 10))
+                # 折到下一行（缩进在命令下面），行高按折了几行算
+                parts = wrap(text, f_desc, inner_right - (cmd_x + 22))
+                laid.append((cmd, parts, 34 + DESC_H * len(parts) + 10, False))
         # 分组小字也**先折行**：它是单行硬画的，说明一写长就冲出卡片右边缘
         note = SECTION_NOTES.get(title)
-        note_lines = wrap(note, f_small, W - PAD * 2 - 66) if note else []
-        body_h = 20 + sum(h for _c, _p, h in laid) + (DESC_H * len(note_lines)) + 12
+        note_lines = wrap(note, f_small, inner_right - (cmd_x + 22)) if note else []
+        body_h = 20 + sum(h for _c, _p, h, _i in laid) + (DESC_H * len(note_lines)) + 12
         panel(img, (PAD, y, W - PAD, y + body_h), cut=20)
 
         ry = y + 20
-        for cmd, parts, height in laid:
+        for cmd, parts, height, inline in laid:
             draw.ellipse([PAD + 24, ry + 12, PAD + 31, ry + 19], fill=(*ACCENT, 255))
             draw.text((cmd_x, ry), cmd, font=f_cmd, fill=(*ACCENT, 255))
-            if len(parts) == 1:
-                draw.text(
-                    (cmd_x + f_cmd.getlength(cmd) + 14, ry + 2), parts[0], font=f_desc, fill=DIM
-                )
+            if inline:
+                draw.text((head_w, ry + 2), parts[0], font=f_desc, fill=DIM)
             else:
                 ty = ry + 34
                 for part in parts:
@@ -345,34 +326,6 @@ def render():
 
     # —— 群里 vs 私信（省得到处找答案）——
     y += list_block(img, draw, (PAD, y), PRIVACY_TITLE, PRIVACY, list_fonts) + 24
-
-    # —— 两张小卡（并排）——
-    tip_w = (W - PAD * 2 - 24) // 2
-    tip_top = y
-    bodies: list[list[list[str]]] = []
-    tip_h = 0
-    for _title, lines in TIPS:
-        body = [wrap(line, f_tip, tip_w - 44) for line in lines]
-        bodies.append(body)
-        tip_h = max(tip_h, 60 + sum(len(parts) * 31 for parts in body) + 16)
-    for i, (title, _lines) in enumerate(TIPS):
-        x0 = PAD + i * (tip_w + 24)
-        panel(img, (x0, tip_top, x0 + tip_w, tip_top + tip_h), cut=18)
-        draw.text((x0 + 22, tip_top + 16), title, font=f_tip_h, fill=(*ACCENT, 255))
-        ty = tip_top + 58
-        for parts in bodies[i]:
-            for part in parts:
-                draw.text((x0 + 22, ty), part, font=f_tip, fill=DIM)
-                ty += 31
-    y = tip_top + tip_h + 28
-
-    # —— 页脚 ——
-    gradient_bar(img, (PAD, y), (W - PAD * 2, 3))
-    y += 22
-    draw.text((PAD, y), FOOTER_TITLE, font=f_foot, fill=TXT)
-    y += 42
-    draw.text((PAD, y), FOOTER_NOTE, font=f_small, fill=DIM)
-    y += 50
 
     return img.crop((0, 0, W, min(CANVAS_H, y + BOTTOM_PAD)))
 

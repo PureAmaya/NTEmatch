@@ -217,7 +217,9 @@ def payload_for(cfg: Config, event_id: str = "", state: dict[str, Any] | None = 
         }
         for section in (rb.get("sections") or [])
     ]
-    note = markdown.to_text(cfg.event.rules_text or "", 600)
+    # 「比赛简介」块：内容取**简介**（不是规则文本）。
+    # 简介支持换行（地图 / 规则 / 注意事项分行写），渲染时按原有换行折行，见 _wrap_multiline。
+    note = str(evt.brief or "").strip()
     return {
         "title": str(evt.name or evt.title or "比赛"),
         "id": str(event_id or ""),
@@ -231,7 +233,7 @@ def payload_for(cfg: Config, event_id: str = "", state: dict[str, Any] | None = 
         "groups": _group_lines(cfg),
         "sections": sections,
         "note": note,
-        "noteTitle": "赛事信息",
+        "noteTitle": "比赛简介",
         "ranks": bool(cfg.event.ranked),
     }
 
@@ -595,8 +597,13 @@ def digest(payload: dict[str, Any]) -> str:
 
 
 def _font_signature() -> str:
-    """画这张图用的字体文件（找不到就是 ``-``）：并入指纹，换字体就自动重画。"""
-    return "|" + "|".join(str(fonts.resolve(kind) or "-") for kind in ("cjk", "latin", "mono"))
+    """画这张图用的字体（找不到就是 ``-``）：并入指纹，换字体就自动重画。
+
+    用 :func:`app.fonts.identity` 而不是裸路径：多语言合集里 JP / SC 是**同一个文件的不同
+    face**——只认路径的话，把日文那支换成简体那支以后，缓存里那些「日文字形」的卡片
+    还会被一直发出去。
+    """
+    return "|" + "|".join(fonts.identity(kind) for kind in ("cjk", "latin", "mono"))
 
 
 # --------------------------------------------------------------------------- #
@@ -628,6 +635,21 @@ def _tokens(text: str) -> list[str]:
         else:
             merged.append(token)
     return merged or [""]
+
+
+def _wrap_multiline(text: str, font, width: int) -> list[str]:
+    """折行，且**尊重原文里的换行**。
+
+    简介是**可以换行**的（地图 / 规则 / 注意事项分行写），所以先按 ``\\n`` 分段、
+    每段各自折行；空行直接跳过（免得白占一行高度）。以前一律当成一整段，
+    用户敲的回车全被吃掉了。
+    """
+    out: list[str] = []
+    for paragraph in str(text or "").replace("\r\n", "\n").split("\n"):
+        if not paragraph.strip():
+            continue
+        out.extend(_wrap(paragraph, font, width))
+    return out
 
 
 def _wrap(text: str, font, width: int) -> list[str]:
@@ -764,16 +786,16 @@ def render(payload: dict[str, Any], *, site: str = "") -> bytes | None:
                 y += 40
                 break
 
-        # ---- 赛事信息（Markdown 原文的纯文本摘要）----
+        # ---- 比赛简介（原文照排，**尊重用户敲的换行**）----
         note = str(payload.get("note") or "").strip()
         if note and y < MAX_HEIGHT - 260:
-            title = str(payload.get("noteTitle") or "赛事信息")
+            title = str(payload.get("noteTitle") or "比赛简介")
             tab_w = int(f_tab.getlength(title)) + 40
             tab = Image.new("RGBA", (tab_w, f_tab.size + 20), (*DIM, 60))
             img.alpha_composite(tab, (PAD, y))
             ImageDraw.Draw(img).text((PAD + 20, y + 9), title, font=f_tab, fill=TXT)
             y += f_tab.size + 34
-            for line in _wrap(note, f_note, inner):
+            for line in _wrap_multiline(note, f_note, inner):
                 if y > MAX_HEIGHT - 140:
                     break
                 draw.text((PAD + 6, y), line, font=f_note, fill=DIM)

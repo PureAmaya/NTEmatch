@@ -28,19 +28,28 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from .logging_conf import get_logger
 
 log = get_logger("font")
 
-#: 中文候选（前两条是 Windows 的微软雅黑，站点字体栈里的中文就是它）
+#: 中文候选（前几条是 Windows 的微软雅黑 / 等线，站点字体栈里的中文就是它）
+#:
+#: **简体优先**：多语言合集（``NotoSansCJK-*.ttc`` / ``SourceHanSans*.ttc``）里
+#: 一台机器上同时装着 JP / KR / SC / TC 四套字形，取错一支就会把简体字画成日文字形
+#: （「直」「骨」「次」那类一眼就能看出是日文的写法）。所以顺序是：
+#: ① 简体单语言文件 → ② 简体命名的合集 → ③ 多语言合集（由 :func:`_sc_face_index` 挑 face）。
 CJK_PATHS: tuple[str, ...] = (
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\Deng.ttf",
+    r"C:\Windows\Fonts\simhei.ttf",
     "/System/Library/Fonts/PingFang.ttc",
-    # 单语言版（无 .ttc 的 face 索引问题）优先于多语言合集
     "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -116,6 +125,7 @@ def reset() -> None:
     """清掉缓存（测试里换了环境变量 / 字体目录之后要调；运行中不需要）。"""
     _resolved.clear()
     _fonts.clear()
+    _FACE_INDEX.clear()
 
 
 def _from_env(name: str) -> Path | None:
@@ -138,7 +148,12 @@ def _first_existing(paths: tuple[str, ...]) -> Path | None:
 
 
 def _scan(prefixes: tuple[str, ...]) -> Path | None:
-    """扫常见字体目录，按文件名前缀认（发行版放在哪一层都能找到）。"""
+    """扫常见字体目录，按文件名前缀认（发行版放在哪一层都能找到）。
+
+    简体优先：同一台机器上既有 ``NotoSansCJKsc-*.otf`` 也有 ``NotoSansCJK-*.ttc`` 时，
+    取前者（单语言文件，不用猜 face；见 :func:`_sc_face_index`）。
+    """
+    found: list[Path] = []
     for raw_root in _FONT_DIRS:
         root = Path(raw_root).expanduser()
         if not root.is_dir():
@@ -152,8 +167,27 @@ def _scan(prefixes: tuple[str, ...]) -> Path | None:
                 continue
             name = path.name.lower()
             if name.startswith(prefixes):
-                return path
-    return None
+                found.append(path)
+    if not found:
+        return None
+    # 简体优先，其次按路径（同一台机器上重复安装同一支字体时结果要稳定）
+    return min(found, key=lambda p: (not _looks_simplified(p.name), str(p)))
+
+
+#: 认「这支字体是简体中文」的记号（文件名与 face 名都按这个认）
+_SC_TOKENS = ("sc", "simplified", "chs", "gb", "简体")
+
+
+def _looks_simplified(name: str) -> bool:
+    """这个字体名（文件名或 face 名）看着是**简体中文**那一支吗。
+
+    ``sc`` 单独成段才算：``NotoSansCJKsc`` / ``Noto Sans CJK SC`` / ``Yozai SC`` 都认，
+    而 ``Scaramouche`` 这种顺带出现的字母组合不该被当成简体。
+    """
+    text = str(name or "").lower()
+    if any(tok in text for tok in _SC_TOKENS if tok != "sc"):
+        return True
+    return any(part == "sc" or part.endswith("sc") for part in re.split(r"[^a-z0-9]+", text))
 
 
 def resolve(kind: str = "cjk") -> Path | None:
@@ -181,6 +215,65 @@ def resolve(kind: str = "cjk") -> Path | None:
     return found
 
 
+#: 集合字体（.ttc / .otc）里挑出来的 face 序号（按文件路径缓存）
+_FACE_INDEX: dict[str, int] = {}
+
+
+def _sc_face_index(path: Path) -> int:
+    """集合字体里**简体中文**那一支的 face 序号（挑不到就 0）。
+
+    ``NotoSansCJK-*.ttc`` / ``SourceHanSans*.ttc`` 这类**多语言合集**里同时装着
+    JP / KR / SC / TC 四套字形，而 ``ImageFont.truetype`` 默认取第 0 个——取到 JP 那支，
+    简体中文就会被画成**日文字形**（「直」「骨」「次」的写法一眼能看出来）。
+    所以这里按 face 名挑：名字里带 SC / Simplified 的那一支才是要的。
+
+    单语言文件（``NotoSansSC-Regular.otf`` / ``msyh.ttc`` 之类）只有一个 face，
+    这里不会去动它。
+    """
+    key = str(path)
+    hit = _FACE_INDEX.get(key)
+    if hit is not None:
+        return hit
+    index = 0
+    if path.suffix.lower() in (".ttc", ".otc"):
+        from PIL import ImageFont
+
+        for candidate in range(12):
+            try:
+                probe = ImageFont.truetype(key, 20, index=candidate)
+            except OSError:
+                break
+            family, style = probe.getname()
+            if _looks_simplified(family) or _looks_simplified(style):
+                index = candidate
+                log.info(
+                    "集合字体里挑了简体那一支 | %s | face=%d | %s", path.name, candidate, family
+                )
+                break
+    _FACE_INDEX[key] = index
+    return index
+
+
+def identity(kind: str = "cjk") -> str:
+    """这一类字体用来「算内容指纹」的标识：**文件 + face**（找不到回 ``-``）。
+
+    为什么不只写路径：多语言合集（``NotoSansCJK-*.ttc``）里 JP / KR / SC / TC 是**同一个
+    文件的不同 face**——只按路径算指纹的话，把 face 从日文改成简体也认不出来，
+    于是同一份内容会**继续用那张旧图**（日文字形的卡片就是这么被缓存下来的）。
+    """
+    path = resolve(kind)
+    if path is None:
+        return "-"
+    face = _sc_face_index(path)
+    if not face:
+        return str(path)
+    try:
+        family, _style = load(kind, 20).getname()
+    except Exception:  # noqa: BLE001  (个别字体读不出名字：face 序号本身也够用)
+        family = ""
+    return f"{path}#{face}{'·' + family if family else ''}"
+
+
 def load(kind: str, size: int):
     """拿一个指定字号的字体对象（没有可用字体时退回 Pillow 内置位图字体）。
 
@@ -198,7 +291,8 @@ def load(kind: str, size: int):
     font = None
     if path is not None:
         try:
-            font = ImageFont.truetype(str(path), int(size))
+            # face 序号只在集合字体上有效；单语言文件恒为 0（见 _sc_face_index）
+            font = ImageFont.truetype(str(path), int(size), index=_sc_face_index(path))
         except OSError as exc:  # 字体损坏 / 不是 TrueType：兜回内置
             log.warning("字体读不动，改用内置字体 | %s | %s", path, exc)
     if font is None:

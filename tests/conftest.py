@@ -94,3 +94,28 @@ async def admin_client():
         headers={"X-NTE-Token": session.token},
     ) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+async def _restore_event_status():
+    """每个用例跑完，把「自动结束」改过的届状态还原。
+
+    打完比赛会自动把本届标记成「已结束」（见 ``logic.close_on_champion``：冠军决出，
+    或积分制全部对局打完）。测试之间**共用一届**，于是「上一条用例把赛程打完了」就把
+    这一届关上了——下一条用例再往赛事信息里写东西就会被「已结束只读」闸门拦下，
+    表现成一条毫不相干的用例莫名其妙地失败（真实遇到过）。
+
+    只还原自动结束唯一会动的两个字段：``status`` 与 ``endTime``。
+    用例**内部**照旧能断言「自动结束」这件事本身。
+    """
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    before = store.snapshot()
+    status, end_time = before.event.status, before.event.end_time
+    yield
+    after = store.snapshot()
+    if (after.event.status, after.event.end_time) != (status, end_time):
+        await store.update(
+            {"event": {"status": status, "endTime": end_time}}, actor="test:restore-status"
+        )

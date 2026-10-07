@@ -10,8 +10,51 @@
 
 from __future__ import annotations
 
-from app import metrics, tournament
+from app import logic, metrics, tournament
 from app.models import Round, Rules, SetScore, Side, Team
+
+
+# --------------------------------------------------------------------------- #
+# 打完自动结束这一届（两套赛制的口径不一样）
+# --------------------------------------------------------------------------- #
+def test_tournament_closes_once_the_champion_is_decided(make_config):
+    """锦标赛制：总决赛有了胜者 → 本届自动标记「已结束」，并补上结束时间。"""
+    cfg = make_config(teams=2)
+    cfg.event.status = "active"
+    cfg.event.end_time = ""
+    cfg.rounds[0].stage = "gf"
+    cfg.rounds[0].status = "done"
+    cfg.rounds[0].winner = "A"
+    out = logic.close_on_champion(cfg.dump())
+    assert out["event"]["status"] == "closed"
+    assert out["event"]["endTime"], "结束时间要顺手补上（赛后「用时」与「已结束」都靠它）"
+
+
+def test_league_closes_only_after_every_round_is_played(make_config):
+    """积分制：没有「总决赛」这一场，**每场都打完**才算结束。
+
+    这是用户报的那个 bug：以前只认锦标赛制，于是积分制打完了永远停在「进行中」，
+    管理员得手动再点一次「标记结束」。
+    """
+    cfg = make_config(teams=2, fmt="league")
+    cfg.event.status = "active"
+    cfg.rounds[0].status = "done"
+    cfg.rounds[0].winner = "A"
+    assert "积分制" in logic.season_finished(cfg), "只有一场时打完就该算结束"
+
+    # 还有没打的对局 → 不算结束，也不许关（否则赛程打到一半就被封存）
+    pending = cfg.rounds[0].model_copy(update={"code": "L-2", "index": 2, "status": "pending", "winner": ""})
+    cfg.rounds = [cfg.rounds[0], pending]
+    assert logic.season_finished(cfg) == ""
+    assert logic.close_on_champion(cfg.dump())["event"]["status"] == "active"
+
+
+def test_closing_is_idempotent_and_the_end_time_is_kept(make_config):
+    """已经结束的届原样返回：不重复写结束时间，也不会把管理员填的时间改掉。"""
+    cfg = make_config(teams=2)
+    cfg.event.status = "closed"
+    cfg.event.end_time = "2026-10-06T23:30"
+    assert logic.close_on_champion(cfg.dump())["event"]["endTime"] == "2026-10-06T23:30"
 
 
 def test_three_rounds_by_round_wins(make_config):

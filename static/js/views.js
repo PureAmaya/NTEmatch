@@ -314,7 +314,10 @@ export function renderOverview(s) {
 }
 
 /**
- * 比赛简介（≤30 字）：由赛事创办者撰写，**留空就整块不显示**。
+ * 比赛简介：由赛事创办者撰写，**留空就整块不显示**。
+ *
+ * 简介可以换行（地图 / 规则 / 注意事项分行写）：换行靠在 CSS 上开
+ * ``white-space: pre-line``（见 .brief__text），这里照常转义就行。
  */
 function briefPanelHtml(s) {
   const brief = String(s.event?.brief || '').trim();

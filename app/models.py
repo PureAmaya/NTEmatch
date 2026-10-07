@@ -41,8 +41,11 @@ SideKey = Literal["A", "B", "C", "D"]
 MAX_SIDES = 4
 # 每场同场竞技的队伍数：2 = 组vs组，3 = 组vs组vs组，4 = 四队同场
 MIN_TEAMS_PER_MATCH = 2
-# 比赛简介的字数上限（按字符计，中英文同规）：界面用 maxlength 挡，服务端再截一次兜底
-MAX_BRIEF_CHARS = 30
+# 比赛简介的字数上限与行数上限（按字符计，中英文同规）：界面用 maxlength 挡，服务端再截一次兜底。
+# 简介**支持换行**（把地图 / 规则 / 注意事项分行写，卡片与群消息都照着换行显示），
+# 所以上限比原来的一句话宽得多。
+MAX_BRIEF_CHARS = 200
+MAX_BRIEF_LINES = 6
 RoundStatus = Literal["pending", "live", "done"]
 # 胜方编号：**空 = 还没判定**、``DRAW`` = 平局，其余是各方的编号。
 # 必须与 SideKey / MAX_SIDES 对齐：3~4 队同场时胜方可能是 C / D，
@@ -574,12 +577,26 @@ class EventInfo(NTEModel):
     @field_validator("brief")
     @classmethod
     def _clean_brief(cls, value: str) -> str:
-        """比赛简介：合并空白并**硬性截到 30 字**（界面用 maxlength 挡在前面）。
+        """比赛简介：**保留换行**、行内合并空白、最多 :data:`MAX_BRIEF_LINES` 行 / 200 字。
 
+        换行是有用的内容（地图 / 规则 / 注意事项分行写，卡片与群消息都照着换行显示），
+        所以只在行内合并空白、丢掉空行；以前一律压成一行，用户敲的回车全丢了。
         这里刻意「截断」而不是「报错」：简介是随时可改的展示文案，
         没必要因为多打一个字就让整个赛事信息存不进去。
         """
-        return " ".join(str(value or "").split())[:MAX_BRIEF_CHARS]
+        lines = [
+            " ".join(raw.split())
+            for raw in str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        ]
+        kept: list[str] = []
+        used = 0
+        for line in [ln for ln in lines if ln][:MAX_BRIEF_LINES]:
+            room = MAX_BRIEF_CHARS - used
+            if room <= 0:
+                break
+            kept.append(line[:room])
+            used += len(kept[-1]) + 1
+        return "\n".join(kept)
 
 
 class Rules(NTEModel):

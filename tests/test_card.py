@@ -140,13 +140,92 @@ def test_digest_is_stable_but_follows_the_rules(make_config):
     assert same_a != other
 
 
-def test_payload_includes_the_event_note(make_config):
-    """「赛事信息」（Markdown）也进卡片，且是**纯文本**（图里没有 Markdown）。"""
+def test_payload_shows_the_brief_and_keeps_its_line_breaks(make_config):
+    """卡片上那一块（以前叫「赛事信息」、放规则文本）现在放**比赛简介**，且保留换行。"""
     cfg = make_config(teams=2)
-    cfg.event.rules_text = "**注意**：请提前十分钟到场"
+    cfg.event.brief = "地图：白尾树盘山公路\n规则：禁用改装\n提前 10 分钟到场"
+    cfg.event.rules_text = "**注意**：这段规则不该出现在这一块里"
     payload = card.payload_for(cfg, "e001")
-    assert "注意" in payload["note"]
-    assert "**" not in payload["note"]
+    assert payload["noteTitle"] == "比赛简介"
+    assert "白尾树盘山公路" in payload["note"] and "禁用改装" in payload["note"]
+    assert "\n" in payload["note"], "换行要留着（渲染时按原有换行折行）"
+    assert "注意" not in payload["note"], "这一块不再放规则文本"
+
+
+def test_simplified_chinese_fonts_are_recognised():
+    """集合字体里挑「简体那一支」的判断：SC / Simplified 认，JP / KR / TC 不认。
+
+    这条不显眼但很要命：``NotoSansCJK-*.ttc`` 里 JP 排在前面，默认取第 0 个 face 就会把
+    简体中文画成**日文字形**（「直」「骨」「次」的写法一眼能看出来）。单语言文件
+    （微软雅黑 / NotoSansSC）只有一个 face，名字里没有 SC 也照样能用（返回 0）。
+    """
+    from app import fonts
+
+    for name in ("Noto Sans CJK SC", "Source Han Sans SC", "NotoSansCJKsc-Regular.otf", "简体黑体"):
+        assert fonts._looks_simplified(name), name
+    for name in ("Noto Sans CJK JP", "Noto Serif CJK KR", "Source Han Sans TC", "Microsoft YaHei"):
+        assert not fonts._looks_simplified(name), name
+    assert not fonts._looks_simplified("Scaramouche"), "顺带出现的 sc 不算简体"
+
+
+def test_scan_prefers_the_simplified_single_language_file(tmp_path, monkeypatch):
+    """扫目录时优先取简中**单语言**文件：多语言合集要猜 face，容易取到日文那支。"""
+    from app import fonts
+
+    (tmp_path / "NotoSansCJK-Regular.ttc").write_bytes(b"x")
+    (tmp_path / "NotoSansCJKsc-Regular.otf").write_bytes(b"x")
+    monkeypatch.setattr(fonts, "_FONT_DIRS", (str(tmp_path),))
+    picked = fonts._scan(("notosanscjk", "notosanssc"))
+    assert picked is not None and picked.name == "NotoSansCJKsc-Regular.otf"
+
+
+def test_card_digest_follows_the_font_face(make_config, monkeypatch):
+    """**换了 face 也要重画**：多语言合集里 JP / SC 是同一个文件的不同 face。
+
+    指纹里只写路径的话，把「日文那支 face」换成「简体那支」以后，缓存里那张旧图
+    还会被一直发出去——同一条内容、同一个文件名，群里看到的仍是日文字形。
+    """
+    from app import card as card_mod
+
+    payload = card_mod.payload_for(make_config(teams=2), "e001")
+    monkeypatch.setattr(card_mod.fonts, "identity", lambda kind="cjk": f"{kind}:jp")
+    jp = card_mod.digest(payload)
+    monkeypatch.setattr(card_mod.fonts, "identity", lambda kind="cjk": f"{kind}:sc")
+    assert card_mod.digest(payload) != jp
+
+
+def test_font_identity_mentions_file_and_face():
+    """字体标识：至少要说清「哪个文件」（同一台机器上重复调用也要稳定）。"""
+    from app import fonts
+
+    ident = fonts.identity("cjk")
+    path = fonts.resolve("cjk")
+    if path is None:  # 这台机器没装中文字体：标识就是 `-`
+        assert ident == "-"
+        return
+    assert ident.startswith(str(path))
+    assert fonts.identity("cjk") == ident
+
+
+def test_multiline_wrap_keeps_paragraph_breaks():
+    """折行按原有换行分段：空行丢掉，每段各自折（简介是分行写的）。"""
+    from app import fonts
+    from app.card import _wrap_multiline
+
+    font = fonts.load("cjk", 22)
+    lines = _wrap_multiline("地图：白尾树盘山公路\n\n规则：禁用改装\n提前 10 分钟到场", font, 2000)
+    assert lines == ["地图：白尾树盘山公路", "规则：禁用改装", "提前 10 分钟到场"]
+
+
+def test_brief_keeps_line_breaks_but_drops_blank_lines():
+    """简介：**保留换行**、行内合并空白、丢掉空行（最多 6 行 / 200 字）。"""
+    from app.models import MAX_BRIEF_LINES, EventInfo
+
+    evt = EventInfo(brief="地图：白尾树盘山公路\n\n  规则：禁用改装  \n\n\n提前 10 分钟到场")
+    assert evt.brief == "地图：白尾树盘山公路\n规则：禁用改装\n提前 10 分钟到场"
+    long = EventInfo(brief="\n".join(f"第 {i} 行" for i in range(1, 12)))
+    assert len(long.brief.split("\n")) == MAX_BRIEF_LINES
+    assert len(EventInfo(brief="字" * 500).brief) == 200
 
 
 # --------------------------------------------------------------------------- #
