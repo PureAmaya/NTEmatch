@@ -285,8 +285,9 @@ async def test_copy_becomes_the_current_event_and_is_playable(source):
     assert entry["rounds"] == 2 and entry["played"] == 0 and entry["champion"] == ""
     assert entry["ownerUid"] == "u_operator"
 
-    # 复制出来的届不能再自助报名：它已经有队伍与赛程（报名只对「还没组队」的筹备届开放）
-    assert signup_blocked(await store.read_event(copy_id)), "已有队伍/赛程的届不该放开自助报名"
+    # 复制出来的届是筹备中 → **自助报名照旧开放**（名单是名单、队伍是队伍；
+    # 报进来的人落在候选池里，要上场由管理员在组队台安排）
+    assert not signup_blocked(await store.read_event(copy_id)), "筹备中的届不该被报名闸门挡住"
 
 
 async def test_copied_round_can_take_a_fresh_result(source, admin_client):

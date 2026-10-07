@@ -339,8 +339,14 @@ async def test_signup_only_while_the_event_is_being_prepared(bot, botclient, eve
     await store.update_event_meta(target, {"status": "draft"})
 
 
-async def test_signup_refused_when_the_event_is_already_teamed_up(bot, botclient, events):
-    """已经组队（或生成赛程）的届：名单不能再自助改——改了队伍与对阵就对不上。"""
+async def test_signup_allowed_even_after_teams_are_formed(bot, botclient, events):
+    """**已经组队的筹备中届，照样能自助报名 / 取消报名**（用户报的那条）。
+
+    以前这里有一条闸门：只要队伍或赛程存在就回「这一届已经组队 / 生成赛程了」——
+    管理员点过一次「随机组队」，群里的报名就全被拒。现在口径是**名单是名单、队伍是队伍**：
+    报名只动名单，不动队伍也不动赛程；报进来的人落在候选池里，要上场由管理员安排
+    （要重排队伍就用「删除组队」，见 ``POST /api/teams/clear``）。
+    """
     target, _ = events
     await _member(KNOWN_QQ, "甲")
     await store.mutate_event(
@@ -348,12 +354,43 @@ async def test_signup_refused_when_the_event_is_already_teamed_up(bot, botclient
         lambda data: {
             **data,
             "teams": [{"id": "t1", "label": "甲队", "group": "A", "playerIds": []}],
+            "rounds": [
+                {
+                    "index": 1,
+                    "code": "G-A-1-1",
+                    "stage": "group",
+                    "label": "A 组 · 第 1 场",
+                    "sides": [{"teamId": "t1"}, {"teamId": ""}],
+                }
+            ],
         },
         actor="test",
     )
     res = await botclient.post("/api/bot/signup", json=_body(KNOWN_QQ, target))
-    assert res.status_code == 400, res.text
-    assert "组队" in str(res.json())
+    assert res.status_code == 200, res.text
+    assert "已报名" in res.json()["text"]
+
+    after = await store.read_event(target)
+    assert after.participants, "报了名就该进这一届的名单"
+    assert len(after.rounds) == 1 and after.teams, "报名不该反过来动队伍或赛程"
+
+    # 取消报名也照旧可用：人若还留在队伍里，回话要**提醒一句**（而不是把人挡回去）
+    player_id = res.json()["playerId"]
+    await store.mutate_event(
+        target,
+        lambda data: {
+            **data,
+            "teams": [{"id": "t1", "label": "甲队", "group": "A", "playerIds": [player_id]}],
+        },
+        actor="test",
+    )
+    cancelled = await botclient.post(
+        "/api/bot/signup", json=_body(KNOWN_QQ, target, action="cancel")
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    text = cancelled.json()["text"]
+    assert "已取消" in text, text
+    assert "队伍" in text, f"人还在队伍里时要提醒一句（不然他会以为真的不上场了）：{text}"
 
 
 async def test_group_facing_texts_have_no_markdown(bot, botclient, events):

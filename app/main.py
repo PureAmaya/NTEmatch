@@ -2148,6 +2148,36 @@ async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_c
     }
 
 
+@app.post("/api/teams/clear")
+async def api_teams_clear(_: Session = Depends(require_current_event)) -> dict[str, Any]:
+    """删除**全部队伍**（参与名单与选手档案留着），**顺带清空赛程**。
+
+    为什么顺带清空赛程：每场对阵都引用 ``teamId``，队伍没了，旧对阵就是一堆空席位——
+    留着只会让人以为「队伍没了，赛程还能打」。赛程为空是合法状态，之后
+    「随机组队 / 快速创建分组 / 生成赛程」随时可以重来。
+
+    这是「先删组队再重新报名 / 重排队伍」那条路的入口：组队之后名单照样能自助改
+    （见 ``store.signup_blocked``），要重排队伍就来这里清一次。
+
+    比赛开始后禁止（属于结构性改动，需先在「比赛状态」里解除锁定）。
+    """
+    _require_unlocked("队伍")
+    before = len(store.snapshot().teams)
+    cfg = await store.clear_teams(actor="web:teams-clear")
+    return {
+        "ok": True,
+        "revision": cfg.revision,
+        "removed": before,
+        "count": 0,
+        "warnings": (
+            [f"已删除 {before} 支队伍，原赛程与比分一并清空；请重新组队并生成赛程。"]
+            if before
+            else []
+        ),
+        "state": build_public_state(cfg),
+    }
+
+
 class TeamSubstitutePayload(NTEModel):
     """队伍换人：把 ``from_id`` 换成 ``to_id``（1:1，队伍规模不变）。"""
 

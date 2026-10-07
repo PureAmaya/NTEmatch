@@ -176,12 +176,17 @@ _EVENT_STATUS_CN = {"draft": "筹备中", "active": "进行中", "closed": "已�
 def signup_blocked(cfg: Config) -> str:
     """报名 / 取消报名现在能不能做；返回**不能做的原因**（空串 = 可以做）。
 
-    两条闸门，理由各不一样，所以文案要分开：
+    **只留一条闸门：只有筹备中的届**。开赛之后名单就该冻住（谁上场、谁替补已经定了），
+    赛后更不用说了——报名 / 取消报名都是「赛前那件事」。
 
-    * **只有筹备中的届**：开赛之后名单就该冻住（谁上场、谁替补已经定了），
-      赛后更不用说了——报名 / 取消报名都是「赛前那件事」；
-    * **已经组队或生成过赛程的届也不行**：名单一改，队伍与对阵里引用的选手就对不上，
-      这种改动得让管理员在网站上看着办（先清空组队 / 赛程，再改名单）。
+    以前还有第二条「已经组队 / 生成过赛程的届也不许自助改」，**去掉了**：那是把名单与队伍
+    绑在一起看，结果是管理员只要点过一次「随机组队」，群里的报名就全被拒——明明还在筹备中，
+    机器人却回一句「这一届已经组队 / 生成赛程了」（用户报的正是这个）。现在口径很清楚：
+
+    * **名单是名单，队伍是队伍**：报名 / 取消报名只动名单，**不动队伍、不动赛程**；
+    * 报进来的人先落在**候选池**（组队台上看得到），要上场由管理员拉进队伍或重新组队；
+    * 取消报名的人若还在某支队伍里，会在回应里**提醒一句**（要真不让他上场，去组队台调整，
+      或用「删除组队」清空重排），而不是拿一句「不允许」把人挡回去。
     """
     if cfg.event.status != SIGNUP_EVENT_STATUS:
         state = _EVENT_STATUS_CN.get(cfg.event.status, cfg.event.status)
@@ -190,8 +195,6 @@ def signup_blocked(cfg: Config) -> str:
             f"这一届现在是「{state}」：报名只对「筹备中」的比赛开放"
             f"（管理员在网站上把状态改回「筹备中」才能继续报名）。"
         )
-    if cfg.teams or cfg.rounds:
-        return "这一届已经组队 / 生成赛程了：名单不能再自助改，请联系管理员在网站上处理。"
     return ""
 
 
@@ -1722,7 +1725,8 @@ class ConfigStore:
         """把成员加进**指定届**的参赛名单（机器人自助报名 / 网站报名共用这一份）。
 
         **只定「谁来打」**：不动成员档案、不组队、不生成赛程——组队与赛制留给管理员
-        在网站上做（报名期本来就只该定名单，见 :func:`signup_blocked` 的两条闸门）。
+        在网站上做（报名只要求「这一届是筹备中」，见 :func:`signup_blocked`）。
+        已经有队伍的届也照收：新人落在**候选池**里，要上场由管理员拉进队伍或重新组队。
 
         返回 ``{"cfg", "playerId", "already", "created", "warnings"}``：
         ``already=True`` 表示他本来就在名单里（这一次一个字都没写，revision 也不动）。
@@ -1804,6 +1808,16 @@ class ConfigStore:
             }
 
         warnings: list[str] = []
+        # 已经被排进队伍的（组队发生在名单之后）：名单里去掉他，**队伍一个字不动**——
+        # 改队伍会让服务端清空赛程（对阵引用队伍 id），那不是「取消报名」该干的事。
+        # 所以只提醒一句，让人知道该去哪儿收尾（而不是拿「不允许」把人挡回去）。
+        still_in = [t.label or t.id for t in before_cfg.teams if hit.id in t.player_ids]
+        if still_in:
+            warnings.append(
+                f"{hit.display_name or hit.id} 还在队伍「{'、'.join(still_in)}」里：名单已取消，"
+                "但他仍留在那支队伍中。要真的不让他上场，请到「组队台」调整那支队伍，"
+                "或用「删除组队」清空后重排。"
+            )
 
         def _mutate(data: dict[str, Any]) -> dict[str, Any]:
             cfg = Config.model_validate(data)
@@ -2018,6 +2032,25 @@ class ConfigStore:
     async def clear_tournament(self, actor: str = "api") -> Config:
         """清空赛程（保留队伍），用于重新编排。与 :meth:`clear_rounds` 同义。"""
         return await self.clear_rounds(actor=actor)
+
+    async def clear_teams(self, actor: str = "api") -> Config:
+        """删掉**全部队伍**（名单与选手档案留着），**顺带清空赛程**。
+
+        为什么顺带清空赛程：对阵里的每一场都引用 ``teamId``，队伍没了，旧对阵就是一堆
+        空席位——留着只会让人以为「队伍没了赛程还在，那还能打」。赛程为空是合法状态，
+        之后「随机组队 / 快速创建分组 / 生成赛程」可以重来。
+
+        「先删组队再重新报名」是这次特意要支持的用法：组队之后名单照样能自助改
+        （见 :func:`signup_blocked`），要重排队伍就来这里清一次。
+        """
+        before = len(self._config.teams)
+
+        def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+            return {**data, "teams": [], "rounds": []}
+
+        cfg = await self.mutate(_mutate, actor=actor, resolve=False)
+        log.warning("已删除全部队伍 | 届=%s | 原队伍=%d", self._current, before)
+        return cfg
 
     # ------------------------------------------------------------------ #
     # 届次管理

@@ -1161,7 +1161,7 @@ def _signup_plugin(plugin_module, calls: list[tuple], resolved: str = "e001"):
     async def fake_post(path, payload=None):
         calls.append((path, payload))
         if resolved == "boom":
-            return {"ok": False, "error": "这一届已经组队 / 生成赛程了"}
+            return {"ok": False, "error": "这一届现在是「进行中」：报名只对「筹备中」的比赛开放。"}
         return {"ok": True, "text": "已报名：甲届（e001）"}
 
     plugin._resolve_event = fake_resolve
@@ -1205,4 +1205,4 @@ async def test_signup_shows_the_sites_reason_verbatim(plugin_module):
     calls: list[tuple] = []
     plugin = _signup_plugin(plugin_module, calls, resolved="boom")
     out = await _collect(plugin.cmd_signup(_FakeEvent(sender="10001", group="g1"), "甲届"))
-    assert out[0]["text"] == "这一届已经组队 / 生成赛程了"
+    assert out[0]["text"] == "这一届现在是「进行中」：报名只对「筹备中」的比赛开放。"

@@ -43,6 +43,63 @@ async def test_help_image_is_regenerated_before_serving(client):
 
 
 # --------------------------------------------------------------------------- #
+# 删除组队（`POST /api/teams/clear`）
+# --------------------------------------------------------------------------- #
+async def test_clearing_teams_keeps_the_roster_and_drops_the_schedule(admin_client):
+    """「删除组队」只清队伍与赛程：**名单 / 选手档案 / 参与状态都不动**。
+
+    这条是这次特意加的能力：组队之后还想让人自助报名、或者想把队伍重排一遍，
+    以前只能一支支删分组；现在一键清空，而且**不会把名单一起清掉**（那是「删届」）。
+    赛程必须跟着清：每场对阵都引用 ``teamId``，队伍没了，旧对阵就是一堆空席位。
+    """
+    from app import db
+    from app.store import store
+
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("删除组队用例届")
+    mine = store.current_id
+    try:
+        await store.update(
+            {
+                "players": [{"id": "p01", "name": "甲"}, {"id": "p02", "name": "乙"}],
+                "participants": ["p01", "p02"],
+                "participantsSet": True,
+                "teams": [
+                    {"id": "t1", "name": "甲队", "playerIds": ["p01"]},
+                    {"id": "t2", "name": "乙队", "playerIds": ["p02"]},
+                ],
+                "rounds": [
+                    {
+                        "index": 1,
+                        "code": "G-A-1-1",
+                        "stage": "group",
+                        "label": "A 组 · 第 1 场",
+                        "sides": [{"teamId": "t1"}, {"teamId": "t2"}],
+                    }
+                ],
+            }
+        )
+        res = await admin_client.post("/api/teams/clear")
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["removed"] == 2 and body["count"] == 0
+
+        cfg = await store.read_event(mine)
+        assert cfg.teams == [], "队伍应当被清空"
+        assert cfg.rounds == [], "赛程必须一起清（对阵引用着队伍 id）"
+        assert [p.id for p in cfg.players] == ["p01", "p02"], "选手档案不许动"
+        assert cfg.participants == ["p01", "p02"], "参与名单不许动"
+        assert cfg.participants_set is True, "「名单是显式指定过的」这个标记也要留着"
+    finally:
+        if previous:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
+
+
+# --------------------------------------------------------------------------- #
 # 赛程预览接口（「快速创建分组」弹窗的实时预览）
 # --------------------------------------------------------------------------- #
 async def test_tournament_preview_still_works(admin_client):
