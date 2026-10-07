@@ -498,7 +498,7 @@ function legacyPanelHtml() {
 }
 
 /**
- * 查询接口令牌：给配套的 AstrBot 插件用（群命令，不依赖任何大模型）。
+ * 查询接口令牌：给配套的 AstrBot 插件用（群命令 + 可选的 LLM 工具）。
  *
  * 令牌只存**加盐哈希**，明文只在生成那一次弹出；重置后旧令牌立即失效。
  */
@@ -506,7 +506,10 @@ function botTokenBlockHtml(q) {
   return (
     `<div class="panel__divider" style="margin:12px 0;border-top:1px solid var(--line)"></div>` +
     `<div class="notice">配套插件 <code>astrbot_plugin_nte_match</code>（见项目里 <code>integrations/</code>）` +
-    `可以把赛事数据做成 <b>群命令</b>（不经过大模型，答案稳定）。` +
+    `可以把赛事数据做成 <b>群命令</b>（不经过大模型，答案稳定）；大模型被唤醒时，` +
+    `还能把同样这些查询当 <b>LLM 工具</b>用（查询 / 报名 / 我的资料 / 帮助）——` +
+    `工具只回文本、由模型按<b>当前人格</b>转述，人格设定不受影响；` +
+    `密钥 / 令牌 / 召集这类能力永远不给模型。` +
     `把帮助图放成 <code>static/help.jpg</code>，本域 <code>/help.jpg</code> 即可访问，` +
     `「比赛帮助」会自动改成回这张图（插件无需配置；没放图就回文字说明）。` +
     `它需要一个只读查询令牌：</div>` +

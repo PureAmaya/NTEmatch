@@ -1,8 +1,13 @@
 """NTE 比赛 × AstrBot 插件。
 
-把「NTE 比赛」平台的赛事数据接进群聊，**全部能力都是群命令**（``@filter.command``）：
-不注册任何 ``llm_tool``、也不调用任何大模型——命中哪条命令、回什么，全由字符串匹配
-与站点数据决定，同一个问题问两次结果一样，不依赖 LLM provider 是否配好。
+把「NTE 比赛」平台的赛事数据接进群聊，两种用法：
+
+* **群命令**（``@filter.command``，25 条）：命中哪条命令、回什么，全由字符串匹配与站点
+  数据决定，同一个问题问两次结果一样——**关掉大模型 / 不配 provider 也照常工作**；
+* **LLM 工具**（``@filter.llm_tool``，可选，见 :meth:`NTEMatchPlugin.tool_query`）：
+  大模型被唤醒时，把同样这些数据挂成函数工具，让它能答「自由问法」（例如「我们下把打谁」）。
+  工具**只查数据、只回文本**：不自己往群里发消息、不碰系统提示词与人格——最终那句话
+  由大模型按**当前人格**说出来（工具结果会作为「工具返回」回给模型，见 README「LLM 工具」）。
 
 唯一「不查数据」的是一条快捷键：**问帮助**可以直接回一张帮助图——默认就发**站点内置的
 那张**（把图放成站点里的 ``static/help.jpg`` 即可，地址 ``/help.jpg``；没有图就回文字说明，
@@ -56,6 +61,53 @@ def _conf(config, key: str, default):
     if raw is None or raw == "":
         return default
     return raw
+
+
+#: 大模型可以查的查询类型：名字与站点 ``app/qqbot.py`` 的 ``KIND_META`` **一一对应**，
+#: 只少一个 ``call``（召集）。为什么单列一份、而不是「站点有什么就给什么」：
+#:
+#: * ``call``（召集）是往群里 @ 一大片人 —— 「什么时候喊人」该由人决定，不该由模型决定；
+#: * **凭据类能力一律不给工具**（推流地址 / 重置密钥 / 重置令牌 / 改推流码 / 直播注册）：
+#:   工具的结果是**回给大模型的**，模型会照着重述到群里 —— 密钥与令牌泄一次就等于白送；
+#: * 差集有测试盯着（``test_llm_tool_kinds_follow_the_site``）：
+#:   站点加了新类型而这里没跟上，会红，逼着人做一次「给不给模型」的决定。
+_AGENT_KINDS = (
+    "event",
+    "progress",
+    "next",
+    "result",
+    "champion",
+    "roster",
+    "detail",
+    "live",
+    "list",
+    "ids",
+    "uuids",
+)
+
+#: 这几个是**全局**类型（不挑届次）：与命令一侧 ``比赛直播`` / ``比赛列表`` / ``比赛届次`` 一致，
+#: 工具也不该逼着模型去要一个届次编号。
+_AGENT_GLOBAL_KINDS = ("live", "list", "ids")
+
+
+def _llm_tool(name: str):
+    """``@filter.llm_tool(name)`` 的安全包装：拿不到它就退回「不注册这个工具」。
+
+    **不能**直接写 ``@filter.llm_tool(...)``：装饰器在**类定义时**求值，老版本 AstrBot 上
+    会 AttributeError —— 插件整个加载不了，连命令一起没了。这里拿不到就当普通函数，
+    命令照旧可用，只是大模型那侧看不见这些工具。
+
+    ``name`` 与函数 docstring 里的 ``Args:`` 是 AstrBot 生成工具描述的唯一来源（它**不看**
+    类型注解）：docstring 少写类型、或参数名与签名对不上，轻则参数被静默丢掉、重则**装饰时
+    直接抛异常**（插件加载失败）。所以有三条测试专门盯着这些 docstring。
+    """
+    factory = getattr(filter, "llm_tool", None)
+    if callable(factory):
+        try:
+            return factory(name=name)
+        except TypeError:  # 极老的版本：不吃 name 关键字
+            return factory()
+    return lambda func: func
 
 
 def _sender_id(event) -> str:
@@ -361,7 +413,7 @@ def _image_result(event, image: str):
 
 
 class NTEMatchPlugin(star.Star):
-    """赛事查询：全部能力都是群命令，不依赖任何大模型。"""
+    """赛事查询：25 条群命令（不经过大模型）+ 4 个可选的 LLM 工具（只回文本、不碰人格）。"""
 
     def __init__(self, context: star.Context, config: dict | None = None):
         super().__init__(context)
@@ -489,14 +541,36 @@ class NTEMatchPlugin(star.Star):
             qq=qq,
         )
 
-    def _texts(self, data: dict) -> list[str]:
-        """把接口回的分段拼上前缀；出错时只回一行错误说明。"""
+    def _texts(self, data: dict, *, decorated: bool = True) -> list[str]:
+        """把接口回的分段拼上前缀；出错时只回一行错误说明。
+
+        ``decorated=False`` 给 **LLM 工具**用：``reply_prefix`` 是给群里的人认机器人用的，
+        回给大模型的纯文本不需要它（模型照着重述时反而会多带一句前缀）。
+        """
         if not data.get("ok"):
             return [f"查询失败：{data.get('error') or '未知原因'}"]
         parts = data.get("parts") or []
         if not parts:
             return ["（没有可显示的内容）"]
-        return [f"{self.reply_prefix}{part}" if self.reply_prefix else part for part in parts]
+        prefix = self.reply_prefix if decorated else ""
+        return [f"{prefix}{part}" if prefix else part for part in parts]
+
+    async def _agent_query(
+        self, kind: str, event_id: str, ref: str, page: int, scope: str, qq: str
+    ) -> str:
+        """LLM 工具用的一次查询：**只回纯文本**。
+
+        与命令那条路（:meth:`_run`）的差别只在「往哪儿去」：命令要把结果发到群里，
+        所以带回复前缀、还可能带 @ 片段；工具的文本是**回给大模型**的（由它按当前人格
+        转述），所以不带前缀、也不带 @ 片段——`at=False` 同时让站点省掉那些 @ 片段。
+        """
+        target = ""
+        if kind not in _AGENT_GLOBAL_KINDS:
+            target, error = await self._resolve_event(event_id)
+            if error:
+                return error
+        data = await self._query(kind, target, ref, page, at=False, scope=scope, qq=qq)
+        return "\n".join(self._texts(data, decorated=False))
 
     # ------------------------------------------------------------------ #
     # 届次解析：让用户能用「e001 / 1 / 第2届 / 名称片段」随便写
@@ -701,10 +775,13 @@ class NTEMatchPlugin(star.Star):
     # ------------------------------------------------------------------ #
     # 自助报名 / 取消报名（只改名单，不组队不定赛制；闸门与白名单都在站点侧判）
     # ------------------------------------------------------------------ #
-    async def _signup(self, event, action: str, token: str):
-        """公共流程：解析届次 → 让站点改名单 → 把人话原样回群。
+    async def _signup_text(self, event, action: str, token: str) -> str:
+        """报名 / 取消报名的**纯文本结果**（命令与 LLM 工具共用这一份）。
 
-        两条命令只差一个 ``action``：站点那边是同一条接口（``POST /api/bot/signup``）。
+        两条命令、一个工具，都只差「谁来送」这一段文本：判断与文案只有这里一处
+        （两处各写一遍，迟早会出现「命令里说不行、工具里说行」这种自相矛盾）。
+
+        **这里不发任何消息**：命令拿到它自己发（:meth:`_signup`），工具直接把它回给大模型。
 
         **群号要一起报上去**：站点用它判「报名白名单」——白名单群里的非成员也能报上
         （站点顺手把他建成成员，登录密钥私聊给本人）。私聊没有群号，站点按「只认成员」处理。
@@ -714,7 +791,7 @@ class NTEMatchPlugin(star.Star):
         """
         target, error = await self._resolve_event(token)
         if error:
-            return event.plain_result(error)
+            return error
         data = await self._post(
             "signup",
             {
@@ -726,8 +803,12 @@ class NTEMatchPlugin(star.Star):
             },
         )
         if not data.get("ok"):
-            return event.plain_result(str(data.get("error") or "操作失败"))
-        return event.plain_result(str(data.get("text") or "操作完成"))
+            return str(data.get("error") or "操作失败")
+        return str(data.get("text") or "操作完成")
+
+    async def _signup(self, event, action: str, token: str):
+        """命令用：把 :meth:`_signup_text` 的结果原样回群。"""
+        return event.plain_result(await self._signup_text(event, action, token))
 
     @filter.command("比赛报名", alias={"我要报名", "报名", "比赛我要报名"})
     async def cmd_signup(self, event: AstrMessageEvent, event_id: str = ""):
@@ -857,6 +938,34 @@ class NTEMatchPlugin(star.Star):
     # ------------------------------------------------------------------ #
     # 资料 / 直播注册 / 游戏 UUID：用户自助（管理员可 @ 代办，私信仍只发本人）
     # ------------------------------------------------------------------ #
+    async def _profile_text(self, event, target: str, args: list[str]) -> tuple[dict, str, str]:
+        """查 / 改资料的**纯文本结果**：返回 ``(接口回的数据, 正文, 出错说明)``。
+
+        命令与 LLM 工具共用这一份：命令拿到正文后**私聊**给本人（群里只报一句），
+        工具直接把它回给大模型。出错说明非空就是失败了（``""`` = 成功）。
+
+        正文里**没有密钥 / 令牌本身**（只有「有没有设置」），所以给工具用也安全——
+        这条是站点侧保证的（见 ``/api/bot/profile``）。
+        """
+        who = _sender_id(event)
+        if not who:
+            return {}, "", "没识别到你的 QQ，请稍后再试。"
+        if not args:
+            data = await self._get("profile", qq=who, targetQq=target)
+        else:
+            data = await self._post(
+                "profile",
+                {
+                    "qq": who,
+                    "targetQq": target,
+                    "field": args[0],
+                    "value": " ".join(args[1:]) if len(args) > 1 else "",
+                },
+            )
+        if not data.get("ok"):
+            return data, "", str(data.get("error") or "操作失败")
+        return data, "\n\n".join(data.get("parts") or []) or str(data.get("text") or ""), ""
+
     @filter.command("比赛资料", alias={"我的资料", "个人资料", "改资料", "比赛我的资料"})
     async def cmd_profile(self, event: AstrMessageEvent, field: str = "", value: str = "", more: str = ""):
         """查看 / 修改自己的资料（**私聊发你**）：QQ、名字、游戏 UUID、B站 房间号、推流码、直播间标题。
@@ -881,23 +990,11 @@ class NTEMatchPlugin(star.Star):
         if target:
             # 被 @ 的人的 QQ 有时会混进参数里：它不是字段名，剔掉
             args = [x for x in args if not (x.isdigit() and x == target)]
-        if not args:
-            data = await self._get("profile", qq=who, targetQq=target)
-        else:
-            data = await self._post(
-                "profile",
-                {
-                    "qq": who,
-                    "targetQq": target,
-                    "field": args[0],
-                    "value": " ".join(args[1:]) if len(args) > 1 else "",
-                },
-            )
-        if not data.get("ok"):
-            yield event.plain_result(str(data.get("error") or "操作失败"))
+        data, text, error = await self._profile_text(event, target, args)
+        if error:
+            yield event.plain_result(error)
             return
         to_qq = str(data.get("toQq") or target or who)
-        text = "\n\n".join(data.get("parts") or []) or str(data.get("text") or "")
         other = bool(data.get("forOther"))
         changed = [str(x) for x in (data.get("changed") or [])]
         sent = await self._notify(to_qq, text)
@@ -1158,6 +1255,106 @@ class NTEMatchPlugin(star.Star):
             logger.warning("[NTE 比赛] At 组件不可用，退化为纯文本：%s", exc)
             head = "".join(f"@{qq}" for qq in qqs)
             yield event.plain_result(f"{head}\n" + "\n".join(texts))
+
+    # ------------------------------------------------------------------ #
+    # LLM 工具（可选）：让大模型也能查这些数据
+    # ------------------------------------------------------------------ #
+    # 改这一节之前先读这四条——它们每一条都有测试盯着（tests/test_plugin_helpers.py）：
+    #
+    # 1. **只回文本**（``return str``）：AstrBot 把返回值当「工具结果」交给大模型，由它按
+    #    **当前人格**说出最终那句话。工具里**不许** yield / ``plain_result`` / 私聊 / 停事件
+    #    —— 那等于绕开人格自己发言，还会和模型的话重复一遍；
+    # 2. **不碰系统提示词与人格**：不注册 ``on_llm_request``、不读不写 persona。工具**只**
+    #    在「大模型决定调它」时执行，人格怎么说话完全不受影响（工具描述也只写「能查什么」，
+    #    不写任何语气 / 角色要求）；
+    # 3. **不给凭据、不给「喊话」能力**：密钥 / 令牌 / 推流地址 / 改推流码 / 直播注册 / 召集
+    #    一律只走命令。工具结果会进大模型的上下文，而它会照着重述到群里；
+    # 4. **参数定义来自 docstring**（不是类型注解）：AstrBot 解析 ``Args:`` 里的
+    #    ``参数名(类型): 说明``，类型只能是 string / number / boolean / object / array
+    #    （一层泛型如 ``array[string]`` 也行）。写漏类型会在**装饰时**抛异常 →
+    #    插件加载失败 → 连命令一起没。所以参数名必须与签名逐个对上、说明写一行。
+    #
+    # 想让人格**完全看不见**这些工具：AstrBot 人格设定里有「工具」范围（不填 = 全部；
+    # 空 = 一个都不用；填名字 = 白名单），或在 WebUI「函数工具」里逐个关。
+    # 模型不支持 function calling 时 AstrBot 自己会去掉工具，命令照常。
+    @_llm_tool("nte_query")
+    async def tool_query(
+        self,
+        event: AstrMessageEvent,
+        kind: str = "progress",
+        event_id: str = "",
+        match: str = "",
+        page: float = 1,
+        mine: bool = False,
+    ) -> str:
+        """查「NTE 比赛」的赛事数据（届次、赛程进度、对阵结果、冠军、名单、直播等）。
+
+        只转述查到的内容，别自己编比分 / 编名字。用户没说清是「哪一届」时先问一句，
+        或先查 kind=ids 拿到编号。
+
+        Args:
+            kind(string): 查什么：event 届次信息 / progress 赛程进度 / next 下一场 / result 结果 / champion 冠军 / roster 参赛名单 / detail 单届详情（配 match 细说那一场）/ live 当前直播 / list 全部赛事 / ids 届次编号 / uuids 选手 UUID 清单
+            event_id(string): 届次：编号（如 e001）或名称片段（如 春节）。live / list / ids 不用填
+            match(string): 场次编号（如 L-1 / 八强赛-1），只在 kind=detail 时用
+            page(number): 页码，从 1 开始，只在 kind=list / ids 时用
+            mine(boolean): 只要「自己创建的届」，只在 kind=ids 时用
+        """
+        key = (kind or "").strip().lower()
+        if key not in _AGENT_KINDS:
+            return f"kind 只能是 {' / '.join(_AGENT_KINDS)}（收到的是「{kind}」）。"
+        try:
+            number = max(1, int(float(page or 1)))
+        except (TypeError, ValueError):  # 模型给了胡话：按第 1 页查，别把它变成一次失败
+            number = 1
+        scope = "mine" if (mine and key == "ids") else "all"
+        qq = _sender_id(event) if scope == "mine" else ""
+        return await self._agent_query(key, event_id, match, number, scope, qq)
+
+    @_llm_tool("nte_signup")
+    async def tool_signup(
+        self, event: AstrMessageEvent, event_id: str = "", action: str = "join"
+    ) -> str:
+        """替发消息这个人报名 / 取消报名某一届比赛（只改参赛名单，不组队、不定赛制）。
+
+        只在用户明确说要报名或退赛时调用；被拒时（不是筹备中 / 已经组队 / 不在白名单群
+        且还不是成员）把给的原因照实说清，别当成报名成功。
+
+        Args:
+            event_id(string): 届次：编号（如 e001）或名称片段（如 春节）
+            action(string): join 报名 / cancel 取消报名
+        """
+        act = (action or "join").strip().lower()
+        if act not in ("join", "cancel"):
+            return "action 只能是 join（报名）或 cancel（取消报名）。"
+        return await self._signup_text(event, act, event_id)
+
+    @_llm_tool("nte_me")
+    async def tool_me(self, event: AstrMessageEvent, field: str = "", value: str = "") -> str:
+        """查 / 改发消息这个人自己的站内资料（名字、游戏 UUID、B站 房间号、推流码等）。
+
+        不带 field 就是查看（内容里不含密钥 / 令牌，只说「有没有设置」）；带 field 才是修改，
+        只在用户明确要求时改。只能改自己的，别人的资料请让他自己发命令。
+
+        Args:
+            field(string): 要改的字段：名字 / 游戏UID / B站 / 推流码 / 直播间 / QQ（不填 = 只看不改）
+            value(string): 新的值；清空某一项就写 清空
+        """
+        args = [str(x).strip() for x in (field, value) if str(x or "").strip()]
+        data, text, error = await self._profile_text(event, "", args)
+        if error:
+            return error
+        changed = [str(x) for x in (data.get("changed") or [])]
+        head = f"已改：{'、'.join(changed)}。\n" if changed else ""
+        return head + text
+
+    @_llm_tool("nte_help")
+    async def tool_help(self, event: AstrMessageEvent) -> str:
+        """这机器人能做的事（命令清单）+ 哪些在群里回、哪些只私聊发本人。
+
+        用户问「你能干什么」「怎么报名」「有什么命令」时用它，挑相关的几条说，别整段念完；
+        清单里没有的能力就是没有，别自己发明。
+        """
+        return HELP_TEXT
 
     # ------------------------------------------------------------------ #
     # 真 @ 投递：站点排队，**这里**来发

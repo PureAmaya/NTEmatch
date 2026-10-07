@@ -815,14 +815,246 @@ def test_help_card_lists_exactly_the_same_commands(plugin_module):
     )
 
 
-def test_plugin_registers_no_llm_tools(plugin_module):
-    """插件**不注册任何 ``llm_tool``**：机器人不经过大模型，答案稳定可复现。
+# --------------------------------------------------------------------------- #
+# LLM 工具（可选）：让大模型也能查这些数据
+#
+# 这一节盯的是「工具会不会反过来影响人格」。最容易踩的三件事：
+# 1. 工具自己往群里发消息 —— 那等于绕开人格发言，还会与模型的话重复一遍；
+# 2. 工具去改系统提示词 / 人格设定 —— 用户配的人格被悄悄换掉；
+# 3. 参数的 docstring 不合 AstrBot 的规矩：轻则参数被静默丢掉（模型传了也没用），
+#    重则**注册时**抛异常、插件整个加载不了（连命令一起没）。
+# 2 与 3 在本地都不会报错，只能靠这几条测试拦。
+# --------------------------------------------------------------------------- #
+_LLM_TOOL_TYPES = {"string", "number", "boolean", "object", "array"}
 
-    有人「顺手」加回一个 LLM 工具时，这条会红——那正是要提醒的时候。
+#: 允许暴露给大模型的工具（**只有这四个**）：查询、报名 / 取消报名、自己的资料、帮助。
+#: 凭据类（推流地址 / 重置密钥 / 重置令牌 / 改推流码 / 直播注册）与「召集」永远不给工具：
+#: 工具结果是回给大模型的，而它会照着重述到群里。
+_LLM_TOOL_NAMES = {"nte_query", "nte_signup", "nte_me", "nte_help"}
+
+
+def _llm_tools_in_source() -> dict:
+    """从源码里找出所有 ``@_llm_tool("…")`` 的方法（返回 ``{工具名: 函数节点}``）。
+
+    读源码而不是读加载后的类：测试用的 astrbot 桩把装饰器做成了「原样返回」，
+    运行时根本看不出哪些方法是工具。
     """
-    source = PLUGIN.read_text(encoding="utf-8")
-    assert "llm_tool(" not in source, "插件里又注册了 llm_tool：本项目不用大模型（见 README）"
-    assert not [name for name in dir(plugin_module.NTEMatchPlugin) if "llm" in name.lower()]
+    import ast
+
+    tree = ast.parse(PLUGIN.read_text(encoding="utf-8"))
+    out: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for deco in node.decorator_list:
+            if not (
+                isinstance(deco, ast.Call)
+                and isinstance(deco.func, ast.Name)
+                and deco.func.id == "_llm_tool"
+            ):
+                continue
+            if deco.args and isinstance(deco.args[0], ast.Constant):
+                out[str(deco.args[0].value)] = node
+    return out
+
+
+def _parse_args_section(doc: str) -> dict:
+    """按 AstrBot 的规矩读 docstring 的 ``Args:`` 段（``参数名(类型): 说明``）。
+
+    AstrBot 用 ``docstring_parser`` 解析这一段、且**只看这段**（不看类型注解）：类型不在
+    白名单里、或者压根没写类型，注册时就会抛异常。缺类型的参数这里读成空串，
+    测试据此报错——比等插件加载失败再回来查快得多。
+    """
+    lines = inspect.cleandoc(doc or "").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "Args:")
+    except StopIteration:
+        return {}
+    out: dict = {}
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t")):  # 缩进回到顶格：Args 段结束了
+            break
+        hit = re.match(r"\s*([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?\s*:", line)
+        if hit:
+            out[hit.group(1)] = (hit.group(2) or "").strip()
+    return out
+
+
+def test_llm_tool_set_is_deliberate(plugin_module):
+    """只暴露这四个工具：多一个都得先改这条测试（凭据与召集永远不给模型）。"""
+    tools = _llm_tools_in_source()
+    assert set(tools) == _LLM_TOOL_NAMES, (
+        f"工具集合变了（现在 {sorted(tools)}）：确认它不会把凭据或「召集」交给大模型，再改这里"
+    )
+
+
+def test_llm_tool_docstrings_match_astrbot_rules(plugin_module):
+    """每个工具的 docstring 都得让 AstrBot 解析出**正确的参数**。
+
+    AstrBot 的工具参数**只**来自 docstring：参数名对不上 → 模型传的参数进不了函数；
+    类型没写 / 不在白名单 → 注册时直接抛异常（插件加载失败，命令一起没）。
+    另外每个参数必须有默认值：模型少传一个参数时不能把调用变成 TypeError。
+    """
+    for name, node in _llm_tools_in_source().items():
+        doc = _docstring_of(node)
+        assert doc.strip(), f"{name} 没有 docstring：工具描述为空的话，模型不知道它干什么"
+        args = _parse_args_section(doc)
+        params = [a.arg for a in node.args.args if a.arg not in ("self", "event")]
+        assert set(args) == set(params), (
+            f"{name} 的 docstring 参数与函数签名对不上：docstring={sorted(args)} 签名={params}"
+        )
+        assert "event" not in args and "self" not in args, f"{name} 不该把 event/self 写进 Args"
+        for param, type_name in args.items():
+            assert type_name in _LLM_TOOL_TYPES, (
+                f"{name}.{param} 的类型「{type_name}」AstrBot 不认"
+                f"（只能是 {' / '.join(sorted(_LLM_TOOL_TYPES))}）；写漏类型会更惨：注册时就抛异常"
+            )
+        defaults = node.args.defaults + node.args.kw_defaults
+        assert len(defaults) == len(params), f"{name} 的参数都要有默认值：模型可能少传"
+
+
+def _docstring_of(node) -> str:
+    """函数节点的 docstring（第一个语句是字符串常量的话）。"""
+    import ast
+
+    first = node.body[0] if node.body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+        return str(first.value.value or "")
+    return ""
+
+
+def test_llm_tools_never_speak_or_touch_the_persona(plugin_module):
+    """工具**只回文本**：不许自己发消息，也不许碰系统提示词 / 人格设定。
+
+    工具的结果是作为「工具返回」交给大模型的，最终那句话由模型按**当前人格**说出来。
+    工具一旦自己发言（yield / plain_result / 私聊），就会出现「人格之外的第二张嘴」，
+    用户看到的是两句重复的话；去改 prompt / persona 就更严重：人格被悄悄换掉。
+    """
+    import ast
+
+    banned_calls = {"plain_result", "chain_result", "image_result", "_notify", "stop_event", "send"}
+    for name, node in _llm_tools_in_source().items():
+        assert not any(isinstance(inner, ast.Yield) for inner in ast.walk(node)), (
+            f"{name} 里有 yield：工具的产出会被当成「发给用户的消息」，绕开人格"
+        )
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                assert inner.func.attr not in banned_calls, f"{name} 调了 {inner.func.attr}：工具不许自己发言"
+        annotation = ast.unparse(node.returns) if node.returns is not None else ""
+        assert annotation == "str", f"{name} 的返回类型要标成 str（工具结果回给大模型，不发群）"
+
+    tree = ast.parse(PLUGIN.read_text(encoding="utf-8"))
+    for inner in ast.walk(tree):
+        if not isinstance(inner, ast.Attribute):
+            continue
+        assert "persona" not in inner.attr.lower(), f"插件动了人格相关的东西：{inner.attr}"
+        assert inner.attr != "on_llm_request", "插件改了 LLM 请求：人格 / 系统提示词不在插件的管辖内"
+
+
+async def test_llm_tools_return_plain_text(plugin_module):
+    """跑一遍四个工具：回的是**纯文本**，而且不带回复前缀（那是给群里看的装饰）。"""
+    calls: list = []
+    plugin = plugin_module.NTEMatchPlugin(context=None, config={"reply_prefix": "[NTE]"})
+
+    async def fake_resolve(token):
+        return ("e001", "") if token else ("", "要写明是「哪一届」")
+
+    async def fake_query(kind, event_id="", ref="", page=1, at=True, scope="", qq=""):
+        calls.append(("query", kind, event_id, ref, page, at, scope, qq))
+        return {"ok": True, "parts": ["甲 3:1 乙"], "text": "甲 3:1 乙"}
+
+    async def fake_get(path, **params):
+        calls.append(("get", path, params))
+        return {"ok": True, "parts": ["资料：名字 甲"], "text": "资料：名字 甲"}
+
+    async def fake_post(path, payload):
+        calls.append(("post", path, payload))
+        if path == "profile":
+            return {"ok": True, "parts": ["资料已更新"], "text": "资料已更新", "changed": ["名字"]}
+        return {"ok": True, "text": "已报名：甲届（e001）"}
+
+    prompt_used = []
+
+    async def fake_notify(*_a, **_kw):  # 工具调用它 = 自己发言，直接判失败
+        prompt_used.append(1)
+        raise AssertionError("工具不许私聊发消息")
+
+    plugin._resolve_event = fake_resolve
+    plugin._query = fake_query
+    plugin._get = fake_get
+    plugin._post = fake_post
+    plugin._notify = fake_notify
+    event = _FakeEvent(sender="10001", group="900001")
+
+    got = await plugin.tool_query(event, "progress", "甲届")
+    assert got == "甲 3:1 乙", f"工具回的应当是站点原文、不带回复前缀：{got!r}"
+    assert calls[-1] == ("query", "progress", "e001", "", 1, False, "all", ""), (
+        "工具查询要带 at=False（群里那套 @ 片段对模型没用）"
+    )
+
+    assert "kind 只能是" in await plugin.tool_query(event, "帮我编个比分")
+    assert calls[-1][0] == "query", "非法 kind 不该再去打扰站点"
+
+    await plugin.tool_query(event, "ids", "", "", 2, True)
+    assert calls[-1] == ("query", "ids", "", "", 2, False, "mine", "10001"), (
+        "「只看我创建的届」要带上发消息那个人的 QQ（站点按它过滤）"
+    )
+
+    assert await plugin.tool_signup(event, "甲届", "join") == "已报名：甲届（e001）"
+    assert calls[-1] == (
+        "post",
+        "signup",
+        {"qq": "10001", "action": "join", "event": "e001", "group": "900001", "name": ""},
+    ), "报名工具与命令走同一条接口、同一份载荷（含群号：白名单按它判）"
+    assert "action 只能是" in await plugin.tool_signup(event, "甲届", "带我飞")
+
+    assert (await plugin.tool_me(event, "名字", "新名字")).startswith("已改：名字")
+    assert calls[-1] == (
+        "post",
+        "profile",
+        {"qq": "10001", "targetQq": "", "field": "名字", "value": "新名字"},
+    )
+    assert await plugin.tool_me(event) == "资料：名字 甲"
+    assert calls[-1] == ("get", "profile", {"qq": "10001", "targetQq": ""})
+
+    assert await plugin.tool_help(event) == plugin_module.HELP_TEXT
+    assert not prompt_used
+
+
+def test_llm_tool_kinds_follow_the_site(plugin_module):
+    """工具能查的类型 = 站点 ``KIND_META`` **减去 call**。
+
+    站点加了新查询类型而插件没跟上 → 工具会天天回「kind 只能是 …」；
+    反过来，多给了模型一个类型也要在这里说明理由（默认全给是不行的，
+    ``call`` 会 @ 一大片人，只能人下命令）。
+    """
+    from app import qqbot
+
+    kinds = set(qqbot.KIND_META)
+    allowed = set(plugin_module._AGENT_KINDS)
+    assert kinds - allowed == {"call"}, (
+        f"工具的查询类型与站点对不上：站点多出来 {sorted(kinds - allowed)}、"
+        f"插件多出来 {sorted(allowed - kinds)}（见 README「LLM 工具」）"
+    )
+    doc = _docstring_of(_llm_tools_in_source()["nte_query"])
+    for kind in allowed:
+        assert kind in doc, f"工具描述里没写 kind={kind}：模型不会用没介绍过的类型"
+
+
+def test_llm_tool_decorator_degrades_on_old_astrbot(monkeypatch, plugin_module):
+    """老版本 AstrBot 没有 ``filter.llm_tool`` 时**不注册工具**，但插件要能正常加载。
+
+    直接写 ``@filter.llm_tool(...)`` 的话，老版本上装饰器求值就 AttributeError，
+    插件整个加载不了——连 25 条命令一起没。所以这里必须能退化成「原样返回函数」。
+    """
+    monkeypatch.setattr(plugin_module.filter, "llm_tool", None, raising=False)
+
+    def sample():
+        return "ok"
+
+    assert plugin_module._llm_tool("nte_x")(sample) is sample
 
 
 class _OldEvent(_FakeEvent):
