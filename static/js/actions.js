@@ -1843,7 +1843,7 @@ async function setFormat(fmt) {
 }
 
 /**
- * 清空**全部比赛**（两套赛制通用）。
+ * 清空**全部比赛**（两套赛制通用）——「删除赛程」。
  *
  * 允许一场不剩——赛程为空是合法状态，之后可以重新生成；
  * 固定队伍与参与名单保留，比分与用时一并丢弃。
@@ -1855,13 +1855,45 @@ async function clearAllRounds() {
     return;
   }
   const ok = window.confirm(
-    `清空全部 ${total} 场比赛？\n` +
-      `比分与用时一并丢失，固定队伍与参与名单会保留；清空后可以重新生成赛程。`
+    `删除全部 ${total} 场比赛（赛程）？\n` +
+      `比分与用时一并丢失，固定队伍与参与名单会保留；删除后可以重新生成赛程。`
   );
   if (!ok) return;
   try {
     const res = await api('/rounds', { method: 'DELETE', auth: true });
-    toast(`已清空 ${res.removed || total} 场比赛`, 'ok');
+    toast(`已删除赛程（${res.removed || total} 场）`, 'ok');
+    if (res.state) App.state = res.state;
+    else if (hooks.refreshState) await hooks.refreshState();
+    App.filter = 'all';
+    App.status = 'all';
+    hooksRenderAdmin();
+    renderPublic();
+  } catch (err) {
+    toast(err.message, 'err', 6000);
+  }
+}
+
+/**
+ * 删除**全部队伍**（「删除组队」）：名单、选手档案、参与状态都留着，赛程会一起清空。
+ *
+ * 为什么连赛程一起清：每场对阵都引用队伍 id，队伍没了，旧对阵就是一堆空席位。
+ * 这条也是「组队之后还想让人自助报名 / 重排队伍」的入口——清完就能重新组队、重新生成赛程。
+ */
+async function clearAllTeams() {
+  const teams = App.state?.teams || [];
+  if (!teams.length) {
+    toast('当前没有队伍', 'info');
+    return;
+  }
+  const ok = window.confirm(
+    `删除全部 ${teams.length} 支队伍？\n` +
+      `参与名单、选手档案、报名状态都不动；但赛程与比分会被一起清空（对阵引用着队伍），` +
+      `之后需要重新「随机组队」并「生成赛程」。`
+  );
+  if (!ok) return;
+  try {
+    const res = await api('/teams/clear', { method: 'POST', auth: true });
+    toast(`已删除组队（${res.removed || teams.length} 支队伍），赛程一并清空`, 'ok', 6000);
     if (res.state) App.state = res.state;
     else if (hooks.refreshState) await hooks.refreshState();
     App.filter = 'all';
@@ -2562,8 +2594,10 @@ export async function handleAction(act, el) {
       // 开赛前换小组赛对手（开打后前后端都会拒绝）
       return openGroupPairingModal();
     case 'rounds-clear':
-    case 'tournament-clear': // 旧入口，两者都是「清空全部比赛」
+    case 'tournament-clear': // 旧入口，两者都是「删除赛程（全部比赛）」
       return clearAllRounds();
+    case 'teams-clear':
+      return clearAllTeams();
     case 'schedule-generate':
       return openScheduleModal();
     case 'schedule-append':

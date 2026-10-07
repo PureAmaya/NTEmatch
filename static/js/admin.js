@@ -568,7 +568,12 @@ export function adminPanelHtml(s) {
       `<div class="tool-group" style="margin-bottom:10px">` +
         `<button class="btn btn--sm${s.event?.locked ? ' btn--primary' : ''}" type="button" data-act="team-sub">` +
         `队伍换人（不重排队伍）</button>` +
-        `<span class="panel__hint">把某队的一位队员换成候选池里的其他人；不在参与名单里会自动加入</span>` +
+        // 删除组队：**名单与选手档案都留着**，只是把队伍清掉（顺带清赛程）——
+        // 「先删组队再重排 / 再让人报名」就走这里（见 store.signup_blocked 的说明）
+        `<button class="btn btn--sm btn--danger" type="button" data-act="teams-clear">` +
+        `删除组队（保留名单）</button>` +
+        `<span class="panel__hint">把某队的一位队员换成候选池里的其他人；不在参与名单里会自动加入。` +
+        `「删除组队」只清队伍，名单、选手档案、参与状态都不动（赛程会一起清空，需重新生成）</span>` +
         `</div>` +
         lockedWrap('<div id="teamHost"></div>', s.event?.locked, '比赛已开始，队伍已锁定')
     ) +
@@ -672,10 +677,10 @@ function participantsPanelHtml(s) {
 function schedulePanelHtml(s) {
   const league = isLeague(s);
   const locked = Boolean(s.event?.locked);
-  // 结构性操作（重建赛程 / 重新组队 / 清空比赛）在开赛后冻结
+  // 结构性操作（重建赛程 / 重新组队 / 删除赛程）在开赛后冻结
   const clearBtn =
     `<button class="btn btn--sm btn--danger" type="button" data-act="rounds-clear">` +
-    `清空全部比赛</button>`;
+    `删除赛程（全部比赛）</button>`;
   const structural = league
     ? `<button class="btn btn--sm btn--primary" type="button" data-act="schedule-generate">生成赛程</button>` +
       clearBtn

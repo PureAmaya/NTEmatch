@@ -1243,9 +1243,9 @@ function renderLeagueTools(s) {
       `<button class="btn btn--sm btn--primary" type="button" data-act="schedule-generate">生成赛程</button>` +
       `<button class="btn btn--sm" type="button" data-act="schedule-append">追加补赛</button>` +
       `<button class="btn btn--sm" type="button" data-act="round-append">追加空局</button>` +
-      // 允许一场不剩：清空后可以重新生成
+      // 允许一场不剩：删掉后可以重新生成
       ((s.rounds || []).length
-        ? `<button class="btn btn--sm btn--danger" type="button" data-act="rounds-clear">清空全部比赛</button>`
+        ? `<button class="btn btn--sm btn--danger" type="button" data-act="rounds-clear">删除赛程</button>`
         : '') +
       `<button class="btn btn--sm" type="button" data-act="reload">同步配置</button></div>`
     : '';
