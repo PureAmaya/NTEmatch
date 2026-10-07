@@ -346,8 +346,8 @@ async def send_text(
             try:
                 resp = await client.post(url, headers=headers, json=body)
             except httpx.HTTPError as exc:
-                result["detail"] = f"请求 AstrBot 失败：{exc}"
-                log.warning("QQ 推送失败 | %s | %s", url, exc)
+                result["detail"] = f"请求 AstrBot 失败：{_why(exc)}"
+                log.warning("QQ 推送失败 | %s | %s", url, result["detail"])
                 return result
             result["status"] = resp.status_code
             if resp.status_code < 400:
@@ -365,6 +365,25 @@ async def send_text(
                 break
     log.warning("QQ 推送失败 | umo=%s | HTTP %s | %s", target, result["status"], result["detail"])
     return result
+
+
+def _why(exc: Exception) -> str:
+    """把请求异常写成**一眼能查**的一句话（必须带上异常类型）。
+
+    为什么要带类型：httpx 的异常经常 ``str(exc)`` 是空串——``ReadTimeout()`` /
+    ``ConnectError()`` 就是这么构造的。于是日志里只剩「请求 AstrBot 失败：」，
+    后面什么都没有；用户把日志贴过来，谁也看不出到底是怎么失败的（真发生过：
+    「卡片推送失败，退回纯文本 | 请求 AstrBot 失败：」后面空着）。
+    """
+    kind = type(exc).__name__
+    if isinstance(exc, httpx.TimeoutException):  # ConnectTimeout 也走这条（它先于 ConnectError）
+        return (
+            f"{kind}：AstrBot 在超时时间内没响应（图片 / 上传比纯文本慢；"
+            "可在「服务器 → QQ 机器人 → 请求超时」调大）"
+        )
+    if isinstance(exc, httpx.ConnectError):
+        return f"{kind}：连不上 AstrBot（地址 / 端口 / 防火墙？）"
+    return f"{kind}：{str(exc) or repr(exc)}"
 
 
 def _error_text(resp: httpx.Response) -> str:
@@ -599,7 +618,7 @@ async def _upload_attachment(
                 url, headers=plain, files={field: (filename, blob, "image/png")}
             )
         except httpx.HTTPError as exc:
-            return "", f"上传图片到 AstrBot 失败：{exc}"
+            return "", f"上传图片到 AstrBot 失败：{_why(exc)}"
         if resp.status_code < 400:
             try:
                 payload = resp.json()
@@ -685,8 +704,8 @@ async def send_image(
                     try:
                         resp = await client.post(endpoint, headers=headers, json=body)
                     except httpx.HTTPError as exc:
-                        result["detail"] = f"请求 AstrBot 失败：{exc}"
-                        log.warning("QQ 图片推送失败 | %s | %s", endpoint, exc)
+                        result["detail"] = f"请求 AstrBot 失败：{_why(exc)}"
+                        log.warning("QQ 图片推送失败 | %s | %s", endpoint, result["detail"])
                         return result
                     result["status"] = resp.status_code
                     if resp.status_code < 400:
@@ -715,7 +734,8 @@ async def send_image(
                     try:
                         resp = await client.post(endpoint, headers=headers, json=body)
                     except httpx.HTTPError as exc:
-                        result["detail"] = f"请求 AstrBot 失败：{exc}"
+                        result["detail"] = f"请求 AstrBot 失败：{_why(exc)}"
+                        log.warning("QQ 图片推送失败 | %s | %s", endpoint, result["detail"])
                         return result
                     result["status"] = resp.status_code
                     if resp.status_code < 400:

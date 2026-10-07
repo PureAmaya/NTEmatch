@@ -34,6 +34,28 @@ def test_defaults_have_no_personal_hosts():
     assert qqbot.DEFAULT_SETTINGS["baseUrl"] == ""
 
 
+def test_http_error_text_names_the_exception_type():
+    """请求 AstrBot 失败时，原因里必须**带上异常类型**，不能只剩一个冒号。
+
+    这条是补的：httpx 的 ``ReadTimeout()`` / ``ConnectError()`` 的 ``str()`` 是**空串**，
+    于是日志里只剩「卡片推送失败，退回纯文本 | 请求 AstrBot 失败：」——用户把这条贴过来，
+    谁也看不出到底是超时、还是连不上（真实发生过，排查等于从零开始）。
+    """
+    import httpx
+
+    for exc, expected in (
+        (httpx.ReadTimeout(""), "ReadTimeout"),
+        (httpx.ConnectTimeout(""), "ConnectTimeout"),
+        (httpx.ConnectError(""), "ConnectError"),
+    ):
+        text = qqbot._why(exc)
+        assert expected in text, text
+        assert len(text) > len(expected) + 6, f"原因太短，等于没说：{text}"
+    # 两类最常见的失败要顺手给出「往哪查 / 往哪调」
+    assert "超时" in qqbot._why(httpx.ReadTimeout(""))
+    assert "连不上" in qqbot._why(httpx.ConnectError(""))
+
+
 async def test_send_text_reports_missing_base_url():
     """没填地址时给一句人话，而不是抛异常（那会变成 500）。"""
     result = await qqbot.send_text(
