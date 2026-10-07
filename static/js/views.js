@@ -2811,9 +2811,12 @@ const PERMISSION_TEXT = {
  * 路由 `/admin` 与 `/user` 照旧可用（刷新 / 收藏 / 分享都落得住）。
  */
 export function syncHeader() {
-  // `管理`：只有**服务器管理员**本人看得见（未登录 / 身份未到手一律收起）
+  // `管理`：登录后只给**服务器管理员**本人；**没登录时也显示**——
+  // 服务一重启会话就没了（会话在内存里），站点主人回来第一件事多半就是管服务器：
+  // 点它直达 /admin 的登录门，输完密钥就地进管理页，不必先绕去「我的」。
+  // 已经登录的普通成员 / 赛事管理员用不上它，藏起来（他们点进去也只能看到「仅限服务器管理员」）。
   const adminBtn = qs('#btnAdmin');
-  if (adminBtn) adminBtn.hidden = !isServerAdmin();
+  if (adminBtn) adminBtn.hidden = Boolean(App.me && !isServerAdmin());
   // 未登录时给一个明确的登录入口，免得密钥没处可输
   const loginBtn = qs('#btnLogin');
   if (loginBtn) loginBtn.hidden = Boolean(App.token);

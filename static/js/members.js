@@ -116,7 +116,8 @@ const serverGateHtml = () =>
   `<input id="serverKey" type="password" autocomplete="current-password" placeholder="请输入服务器管理员密钥"></div>` +
   `<button class="btn btn--primary btn--block" type="button" data-act="admin-login">登录</button>` +
   `<p class="gate__hint">密钥在服务启动日志里（首次启动自动生成）；` +
-  `服务器管理员有且只有一个，忘记可在成员管理里轮换。</p>` +
+  `服务器管理员有且只有一个，忘记可在成员管理里轮换。<br>` +
+  `普通成员改资料请点右上角「登录」（进「我的」），不用在这里输密钥。</p>` +
   `</div></div>`;
 
 function memberSearchMatch(m) {
@@ -1017,7 +1018,11 @@ function uiPanelHtml() {
 export function renderServerPage() {
   const host = qs('#serverBody');
   if (!host) return;
-  if (!App.token) {
+  // 登录门：没登录、**或令牌还没验过身份**（会话随服务重启失效，App.me 为空）都给门——
+  // 服务器管理员输完密钥就地进管理页，不用先去「我的」绕一圈。
+  // （「有 token 但没身份」时给门而不是那句「仅限服务器管理员」：后者是个死胡同，
+  //   连输密钥的地方都没有。）
+  if (!App.token || !App.me) {
     host.innerHTML = serverGateHtml();
     return;
   }

@@ -168,7 +168,10 @@ async function goto(
       seq
     );
   }
-  if (want === 'server' && !isServerAdmin()) {
+  if (want === 'server' && App.me && !isServerAdmin()) {
+    // 只挡「已登录且不是服务器管理员」的人；**没登录的放行**——/admin 自带登录门，
+    // 站点主人输完密钥就地进管理页（见 members.renderServerPage），
+    // 挡在门外反而逼他先去「我的」绕一圈。
     return gotoDenied(
       {
         code: '403',
@@ -633,11 +636,9 @@ function bindStatic() {
     toast('已同步最新状态', 'ok', 2000);
   });
 
-  // 顶栏「管理」= 服务器管理（只有服务器管理员看得见，见 views.syncHeader）
-  qs('#btnAdmin')?.addEventListener('click', () => {
-    if (!isServerAdmin()) return;
-    goto('', 'server');
-  });
+  // 顶栏「管理」= 服务器管理：未登录时也可见（见 views.syncHeader），
+  // 点过去是 /admin 的登录门；权限拦截统一在 goto 与页面里做，这里不重复判
+  qs('#btnAdmin')?.addEventListener('click', () => goto('', 'server'));
 
   // 顶栏「登录」= 去 /user 的登录门（未登录时才出现）
   qs('#btnLogin')?.addEventListener('click', () => goto('', 'user'));
