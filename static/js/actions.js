@@ -80,7 +80,7 @@ const roundOf = (ref) =>
  * * 自然数 → 数字框，步长 1。
  *
  * 时间型**为什么不拆成「时 / 分 / 秒」三个框**：录分行里给成绩的格子只有百来像素
- * （多队同场一行要放「成绩 + 细则分」两个），三个框根本塞不下，会被挤成一半看不见的样子；
+ * （一行就那么宽，还得留出队名与名次），三个框根本塞不下，会被挤成一半看不见的样子；
  * 而且解析本来就认整串写法（见 core.parseMilli）——从计时器上读出来直接粘，比拆三个框更快。
  */
 function valueInputHtml(role, value, sc) {
@@ -112,18 +112,6 @@ function readValueInput(host, role, sc) {
   const input = qs('input', box);
   // 时间型交给 parseVal → parseMilli：`1:23.456`、`1'23"45`、`83.45` 都认；留空 = 没填
   return parseVal(input ? input.value : '', sc);
-}
-
-/**
- * 读回「细则分 / 小分」控件：**留空按 0 算**。
- *
- * 这一格没有「没有成绩」这一说（0 就是「没有小分 / 没有罚时」），而
- * :func:`readValueInput` 对留空给的是「没有成绩」的哨兵（数值口径下是 -1）——
- * 直接发过去会被接口按负分拒收，低胜口径下还会被当成「罚时最少」而排在前面。
- */
-function readPointsInput(host, sc) {
-  const value = readValueInput(host, 'points', sc);
-  return value < 0 ? 0 : value;
 }
 
 /** 一行轮次：`第 N 轮  A 输入 : B 输入  ×`。 */
@@ -198,7 +186,8 @@ function refreshResultPreview(bodyEl, sides, allowDraw) {
         key: side.key,
         label: side.label,
         score: readValueInput(host, 'score', sc),
-        points: readPointsInput(host, sc),
+        // 「细则分 / 小分」的输入框已经去掉：**沿用已有值**（填了轮次时下面会被推导值覆盖）
+        points: Number(side.points) || 0,
       };
     });
   } catch (err) {
@@ -233,9 +222,11 @@ function refreshResultPreview(bodyEl, sides, allowDraw) {
         if (node) node.textContent = text;
       };
       put('score-label', counted ? '大比分' : sc.label);
-      put('points-label', counted ? `总${sc.label}` : '小分');
+      // 没填轮次时不再有「小分」这一格（录入框已经去掉）：留空的格子比一个永远 0 的
+      // 「小分」好——不然人会到处找在哪儿填它
+      put('points-label', counted ? `总${sc.label}` : '');
       put('score-view', fmtScore(entries[index].score, counted, sc));
-      put('points-view', fmtVal(entries[index].points, sc));
+      put('points-view', counted ? fmtVal(entries[index].points, sc) : '');
     });
   }
 
@@ -309,16 +300,15 @@ function openResultModal(rnd) {
       const head =
         `<span class="rrow__key" style="--c:${esc(side.color || 'var(--accent)')}">${esc(side.key)}</span>` +
         `<span class="rrow__name">${esc(side.label)}</span>`;
-      // 多队同场没有「轮次」：成绩就是每一方自己那一格 → 直接给输入框
+      // 多队同场没有「轮次」：成绩就是每一方自己那一格 → **一个框就够**
+      // （以前这里还有一格「细则分」：多队同场排名只看主成绩，那一格既不用填、
+      //   又和两人对局里的「小分」长得像，白白占掉半行宽度）
       if (multi) {
         return (
           `<div class="rrow" data-sid="${esc(side.key)}">` +
           head +
           `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
           valueInputHtml('score', side.score, sc) +
-          `</label>` +
-          `<label class="rrow__f"><span>细则分</span>` +
-          valueInputHtml('points', side.points, sc) +
           `</label></div>`
         );
       }
@@ -334,6 +324,8 @@ function openResultModal(rnd) {
     .join('');
 
   // 没有轮次时才需要手填「本场成绩」（与轮次互斥：显隐由预览里的 refresh 切换）
+  // 同样**只有一个框**：小分那一格既不参与判定（多队同场排名只看主成绩）、
+  // 又要求用户理解「小分是什么」，去掉
   const manualRows = sides
     .map(
       (side) =>
@@ -342,9 +334,6 @@ function openResultModal(rnd) {
         `<span class="rrow__name">${esc(side.label)}</span>` +
         `<label class="rrow__f"><span>${esc(sc.label)}</span>` +
         valueInputHtml('score', side.score, sc) +
-        `</label>` +
-        `<label class="rrow__f"><span>小分</span>` +
-        valueInputHtml('points', side.points, sc) +
         `</label></div>`
     )
     .join('');
@@ -353,10 +342,8 @@ function openResultModal(rnd) {
   const timeHint = sc.timeBased
     ? `时间按 <b>分:秒.毫秒</b> 填（如 <b>1:23.456</b>），也可以只写秒数（<b>83.45</b>）。`
     : '';
-  // 留空的含义（三种录入块都要用）：主成绩留空 = 没有成绩（垫底），细则分留空 = 0
-  const blankHint =
-    `成绩可以<b>留空</b>——留空 = 没有成绩（没跑完 / 未到场），一律排在最后；` +
-    `细则分留空按 0 算。`;
+  // 留空的含义（三种录入块都要用）：一个成绩框，留空 = 没有成绩（垫底）
+  const blankHint = `成绩可以<b>留空</b>——留空 = 没有成绩（没跑完 / 未到场），一律排在最后。`;
   const roundsBlock = multi
     ? `<div class="notice" style="margin-top:10px">${sides.length} 队同场：按 <b>${esc(
         sc.label
@@ -486,9 +473,8 @@ function openResultModal(rnd) {
                 score: derived
                   ? derived.wins[index]
                   : readValueInput(host, 'score', sc),
-                points: derived
-                  ? derived.totals[index]
-                  : readPointsInput(host, sc),
+                // 「小分 / 细则分」的输入框已经去掉：没有轮次时沿用**已有值**（别把老数据清零）
+                points: derived ? derived.totals[index] : Number(side.points) || 0,
               };
             }),
             durationMinutes: Number(read('#rq-duration')) || 0,

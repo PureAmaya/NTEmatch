@@ -82,8 +82,9 @@ function chipHtml(pid) {
 }
 
 //: 队名 / 缩写的长度上限（**字符数**，中文一个算一个）。
-//: 队名短一点读着才像队名（「霓虹」而不是「甲 & 乙 & 丙」），赛程表与对阵图里也放得下。
-const NAME_MAX = 6;
+//: 队名的 8 与后端 ``app/tournament.TEAM_NAME_MAX`` 是同一个数——两边不一致就会出现
+//: 「界面让填 8 个字、随机组队却按 6 个字拼」。
+const NAME_MAX = 8;
 const SHORT_MAX = 4;
 
 /** 队伍卡片里的一行输入（改名 / 改缩写）。 */
@@ -92,26 +93,44 @@ const fieldHtml = (field, label, value, placeholder, extra = '') =>
   `<input data-team-field="${field}" value="${esc(value || '')}" placeholder="${esc(placeholder)}" ` +
   `maxlength="${field === 'short' ? SHORT_MAX : NAME_MAX}">${extra}</label>`;
 
-//: 自动队名的素材（2 字词根 + 后缀，拼出来正好 2~4 字）
+//: 自动队名的兜底素材：**队伍里一个人都没有**时才用（有队员就按队员名拼，
+//: 见 autoTeamName）——空队伍在保存时本来就会被删掉，这里只是别让按钮点了没反应。
 const NAME_STEMS = [
   '霓虹', '深渊', '星轨', '夜刃', '赤鳞', '幻影', '铁翼', '量子', '迷雾', '雷鸣',
   '苍蓝', '灼羽', '虚空', '逆流', '零号', '极昼', '猎风', '暗涌', '折光', '碎片',
-  '白噪', '黑潮', '蚀月', '浮空',
 ];
-const NAME_TAILS = ['队', '团', '盟'];
-const NAME_SUFFIXES = ['小队', '战队', '分队'];
 
-/** 随机一个 2~4 字的队名（尽量不与已有队名重复）。 */
-function randomTeamName() {
-  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-  const taken = new Set(T.teams.map((t) => (t.name || '').trim()));
-  for (let i = 0; i < 20; i += 1) {
-    const stem = pick(NAME_STEMS);
-    const roll = Math.random();
-    const name = roll < 0.55 ? stem : roll < 0.85 ? stem + pick(NAME_TAILS) : stem + pick(NAME_SUFFIXES);
-    if (!taken.has(name)) return name;
+/**
+ * 按队员名拼一个队名：**每人最多分到 ``NAME_MAX ÷ 人数`` 个字符**。
+ *
+ * 与后端 ``app/tournament.auto_team_name`` 同一条规则（随机组队时由后端拼）：
+ * 1 人 → 这个人最多 8 个字；2 人 → 各 4 个字；3 人 → 各 2 个字；4 人 → 各 2 个字。
+ *
+ * 改这条规则的原因：以前「自动」是随机取一个与队员无关的 2~4 字词（「霓虹」「深渊小队」），
+ * 随机组队那边则把所有全名用「 & 」串起来——前者认不出队里是谁，后者一长就爆上限。
+ * 现在两边都按人头分字数，长度可控、名字也认得出人。
+ *
+ * 队里没人就返回空串（由调用方提示），不再编一个和队员无关的名字。
+ */
+function autoTeamName(team) {
+  const names = (team.playerIds || [])
+    .map((pid) => (playerOf(pid)?.name || '').trim())
+    .filter(Boolean);
+  if (!names.length) return '';
+  const each = Math.max(1, Math.floor(NAME_MAX / names.length));
+  let name = names.map((n) => n.slice(0, each)).join('').slice(0, NAME_MAX);
+  // 截断后可能和别的队伍撞名（同姓同前缀）：腾出末位塞个序号，别让它看起来是同一队
+  const taken = new Set(T.teams.filter((t) => t !== team).map((t) => (t.name || '').trim()));
+  if (taken.has(name)) {
+    for (let i = 2; i <= 9; i += 1) {
+      const candidate = `${name.slice(0, NAME_MAX - 1)}${i}`;
+      if (!taken.has(candidate)) {
+        name = candidate;
+        break;
+      }
+    }
   }
-  return pick(NAME_STEMS);
+  return name;
 }
 
 /**
@@ -141,9 +160,14 @@ function teamCardHtml(team, index) {
       'name',
       '队名',
       team.name,
-      '如 霓虹',
+      '如 甲乙',
+      // 「自动」是个**每张卡片都要有的小按钮**：做大了会把队名输入框挤窄，所以样式就地压扁
       `<button class="btn btn--xs btn--ghost" type="button" data-team-op="name-auto" ` +
-        `title="随机生成一个 2~4 字的队名">自动</button>`
+        `style="padding:1px 6px;font-size:11px;line-height:1.5;min-height:0" ` +
+        `title="按队员名自动拼一个队名（每人最多 ${Math.max(
+          1,
+          Math.floor(NAME_MAX / Math.max(1, team.playerIds.length || 1))
+        )} 个字，合计不超过 ${NAME_MAX} 个字）">自动</button>`
     )}` +
     `${fieldHtml('short', '缩写', team.short, '如 NH')}</div>` +
     `<div class="zone__ops">` +
@@ -198,7 +222,7 @@ function shellHtml() {
     `<span class="panel__hint" style="margin-left:auto">${count} 支队伍 · 默认每队 ${size} 人 · 拖拽调整队友</span>` +
     `</div>` +
     `<div class="notice">队友随机分配后<b>全程固定</b>（不换队、不换队友）。` +
-    `卡片上可<b>改队名（≤6 字，点「自动」随机取一个 2~4 字的）/ 缩写 / 主题色</b>、` +
+    `卡片上可<b>改队名（≤8 字，点「自动」按队员名拼：每人最多 8 ÷ 人数 个字）/ 缩写 / 主题色</b>、` +
     `<b>换组</b>（与另一组的队伍互换）、<b>删除分组</b>（队员回到候选池）；` +
     `保存时<b>没有成员的分组会被自动删除</b>，改完队伍需重新「生成赛程」。</div>` +
     `<div id="teamBoard">${boardHtml()}</div>`
@@ -415,10 +439,16 @@ export function installDnD() {
     if (btn.dataset.teamOp === 'drop') dropTeam(card.dataset.team);
     else if (btn.dataset.teamOp === 'swap') openSwapGroup(card.dataset.team);
     else if (btn.dataset.teamOp === 'name-auto') {
-      // 随机 2~4 字队名：只改**本地草案**（点「保存队伍」才落库），所以随便点着换着看
+      // 按队员名拼一个队名（每人最多 NAME_MAX ÷ 人数 个字）：只改**本地草案**
+      // （点「保存队伍」才落库）。队里没人就提示一句，不再编一个和队员无关的名字。
       const hit = teamOfCard(card.querySelector('[data-team-field="name"]'));
       if (!hit) return;
-      hit.team.name = randomTeamName();
+      const name = autoTeamName(hit.team);
+      if (!name) {
+        toast('这支队伍还没有队员：先把人拖进来，队名才有得拼', 'info');
+        return;
+      }
+      hit.team.name = name;
       const input = card.querySelector('[data-team-field="name"]');
       if (input) input.value = hit.team.name;
       const head = card.querySelector('.zone__head b');

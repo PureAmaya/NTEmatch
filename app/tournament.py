@@ -388,12 +388,42 @@ def auto_form_teams(
     return teams, warnings
 
 
+#: 自动队名的长度上限（**中文字符数**，中文一个算一个）：与前端
+#: ``static/js/teams.js`` 的 ``NAME_MAX`` 是同一个数——两边都改才不会出现
+#: 「界面让填 8 个字、后端按 6 个字存」。
+TEAM_NAME_MAX = 8
+
+
+def auto_team_name(names: Iterable[str]) -> str:
+    """按队员名拼一个队名：**每人最多分到 ``TEAM_NAME_MAX ÷ 人数`` 个字符**。
+
+    人数越多，每人能占的字就越少（不然 4 个人各写满就直接爆掉上限）。取整是**向下**的：
+    3 人一队时每人 2 个字符（8 ÷ 3 = 2），拼出来 6 个字——留白比硬塞好，
+    队名越挤越不像名字。
+
+    例（上限 8）：
+
+    * 1 人 → 这个人最多 8 个字（一个人也要看得清是谁）；
+    * 2 人 → 各 4 个字（合计 8）；
+    * 3 人 → 各 2 个字（合计 6）；
+    * 4 人 → 各 2 个字（合计 8）。
+
+    以前这里是 ``" & ".join(全名)``：名字一长就把队名撑成一串，界面上只能看见一个字的缩写；
+    现在按固定预算截断，长度可控、也还认得出人。
+    """
+    clean = [str(n or "").strip() for n in names if str(n or "").strip()]
+    if not clean:
+        return ""
+    each = max(1, TEAM_NAME_MAX // len(clean))
+    return "".join(n[:each] for n in clean)[:TEAM_NAME_MAX]
+
+
 def _make_team(index: int, members: list[Player]) -> Team:
     names = [m.display_name for m in members]
     short = "".join(n[0] for n in names if n)[:3] or f"T{index}"
     return Team(
         id=f"t{index:02d}",
-        name=" & ".join(names),
+        name=auto_team_name(names) or f"T{index}",
         short=short,
         color=PALETTE[(index - 1) % len(PALETTE)],
         player_ids=[m.id for m in members],

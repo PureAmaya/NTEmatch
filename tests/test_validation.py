@@ -123,6 +123,46 @@ def _detail_config(*, per_match: int, players: int, fmt: str = "tournament") -> 
     return cfg
 
 
+def _named(*names: str) -> list[Player]:
+    return [Player(id=f"p{i:02d}", name=name) for i, name in enumerate(names, start=1)]
+
+
+def test_auto_team_name_splits_the_eight_character_budget_by_headcount():
+    """自动队名：**每人最多分到「8 ÷ 人数」个字**（这条规则是用户定的，别悄悄改回去）。
+
+    1 人 → 最多 8 字；2 人 → 各 4 字；3 人 → 各 2 字（合计 6）；4 人 → 各 2 字（合计 8）。
+
+    它替换掉了之前的两套做法：前端「随机取一个与队员无关的 2~4 字词」（认不出队里是谁）、
+    后端「把所有全名用 `` & `` 串起来」（名字一长就爆掉上限，界面上只剩一个字的缩写）。
+    现在两边同一条规则、同一个上限（前端 ``NAME_MAX`` 与这里同一个数）。
+    """
+    assert tournament.TEAM_NAME_MAX == 8, "上限就是 8：前端 static/js/teams.js 的 NAME_MAX 要跟着它"
+
+    # 1 人：这个人最多 8 个字（超了就截到 8）
+    assert tournament.auto_team_name(["早八时睡觉的你"]) == "早八时睡觉的你"
+    assert tournament.auto_team_name(["一二三四五六七八九十"]) == "一二三四五六七八"
+    # 2 人：各 4 字
+    assert tournament.auto_team_name(["早八时睡觉的你", "深渊里的猫"]) == "早八时睡深渊里的"
+    # 3 人：各 2 字（向下取整，合计 6 —— 留白比硬塞好）
+    assert tournament.auto_team_name(["甲乙丙", "丁戊己", "庚辛壬"]) == "甲乙丁戊庚辛"
+    # 4 人：各 2 字，合计正好 8
+    assert tournament.auto_team_name(["甲乙丙", "丁戊己", "庚辛壬", "癸子丑"]) == "甲乙丁戊庚辛癸子"
+    # 空名 / 全空白：拼不出来就返回空串（由调用方决定兜什么）
+    assert tournament.auto_team_name([]) == ""
+    assert tournament.auto_team_name(["  ", ""]) == ""
+
+
+def test_random_teams_get_short_names_made_of_their_members():
+    """随机组队出来的队名也走同一套规则：**不长于 8 个字、就是队员名拼的**。"""
+    players = _named("早八时睡觉的你", "深渊里的猫", "夜见", "白桦", "星野", "雾岛")
+    teams, _warnings = tournament.auto_form_teams(players, 2, seed=3)
+    assert teams
+    for team in teams:
+        assert 0 < len(team.name) <= tournament.TEAM_NAME_MAX, team.name
+        assert " & " not in team.name, "不再用「甲 & 乙」那种串法了：一长就爆掉上限"
+        assert all(member.name[:4] in team.name for member in players if member.id in team.player_ids)
+
+
 def test_schedule_keeps_the_groups_set_on_the_team_board():
     """**组队台里手工分的组必须照用**。
 

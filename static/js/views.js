@@ -1451,7 +1451,7 @@ function matchSideHtml(side, key, rnd) {
   const forfeit = Boolean(side.forfeit);
   const rounds = (rnd.sets || []).length;
   const score = done ? bigScoreText(side, rnd) : '';
-  // 多队同场：显示本场名次与（可选的）细则分
+  // 多队同场：显示本场名次与（老数据里可能有的）细则分——录分弹窗里已经没有这一格了
   const rank = done && side.rank ? `<span class="mside__rank">#${side.rank}</span>` : '';
   const pointsLabel = rounds ? `总${sc.label}` : '小分';
   const points =

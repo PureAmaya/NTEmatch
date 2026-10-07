@@ -408,16 +408,15 @@ function lockPanelHtml(s) {
       `</span></div>` +
       `<div class="notice" style="margin-top:10px"><b>已冻结</b>：赛制、每队人数、每场同场队伍数、败者组开关、` +
       `参赛名单、重新组队、赛程重建 / 清空、删除选手。<br>` +
-      `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补 / 队伍换人</b>（替上的人不在名单里会自动加入）、录分与重置、` +
+      `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补</b>（替上的人不在名单里会自动加入）、录分与重置、` +
       `时间登记、赛事信息、新增选手档案。</div>` +
       `<div class="tool-group" style="margin-top:10px">` +
-      `<button class="btn btn--sm btn--primary" type="button" data-act="team-sub">队伍换人</button>` +
       `<button class="btn btn--sm btn--danger" type="button" data-act="event-unlock">解除锁定</button></div>`
     : `<div class="etime etime--slim">` +
       `<span class="etime__pill etime__pill--upcoming">尚未开赛</span>` +
       `<span class="etime__text">名单、赛制与赛程都可以自由调整</span></div>` +
       `<div class="notice" style="margin-top:10px">确认无误后点「开始比赛」：` +
-      `<b>赛制与参赛名单会被冻结</b>，但<b>直播开关</b>与<b>对局替补 / 队伍换人</b>始终可用。` +
+      `<b>赛制与参赛名单会被冻结</b>，但<b>直播开关</b>与<b>对局替补</b>始终可用。` +
       `开始比赛需要二次确认。</div>` +
       `<div class="kv kv--inline" style="margin-top:10px">` +
       `<div class="kv__row"><dt>赛制</dt><dd>${esc(r.format)}</dd></div>` +
@@ -429,7 +428,7 @@ function lockPanelHtml(s) {
         : '') +
       `<div class="tool-group" style="margin-top:10px">` +
       `<button class="btn btn--sm btn--primary" type="button" data-act="event-start">开始比赛（二次确认）</button>` +
-      `<button class="btn btn--sm" type="button" data-act="team-sub">队伍换人</button></div>`;
+      `</div>`;
   return panelHtml('比赛状态', r.locked ? '已开赛 · 赛制与名单已锁定' : '开赛前请确认名单与赛制', body);
 }
 
