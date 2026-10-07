@@ -131,16 +131,38 @@ ASSET_TTL = 1.0
 _asset_cache: tuple[float, str] | None = None
 
 
+#: 这几个文件**不在版本化路径下**：``/og.png``、``/help.jpg`` 是固定地址（各有自己的缓存头，
+#: 见 ``og_image`` / ``help_image`` 两个路由）。把它们的 mtime 算进版本号，等于「重画分享图 /
+#: 帮助图」就把整站 JS / CSS 的缓存全清掉——而帮助图**服务每次启动都会重画**，
+#: 那会让每次重启都白作废一次前端缓存。
+_UNVERSIONED_STATIC = {"og.png"}
+
+
+def _is_versioned_static(rel_name: str) -> bool:
+    """这个静态文件是否以 ``/static/v/<版本>/…`` 下发（决定要不要计入版本号）。"""
+    if rel_name in _UNVERSIONED_STATIC:
+        return False
+    # help.jpg / help.png / help.webp / help.svg 以及帮助图的指纹文件
+    return not rel_name.rsplit("/", 1)[-1].startswith("help.")
+
+
 def _compute_asset_version_uncached() -> str:
-    """按静态资源的相对路径 / 大小 / mtime 计算版本号。"""
+    """按静态资源的相对路径 / 大小 / mtime 计算版本号。
+
+    只统计**会以版本化地址下发**的文件（:func:`_is_versioned_static`）。
+    """
     digest = hashlib.sha1()
     if STATIC_DIR.exists():
         for path in sorted(STATIC_DIR.rglob("*")):
-            if path.is_file():
-                stat = path.stat()
-                digest.update(path.relative_to(STATIC_DIR).as_posix().encode())
-                digest.update(str(stat.st_size).encode())
-                digest.update(str(stat.st_mtime_ns).encode())
+            if not path.is_file():
+                continue
+            name = path.relative_to(STATIC_DIR).as_posix()
+            if not _is_versioned_static(name):
+                continue
+            stat = path.stat()
+            digest.update(name.encode())
+            digest.update(str(stat.st_size).encode())
+            digest.update(str(stat.st_mtime_ns).encode())
     return digest.hexdigest()[:10]
 
 
@@ -348,8 +370,9 @@ def _abs_url(base: str, path: str) -> str:
 
 
 def _og_image() -> str:
-    """分享图：界面配置里填了就用它，否则用内置那张 ``/og.png``。
+    """分享图：配置里填了就用它，否则用内置那张 ``/og.png``。
 
+    界面已不再暴露这项（见 ``models.UiConfig``），但字段保留、直接写入仍会生效；
     配置读不到（极端情况）也要能出图——分享卡片宁可样式旧一点，也不能没有图。
     """
     try:
@@ -478,6 +501,8 @@ class TournamentPayload(NTEModel):
     seed: int | None = None
     size: int = 0            # 淘汰赛规模（2 的幂），0 = 自动取最大可行值
     teams_per_match: int = 0      # 小组赛每场同场队伍数 2/3/4，0 = 沿用配置
+    # 淘汰赛每场同场队伍数的偏好（2/3/4），0 = 沿用配置
+    knockout_teams_per_match: int = 0
     loser_bracket: bool | None = None  # None = 沿用配置；False = 单败（输一场即淘汰）
     reform: bool = False          # 先重新随机组队再排赛程（「快速创建分组」）
     team_size: int = 0            # 每队人数，0 = 沿用配置
@@ -1457,16 +1482,16 @@ _STREAM_SERVER_KEYS = frozenset(
 
 
 def _apply_ui_patch(patch: dict[str, Any], session: Session) -> None:
-    """界面配置只有服务器管理员能改。
+    """界面配置（分享图 / 展示开关）只有服务器管理员能改。
 
-    主题色 / 分享图 / 展示开关全是**站点级**的（整站共用一套外观），所以赛事管理页不再
-    提供这块表单（见 ``static/js/admin.js``），写接口这边同样把关——别只靠前端藏。
+    这些是**站点级**的（整站共用一套外观），写接口这边把关——别只靠前端藏。
+    主题色已固定、不再随届次切换，所以这里不再涉及配色。
     """
     if session.is_server:
         return
     raise HTTPException(
         status_code=403,
-        detail="界面配置（主题色 / 分享图 / 展示开关）是站点级设置，只有服务器管理员能改。",
+        detail="界面配置（分享图 / 展示开关）是站点级设置，只有服务器管理员能改。",
     )
 
 
@@ -1641,7 +1666,7 @@ async def api_event_start(
 
     * 开 / 关每场比赛的直播推流；
     * 替补换人——换上的人即使不在参与名单里也会**自动加入**；
-    * 录分、改时间、重置比分、赛事信息与界面配置。
+    * 录分、改时间、重置比分与赛事信息。
 
     会被拒绝的是结构性改动：赛制切换、每队/每场人数、败者组开关、
     参赛名单、重新组队、赛程重建与清空（都会回 409 并说明原因）。
@@ -2085,7 +2110,7 @@ async def api_teams_auto(payload: TeamsFormPayload, _: Session = Depends(require
 
 @app.put("/api/teams")
 async def api_teams_update(payload: TeamsPayload, _: Session = Depends(require_current_event)) -> dict[str, Any]:
-    """手动调整队伍（成员 / 队名 / 缩写 / 主题色 / 分组）；队伍增删或改分组时清空赛程。
+    """手动调整队伍（成员 / 队名 / 主题色 / 分组）；队伍增删或改分组时清空赛程。
 
     三条约定：
 
@@ -2282,6 +2307,7 @@ async def api_tournament_generate(
 
     * ``size``：淘汰赛规模（2 的幂且不超过队伍数），留 0 自动取最大可行值；
     * ``teamsPerMatch``：小组赛每场同场队伍数（2/3/4）；
+    * ``knockoutTeamsPerMatch``：淘汰赛每场同场队伍数的偏好（2/3/4）；
     * ``loserBracket``：开 = 双败淘汰，关 = 输一场即淘汰。
     """
     if store.snapshot().rules.format != "tournament":
@@ -2293,6 +2319,7 @@ async def api_tournament_generate(
             seed=seed,
             size=payload.size or None,
             teams_per_match=payload.teams_per_match or None,
+            knockout_teams_per_match=payload.knockout_teams_per_match or None,
             loser_bracket=payload.loser_bracket,
             reform=payload.reform,
             team_size=payload.team_size or None,
@@ -2309,6 +2336,7 @@ async def api_tournament_generate(
         "teams": len(cfg.teams),
         "size": cfg.rules.knockout_size,
         "teamsPerMatch": cfg.rules.teams_per_match,
+        "knockoutTeamsPerMatch": cfg.rules.knockout_teams_per_match,
         "loserBracket": cfg.rules.loser_bracket,
         "warnings": warnings,
         "state": build_public_state(cfg),
@@ -2334,7 +2362,7 @@ def _set_side_team(side: dict[str, Any], team: dict[str, Any]) -> None:
     """把一侧换成一支队：**阵容与显示名都要跟着换**（否则标签还是原来那支队）。"""
     side["teamId"] = str(team.get("id") or "")
     side["playerIds"] = [str(pid) for pid in (team.get("playerIds") or [])]
-    side["label"] = str(team.get("short") or team.get("name") or team.get("id") or "")
+    side["label"] = str(team.get("name") or team.get("id") or "")
 
 
 def _group_rounds_by_key(rounds: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -2520,6 +2548,7 @@ async def api_tournament_preview(
         store.snapshot(),
         team_size=payload.team_size or None,
         teams_per_match=payload.teams_per_match or None,
+        knockout_teams_per_match=payload.knockout_teams_per_match or None,
         loser_bracket=payload.loser_bracket,
         group_count=payload.group_count if payload.group_count >= 0 else None,
         knockout_size=payload.size or None,
@@ -3597,7 +3626,7 @@ async def favicon() -> Response:
 async def og_image() -> Response:
     """默认分享图（1200×630）。放在这里而不是 /static 下：路径短、且不受资源版本号影响。
 
-    管理端在「界面配置」里填了「分享图」就会改用那张，这个路由只是兜底。
+    配置里填了分享图就会改用那张（界面已不再暴露），这个路由只是兜底。
     """
     art = STATIC_DIR / "og.png"
     if not art.exists():

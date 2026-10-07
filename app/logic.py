@@ -604,7 +604,7 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
         return {
             "key": key,
             "label": label,
-            "short": (team.short if team else "") or label,
+            "name": (team.name if team else "") or label,
             "teamId": side.team_id,
             "color": (team.color if team else "") or T.PALETTE[index % len(T.PALETTE)],
             "score": side.score,
@@ -664,6 +664,8 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
         "streams": {"cast": cast},
         "srcA": rnd.src_a,
         "srcB": rnd.src_b,
+        "srcC": rnd.src_c,
+        "srcD": rnd.src_d,
         "winnerTo": rnd.winner_to,
         "loserTo": rnd.loser_to,
         "sides": sides,
@@ -680,11 +682,27 @@ def round_view(cfg: Config, rnd: Round, *, historical: bool = False) -> dict[str
 # 规则不是另写一份文案，而是**从当前赛制参数推导出来**：
 # 管理员切换赛制或改动任何参数，用户端看到的条目立即跟着变，不会与实际赛制脱节。
 # --------------------------------------------------------------------------- #
-def knockout_round_names(size: int, loser_bracket: bool) -> list[str]:
-    """淘汰赛逐轮名称，如 ``八强 / 半决赛 / 决赛``。"""
+def knockout_round_names(
+    size: int, loser_bracket: bool, teams_per_match: int = 2
+) -> list[str]:
+    """淘汰赛逐轮名称，如 ``八强 / 半决赛 / 决赛``。
+
+    ``teams_per_match > 2``（多队同场）时按热场轮次命名：每轮开局剩余队伍数决定名称。
+    """
     size = max(2, size)
+    k = max(2, min(T.MAX_SIDES, int(teams_per_match or 2)))
+    if k > 2:
+        levels = T._heat_wb_levels(size, k)
+        names: list[str] = []
+        for i, _sizes in enumerate(levels):
+            start_teams = size if i == 0 else len(levels[i - 1])
+            if i == len(levels) - 1:
+                names.append("胜者组决赛" if loser_bracket and size >= 4 else "决赛")
+            else:
+                names.append(T.ROUND_NAMES.get(start_teams, f"第 {i + 1} 轮"))
+        return names
     count = size.bit_length() - 1
-    names: list[str] = []
+    names = []
     for rnd in range(1, count + 1):
         if rnd == count:
             names.append("胜者组决赛" if loser_bracket and size >= 4 else "决赛")
@@ -739,6 +757,7 @@ def rulebook(cfg: Config) -> dict[str, Any]:
     # 组织者要的是「规则跟着赛制走」——称呼不该是另一层需要维护的东西。
     meta = SPORT_WORDS
     per_match = max(2, min(MAX_SIDES, rules.teams_per_match or 2))
+    ko_per_match = max(2, min(MAX_SIDES, rules.knockout_teams_per_match or 2))
     loser = bool(rules.loser_bracket)
     sections: list[dict[str, Any]] = []
 
@@ -947,12 +966,15 @@ def rulebook(cfg: Config) -> dict[str, Any]:
         # 就是一句假话（用户看不到自己那一届的真实规则）。
         knockout_items: list[str] = []
         if size:
-            tree = " → ".join(knockout_round_names(size, loser))
-            knockout_items.append(
-                f"规模：{size} 强（首轮 {size // 2} 场），每场固定 2 队对阵，逐轮 {tree}。"
+            tree = " → ".join(knockout_round_names(size, loser, ko_per_match))
+            shape_ko = (
+                f"首轮 {size // 2} 场、每场固定 2 队对阵"
+                if ko_per_match == 2
+                else f"每场最多 {ko_per_match} 队同场（取第 1 名晋级）"
             )
+            knockout_items.append(f"规模：{size} 强（{shape_ko}），逐轮 {tree}。")
             knockout_items.append(
-                "晋级：每场胜者进入下一轮"
+                "晋级：每场第 1 名进入下一轮"
                 + (
                     f"；种子按小组总排名排入 {size} 强签位（第 1 名与第 2 名只可能在决赛相遇）。"
                     if loser
@@ -963,8 +985,13 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             knockout_items.append("规模：队伍确定后自动取不超过队伍数的最大 2 的幂作为规模。")
         if loser:
             knockout_items.append(
-                "淘汰方式（**双败**）：胜者组输一场掉进败者组（还有一次机会），"
-                "在败者组再输一场才真正淘汰"
+                (
+                    "淘汰方式（**双败**）：胜者组输一场掉进败者组（还有一次机会），"
+                    "在败者组再输一场才真正淘汰"
+                    if ko_per_match == 2
+                    else "淘汰方式（**双败**）：胜者组每场除第 1 名外都掉进败者组，"
+                    "在败者组每场除第 1 名外直接淘汰"
+                )
                 + (f"；败者组共 {max(0, 2 * (size.bit_length() - 1) - 2)} 轮。" if size >= 4 else "。")
             )
             knockout_items.append(
@@ -1020,6 +1047,7 @@ def rulebook(cfg: Config) -> dict[str, Any]:
             "formatLabel": "积分制" if league else "锦标赛制",
             "teamSize": rules.team_size,
             "teamsPerMatch": per_match,
+            "knockoutTeamsPerMatch": ko_per_match,
             "shape": shape,
             "loserBracket": loser,
             "allowDraw": rules.allow_draw,
@@ -1174,7 +1202,8 @@ def tournament_plan(cfg: Config, **overrides: Any) -> dict[str, Any]:
     淘汰赛规模（8 强 / 16 强 / 32 强…）→ 总场次，让管理员在动手前就看清结构。
 
     可覆盖参数：``team_size`` / ``teams_per_match`` / ``loser_bracket`` /
-    ``group_count`` / ``knockout_size`` / ``merge_remainder`` / ``seed``。
+    ``group_count`` / ``knockout_size`` / ``knockout_teams_per_match`` /
+    ``merge_remainder`` / ``seed``。
     """
     mapping = {
         "team_size": "team_size",
@@ -1182,6 +1211,7 @@ def tournament_plan(cfg: Config, **overrides: Any) -> dict[str, Any]:
         "loser_bracket": "loser_bracket",
         "group_count": "group_count",
         "knockout_size": "knockout_size",
+        "knockout_teams_per_match": "knockout_teams_per_match",
     }
     patch = {
         field: overrides[key]
@@ -1218,12 +1248,17 @@ def tournament_plan(cfg: Config, **overrides: Any) -> dict[str, Any]:
         "teams": len(teams),
         "teamSize": rules.team_size,
         "teamsPerMatch": rules.teams_per_match,
+        "knockoutTeamsPerMatch": rules.knockout_teams_per_match,
         "loserBracket": bool(rules.loser_bracket),
         "groupCount": len(groups),
         "groupSizes": [{"key": key, "teams": count} for key, count in sorted(groups.items())],
         "size": size,
         "sizeOptions": T.size_options(len(teams)) if teams else [],
-        "knockoutRounds": knockout_round_names(size, bool(rules.loser_bracket)) if size else [],
+        "knockoutRounds": (
+            knockout_round_names(size, bool(rules.loser_bracket), rules.knockout_teams_per_match)
+            if size
+            else []
+        ),
         "groupMatches": summary.get("groupMatches", 0),
         "knockoutMatches": summary.get("knockoutMatches", 0),
         "total": summary.get("total", 0),

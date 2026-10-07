@@ -125,84 +125,7 @@ function setPanel(id, html) {
 }
 
 /* ------------------------------- HUD ---------------------------------- */
-// 预设名 → 主色（与 nte.css 的 :root[data-accent=...] 一一对应；这里只用于 theme-color）
-const ACCENT_HEX = {
-  cyan: '#22e0e8',
-  violet: '#7d5cff',
-  magenta: '#ff2f8e',
-  amber: '#ffd83d',
-  lime: '#43e58a',
-};
-
-/** 解析 `#rgb` / `#rrggbb`（可省 `#`）→ {r,g,b}；不合法返回 null。 */
-function hexToRgb(value) {
-  const body = String(value || '').trim().replace(/^#/, '');
-  if (!/^(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(body)) return null;
-  const full = body.length === 3 ? body.split('').map((c) => c + c).join('') : body;
-  return {
-    r: parseInt(full.slice(0, 2), 16),
-    g: parseInt(full.slice(2, 4), 16),
-    b: parseInt(full.slice(4, 6), 16),
-  };
-}
-
-const clamp01 = (n) => Math.min(1, Math.max(0, n));
-
-function rgbToHsl({ r, g, b }) {
-  const R = r / 255, G = g / 255, B = b / 255;
-  const max = Math.max(R, G, B), min = Math.min(R, G, B);
-  const l = (max + min) / 2;
-  const d = max - min;
-  if (!d) return { h: 0, s: 0, l };
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h;
-  if (max === R) h = ((G - B) / d + (G < B ? 6 : 0)) / 6;
-  else if (max === G) h = ((B - R) / d + 2) / 6;
-  else h = ((R - G) / d + 4) / 6;
-  return { h: h * 360, s, l };
-}
-
-function hslToHex(h, s, l) {
-  const k = (n) => (n + h / 30) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-  const to2 = (v) => Math.round(clamp01(v) * 255).toString(16).padStart(2, '0');
-  return `#${to2(f(0))}${to2(f(8))}${to2(f(4))}`;
-}
-
-/** 主色 → 副色：色相转 +40°。自定义色只有一个输入框，副色得自己推出来。 */
-function companionHex(hex) {
-  const { h, s, l } = rgbToHsl(hexToRgb(hex) || { r: 34, g: 224, b: 232 });
-  return hslToHex((h + 40) % 360, clamp01(Math.max(s, 0.55)), clamp01(Math.min(Math.max(l, 0.42), 0.68)));
-}
-
-/** 手机浏览器的地址栏底色也跟着主题色走（原来是写死的 #0a1020）。 */
-function setThemeColor(hex) {
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta && hex) meta.setAttribute('content', hex);
-}
-
-export function applyTheme(s) {
-  const ui = s.ui || {};
-  const root = document.documentElement;
-  const custom = ui.accentCustom ? hexToRgb(ui.accentCustom) : null;
-  if (custom) {
-    // 自定义主题色：直接覆盖两个变量。data-accent 标成 custom——它没有对应 CSS 规则，
-    // 所以真正生效的是这两条内联变量（预设那几条不会来抢）。
-    const main = `#${[custom.r, custom.g, custom.b].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
-    root.style.setProperty('--accent', main);
-    root.style.setProperty('--accent-2', companionHex(main));
-    if (root.dataset.accent !== 'custom') root.dataset.accent = 'custom';
-    setThemeColor(main);
-    return;
-  }
-  // 回到预设：必须清掉内联变量，否则会一直盖住 :root[data-accent] 的规则
-  root.style.removeProperty('--accent');
-  root.style.removeProperty('--accent-2');
-  const accent = ui.accent || 'cyan';
-  if (root.dataset.accent !== accent) root.dataset.accent = accent;
-  setThemeColor(ACCENT_HEX[accent] || ACCENT_HEX.cyan);
-}
+// 主题色已固定（冷蓝青 + 荧光紫，见 nte.css），不再随届次切换，这里没有主题应用逻辑。
 
 export function renderHeader(s) {
   const evt = s.event || {};
@@ -605,7 +528,9 @@ function leagueFormHtml(s) {
  */
 const BT = {
   box: 250,       // 对阵框宽（要放得下：两位选手头像 + 队名 + 小组战绩 + 比分）
-  boxH: 118,      // 对阵框高（顶栏 + 两行「头像 + 队名」，留 1~2px 余量不裁切）
+  boxH: 118,      // 2 队对阵框高（顶栏 + 两行「头像 + 队名」，留 1~2px 余量不裁切）
+  sideH: 42,      // 每多一方（多队同场）增加的高度；boxH = topH + 2 × sideH
+  topH: 34,       // 框顶栏高（编号 + 状态 + 用时）
   gapX: 42,       // 列间距（连线走这里；收窄一点，八强双败常见宽度下刚好不用横向滚动）
   champ: 184,     // 冠军框宽
   // 冠军框在「有成员头像」时额外留的高度：正好一行 `ava--xs`（30px）+ 一点间距。
@@ -624,10 +549,12 @@ const BT = {
   bandBleed: 12,  // 带底块比框左右各外扩多少（仍要小于 pad，不然会被裁掉）
 };
 
-/** 叶子行距：至少要容得下一个对阵框，否则相邻两场会叠在一起。 */
-function leafGapOf() {
-  return BT.boxH + 10;
-}
+/** 淘汰赛一场最多 4 队同场（与后端 ``MAX_SIDES`` 对齐）。 */
+const MAX_SIDES = 4;
+
+/** 一场对阵框的高度：按同场队伍数伸缩（多队同场时框会变高，布局跟着让位）。 */
+const boxHeightOf = (sideCount) =>
+  BT.topH + Math.max(2, Math.min(MAX_SIDES, Number(sideCount) || 2)) * BT.sideH;
 
 /** 把 bracket 的三段整理成「列 + 节点」；单败时胜者组与决赛算同一条带。 */
 function treeNodes({ wb, lb, gf, single }) {
@@ -637,7 +564,16 @@ function treeNodes({ wb, lb, gf, single }) {
   const push = (list, stage) => {
     (list || []).forEach((col) => {
       const nodes = (col.matches || []).map((m, i) => {
-        const node = { m, band: bandOf[stage], stage, x: 0, y: 0, kids: [], slot: i + 1 };
+        const node = {
+          m,
+          band: bandOf[stage],
+          stage,
+          x: 0,
+          y: 0,
+          kids: [],
+          slot: i + 1,
+          h: boxHeightOf((m.sides || []).length),
+        };
         byCode.set(m.code, node);
         return node;
       });
@@ -653,7 +589,7 @@ function treeNodes({ wb, lb, gf, single }) {
   // 它们的来源由对阵框里的「席位来源」文案体现（如「WB-1-1 败者」）。
   cols.forEach((col) =>
     col.nodes.forEach((node) => {
-      [node.m.srcA, node.m.srcB].forEach((ref) => {
+      [node.m.srcA, node.m.srcB, node.m.srcC, node.m.srcD].forEach((ref) => {
         const kid = byCode.get(String(ref || '').split(':')[0]);
         if (!kid) return;                      // seed:3 / 组内名次 → 没有上游对局
         if (kid.band !== node.band && node.band !== 'gf') return;
@@ -674,7 +610,9 @@ const mid = (list) => (list.length ? list.reduce((n, v) => n + v, 0) / list.leng
  */
 function layoutTree(cols, single, champExtra = 0) {
   const pitch = BT.box + BT.gapX;
-  const gap = leafGapOf(cols);
+  const nodes = cols.flatMap((c) => c.nodes);
+  // 叶子行距：至少要容得下**最高**的对阵框（多队同场时框更高），否则相邻两场会叠在一起
+  const slotH = Math.max(BT.boxH, ...nodes.map((n) => n.h), 0) + 10;
   const bands = single ? ['main'] : ['wb', 'lb', 'gf'];
   const top = {};
   // 起点整体右下移 BT.pad：这一圈留白跟着内容走，滚动时不会被吞
@@ -696,12 +634,16 @@ function layoutTree(cols, single, champExtra = 0) {
           : ci * pitch);
       col.nodes.forEach((node, i) => {
         node.x = col.x;
-        const kidY = node.kids.map((k) => k.node.y).filter((v) => Number.isFinite(v));
-        node.y = kidY.length ? mid(kidY) : leafTop + i * gap;
+        // 父节点取孩子**中心**的中点，再按自身高度回推左上角（各方框高度可能不同）
+        const kidCenter = node.kids
+          .map((k) => k.node.y + k.node.h / 2)
+          .filter((v) => Number.isFinite(v));
+        node.y = kidCenter.length ? mid(kidCenter) - node.h / 2 : leafTop + i * slotH;
       });
     });
     const leaves = bandCols[0].nodes.length;
-    cursor += (leaves - 1) * gap + BT.boxH + BT.bandGap;
+    const bandH = Math.max(BT.boxH, ...bandCols.flatMap((c) => c.nodes.map((n) => n.h)), 0);
+    cursor += (leaves - 1) * slotH + bandH + BT.bandGap;
   });
 
   // 冠军框接在最后一列右侧（单败 = 决赛列，双败 = 总决赛列）
@@ -710,7 +652,6 @@ function layoutTree(cols, single, champExtra = 0) {
   const champX = (last ? last.x : BT.pad) + BT.box + BT.gapX + 14;
   const champY = last && last.nodes[0] ? last.nodes[0].y : BT.pad + BT.head;
 
-  const nodes = cols.flatMap((c) => c.nodes);
   return {
     top,
     nodes,
@@ -719,7 +660,7 @@ function layoutTree(cols, single, champExtra = 0) {
     champY,
     width: champX + BT.champ + BT.pad,
     // 冠军框（可能比一个对阵框高）也要算进来，否则会被容器裁掉
-    height: Math.max(...nodes.map((n) => n.y + BT.boxH), champY + BT.boxH + champExtra, 0) + BT.pad,
+    height: Math.max(...nodes.map((n) => n.y + n.h), champY + BT.boxH + champExtra, 0) + BT.pad,
   };
 }
 
@@ -734,7 +675,7 @@ function bracketTreeHtml(s, { wb, lb, gf, single }) {
   // 冠军框里要摆成员头像：先把「要不要多留一行」算出来交给布局（常量与 treeChampHtml 同一份）
   const champExtra = champMembersOf(s).length ? BT.champAvatars : 0;
   const geo = layoutTree(cols, single, champExtra);
-  // 对阵图里的队伍只有 id / 缩写：颜色、头像、小组战绩都要回公开状态里取
+  // 对阵图里的队伍只有 id / 队名：颜色、头像、小组战绩都要回公开状态里取
   const colors = new Map((s.teams || []).map((t) => [t.id, t.color]));
   const players = new Map((s.players || []).map((p) => [p.id, p]));
   const groups = new Map();
@@ -764,7 +705,7 @@ function bracketTreeHtml(s, { wb, lb, gf, single }) {
       // 带底块比框左右各外扩 bandBleed，但整体仍在画布留白之内
       const left = BT.pad - BT.bandBleed;
       const right = bandCols[bandCols.length - 1].x + BT.box + BT.bandBleed;
-      const bottom = Math.max(...bandCols.flatMap((c) => c.nodes.map((n) => n.y + BT.boxH)));
+      const bottom = Math.max(...bandCols.flatMap((c) => c.nodes.map((n) => n.y + n.h)));
       return (
         `<div class="btree__band btree__band--${band}" style="left:${left}px;top:${geo.top[band] - BT.head}px;` +
         `width:${right - left}px;height:${bottom - geo.top[band] + BT.head + BT.bandBleed}px"></div>` +
@@ -782,8 +723,8 @@ function bracketTreeHtml(s, { wb, lb, gf, single }) {
       node.kids.forEach((kid) => {
         const x1 = kid.node.x + BT.box;
         const x2 = node.x;
-        const y1 = kid.node.y + BT.boxH / 2;
-        const y2 = node.y + BT.boxH / 2;
+        const y1 = kid.node.y + kid.node.h / 2;
+        const y2 = node.y + node.h / 2;
         const mx = x2 - BT.gapX / 2;
         const cls =
           `btree__link${kid.node.m.status === 'live' ? ' btree__link--live' : ''}` +
@@ -817,8 +758,8 @@ function bracketTreeHtml(s, { wb, lb, gf, single }) {
 
 function treeBoxHtml(node, ctx) {
   const m = node.m;
-  const sides = (m.sides || []).slice(0, 2);
-  const ready = sides.length === 2 && sides.every((side) => side.teamId);
+  const sides = (m.sides || []).slice(0, MAX_SIDES);
+  const ready = sides.length >= 2 && sides.every((side) => side.teamId);
   // 管理端且双方已就位时，整框可点 → 直接录比分（弃权在录分弹窗里）
   const actionable = canEdit() && ready && m.status !== 'done';
   const act = actionable
@@ -832,7 +773,7 @@ function treeBoxHtml(node, ctx) {
   const tip = `${m.label || m.code}${slots ? ` · 等待 ${slots}` : ''}${actionable ? ' · 点击录入比分' : ''}`;
   return (
     `<div class="btree__box btree__box--${esc(m.status)}${actionable ? ' btree__box--act' : ''}" ` +
-    `style="left:${node.x}px;top:${node.y}px;width:${BT.box}px;height:${BT.boxH}px" ` +
+    `style="left:${node.x}px;top:${node.y}px;width:${BT.box}px;height:${node.h}px" ` +
     `data-code="${esc(m.code)}" title="${esc(tip)}"${act}>` +
     `<div class="btree__top"><span class="btree__code">${esc(m.code)}</span>` +
     // 对阵图节点只有简略字段，回公开状态里取同一场来数「在播机位」
@@ -886,7 +827,7 @@ function treeSideHtml(side, key, rnd, ctx) {
  */
 function treeChampHtml(s, x, y, ctx) {
   const champ = s.champion;
-  const name = champ ? champ.short || champ.name || champ.id : '';
+  const name = champ ? champ.name || champ.id : '';
   const members = (champ?.playerIds || []).map((pid) => ctx.playerOf(pid)).filter(Boolean);
   const shown = members.slice(0, BT.champAvatarsMax);
   const names = members.map((p) => p.name || p.id).filter(Boolean);
@@ -981,7 +922,7 @@ function groupSectionHtml(s) {
               `<div class="gtable__row${started && row.rank === 1 ? ' gtable__row--top' : ''}">` +
               `<div class="gtable__rank">${started ? row.rank : '—'}</div>` +
               `<div class="gtable__team"><i style="background:${esc(row.color || 'var(--accent)')}"></i>` +
-              `<span title="${esc(row.name)}">${esc(row.short || row.name)}</span>` +
+              `<span title="${esc(row.name)}">${esc(row.name)}</span>` +
               `${perMatch > 2 && row.bestRank ? `<small class="gtable__best">最好 #${row.bestRank}</small>` : ''}` +
               `</div>` +
               `<div>${row.played}</div><div>${row.win}</div><div>${row.lose}</div>` +
@@ -1006,7 +947,7 @@ function groupSectionHtml(s) {
         .map(
           (r) =>
             `<span class="gorder__item${r.advanced ? ' gorder__item--in' : ''}">` +
-            `<b>${r.seed}</b>${esc(r.team.short || r.team.name)}</span>`
+            `<b>${r.seed}</b>${esc(r.team.name)}</span>`
         )
         .join('') ||
         '<span class="panel__hint">—</span>') +
@@ -2879,7 +2820,6 @@ export function renderPublic() {
   // 记下「已渲染的指纹 + 视图」，供 app.js 判断重复推送时是否可以跳过重建
   App.renderedKey = stateKey(s);
   App.renderedView = App.view;
-  applyTheme(s);
   renderHeader(s);
   syncTabs(s);
   syncHeader();

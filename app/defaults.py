@@ -162,7 +162,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "note": "",
     },
     "ui": {
-        "accent": "cyan",
         "showQq": True,
         "showAvatar": True,
         "revealResults": True,

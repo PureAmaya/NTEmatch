@@ -107,11 +107,7 @@ function pageHtml(data) {
         row('昵称', esc(a.name || '—')),
         row('B 站', a.bilibili ? linked(a.bilibili, 'space.bilibili.com/11393965') : '—'),
         row('源码', data.source ? linked(data.source, 'github.com/PureAmaya/NTEmatch') : '—'),
-      ]) +
-        `<ul class="dev__list" style="margin-top:12px">` +
-        `<li>用着有问题、或者想加个赛制：到源码仓库提 Issue，或 B 站私信。</li>` +
-        `<li>这个站<b>不收集你的数据</b>：没有第三方统计脚本。</li>` +
-        `</ul>`
+      ])
     ) +
 
     // ---- 关于这个项目 ----
@@ -120,12 +116,18 @@ function pageHtml(data) {
       '开源 · 自托管',
       rowsHtml([
         row('许可证', linked(lic.url, `${lic.id || 'AGPL-3.0'}（${lic.name || ''}）`)),
-        row('一句话', '可自由使用、修改与分发；改动后对外提供服务，也必须公开源码。'),
         row(
-          '前端',
-          esc(data.frontendNote || '零依赖的原生 ESM 与手写 CSS')
+          '如何使用',
+          esc('自托管：克隆源码仓库，按 README 装好依赖（uv sync）后启动即可；也可以用仓库里的 Dockerfile / compose。')
         ),
-        row('后端', 'FastAPI + SQLite，单进程；直播走你自己那台 MediaMTX。'),
+        row(
+          '允许',
+          esc('自由使用、修改、分发，包含私有部署与商用；改动之后只要仍以 AGPL-3.0 开源即可。')
+        ),
+        row(
+          '不允许',
+          esc('移除或替换版权与许可声明；把改动闭源后对外提供网络服务（AGPL 第 13 条）；用作者名义为衍生作品背书。')
+        ),
       ])
     ) +
 

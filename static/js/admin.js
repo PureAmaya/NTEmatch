@@ -286,7 +286,7 @@ function tournamentRulesForm(rules, s) {
     scoringFields(rules) +
     fieldSelect(
       'teamSize',
-      '每个组的人数',
+      '每队人数',
       rules.teamSize ?? 2,
       [['1', '1 人'], ['2', '2 人（默认）'], ['3', '3 人'], ['4', '4 人'], ['5', '5 人'], ['6', '6 人']],
       { hint: '每次「随机组队」按此人数分队；组队台里还能逐队微调' }
@@ -296,7 +296,17 @@ function tournamentRulesForm(rules, s) {
       '每场比赛',
       perMatch,
       [['2', '组 vs 组'], ['3', '组 vs 组 vs 组'], ['4', '组 vs 组 vs 组 vs 组']],
-      { hint: '小组赛每场同场竞技的队伍数；淘汰赛恒为 2 队对阵' }
+      { hint: '小组赛每场同场竞技的队伍数' }
+    ) +
+    fieldSelect(
+      'knockoutTeamsPerMatch',
+      '淘汰赛偏好队伍数',
+      Number(rules.knockoutTeamsPerMatch) || 2,
+      [['2', '2 队（1v1）'], ['3', '3 队同场'], ['4', '4 队同场']],
+      {
+        hint:
+          '淘汰赛每场最多几队同场（取第 1 名晋级）；队伍不够时当轮少排几队，但不低于 2 队',
+      }
     ) +
     fieldSwitch(
       'loserBracket',
@@ -321,7 +331,7 @@ function tournamentRulesForm(rules, s) {
     // （比如单败的届里写着双败怎么打）就是错的。规则由参数推导、显示在
     // 「总览 → 比赛规则」里，改完保存一看便知。
     `<div class="notice" style="grid-column:1/-1">保存后，<b>总览 → 比赛规则</b>` +
-    `会按当前参数（每队人数 / 每场同场队伍数 / 小组数 / ${loser ? '双败' : '单败'}淘汰…）` +
+    `会按当前参数（每队人数 / 每场同场队伍数 / 小组数 / 淘汰赛偏好队伍数 / ${loser ? '双败' : '单败'}淘汰…）` +
     `自动重算并展示本届的完整规则。</div>` +
     `<div class="form-actions" style="grid-column:1/-1"><button class="btn btn--primary" type="submit">保存规则</button></div></form>`
   );
@@ -481,8 +491,7 @@ export function adminPanelHtml(s) {
   // 这里只用**公开**的 stream（脱敏白名单：enabled / mode / 文案）。
   // 媒体服务器地址与凭据不在这页的渲染范围里，所以不必去拿私有配置——
   // 拿不到值时渲染出空输入框、一保存就把地址清空，正是要避免的那种事故。
-  // 界面配置（主题色 / 分享图 / 展示开关）同理：它按届保存，但**只有服务器管理员**能改，
-  // 所以表单也搬去了「服务器」页（见 members.js 的 uiPanelHtml）。
+  // 界面配置已从「服务器」页移除：主题色固定，其余字段（分享图 / 展示开关）不再暴露出表单。
   // 直播配置同理，而且更彻底：这一页**没有**任何直播表单了——直播没有总开关
   // （只要有赛事就允许直播），媒体服务器地址 / 账号 / 凭据全是站点级设置，
   // 统一在「服务器 → 直播配置」里维护（写接口也把关，见 main._apply_stream_patch）。
@@ -668,7 +677,7 @@ function participantsPanelHtml(s) {
   );
 }
 
-/* 「队伍信息」面板已移除：队名 / 缩写 / 主题色 / 分组 / 成员全部在「组队台」上就地编辑
+/* 「队伍信息」面板已移除：队名 / 主题色 / 分组 / 成员全部在「组队台」上就地编辑
  * （见 static/js/teams.js），两处重复的表单只会各自漂移。 */
 
 /* 选手名单的编辑面板已移除：名单统一在「选手」页处理（卡片上可新增 / 编辑 / 删除） */

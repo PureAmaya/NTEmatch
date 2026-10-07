@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN" data-accent="cyan" data-view="overview">
+<html lang="zh-CN" data-view="overview">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0a1020">
+<meta name="theme-color" content="#0b0e1c">
 <meta name="color-scheme" content="dark">
 <meta name="description" content="NTE 比赛（异环）通用赛事平台：自动分组、积分结算、选手档案与直播推流。">
 <title>NTE 比赛 · 赛事平台</title>
@@ -12,6 +12,25 @@
 <link rel="alternate icon" href="/favicon.ico" type="image/x-icon">
 <link rel="manifest" href="/static/manifest.webmanifest">
 <link rel="stylesheet" href="/static/css/nte.css">
+<!-- 预加载整个 ESM 模块图：原生 ESM 没有打包器，不写这几行，浏览器会「先取 app.js、
+     再逐个发现它 import 的模块」，串成一条瀑布；modulepreload 让它们并行下载。
+     入口 app.js 由页面底部的 <script type="module"> 取，不必在这里重复预加载。
+     路径同样带版本号（服务端注入）；tools/check_assets.py 盯着这张表别漏、别多。 -->
+<link rel="modulepreload" href="/static/js/core.js">
+<link rel="modulepreload" href="/static/js/ui.js">
+<link rel="modulepreload" href="/static/js/clock.js">
+<link rel="modulepreload" href="/static/js/icons.js">
+<link rel="modulepreload" href="/static/js/notices.js">
+<link rel="modulepreload" href="/static/js/events.js">
+<link rel="modulepreload" href="/static/js/teams.js">
+<link rel="modulepreload" href="/static/js/live.js">
+<link rel="modulepreload" href="/static/js/views.js">
+<link rel="modulepreload" href="/static/js/admin.js">
+<link rel="modulepreload" href="/static/js/actions.js">
+<link rel="modulepreload" href="/static/js/members.js">
+<link rel="modulepreload" href="/static/js/mdeditor.js">
+<link rel="modulepreload" href="/static/js/credits.js">
+<link rel="modulepreload" href="/static/js/hot.js">
 </head>
 <body>
 
@@ -28,7 +47,7 @@
     <!-- 品牌 logo = 回主页的入口：站内真链接（`data-route`）——左键走客户端路由，
          中键 / ⌘+点击仍然是浏览器原生的「新标签打开 / 复制链接」，无 JS 也能用 -->
     <a class="logo-plate" href="/" data-route title="回主页" aria-label="回主页">
-      <!-- 品牌标记：渐变用主题变量而不是写死的颜色，换主题色 / 自定义色都会跟着变 -->
+      <!-- 品牌标记（环）：渐变走固定主色变量（冷蓝青 / 荧光紫），不再随届次切换 -->
       <svg class="mark" viewBox="0 0 48 48" aria-hidden="true">
         <defs>
           <linearGradient id="markGrad" x1="0" y1="1" x2="1" y2="0">
@@ -37,9 +56,9 @@
             <stop offset="100%" style="stop-color:var(--accent)"/>
           </linearGradient>
         </defs>
-        <polygon points="24,3 41.5,13 41.5,35 24,45 6.5,35 6.5,13" fill="none" stroke="url(#markGrad)" stroke-width="3.4" stroke-linejoin="round"/>
-        <circle cx="24" cy="24" r="9" fill="none" stroke="url(#markGrad)" stroke-width="2.6"/>
-        <path d="M14.6 24h18.8M24 14.6c4.2 5.5 4.2 13.3 0 18.8M24 14.6c-4.2 5.5-4.2 13.3 0 18.8" fill="none" stroke="url(#markGrad)" stroke-width="1.8" opacity=".9"/>
+        <circle cx="24" cy="24" r="18" fill="none" stroke="url(#markGrad)" stroke-width="3.2"/>
+        <circle cx="24" cy="24" r="9.6" fill="none" stroke="url(#markGrad)" stroke-width="2.4" opacity=".8"/>
+        <circle cx="24" cy="24" r="2.6" fill="url(#markGrad)"/>
       </svg>
     </a>
     <div class="hud__titles">

@@ -1,6 +1,6 @@
 """生成默认分享图（og:image）。
 
-站点的 HUD 风格（深色底 + 网格 + 切角括号 + 青/品红）**用代码画出来**，而不是塞一份
+站点的 HUD 风格（深色底 + 网格 + 切角括号 + 青/紫）**用代码画出来**，而不是塞一份
 设计稿：这样改主色、改站名都能重新生成，仓库里也不会多一个二进制设计源文件。
 
 用法（Pillow 只在「生成」时需要，不进入运行依赖）：
@@ -28,7 +28,7 @@ from app import fonts
 
 W, H = 1200, 630
 ACCENT = (34, 224, 232)
-ACCENT_2 = (255, 47, 142)
+ACCENT_2 = (125, 92, 255)
 DIM = (147, 167, 193)
 TXT = (230, 240, 255)
 
@@ -65,26 +65,26 @@ def background() -> Image.Image:
     return Image.alpha_composite(img.convert("RGBA"), overlay)
 
 
+def _grad_ring(draw: ImageDraw.ImageDraw, cx: int, cy: int, r: int, width: int,
+               segs: int = 120, alpha: int = 255) -> None:
+    """用一串小圆弧拼出「青→紫→青」的渐变环（Pillow 的 arc 不能直接吃渐变）。"""
+    box = [cx - r, cy - r, cx + r, cy + r]
+    for i in range(segs):
+        start = i * 360 / segs
+        end = start + 360 / segs + 0.8  # 轻微重叠，避免分段之间出现缝
+        k = 1 - abs(2 * (i / segs) - 1)  # 三角波：两端青、中间紫
+        draw.arc(box, start=start, end=end, fill=(*_lerp(ACCENT, ACCENT_2, k), alpha), width=width)
+
+
 def brand_mark(img: Image.Image) -> None:
-    """六边形 + 准星（与页面顶栏那个 mark 同构），描边做成青→品红的渐变。"""
+    """同心环 + 中心点（与页面顶栏那个 mark 同构）。"""
     cx, cy, r = 168, 296, 78
-    pts = [
-        (cx, cy - r),
-        (cx + r * 0.866, cy - r / 2),
-        (cx + r * 0.866, cy + r / 2),
-        (cx, cy + r),
-        (cx - r * 0.866, cy + r / 2),
-        (cx - r * 0.866, cy - r / 2),
-    ]
     layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
-    segs = list(zip(pts, pts[1:] + pts[:1]))
-    for i, (a, b) in enumerate(segs):
-        draw.line([a, b], fill=(*_lerp(ACCENT, ACCENT_2, i / (len(segs) - 1)), 255), width=7, joint="curve")
-    inner = r * 0.42
-    draw.ellipse([cx - inner, cy - inner, cx + inner, cy + inner], outline=(*ACCENT, 255), width=5)
-    draw.line([(cx - inner, cy), (cx + inner, cy)], fill=(*ACCENT, 190), width=3)
-    draw.line([(cx, cy - inner), (cx, cy + inner)], fill=(*ACCENT, 190), width=3)
+    _grad_ring(draw, cx, cy, r, 7)
+    _grad_ring(draw, cx, cy, round(r * 0.53), 5, alpha=200)
+    dot = round(r * 0.145)
+    draw.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=(*ACCENT, 255))
 
     halo = layer.filter(ImageFilter.GaussianBlur(14))
     img.alpha_composite(halo)
@@ -109,7 +109,7 @@ def brackets(img: Image.Image) -> None:
 
 
 def wedge(img: Image.Image) -> None:
-    """右下角的品红斜切：整张图的第二色只出现在这里，量少但点得住。"""
+    """右下角的紫色斜切：整张图的第二色只出现在这里，量少但点得住。"""
     layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     draw.polygon([(W, H - 150), (W, H), (W - 190, H)], fill=(*ACCENT_2, 210))

@@ -1,17 +1,18 @@
 /* ==========================================================================
    NTE 比赛 · 赛事平台  视觉系统
-   设计语言：深空暗色 + 霓虹青/紫双色 + HUD 边框 + 六边形 + 扫描线/噪点
+   设计语言：靛蓝夜空 + 冷蓝青 / 荧光紫双主色 + 琥珀点缀 + 环
+   （固定一套配色，不再随届次切换）
    ========================================================================== */
 
 /* ---------- 1. Tokens ---------- */
 :root {
-  --bg: #07090f;
-  --bg-2: #0a0e17;
+  --bg: #0b0e1c;
+  --bg-2: #0f1428;
   /* 面板比底色亮一档：原来 --bg 与 --panel 的亮度差太小（ΔL 只有几个点），
      卡片「浮不起来」= 层级看不出来，也是之前觉得「看不清」的一半原因。 */
-  --panel: rgba(16, 23, 37, 0.92);
-  --panel-2: rgba(21, 29, 45, 0.97);
-  --solid: #141d2b;
+  --panel: rgba(19, 25, 45, 0.92);
+  --panel-2: rgba(24, 31, 54, 0.97);
+  --solid: #161d33;
   /* 卡片顶边的一道极淡高光：给平面加一层「受光」的暗示，成本几乎为零 */
   --panel-hi: rgba(186, 224, 255, 0.07);
 
@@ -25,14 +26,15 @@
      现在约 4.8:1；仍是三级层次里最弱的一档，不至于抢正文。 */
   --txt-mute: #6d8098;
 
+  /* 具名色：冷蓝青（主）/ 荧光紫（主）/ 琥珀（点缀）；品红只作少量艳色 */
   --cyan: #22e0e8;
   --violet: #7d5cff;
-  --magenta: #ff2f8e;
   --amber: #ffd83d;
-  --lime: #43e58a;
+  --magenta: #ff2f8e;
 
+  /* 固定主色：不随届次切换（异环的识别靠固定的一套） */
   --accent: var(--cyan);
-  --accent-2: var(--magenta);
+  --accent-2: var(--violet);
 
   --ok: #2fe08a;
   --warn: #ffd83d;
@@ -43,7 +45,7 @@
 
   --shadow: 7px 7px 0 rgba(0, 0, 0, 0.6);
   --glow: 0 0 0 2px rgba(34, 224, 232, 0.4);
-  --glow-2: 0 0 0 2px rgba(255, 47, 142, 0.42);
+  --glow-2: 0 0 0 2px rgba(125, 92, 255, 0.42);
 
   --font-ui: "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, -apple-system, sans-serif;
   --font-disp: "Bahnschrift SemiCondensed", "Oswald", "DIN Alternate", "HarmonyOS Sans SC", "PingFang SC", sans-serif;
@@ -53,11 +55,6 @@
   --gap: 14px;
   --nav-safe: env(safe-area-inset-bottom, 0px);
 }
-
-:root[data-accent="violet"] { --accent: var(--violet); --accent-2: var(--magenta); }
-:root[data-accent="magenta"] { --accent: var(--magenta); --accent-2: var(--cyan); }
-:root[data-accent="amber"] { --accent: var(--amber); --accent-2: var(--magenta); }
-:root[data-accent="lime"] { --accent: var(--lime); --accent-2: var(--cyan); }
 
 /* ---------- 2. Reset ---------- */
 *, *::before, *::after { box-sizing: border-box; }
@@ -104,7 +101,7 @@ img { display: block; max-width: 100%; }
 .fx__grid {
   position: absolute; inset: -8%;
   background-image:
-    radial-gradient(rgba(255, 47, 142, 0.55) 1.6px, transparent 1.7px),
+    radial-gradient(rgba(125, 92, 255, 0.55) 1.6px, transparent 1.7px),
     radial-gradient(rgba(34, 224, 232, 0.45) 1.6px, transparent 1.7px);
   background-size: 18px 18px, 18px 18px;
   background-position: 0 0, 9px 9px;
@@ -121,11 +118,11 @@ img { display: block; max-width: 100%; }
 /* 光斑本身就是柔和径向渐变，再叠 90px 高斯模糊等于额外做一次大范围离屏渲染 */
 .fx__glow { position: absolute; border-radius: 50%; opacity: 0.42; }
 .fx__glow--a { width: 44vw; height: 44vw; top: -12vw; left: -10vw; background: radial-gradient(circle, rgba(34,224,232,.55), transparent 68%); }
-.fx__glow--b { width: 50vw; height: 50vw; bottom: -18vw; right: -12vw; background: radial-gradient(circle, rgba(255,47,142,.5), transparent 68%); }
+.fx__glow--b { width: 50vw; height: 50vw; bottom: -18vw; right: -12vw; background: radial-gradient(circle, rgba(125,92,255,.5), transparent 68%); }
 
 .fx__scan {
-  position: absolute; inset: 0; opacity: .55;
-  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .06) 0 10px, transparent 10px 26px);
+  position: absolute; inset: 0; opacity: .22;
+  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .05) 0 10px, transparent 10px 26px);
 }
 .fx__noise {
   position: absolute; inset: 0; opacity: .05;
@@ -139,7 +136,7 @@ img { display: block; max-width: 100%; }
   min-height: var(--hud-h);
   padding: 9px max(14px, env(safe-area-inset-left)) 9px max(14px, env(safe-area-inset-right));
   /* 不用 backdrop-filter：吸顶元素每滚动一帧都要重新采样背景，是滚动卡顿的头号来源 */
-  background: linear-gradient(180deg, rgba(8, 11, 18, 0.99), rgba(8, 11, 18, 0.92));
+  background: linear-gradient(180deg, rgba(11, 14, 28, 0.99), rgba(11, 14, 28, 0.92));
   border-bottom: 1px solid var(--line);
 }
 .hud::after {
@@ -356,8 +353,8 @@ img { display: block; max-width: 100%; }
   background: var(--panel);      /* 已经 0.9 不透明：无需 backdrop-filter（见文件末尾「性能」注释） */
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  /* 硬阴影（原有的「蓝图」风格）+ 顶边一道极淡内高光：让卡片从底色里浮出来 */
-  box-shadow: var(--shadow), inset 0 1px 0 var(--panel-hi);
+  /* 硬阴影 + 顶边受光高光 + 底边一道暗边：给卡片一点「金属片」的厚度感 */
+  box-shadow: var(--shadow), inset 0 1px 0 var(--panel-hi), inset 0 -1px 0 rgba(0, 0, 0, .45);
 }
 .panel::before, .panel::after {
   content: ""; position: absolute; width: 12px; height: 12px; pointer-events: none;
@@ -390,11 +387,11 @@ img { display: block; max-width: 100%; }
   padding: 34px 18px; text-align: center; color: var(--txt-mute);
   font-family: var(--font-mono); font-size: 12px; letter-spacing: .1em;
 }
-/* 空状态的小插画：把品牌那个六边形 + 准星做成遮罩，再盖一层主题色渐变——
-   于是它自动跟随主题色（含自定义色），不用为每个主题各画一张图。
+/* 空状态的小插画：把品牌那个「环」做成遮罩，再盖一层主色渐变——
+   于是它自动跟随主色，不用为每个主题各画一张图。
    全站 15 处空状态共用这段样式，所以插画放在 CSS 里而不是逐个改 JS。 */
 .empty::before {
-  --empty-art: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 88 68' fill='none' stroke='%23fff' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M44 11 63.5 22.3v22.4L44 56 24.5 44.7V22.3z' stroke-width='2.6' opacity='.85'/%3E%3Ccircle cx='44' cy='34' r='10.5' stroke-width='2.2'/%3E%3Cpath d='M44 23.5v21M33.5 34h21' stroke-width='1.4' opacity='.75'/%3E%3Cpath d='M9 34h8M71 34h8M44 3.5v7M44 57.5v7' stroke-width='2.6' opacity='.8'/%3E%3C/svg%3E");
+  --empty-art: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 88 68' fill='none' stroke='%23fff' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='44' cy='34' r='26' stroke-width='2.6' opacity='.85'/%3E%3Ccircle cx='44' cy='34' r='13.5' stroke-width='2.2' opacity='.8'/%3E%3Ccircle cx='44' cy='34' r='3.6' stroke-width='2.6'/%3E%3C/svg%3E");
   content: ""; display: block; width: 88px; height: 68px; margin: 0 auto 16px;
   background: linear-gradient(140deg, var(--accent), var(--accent-2));
   opacity: .34;
@@ -944,11 +941,11 @@ img { display: block; max-width: 100%; }
   border-bottom: 2px solid rgba(34, 224, 232, .55);
   background: linear-gradient(180deg, rgba(6, 9, 15, .98), rgba(6, 9, 15, .82));
 }
-.hud::after { height: 3px; opacity: 1; background: linear-gradient(90deg, var(--cyan), var(--magenta)); }
+.hud::after { height: 3px; opacity: 1; background: linear-gradient(90deg, var(--cyan), var(--accent-2)); }
 .logo-plate {
   display: grid; place-items: center; width: 42px; height: 42px; flex: none;
   background: #05080e; border: 2px solid #05080e;
-  box-shadow: 3px 3px 0 var(--magenta);
+  box-shadow: 3px 3px 0 var(--accent-2);
   clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
 }
 .mark { filter: drop-shadow(0 0 6px rgba(34, 224, 232, .45)); }
@@ -962,14 +959,14 @@ img { display: block; max-width: 100%; }
 .logo-plate:active { transform: translate(1px, 1px); }
 .hud__title {
   font-style: italic; font-weight: 800; letter-spacing: .01em; color: #fff;
-  text-shadow: 2px 2px 0 #05080e, 4px 4px 0 rgba(255, 47, 142, .5);
+  text-shadow: 2px 2px 0 #05080e, 4px 4px 0 rgba(125, 92, 255, .5);
 }
 .hud__sub { color: var(--cyan); }
 
 /* 顶栏下方的斜纹警示带（复用 .hud__stripes） */
 .hud__stripes {
   position: relative; z-index: 38; height: 6px;
-  background: repeating-linear-gradient(115deg, var(--cyan) 0 12px, #05080e 12px 24px, var(--magenta) 24px 36px, #05080e 36px 48px);
+  background: repeating-linear-gradient(115deg, var(--cyan) 0 12px, #05080e 12px 24px, var(--accent-2) 24px 36px, #05080e 36px 48px);
   border-bottom: 1px solid rgba(0, 0, 0, .6);
 }
 .hud__stripes i { display: none; }
@@ -987,7 +984,7 @@ img { display: block; max-width: 100%; }
 .panel__head h2 { font-style: italic; letter-spacing: .14em; }
 .panel__head h2::before {
   width: 4px; height: 17px; box-shadow: none;
-  background: linear-gradient(180deg, var(--cyan), var(--magenta));
+  background: linear-gradient(180deg, var(--cyan), var(--accent-2));
 }
 
 /* 21.3 按钮：实心亮块 + 黑色偏移投影
@@ -1027,7 +1024,7 @@ img { display: block; max-width: 100%; }
 }
 .kpi__value { font-style: italic; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6); }
 .kpi__bar { height: 5px; background: rgba(34, 224, 232, .14); }
-.kpi__bar i { background: linear-gradient(90deg, var(--cyan), var(--magenta)); }
+.kpi__bar i { background: linear-gradient(90deg, var(--cyan), var(--accent-2)); }
 
 /* 21.6 排行榜 */
 .board__head {
@@ -1068,7 +1065,7 @@ img { display: block; max-width: 100%; }
 /* 21.9 选手卡 */
 .pcard { border: 2px solid rgba(34, 224, 232, .2); box-shadow: none; filter: drop-shadow(5px 5px 0 rgba(0, 0, 0, .5)); }
 .pcard:hover { box-shadow: none; filter: drop-shadow(6px 6px 0 rgba(0, 0, 0, .55)); }
-.pcard__band { height: 6px; background: repeating-linear-gradient(115deg, var(--cyan) 0 10px, var(--magenta) 10px 20px); }
+.pcard__band { height: 6px; background: repeating-linear-gradient(115deg, var(--cyan) 0 10px, var(--accent-2) 10px 20px); }
 .pcard__name { font-style: italic; }
 .pcard__rate { height: 5px; }
 .pcard__rate i { background: linear-gradient(90deg, var(--ok), var(--cyan)); }
@@ -1750,7 +1747,7 @@ img { display: block; max-width: 100%; }
 .zone--full { border-color: rgba(255, 216, 61, .5); }
 .zone--full .zone__count { color: var(--amber); }
 
-/* 26.4.1 队伍卡片就地编辑：主题色走 --tc（卡片左边框一眼可见），队名 / 缩写 / 分组 / 换组 / 删除 */
+/* 26.4.1 队伍卡片就地编辑：主题色走 --tc（卡片左边框一眼可见），队名 / 分组 / 换组 / 删除 */
 .zone--team { border-left: 4px solid var(--tc, rgba(34, 224, 232, .35)); }
 .zone--team .zone__head b { color: var(--tc, var(--accent)); }
 .zone__edit { display: grid; grid-template-columns: 1fr 88px; gap: 6px; margin-bottom: 6px; }
@@ -2581,7 +2578,6 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 .dev__row dd { margin: 0; min-width: 0; color: var(--txt); }
 .dev__row a { color: var(--accent); text-decoration: none; border-bottom: 1px dotted currentColor; }
 .dev__row a:hover { border-bottom-style: solid; }
-.dev__list { margin: 0; padding-left: 18px; display: grid; gap: 7px; line-height: 1.8; font-size: 12.5px; }
 .dev__loading { padding: 26px; text-align: center; color: var(--txt-mute); font-family: var(--font-mono); font-size: 12px; }
 
 /* ---------- 开源组件清单（页脚「开源组件」弹窗） ---------- */

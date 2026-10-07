@@ -47,7 +47,7 @@ function treeState({ members = [], champion = true } = {}) {
   return {
     event: { name: '用例届' },
     players: members,
-    teams: [{ id: 't1', label: '仙台猫粮', short: '仙台猫粮', color: '#ffd83d' }],
+    teams: [{ id: 't1', label: '仙台猫粮', name: '仙台猫粮', color: '#ffd83d' }],
     rules: { teamsPerMatch: 2, loserBracket: false },
     format: { size: 2, groupCount: 0, groupMatches: 0, knockoutMatches: 1, groupStageDone: true },
     groups: [],
@@ -70,7 +70,7 @@ function treeState({ members = [], champion = true } = {}) {
       lb: [],
       gf: [{ title: '总决赛', matches: [] }],
     },
-    champion: champion ? { id: 't1', name: '仙台猫粮', short: '仙台猫粮', playerIds: ids } : null,
+    champion: champion ? { id: 't1', name: '仙台猫粮', playerIds: ids } : null,
   };
 }
 
@@ -134,6 +134,47 @@ check(
   '画布仍然包得住',
   wrapperHeight(html) >= champ.top + champ.height,
   `画布 ${wrapperHeight(html)} ≥ ${champ.top + champ.height}`
+);
+
+console.log('');
+console.log('=== 多队同场（淘汰赛偏好 > 2）：框按队数变高，画布包得住 ===');
+const multi = treeState({ members: [], champion: false });
+multi.format = { size: 4, groupCount: 0, groupMatches: 0, knockoutMatches: 1, groupStageDone: true };
+multi.bracket = {
+  wb: [
+    {
+      title: '半决赛',
+      matches: [
+        {
+          code: 'WB-1-1',
+          label: '半决赛 · 第 1 场',
+          status: 'pending',
+          winner: '',
+          sides: [
+            { teamId: 't1', label: '甲队', playerIds: [], score: 0 },
+            { teamId: 't2', label: '乙队', playerIds: [], score: 0 },
+            { teamId: 't3', label: '丙队', playerIds: [], score: 0 },
+          ],
+        },
+      ],
+    },
+  ],
+  lb: [],
+  gf: [],
+};
+html = bracketPanelHtml(multi);
+const boxStyle = html.match(/class="btree__box[^"]*"[^>]*style="([^"]+)"/)?.[1] || '';
+const boxH = Number((boxStyle.match(/height:(\d+)px/) || [, NaN])[1]);
+check('3 队同场的框更高（topH 34 + 3 × sideH 42 = 160）', boxH === 160, `${boxH}px`);
+check(
+  '3 队都在框里',
+  ['甲队', '乙队', '丙队'].every((n) => html.includes(n)),
+  ''
+);
+check(
+  '画布高度包得住这一框',
+  wrapperHeight(html) >= boxH,
+  `画布 ${wrapperHeight(html)} ≥ ${boxH}`
 );
 
 console.log('');

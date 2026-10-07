@@ -130,18 +130,20 @@ class Player(NTEModel):
 
 
 class Team(NTEModel):
-    """固定队伍：组队后人数固定、全程不换人。"""
+    """固定队伍：组队后人数固定、全程不换人。
+
+    **没有缩写字段**：赛程、对阵图与结果卡片一律显示 ``name``（队名）。
+    """
 
     id: str
-    name: str = ""            # 队名，默认由成员名拼成「甲 & 乙」
-    short: str = ""           # 缩写，赛程与对阵图里使用
+    name: str = ""            # 队名，默认由成员名拼成
     color: str = ""
     player_ids: list[str] = Field(default_factory=list)
     group: str = ""           # 小组赛分组（A/B/C/D…），空表示尚未分组
 
     @property
     def label(self) -> str:
-        return self.name or self.short or self.id
+        return self.name or self.id
 
 
 class Channel(NTEModel):
@@ -437,10 +439,19 @@ class Round(NTEModel):
     finished_at: str = ""
     locked: bool = False
     # 淘汰赛席位来源与去向（引用其它对局的 code）
-    src_a: str = ""           # seed:3 / WB-1-1:W / WB-1-1:L / LB-2-1:W
+    src_a: str = ""           # seed:3 / WB-1-1:W / WB-1-1:L / WB-1-1:R2 / LB-2-1:W
     src_b: str = ""
+    # 多队同场（淘汰赛偏好队伍数 > 2）时的第 3 / 第 4 个席位来源。
+    # ``src_a`` / ``src_b`` 始终是权威字段；这两个为空即该场只 2 队。
+    src_c: str = ""
+    src_d: str = ""
     winner_to: str = ""       # 胜者去向（对局 code，GF 为空）
     loser_to: str = ""        # 败者去向（对局 code，败者组入口）
+
+    @property
+    def source_refs(self) -> list[str]:
+        """本场的全部席位来源（按 A/B/C/D 顺序，去掉空位）。"""
+        return [ref for ref in (self.src_a, self.src_b, self.src_c, self.src_d) if ref]
 
     @model_validator(mode="before")
     @classmethod
@@ -644,6 +655,8 @@ class Rules(NTEModel):
     # ---- 锦标赛制（tournament）----
     group_count: int = 0         # 小组赛组数，0 = 按队伍数自动推算
     knockout_size: int = 0       # 淘汰赛规模（2 的幂），0 = 自动取最大可行值
+    # 淘汰赛每场同场队伍数的**偏好值**（2 = 标准 1v1 对阵，3/4 = 多队同场取第 1 名晋级）
+    knockout_teams_per_match: int = 2
     loser_bracket: bool = True   # 败者组开关：开 = 双败淘汰，关 = 输一场即淘汰
 
     @model_validator(mode="after")
@@ -681,6 +694,11 @@ class Rules(NTEModel):
     @classmethod
     def _clamp_team_size(cls, value: int) -> int:
         return max(1, min(6, int(value or 1)))
+
+    @field_validator("knockout_teams_per_match")
+    @classmethod
+    def _clamp_knockout_per_match(cls, value: int) -> int:
+        return max(MIN_TEAMS_PER_MATCH, min(MAX_SIDES, int(value or MIN_TEAMS_PER_MATCH)))
 
 
 class StreamConfig(NTEModel):
@@ -765,29 +783,19 @@ class StreamConfig(NTEModel):
 
 
 class UiConfig(NTEModel):
-    accent: str = "cyan"
-    # 自定义主题色（``#rgb`` / ``#rrggbb``，留空 = 用上面的预设）。
-    # 填了它就覆盖预设：前端会按它推一个和谐的副色（见 views.js 的 applyTheme）。
-    accent_custom: str = ""
+    """届次级的展示开关。
+
+    主题色已固定（冷蓝青 / 荧光紫，见 ``static/css/nte.css``），不再随届次切换，
+    因此这里没有 ``accent`` / ``accent_custom``；数据库里那两列保留但不再读写
+    （删列等于对旧库做破坏性迁移）。
+    """
+
     # 分享图（og:image）：留空 = 用内置那张（/og.png）。可填站内绝对路径或完整 http(s) 地址。
     og_image: str = ""
     show_qq: bool = True
     show_avatar: bool = True
     reveal_results: bool = True
     ticker: str = ""
-
-    @field_validator("accent_custom")
-    @classmethod
-    def _clean_accent_custom(cls, value: str) -> str:
-        """只收十六进制色（允许省掉 ``#``）；不认识的值一律置空回落预设。
-
-        这里**只做格式校验**，不判断颜色好不好看——主题色是赛事自己的事。
-        """
-        raw = str(value or "").strip()
-        body = raw.removeprefix("#")
-        if len(body) in (3, 6) and all(ch in "0123456789abcdefABCDEF" for ch in body):
-            return f"#{body.lower()}"
-        return ""
 
     @field_validator("og_image")
     @classmethod

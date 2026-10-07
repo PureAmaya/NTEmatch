@@ -292,6 +292,39 @@ def _round_without_result(round_data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def merge_short_names_in_event(data: dict[str, Any]) -> dict[str, Any]:
+    """把一届原始数据里的队伍「缩写」并入队名（缩写字段已取消）。
+
+    规则：**队名为空时才用缩写补齐**，否则保留原队名；同时把各场对阵里存的旧缩写标签
+    换成队名。纯函数，便于单测。
+    """
+    names: dict[str, str] = {}
+    teams: list[dict[str, Any]] = []
+    for team in data.get("teams") or []:
+        tid = str(team.get("id") or "")
+        short = str(team.get("short") or "").strip()
+        name = str(team.get("name") or "").strip()
+        if not name and short:
+            name = short
+        names[tid] = name
+        item = {k: v for k, v in team.items() if k != "short"}
+        item["name"] = name
+        teams.append(item)
+    rounds: list[dict[str, Any]] = []
+    for rnd in data.get("rounds") or []:
+        item = dict(rnd)
+        sides = item.get("sides")
+        if isinstance(sides, list):
+            item["sides"] = [
+                {**side, "label": names[str(side.get("teamId") or "")]}
+                if str(side.get("teamId") or "") in names
+                else side
+                for side in sides
+            ]
+        rounds.append(item)
+    return {**data, "teams": teams, "rounds": rounds}
+
+
 def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     """递归合并：字典逐层合并，列表与标量整体替换。"""
     result = dict(base)
@@ -349,6 +382,8 @@ class ConfigStore:
         # 计分口径升级：把老数据的 metric 落成「类型 / 标签 / 判断标准」。
         # **写入之前先留一份旧库快照**（只读、可下载、不提供还原，见 app/legacy.py）。
         await asyncio.to_thread(self.migrate_scoring)
+        # 队伍缩写取消：把旧缩写并入队名（同样先留快照再转换）。
+        await asyncio.to_thread(self.migrate_short_names)
 
         current = await asyncio.to_thread(self._read_current_sync)
         if not current:
@@ -777,6 +812,57 @@ class ConfigStore:
         if done:
             log.warning(
                 "计分口径已升级 | 届=%d/%d | 旧数据快照见「服务器 → 旧数据备份」",
+                done,
+                len(pending),
+            )
+        return done
+
+    def migrate_short_names(self) -> int:
+        """把队伍「缩写」并入队名（缩写字段已取消），返回处理了几届。
+
+        为什么要有这一步：队伍不再有 ``short`` 字段，赛程、对阵图与结果卡片一律显示
+        队名。旧数据里队名可能为空、只有缩写，若不迁移这些队伍就没有可显示的名字。
+        迁移规则：**队名为空时才用缩写补齐**，其余保留原队名；同时把各场对阵里存的
+        旧缩写标签一并换成队名——之后缩写彻底不再出现。
+
+        动手之前先留一份旧库快照（见 :mod:`app.legacy`）。留不下来就不转换——
+        缩写本来就是可无损读取的，宁可不转换，也不能在没有退路的情况下改库。
+        """
+        from . import legacy
+
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for entry in self._list_sync():
+            event_id = str(entry.get("id") or "")
+            if not event_id:
+                continue
+            data = self._raw_sync(event_id)
+            if data is None:
+                continue
+            if any(str(t.get("short") or "").strip() for t in (data.get("teams") or [])):
+                pending.append((event_id, data))
+        if not pending:
+            return 0
+
+        try:
+            legacy.snapshot(
+                reason="short-name-merge",
+                note=f"取消队伍缩写并并入队名前的旧数据（{len(pending)} 届待转换）",
+            )
+        except Exception:
+            log.exception("旧数据快照失败，本次不转换（缩写仍可读取，仅界面不再显示）")
+            return 0
+
+        done = 0
+        for event_id, data in pending:
+            try:
+                cfg = Config.model_validate(merge_short_names_in_event(data))
+                self._save_sync(event_id, cfg, touch_current=False)
+                done += 1
+            except Exception:
+                log.exception("队伍缩写并入队名失败（该届保持原样）| 届=%s", event_id)
+        if done:
+            log.warning(
+                "队伍缩写已并入队名 | 届=%d/%d | 旧数据快照见「服务器 → 旧数据备份」",
                 done,
                 len(pending),
             )
@@ -1445,6 +1531,8 @@ class ConfigStore:
         async with self._lock:
             await asyncio.to_thread(db.init_db, self._db_path)
             await asyncio.to_thread(self._migrate_sync)
+            await asyncio.to_thread(self.migrate_scoring)
+            await asyncio.to_thread(self.migrate_short_names)
             current = await asyncio.to_thread(self._read_current_sync)
             if not current:
                 current = await asyncio.to_thread(self._create_blank_sync)
@@ -1890,6 +1978,7 @@ class ConfigStore:
         size: int | None = None,
         *,
         teams_per_match: int | None = None,
+        knockout_teams_per_match: int | None = None,
         loser_bracket: bool | None = None,
         reform: bool = False,
         team_size: int | None = None,
@@ -1900,6 +1989,7 @@ class ConfigStore:
 
         * ``size`` 淘汰赛规模（2 的幂，不超过队伍数）；
         * ``teams_per_match``（2/3/4）小组赛每场同场队伍数；
+        * ``knockout_teams_per_match``（2/3/4）淘汰赛每场同场队伍数偏好；
         * ``loser_bracket`` 双败 / 单败；
         * ``reform`` 先**重新随机组队**再排赛程（「快速创建分组」用）；
         * ``team_size`` / ``group_count`` 覆盖每队人数与小组数（0 = 自动）。
@@ -1916,6 +2006,8 @@ class ConfigStore:
                 overrides["knockoutSize"] = int(size)
             if teams_per_match:
                 overrides["teamsPerMatch"] = int(teams_per_match)
+            if knockout_teams_per_match:
+                overrides["knockoutTeamsPerMatch"] = int(knockout_teams_per_match)
             if loser_bracket is not None:
                 overrides["loserBracket"] = bool(loser_bracket)
             if team_size:
@@ -2062,7 +2154,7 @@ class ConfigStore:
         fmt: str = "",
         owner_uid: str = "",
     ) -> Config:
-        """新建一届并切换过去；可选沿用当前届的名单、队伍、规则与界面配置，并指定赛制。
+        """新建一届并切换过去；可选沿用当前届的名单、队伍、规则与展示配置，并指定赛制。
 
         ``fmt`` 留空时按类型自动选：排名模式用锦标赛制，娱乐（不排名）用积分制
         —— 娱乐赛事没有「晋级」可言，锦标赛制跑不起来。
@@ -2121,7 +2213,7 @@ class ConfigStore:
         「筹备中」却已经有冠军，两种都自相矛盾。所以：
 
         * **照抄**：赛制与规则、选手与参与名单（连「名单是显式指定的」这一点一起）、队伍、
-          赛程骨架（对阵、席位来源、每场的人与队伍）、比赛类型与排名开关、直播与界面配置、
+          赛程骨架（对阵、席位来源、每场的人与队伍）、比赛类型与排名开关、直播与展示配置、
           届名之外的展示信息（简介 / 场馆 / 主办 / 副标题 / 规则文案 / logo 文字）；
         * **清空**：每一场回到「未开始」（比分 / 胜者 / 各轮成绩 / 名次 / 弃权 / 用时 /
           起止时间 / 锁定）、开赛与结束时间、场次计划时间、**替补登记**（它按对局编号生效，

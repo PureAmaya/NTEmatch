@@ -50,7 +50,7 @@ from typing import Any
 
 from . import fonts, logic, markdown, metrics
 from .logging_conf import get_logger
-from .models import Config
+from .models import MAX_SIDES, Config
 from .store import DATA_ROOT
 
 log = get_logger("card")
@@ -76,7 +76,7 @@ _NAME_RE = re.compile(r"^[0-9a-f]{16,64}\.png$")
 INK = (4, 7, 12)
 PANEL = (16, 23, 37)
 ACCENT = (34, 224, 232)
-ACCENT_2 = (255, 47, 142)
+ACCENT_2 = (125, 92, 255)
 DIM = (147, 167, 193)
 TXT = (230, 240, 255)
 LINE = (34, 224, 232, 60)
@@ -265,6 +265,14 @@ _TREE_CHAMP_W = 190
 _TREE_BAND_TITLE = {"main": "淘汰赛", "wb": "胜者组", "lb": "败者组"}
 _RESULT_STATUS = {"pending": "待赛", "live": "进行中", "done": "已结束"}
 
+#: 对阵框内每一方（一支队伍）占用的高度；框高 = 顶栏 + 方数 × 行高
+_TREE_SIDE_ROW = 33
+
+
+def _tree_box_h(side_count: int) -> int:
+    """对阵框高度：按同场队伍数伸缩（多队同场时更高）。"""
+    return 30 + max(2, min(MAX_SIDES, int(side_count or 2))) * _TREE_SIDE_ROW
+
 
 def _side_cells(
     rnd: dict[str, Any], sc: Any, colors: dict[str, str]
@@ -320,7 +328,7 @@ def _group_sections(
             rows.append(
                 {
                     "rank": int(row.get("rank") or 0),
-                    "name": str(row.get("short") or row.get("name") or team_id),
+                    "name": str(row.get("name") or team_id),
                     "played": int(row.get("played") or 0),
                     "win": int(row.get("win") or 0),
                     "lose": int(row.get("lose") or 0),
@@ -389,10 +397,16 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
                 "kids": [],
                 "x": 0,
                 "y": None,
+                "h": _tree_box_h(len(rnd.get("sides") or [])),
                 "m": rnd,
             }
     for node in nodes.values():
-        for ref in (node["m"].get("srcA"), node["m"].get("srcB")):
+        for ref in (
+            node["m"].get("srcA"),
+            node["m"].get("srcB"),
+            node["m"].get("srcC"),
+            node["m"].get("srcD"),
+        ):
             kid = nodes.get(str(ref or "").split(":")[0])
             if kid is None:
                 continue
@@ -402,7 +416,7 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
             node["kids"].append(kid)
 
     pitch = _TREE_BOX + _TREE_GAP_X
-    gap = _TREE_BOX_H + 10
+    gap = max([_TREE_BOX_H, *[n["h"] for n in nodes.values()]] or [_TREE_BOX_H]) + 10
     bands = ["main"] if single else ["wb", "lb", "gf"]
     band_boxes: list[dict[str, Any]] = []
     band_tops: dict[str, int] = {}
@@ -427,9 +441,13 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
             for i, rnd in enumerate(col["matches"]):
                 node = nodes[key_of(rnd)]
                 node["x"] = col["x"]
-                kid_y = [k["y"] for k in node["kids"] if k["y"] is not None]
-                node["y"] = round(sum(kid_y) / len(kid_y)) if kid_y else leaf_top + i * gap
-        bottoms = [nodes[key_of(r)]["y"] + _TREE_BOX_H for r in band_cols[0]["matches"]]
+                kid_center = [k["y"] + k["h"] / 2 for k in node["kids"] if k["y"] is not None]
+                node["y"] = (
+                    round(sum(kid_center) / len(kid_center) - node["h"] / 2)
+                    if kid_center
+                    else leaf_top + i * gap
+                )
+        bottoms = [nodes[key_of(r)]["y"] + nodes[key_of(r)]["h"] for r in band_cols[0]["matches"]]
         if band != "gf":
             band_boxes.append(
                 {
@@ -442,7 +460,10 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
                     "h": max(bottoms) - (cursor - 52) + 12,
                 }
             )
-        cursor += (len(band_cols[0]["matches"]) - 1) * gap + _TREE_BOX_H + _TREE_BAND_GAP
+        band_h = max(
+            [_TREE_BOX_H, *[nodes[key_of(r)]["h"] for r in band_cols[0]["matches"]]]
+        )
+        cursor += (len(band_cols[0]["matches"]) - 1) * gap + band_h + _TREE_BAND_GAP
 
     for col in cols:
         col["labelY"] = (
@@ -463,10 +484,10 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
     champ_name = ""
     if champion:
         champ_name = str(
-            champion.get("short") or champion.get("name") or champion.get("id") or ""
+            champion.get("name") or champion.get("id") or ""
         )
     all_nodes = [nodes[key] for key in nodes]
-    height = max([node["y"] + _TREE_BOX_H for node in all_nodes] or [0]) + _TREE_PAD
+    height = max([node["y"] + node["h"] for node in all_nodes] or [0]) + _TREE_PAD
     return {
         "single": single,
         "bands": band_boxes,
@@ -486,9 +507,9 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
         "links": [
             {
                 "x1": kid["x"] + _TREE_BOX,
-                "y1": kid["y"] + _TREE_BOX_H // 2,
+                "y1": kid["y"] + kid["h"] // 2,
                 "x2": node["x"],
-                "y2": node["y"] + _TREE_BOX_H // 2,
+                "y2": node["y"] + node["h"] // 2,
                 "done": kid["m"].get("status") == "done",
             }
             for node in all_nodes
@@ -519,7 +540,7 @@ def payload_for_result(
     champ_name = ""
     if champion:
         champ_name = str(
-            champion.get("short") or champion.get("name") or champion.get("id") or ""
+            champion.get("name") or champion.get("id") or ""
         )
     season = (
         f"已赛 {len(done)} / {len(rounds)} 场"
@@ -1035,9 +1056,10 @@ def render_result(payload: dict[str, Any], *, site: str = "") -> bytes | None:
                 draw.line([(x1, y1), (mx, y1), (mx, y2), (x2, y2)], fill=color, width=2)
             for node in tree.get("nodes") or []:
                 nx, ny = ox + int(node.get("x") or 0), oy + int(node.get("y") or 0)
+                node_h = int(node.get("h") or _TREE_BOX_H)
                 live = node.get("status") == "live"
                 draw.rounded_rectangle(
-                    [nx, ny, nx + _TREE_BOX, ny + _TREE_BOX_H],
+                    [nx, ny, nx + _TREE_BOX, ny + node_h],
                     radius=10,
                     fill=BOX_FILL,
                     outline=WARN if live else BOX_EDGE,
@@ -1052,8 +1074,8 @@ def render_result(payload: dict[str, Any], *, site: str = "") -> bytes | None:
                         font=f_code,
                         fill=WARN if live else DIM,
                     )
-                sides = (node.get("sides") or [])[:2]
-                row_h = max(30, (_TREE_BOX_H - 30) // max(1, len(sides)))
+                sides = (node.get("sides") or [])[:MAX_SIDES]
+                row_h = _TREE_SIDE_ROW
                 for index, side in enumerate(sides):
                     sy = ny + 30 + index * row_h
                     dot = _hex_color(str(side.get("color") or ""), ACCENT)

@@ -478,7 +478,11 @@ export function rulebookBodyHtml(s) {
     chips.push(
       ['每场', facts.shape || (facts.teamsPerMatch === 2 ? '组 vs 组' : `${facts.teamsPerMatch || 2} 队同场`)],
       ['分组', facts.groupSizes || '待分组'],
-      ['淘汰', facts.loserBracket ? '双败' : '单败'],
+      [
+        '淘汰',
+        (facts.loserBracket ? '双败' : '单败') +
+          (Number(facts.knockoutTeamsPerMatch) > 2 ? ` · ${facts.knockoutTeamsPerMatch} 队同场` : ''),
+      ],
       ['出线', facts.size ? `${facts.size} 强` : '待定']
     );
     if (facts.perTeamMatches) chips.push(['小组赛场次', String(facts.perTeamMatches)]);

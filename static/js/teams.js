@@ -1,4 +1,4 @@
-/* 组队台：拖拽编排队伍成员，并就地编辑队名 / 缩写 / 主题色 / 分组。
+/* 组队台：拖拽编排队伍成员，并就地编辑队名 / 主题色 / 分组。
  *
  * 赛制说明：队伍一经生成便全程固定（随机分配队友 → 固定分组），
  * 因此这里编辑的是「队伍成员」，而不是某一场比赛的阵容。
@@ -68,7 +68,6 @@ export function load() {
   T.teams = list.map((t) => ({
     id: t.id,
     name: t.name,
-    short: t.short,
     color: t.color,
     group: t.group,
     playerIds: [...(t.playerIds || [])],
@@ -97,17 +96,16 @@ function chipHtml(pid) {
   );
 }
 
-//: 队名 / 缩写的长度上限（**字符数**，中文一个算一个）。
+//: 队名的长度上限（**字符数**，中文一个算一个）。
 //: 队名的 8 与后端 ``app/tournament.TEAM_NAME_MAX`` 是同一个数——两边不一致就会出现
 //: 「界面让填 8 个字、随机组队却按 6 个字拼」。
 const NAME_MAX = 8;
-const SHORT_MAX = 4;
 
-/** 队伍卡片里的一行输入（改名 / 改缩写）。 */
+/** 队伍卡片里的队名输入。 */
 const fieldHtml = (field, label, value, placeholder, extra = '') =>
   `<label class="zfield"><span>${esc(label)}</span>` +
   `<input data-team-field="${field}" value="${esc(value || '')}" placeholder="${esc(placeholder)}" ` +
-  `maxlength="${field === 'short' ? SHORT_MAX : NAME_MAX}">${extra}</label>`;
+  `maxlength="${NAME_MAX}">${extra}</label>`;
 
 //: 自动队名的兜底素材：**队伍里一个人都没有**时才用（有队员就按队员名拼，
 //: 见 autoTeamName）——空队伍在保存时本来就会被删掉，这里只是别让按钮点了没反应。
@@ -169,7 +167,7 @@ function teamCardHtml(team, index) {
   return (
     `<div class="zone zone--team${full ? ' zone--full' : ''}" data-zone="team:${esc(team.id)}" ` +
     `data-team="${esc(team.id)}" style="--tc:${esc(color)}">` +
-    `<div class="zone__head"><b>${esc(team.name || team.short || team.id)}</b>` +
+    `<div class="zone__head"><b>${esc(team.name || team.id)}</b>` +
     `<span class="zone__count">${ids.length}/${size}</span></div>` +
     `<div class="zone__edit">` +
     `${fieldHtml(
@@ -184,8 +182,7 @@ function teamCardHtml(team, index) {
           1,
           Math.floor(NAME_MAX / Math.max(1, team.playerIds.length || 1))
         )} 个字，合计不超过 ${NAME_MAX} 个字）">自动</button>`
-    )}` +
-    `${fieldHtml('short', '缩写', team.short, '如 NH')}</div>` +
+    )}</div>` +
     `<div class="zone__ops">` +
     `<label class="zcolor" title="主题色（卡片左边框）">` +
     `<input type="color" data-team-field="color" value="${esc(color)}"${auto ? ' disabled' : ''}>` +
@@ -242,7 +239,7 @@ function shellHtml() {
     `<span class="panel__hint" style="margin-left:auto">${count} 支队伍 · 默认每队 ${size} 人 · 拖拽调整队友</span>` +
     `</div>` +
     `<div class="notice">队友随机分配后<b>全程固定</b>（不换队、不换队友）。` +
-    `卡片上可<b>改队名（≤8 字，点「自动」按队员名拼：每人最多 8 ÷ 人数 个字）/ 缩写 / 主题色</b>、` +
+    `卡片上可<b>改队名（≤8 字，点「自动」按队员名拼：每人最多 8 ÷ 人数 个字）/ 主题色</b>、` +
     `<b>换组</b>（与另一组的队伍互换）、<b>删除分组</b>（队员回到候选池）；` +
     `保存时<b>没有成员的分组会被自动删除</b>，改完队伍需重新「生成赛程」。</div>` +
     (strays.length
@@ -296,7 +293,7 @@ export function moveTo(pid, zone) {
   if (team.playerIds.length >= size) {
     const out = team.playerIds.pop();
     if (out) T.pool.push(out);
-    toast(`${team.short || team.name || team.id} 已满（${size} 人），${nameOf(out)} 回到候选池`, 'info', 4000);
+    toast(`${team.name || team.id} 已满（${size} 人），${nameOf(out)} 回到候选池`, 'info', 4000);
   }
   team.playerIds.push(pid);
   refresh();
@@ -313,7 +310,7 @@ function dropTeam(teamId) {
   if (index < 0) return;
   const team = T.teams[index];
   const count = team.playerIds.length;
-  const label = team.name || team.short || team.id;
+  const label = team.name || team.id;
   if (count && !window.confirm(`删除分组「${label}」？${count} 名队员会回到候选池（保存后才生效）。`)) {
     return;
   }
@@ -337,7 +334,7 @@ function openSwapGroup(teamId) {
     toast('没有其它分组的队伍可以交换；先「快速创建分组」或「生成赛程」把队伍分好组', 'warn', 7000);
     return;
   }
-  const label = (t) => esc(t.name || t.short || t.id);
+  const label = (t) => esc(t.name || t.id);
   const body =
     `<div class="notice">把 <b>${label(team)}</b>（${team.group ? `${esc(team.group)} 组` : '未分组'}）` +
     `与另一支队伍<b>互换分组</b>。分组只在生成赛程时生效，换完请重新「生成赛程」。</div>` +
@@ -353,7 +350,7 @@ function openSwapGroup(teamId) {
       .join('') +
     `</div>`;
   Modal.open({
-    title: `换组 · ${team.name || team.short || team.id}`,
+    title: `换组 · ${team.name || team.id}`,
     body,
     footer: `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>`,
     onMount(bodyEl, footEl) {
@@ -439,7 +436,6 @@ export function installDnD() {
     if (!hit) return;
     const field = e.target.dataset.teamField;
     if (field === 'name') hit.team.name = e.target.value;
-    else if (field === 'short') hit.team.short = e.target.value;
     else if (field === 'color') {
       hit.team.color = e.target.value;
       paintCard(hit.card, hit.team, hit.index);
@@ -478,7 +474,7 @@ export function installDnD() {
       const input = card.querySelector('[data-team-field="name"]');
       if (input) input.value = hit.team.name;
       const head = card.querySelector('.zone__head b');
-      if (head) head.textContent = hit.team.name || hit.team.short || hit.team.id;
+      if (head) head.textContent = hit.team.name || hit.team.id;
     }
   });
 
@@ -528,7 +524,6 @@ export async function save() {
         teams: teams.map((t) => ({
           id: t.id,
           name: t.name,
-          short: t.short,
           color: t.color,
           group: t.group,
           playerIds: t.playerIds,

@@ -981,40 +981,6 @@ function streamPanelHtml() {
   return panelHtml('直播配置', 'MediaMTX · 站点级', form);
 }
 
-/**
- * 界面配置（**只有服务器管理员**看得到）。
- *
- * 主题色 / 分享图 / 展示开关和直播配置一样只出现在这里：赛事管理页不再提供这块表单，
- * 写接口那边同样把关（见 main._apply_ui_patch）。
- *
- * 注意这一份**是按届保存的**（数据库里就是 `event_ui(event_id, …)`）：表单改的是
- * **当前届**那一套，所以标题里把届名写出来——否则「改完没生效」多半只是在改别的届。
- */
-function uiPanelHtml() {
-  const ui = App.state?.ui || {};
-  const eventName = App.state?.eventName || App.state?.event?.name || App.state?.eventId || '';
-  const form =
-    `<form class="form form--2" data-form="ui">` +
-    fieldSelect('accent', '主题色', ui.accent, [
-      ['cyan', '青'], ['violet', '紫'], ['magenta', '品红'], ['amber', '琥珀'], ['lime', '青柠'],
-    ]) +
-    fieldText('accentCustom', '自定义主题色', ui.accentCustom, {
-      hint: '十六进制，如 #ff6a00；填了就覆盖上面的预设（副色按色相自动推出来）',
-    }) +
-    fieldText('ogImage', '分享图（og:image）', ui.ogImage, {
-      hint: '留空 = 内置那张 /og.png；可填 /static/xxx.png 或完整网址，1200×630 最佳',
-    }) +
-    // 注：UUID / QQ 属于隐私字段，任何情况下都不下发用户端，因此不再提供开关
-    fieldSwitch('showAvatar', '显示选手头像', ui.showAvatar) +
-    fieldSwitch('revealResults', '公开展示结果', ui.revealResults) +
-    `<div class="notice" style="grid-column:1/-1">这一份作用于<b>当前届` +
-    `${eventName ? `：${esc(eventName)}` : ''}</b>（主题与分享图按届保存）。` +
-    `要给别的届改：先在主页点开那一届（或到「届次管理」里切），回来再保存。</div>` +
-    `<div class="form-actions" style="grid-column:1/-1">` +
-    `<button class="btn btn--primary" type="submit">保存界面配置</button></div></form>`;
-  return panelHtml('界面配置', '主题与展示 · 按届保存', form);
-}
-
 export function renderServerPage() {
   const host = qs('#serverBody');
   if (!host) return;
@@ -1072,7 +1038,6 @@ export function renderServerPage() {
   host.innerHTML =
     serverStatusPanelHtml() +
     sitePanelHtml() +
-    uiPanelHtml() +
     membersPanelHtml() +
     eventsPanelHtml() +
     backupPanelHtml() +
@@ -1917,19 +1882,17 @@ export async function handleMemberAction(act, el) {
 /** 处理成员 / 服务器相关表单；返回是否已处理。 */
 export async function handleMemberForm(formEl) {
   const name = formEl.dataset.form;
-  // 只接**服务器页**上那两张站点级表单（直播配置 / 界面配置）。赛事管理页那个
-  // 「启用直播」开关仍走通用的 PATCH_BUILDERS 分支：那边不需要重绘本页，权限也更低。
+  // 只接**服务器页**上那张站点级表单（直播配置）。赛事管理页那个「启用直播」开关
+  // 仍走通用的 PATCH_BUILDERS 分支：那边不需要重绘本页，权限也更低。
   // 放在这里是为了两件事：保存后刷新面板（`hasApiPass` 会从「未配置」变「已配置」），
   // 以及**清掉刚输入的密码**——明文不该在 DOM 里多留一秒。
-  if ((name === 'stream' || name === 'ui') && formEl.closest('#serverBody')) {
+  if (name === 'stream' && formEl.closest('#serverBody')) {
     const v = collectForm(formEl);
     try {
       await api('/config', { method: 'PUT', auth: true, body: { [name]: v } });
-      toast(name === 'ui' ? '界面配置已保存' : '直播配置已保存', 'ok');
+      toast('直播配置已保存', 'ok');
       await refreshServerData({ silent: true });
       renderServerPage();
-      // 换主题 / 换分享图要立刻生效：让全局状态重新过一遍 applyState
-      if (name === 'ui' && hooks.refreshState) await hooks.refreshState();
     } catch (err) {
       toast(err.message, 'err', 7000);
     }

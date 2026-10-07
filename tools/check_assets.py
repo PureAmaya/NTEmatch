@@ -8,8 +8,10 @@
 3. **导入的符号真的被导出**（``import { foo }`` 而 ``x.js`` 里根本没有 ``foo``）——
    这类错没有任何静态检查兜着，只有在浏览器里点开那个页面才会炸；
 4. ``index.html`` 里引用的 ``/static/...`` 文件真的存在；
-5. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）；
-6. **帮助图这一份（若有）不比它的文案旧**，且文案里没有 Markdown 记号
+5. **``index.html`` 的 modulepreload 表不多不少**（没有打包器时，靠它让整张模块图并行下载，
+   少一个就退回瀑布加载，见 ``check_module_preload``）；
+6. **路由不会被页签回落踩掉**（``syncTabs`` 必须按目标页判断，见该函数注释）；
+7. **帮助图这一份（若有）不比它的文案旧**，且文案里没有 Markdown 记号
    （``static/help.jpg`` 由服务启动时渲染，**不入库**，见该函数注释）。
 
 用法：``uv run python tools/check_assets.py``
@@ -125,6 +127,45 @@ def check_index_assets() -> list[str]:
     return problems
 
 
+def _modulepreload_names() -> list[str]:
+    """``index.html`` 里 ``rel="modulepreload"`` 指向的 ``/static/js/*.js`` 文件名。"""
+    names: list[str] = []
+    for tag in re.findall(r"<link\b[^>]*>", INDEX.read_text(encoding="utf-8")):
+        if 'rel="modulepreload"' not in tag:
+            continue
+        href = re.search(r'href="([^"]+)"', tag)
+        if href and href.group(1).startswith("/static/js/"):
+            names.append(href.group(1).rsplit("/", 1)[-1])
+    return names
+
+
+def check_module_preload() -> list[str]:
+    """``index.html`` 的 modulepreload 表必须**恰好等于** ``static/js`` 下除入口外的模块。
+
+    没有打包器时，浏览器是「取到 app.js 才知道它 import 了谁」—— 每一层都要等上一层
+    下载完才发现下一层，串成瀑布（开发时是 HTTP/1.1，代价最明显）。``modulepreload``
+    让整张模块图并行下载，但这张表是**手写**的：少一个就退回瀑布，多一个就白花一次请求。
+    所以在这里钉住「不多不少」。
+    """
+    if not INDEX.exists():
+        return [f"缺少首页：{INDEX.relative_to(ROOT)}"]
+    listed = set(_modulepreload_names())
+    expected = {path.name for path in JS_DIR.glob("*.js")} - {"app.js"}
+    problems: list[str] = []
+    for name in sorted(listed):
+        if not (JS_DIR / name).exists():
+            problems.append(f"index.html 预加载了不存在的模块：{name}")
+    missing = sorted(expected - listed)
+    if missing:
+        problems.append(f"index.html 少预加载了这些模块（会退回瀑布加载）：{missing}")
+    extra = sorted(listed - expected)
+    if extra:
+        problems.append(f"index.html 预加载了多余的模块（白花一次请求）：{extra}")
+    if not problems:
+        print(f"  OK  modulepreload 覆盖全部 {len(expected)} 个非入口模块")
+    return problems
+
+
 _ICON_CALL_RE = re.compile(r"\bicon\(\s*'([A-Za-z0-9_-]+)'")
 _PANEL_ICON_RE = re.compile(r",\s*'([A-Za-z0-9_-]+)'\s*\]")
 
@@ -199,7 +240,7 @@ def check_sync_tabs_fallback() -> list[str]:
 def check_logo_link() -> list[str]:
     """顶栏那枚品牌 logo 必须是**能回主页的站内链接**。
 
-    它是全站最直觉的「回首页」入口（标题栏左边那枚六边形），但掉了不会报错、不会白屏，
+    它是全站最直觉的「回首页」入口（标题栏左边那枚环），但掉了不会报错、不会白屏，
     只是「点了没反应」——没人会为此写 issue，只会觉得别扭。所以在这里钉住：是 ``<a>``、
     ``href="/"``、并且带 ``data-route``（左键走客户端路由，中键 / ⌘+点击仍然是原生新标签）。
     """
@@ -352,6 +393,7 @@ def main() -> int:
         + check_exported_symbols()
         + check_icons()
         + check_index_assets()
+        + check_module_preload()
         + check_sync_tabs_fallback()
         + check_logo_link()
         + check_live_video_defaults()

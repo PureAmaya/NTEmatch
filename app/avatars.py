@@ -104,7 +104,7 @@ def is_valid_qq(qq: str) -> bool:
 
 
 def _placeholder_svg(qq: str, name: str = "") -> bytes:
-    """按 QQ 号派生稳定配色，生成六边形占位头像。"""
+    """按 QQ 号派生稳定配色，生成「环」占位头像（外环 + 中心圆 + 首字）。"""
     digest = hashlib.md5(qq.encode("utf-8")).hexdigest()
     hue = int(digest[:2], 16) % 360
     label = (name or qq)[:2]
@@ -116,9 +116,9 @@ def _placeholder_svg(qq: str, name: str = "") -> bytes:
     </linearGradient>
   </defs>
   <rect width="200" height="200" fill="#0b0e14"/>
-  <polygon points="100,12 176,54 176,146 100,188 24,146 24,54" fill="url(#g)" opacity="0.92"/>
-  <polygon points="100,30 160,63 160,137 100,170 40,137 40,63" fill="none" stroke="#0b0e14" stroke-width="3" opacity="0.55"/>
-  <text x="100" y="118" text-anchor="middle" font-size="66" font-weight="700"
+  <circle cx="100" cy="100" r="82" fill="none" stroke="url(#g)" stroke-width="9" opacity="0.9"/>
+  <circle cx="100" cy="100" r="63" fill="url(#g)" opacity="0.92"/>
+  <text x="100" y="124" text-anchor="middle" font-size="64" font-weight="700"
         font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" fill="#07121a">{label}</text>
 </svg>"""
     return svg.encode("utf-8")

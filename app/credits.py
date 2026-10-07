@@ -78,7 +78,7 @@ FRONTEND: list[tuple[str, str, str, str]] = [
         "Feather Icons",
         "MIT",
         "https://github.com/feathericons/feather",
-        "编辑器工具栏的 SVG 图标（内联，随主题色；本站不使用图标字体）",
+        "编辑器工具栏的 SVG 图标（内联，跟随主色；本站不使用图标字体）",
     ),
 ]
 
@@ -104,7 +104,7 @@ DEV: list[tuple[str, str, str, str]] = [
 #: 前端本体没有第三方 JS 库：原生 ESM + 手写 CSS；只有图标取自 Feather（内联 SVG）。
 FRONTEND_NOTE = (
     "前端为零依赖的原生 ESM（无打包器、无第三方 JS 库），样式为手写 CSS；"
-    "工具栏图标取自 Feather Icons（MIT），以 SVG 内联，跟随主题色。"
+    "工具栏图标取自 Feather Icons（MIT），以 SVG 内联，跟随主色。"
 )
 
 

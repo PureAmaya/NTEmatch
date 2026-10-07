@@ -24,11 +24,11 @@ def test_data_dir_is_isolated():
 
 
 def test_rules_and_ui_columns_round_trip(tmp_path, make_config):
-    """计分三件套 / metric / accent_custom / og_image 存进去要能原样读出来。"""
+    """计分三件套 / metric / og_image 存进去要能原样读出来。"""
     path = tmp_path / "round.sqlite"
     db.init_db(path)
     cfg = make_config(value_type="time", value_label="用时", better="low")
-    cfg.ui = UiConfig(accent="violet", accent_custom="#FF6A00", og_image="/static/share.png")
+    cfg.ui = UiConfig(og_image="/static/share.png")
 
     with db.connect(path) as conn:
         db.save_event(conn, "e001", cfg.dump())
@@ -39,7 +39,6 @@ def test_rules_and_ui_columns_round_trip(tmp_path, make_config):
     assert back["rules"]["valueLabel"] == "用时"
     assert back["rules"]["better"] == "low"
     assert back["rules"]["metric"] == "time", "旧口径名跟着同步，老版本读得回来"
-    assert back["ui"]["accentCustom"] == "#ff6a00"  # 统一小写
     assert back["ui"]["ogImage"] == "/static/share.png"
 
 

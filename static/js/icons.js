@@ -1,11 +1,11 @@
 /* 全站 SVG 图标集（内联，不请求任何外部资源）。
  *
  * 线条取自 **Feather Icons**（MIT，https://feathericons.com）——一套开放、统一、
- * 24×24 网格 / 2px 描边的图标集；标题图标（H1~H4）与品牌六边形在此基础上自绘。
+ * 24×24 网格 / 2px 描边的图标集；标题图标（H1~H4）与品牌环在此基础上自绘。
  *
  * 三条约定：
  *
- * 1. 全部走 `stroke="currentColor"`：**自动跟随主题色**（含管理员自定义的主题色）；
+ * 1. 全部走 `stroke="currentColor"`：**自动跟随主色**；
  * 2. 尺寸由 CSS 的 `font-size` 决定（`.ic` 是 1em 方块），调用方不用传尺寸；
  * 3. 静态 HTML 写 `<span class="ic" data-icon="bell"></span>`，
  *    由 `hydrateIcons()` 在启动时补上 SVG；JS 模板直接调 `icon('bell')`。
@@ -43,6 +43,9 @@ const PATHS = {
   user: S('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>'),
   hexagon: S('<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 ' +
     '1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>'),
+  /* 品牌环：面板标题认不出关键词时的兜底图标（与顶栏 logo 同一套几何） */
+  ring: S('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/>' +
+    '<circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/>'),
 
   /* ---- 赛事 ---- */
   award: S('<circle cx="12" cy="8" r="7"/>' +
@@ -276,5 +279,5 @@ export function panelIcon(title) {
   for (const [pattern, name] of PANEL_ICONS) {
     if (pattern.test(text)) return name;
   }
-  return 'hexagon';
+  return 'ring';
 }

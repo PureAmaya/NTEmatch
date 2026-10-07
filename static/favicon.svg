@@ -1,17 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
-  <!-- 站点图标：与顶栏品牌标记同一套几何（六边形 + 准星）。
-       颜色写死：favicon 是独立文档，拿不到页面里的主题变量；这里用品牌青→品红渐变。 -->
+  <!-- 站点图标：与顶栏品牌标记同一套几何（同心环 + 中心点）。
+       颜色写死：favicon 是独立文档，拿不到页面里的主色变量；这里用冷蓝青→荧光紫。 -->
   <defs>
     <linearGradient id="mark" x1="0" y1="1" x2="1" y2="0">
       <stop offset="0%" stop-color="#0ea5c6"/>
       <stop offset="50%" stop-color="#22e0e8"/>
-      <stop offset="100%" stop-color="#ff2f8e"/>
+      <stop offset="100%" stop-color="#7d5cff"/>
     </linearGradient>
   </defs>
-  <rect width="48" height="48" rx="10" fill="#0a1020"/>
-  <polygon points="24,5 41,14.5 41,33.5 24,43 7,33.5 7,14.5" fill="none"
-           stroke="url(#mark)" stroke-width="3.2" stroke-linejoin="round"/>
-  <circle cx="24" cy="24" r="8.6" fill="none" stroke="url(#mark)" stroke-width="2.4"/>
-  <path d="M15.4 24h17.2M24 15.4c4 5.2 4 12.8 0 17.2M24 15.4c-4 5.2-4 12.8 0 17.2"
-        fill="none" stroke="url(#mark)" stroke-width="1.7" opacity=".9"/>
+  <rect width="48" height="48" rx="10" fill="#0b0e1c"/>
+  <circle cx="24" cy="24" r="18" fill="none" stroke="url(#mark)" stroke-width="3"/>
+  <circle cx="24" cy="24" r="9.6" fill="none" stroke="url(#mark)" stroke-width="2.2" opacity=".8"/>
+  <circle cx="24" cy="24" r="2.6" fill="url(#mark)"/>
 </svg>

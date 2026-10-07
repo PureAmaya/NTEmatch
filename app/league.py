@@ -321,12 +321,12 @@ def generate_fixed_rounds(
                     Side(
                         team_id=top["id"],
                         player_ids=list(top.get("playerIds") or []),
-                        label=top.get("short") or top.get("name") or "",
+                        label=top.get("name") or "",
                     ),
                     Side(
                         team_id=bottom["id"],
                         player_ids=list(bottom.get("playerIds") or []),
-                        label=bottom.get("short") or bottom.get("name") or "",
+                        label=bottom.get("name") or "",
                     ),
                 ],
             )

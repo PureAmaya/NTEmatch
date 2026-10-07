@@ -229,16 +229,16 @@ def test_media_server_settings_are_server_only():
 
 
 def test_ui_config_is_server_only():
-    """界面配置（主题色 / 分享图 / 展示开关）是**站点级外观**：赛事管理员碰它一律 403。
+    """界面配置（分享图 / 展示开关）是**站点级外观**：赛事管理员碰它一律 403。
 
-    和直播配置同一条思路：表单从赛事管理页搬走了，但真正把关的是这里——
+    和直播配置同一条思路：表单已从服务器页移除，但真正把关的是这里——
     前端藏起来不算数。
     """
     event_admin = SimpleNamespace(is_server=False)
     with pytest.raises(HTTPException) as err:
-        _apply_ui_patch({"accent": "lime"}, event_admin)
+        _apply_ui_patch({"ogImage": "/static/x.png"}, event_admin)
     assert err.value.status_code == 403
-    _apply_ui_patch({"accent": "lime"}, SimpleNamespace(is_server=True))  # 服务器管理员放行
+    _apply_ui_patch({"ogImage": "/static/x.png"}, SimpleNamespace(is_server=True))  # 服务器管理员放行
 
 
 def test_markdown_media_writes_need_login_only():

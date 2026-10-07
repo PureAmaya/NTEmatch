@@ -701,7 +701,7 @@ function openGroupPairingModal() {
   const teams = App.state?.teams || [];
   const perMatch = Number(App.state?.rules?.teamsPerMatch) || 2;
   const teamById = new Map(teams.map((t) => [t.id, t]));
-  const nameOf = (id) => teamById.get(id)?.short || teamById.get(id)?.name || id;
+  const nameOf = (id) => teamById.get(id)?.name || id;
   const colorOf = (id) => teamById.get(id)?.color || 'var(--accent)';
   const groupOf = (rnd) => String(rnd.code || '').split('-')[1] || 'A';
   const list = [...rounds].sort(
@@ -1069,7 +1069,7 @@ function startEvent() {
       `<div class="notice">开始后 <b>赛制与参赛名单将锁定</b>：赛制、每队人数、每场同场队伍数、` +
       `败者组开关、参与名单、重新组队、赛程重建与清空、删除选手都会被拒绝。<br>` +
       `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补 / 队伍换人</b>（替上的人不在名单里会自动加入）、` +
-      `录分与重置、时间登记、弃权、赛事信息与界面配置。</div>` +
+      `录分与重置、时间登记、弃权、赛事信息。</div>` +
       readinessHtml(r) +
       `<div style="margin-top:12px">${fieldSwitch(
         'confirmStart',
@@ -1404,12 +1404,13 @@ function renderPlan(plan, box) {
   }
   const groups = (plan.groupSizes || []).map((g) => `${g.key} 组 ${g.teams} 队`).join(' / ');
   const shape = plan.teamsPerMatch === 2 ? '组 vs 组' : `${plan.teamsPerMatch} 队同场`;
+  const koShape = Number(plan.knockoutTeamsPerMatch) > 2 ? `${plan.knockoutTeamsPerMatch} 队同场` : '1v1';
   box.className = 'notice';
   box.innerHTML =
     `<b>${plan.players} 人 → ${plan.teams} 支队</b>（每队 ${plan.teamSize} 人）` +
     `<br>小组赛：${plan.groupCount} 组${groups ? `（${esc(groups)}）` : ''} · 每场 ${shape}` +
     ` → ${plan.groupMatches} 场` +
-    `<br>淘汰赛：${plan.size} 强${plan.loserBracket ? '双败' : '单败'}（` +
+    `<br>淘汰赛：${plan.size} 强${plan.loserBracket ? '双败' : '单败'} · ${koShape}（` +
     `${esc((plan.knockoutRounds || []).join(' → '))}） → ${plan.knockoutMatches} 场` +
     `<br><b>合计 ${plan.total} 场</b>` +
     (plan.warnings && plan.warnings.length
@@ -1420,7 +1421,7 @@ function renderPlan(plan, box) {
 /**
  * 快速创建分组：开赛前（还没有比赛结果）一键「重新随机组队 + 生成赛程」。
  *
- * 弹窗里可微调每个组的人数、小组数、淘汰赛规模、每场同场队伍数与败者组开关，
+ * 弹窗里可微调每队人数、小组数、淘汰赛规模、每场同场队伍数与败者组开关，
  * 结构会实时预估：人少自动少分组、淘汰赛从 4/8 强起步；人多则拉长赛程。
  */
 export function openQuickGroupModal() {
@@ -1444,10 +1445,10 @@ export function openQuickGroupModal() {
       `<div class="form form--2" style="margin-top:10px">` +
       fieldSelect(
         'teamSize',
-        '每个组的人数',
+        '每队人数',
         Number(rules.teamSize) || 2,
         [['1', '1 人'], ['2', '2 人（默认）'], ['3', '3 人'], ['4', '4 人'], ['5', '5 人'], ['6', '6 人']],
-        { hint: '凑不满一组的人留在候选池，可在组队台里顶上' }
+        { hint: '凑不满一队的人留在候选池，可在组队台里顶上' }
       ) +
       fieldNum('groupCount', '小组数（0 = 自动）', Number(rules.groupCount) || 0, {
         hint: '自动 = 在「每组排得满一场」的前提下尽量多分组（队伍越多组越多，小组赛更短）；下面会按当前人数实时预估',
@@ -1455,9 +1456,16 @@ export function openQuickGroupModal() {
       fieldSelect('size', '淘汰赛规模', '0', sizeOpts, { hint: '人少自动短赛程（如 4/8 强）' }) +
       fieldSelect(
         'teamsPerMatch',
-        '每场比赛',
+        '小组赛每场',
         Number(rules.teamsPerMatch) || 2,
         [['2', '组 vs 组'], ['3', '组 vs 组 vs 组'], ['4', '组 vs 组 vs 组 vs 组']]
+      ) +
+      fieldSelect(
+        'knockoutTeamsPerMatch',
+        '淘汰赛偏好队伍数',
+        Number(rules.knockoutTeamsPerMatch) || 2,
+        [['2', '2 队（1v1）'], ['3', '3 队同场'], ['4', '4 队同场']],
+        { hint: '淘汰赛每场最多几队同场（取第 1 名晋级）；队伍不够时当轮少排几队，但不低于 2 队' }
       ) +
       fieldSwitch('loserBracket', '启用败者组（双败淘汰）', rules.loserBracket !== false, {
         hint: '关 = 输一场即淘汰',
@@ -1476,6 +1484,7 @@ export function openQuickGroupModal() {
         groupCount: Number(qs('#f-groupCount', bodyEl).value) || 0,
         size: Number(qs('#f-size', bodyEl).value) || 0,
         teamsPerMatch: Number(qs('#f-teamsPerMatch', bodyEl).value) || 2,
+        knockoutTeamsPerMatch: Number(qs('#f-knockoutTeamsPerMatch', bodyEl).value) || 2,
         loserBracket: qs('#f-loserBracket', bodyEl).checked,
       });
       const box = qs('#qgPreview', bodyEl);
@@ -1551,6 +1560,7 @@ function openTournamentModal() {
     opts.map((n) => [String(n), `${n} 强${n === maxSize ? '（上限）' : ''}`])
   );
   const perMatch = Number(s.rules?.teamsPerMatch) || 2;
+  const koPerMatch = Number(s.rules?.knockoutTeamsPerMatch) || 2;
   const loser = s.rules?.loserBracket !== false;
   Modal.open({
     title: '生成赛程 · 锦标赛制',
@@ -1561,8 +1571,14 @@ function openTournamentModal() {
         'teamsPerMatch',
         '小组赛每场',
         perMatch,
-        [['2', '组 vs 组'], ['3', '组 vs 组 vs 组'], ['4', '组 vs 组 vs 组 vs 组']],
-        { hint: '淘汰赛恒为 2 队对阵' }
+        [['2', '组 vs 组'], ['3', '组 vs 组 vs 组'], ['4', '组 vs 组 vs 组 vs 组']]
+      ) +
+      fieldSelect(
+        'knockoutTeamsPerMatch',
+        '淘汰赛偏好队伍数',
+        koPerMatch,
+        [['2', '2 队（1v1）'], ['3', '3 队同场'], ['4', '4 队同场']],
+        { hint: '淘汰赛每场最多几队同场（取第 1 名晋级）；队伍不够时当轮少排几队，但不低于 2 队' }
       ) +
       fieldSwitch('loserBracket', '启用败者组（双败淘汰）', loser, {
         hint: '关 = 单败，输一场即淘汰',
@@ -1580,6 +1596,7 @@ function openTournamentModal() {
       footEl.querySelector('[data-submit]').onclick = async () => {
         const size = Number(qs('#f-size', bodyEl).value) || 0;
         const teamsPerMatch = Number(qs('#f-teamsPerMatch', bodyEl).value) || 2;
+        const knockoutTeamsPerMatch = Number(qs('#f-knockoutTeamsPerMatch', bodyEl).value) || 2;
         const loserBracket = qs('#f-loserBracket', bodyEl).checked;
         const seedRaw = qs('#f-seed', bodyEl).value;
         const seed = seedRaw === '' ? null : Number(seedRaw);
@@ -1587,12 +1604,12 @@ function openTournamentModal() {
           const res = await api('/tournament/generate', {
             method: 'POST',
             auth: true,
-            body: { size, seed, teamsPerMatch, loserBracket },
+            body: { size, seed, teamsPerMatch, knockoutTeamsPerMatch, loserBracket },
           });
           Modal.close();
           toast(
             `已生成 ${res.count} 场（${res.teams} 支队伍 · ${res.size || 0} 强` +
-              ` · 每场 ${res.teamsPerMatch || 2} 队 · ${res.loserBracket ? '双败' : '单败'}）`,
+              ` · 淘汰赛 ${res.knockoutTeamsPerMatch || 2} 队同场 · ${res.loserBracket ? '双败' : '单败'}）`,
             'ok',
             5000
           );
@@ -1998,7 +2015,7 @@ function openEventNewModal() {
         ['tournament', '锦标赛制（固定队伍 + 双败淘汰）'],
         ['league', '积分制（动态轮换 + 均分排名）'],
       ]) +
-      fieldSwitch('copyRoster', '沿用当前届的选手 / 参与名单 / 队伍 / 规则 / 直播 / 界面配置', true) +
+      fieldSwitch('copyRoster', '沿用当前届的选手 / 参与名单 / 队伍 / 规则 / 直播与展示配置', true) +
       `</div>` +
       `<div class="notice" style="margin-top:10px">新建后直接进入新的一届，原赛事完整保留在「全部赛事」里；` +
       `赛制决定比赛界面与赛程生成方式，之后也可在赛事管理里切换（切换会清空赛程）。</div>`,
@@ -2057,7 +2074,7 @@ function openEventCopyModal(id) {
       `<div class="form"><div class="field"><label for="f-copy-name">新届名</label>` +
       `<input id="f-copy-name" value="${esc(`${base} 副本`)}" placeholder="例如 2026 秋季联赛"></div></div>` +
       `<div class="notice" style="margin-top:10px"><b>照抄</b>：赛制与规则、选手与参与名单、队伍、` +
-      `赛程对阵（含席位来源）、比赛类型、直播与界面配置。<br>` +
+      `赛程对阵（含席位来源）、比赛类型、直播与展示配置。<br>` +
       `<b>不带走</b>：比分与胜负（每一场回到「未开始」）、开赛与场次时间、替补登记、公告。<br>` +
       `新届状态是<b>筹备中</b>，复制完直接进入这一届；源届一个字节都不动。</div>`,
     footer:
