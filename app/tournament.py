@@ -1315,13 +1315,18 @@ _SIDE_RECORD_FIELDS = ("team_id", "score", "points", "rank", "forfeit", "extras"
 
 
 def round_finished(rnd: Round) -> bool:
-    """这一场是不是**已经完成**（已结算）：状态是 ``done``，或已经有胜者。
+    """这一场是不是**已经定局**：**已经有胜者**才算（平局记为 ``DRAW``，也算）。
+
+    为什么不是「状态是 ``done`` 就算」：``done`` 只表示**这场结束了**（管理端点一下
+    「结束」就会这么标），比分往往还没录。若把它也算成定局，点完「结束」就再也录不进
+    比分了——那是把操作顺序写死的陷阱。真正锁住成绩的是**结果本身**，这与
+    :func:`app.announce.settled`（有胜者才算有结果）是同一个口径。
 
     注意与 :func:`round_has_result` 的分工：那个问的是「**动过没有**」（进行中、只填了
-    一方的分都算，用于锁结构操作与对阵调整）；这里问的是「**打完了没有**」——只有打完的
+    一方的分都算，用于锁结构操作与对阵调整）；这里问的是「**有结果了没有**」——有结果
     才只读。比赛进行中当然还要能录分、能重置。
     """
-    return rnd.status == "done" or bool(rnd.winner)
+    return bool(rnd.winner)
 
 
 def round_record(rnd: Round) -> dict[str, Any]:
@@ -1341,8 +1346,9 @@ def finished_rounds_changed(
 
     这是「**已结束的比赛只读**」的守门员（挂在 :meth:`app.store.Store.mutate` 上）：
 
-    * 「已经打完」用 :func:`round_finished`（``status == "done"`` 或已有胜者）——与
-      ``announce.settled`` 同一口径；**进行中的比赛照旧可改**（还要录分、还能重置）；
+    * 「已经打完」用 :func:`round_finished`（**已有胜者**）——与 ``announce.settled``
+      同一口径；**还没出结果的照旧可改**：进行中要能录分、能重置，连标了「结束」但
+      还没录比分的那一场也还能补录（只是标记而已）；
     * 「被改动」只比 :func:`round_record` 那几个字段：改一个数字、换对手（``team_id``）、
       抹掉弃权留痕、把状态退回未开始，都算动过；而队伍改名这类展示字段刷新不算；
     * **整场从列表里消失也算动过**：清空赛程、重建赛程、重新组队都会把对局整批换掉，

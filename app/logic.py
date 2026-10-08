@@ -170,8 +170,10 @@ def round_time_view(rnd: Round) -> dict[str, Any]:
         "startedAt": start,
         "finishedAt": end,
         "durationMinutes": minutes_between(start, end),
-        # 登记了结束时间但还没结算比分：前端会提示补录，晋级不受影响
-        "pendingSettlement": state == "finished" and rnd.status != "done",
+        # 标了结束（或登记了结束时间）但还没有结果：前端提示补录，晋级不受影响。
+        # 认的是「有没有胜者」而不是「status 是不是 done」——「结束」只是标记，
+        # 比分没录之前这一场还能改（见 tournament.round_finished）。
+        "pendingSettlement": state == "finished" and not rnd.winner,
     }
 
 

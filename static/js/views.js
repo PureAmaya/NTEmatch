@@ -1273,15 +1273,19 @@ function leagueDuoHtml(s, rnd, side) {
 const leagueScore = (rnd, side) => (reveal() || rnd.status !== 'done' ? bigScoreText(side, rnd) : '–');
 
 /**
- * 这场比赛是否**已经打完**（与服务端同一口径：状态是 done，或已经有胜者）。
+ * 这场比赛是否**已经定局**（与服务端同一口径：**已经有胜者**，平局记为 DRAW 也算）。
  *
- * 打完之后这场比赛就是**只读**的——服务端那道闸门见 `app/store.py` 的
+ * 定局之后这场比赛就是**只读**的——服务端那道闸门见 `app/store.py` 的
  * `_guard_frozen_rounds`：比分、对手、名次、弃权留痕、起止时间、上场名单全锁着。
  * 所以这里**不再摆那些会写盘的按钮**（开始 / 结束 / 时间 / 录入比分 / 弃权 / 重置 /
  * 删除本局），选手也不给点（点它是安排替补，同样写盘）——不给按钮，比点了再被拒友好。
  * 读取、直播入口照旧；召集也不受影响（它只往群里发一条消息，不写配置）。
+ *
+ * 为什么认「有没有胜者」而不是「状态是不是 done」：`done` 只表示这场结束了
+ * （「结束」按钮就会这么标），比分可能还没录——那种情况要**留着补录的入口**，
+ * 否则点一下「结束」就把成绩关在门外了。
  */
-const roundFinished = (rnd) => rnd?.status === 'done' || Boolean(rnd?.winner);
+const roundFinished = (rnd) => Boolean(rnd?.winner);
 
 /** 已结束的对局：操作行只留一句「成绩只读」，一个写盘按钮都不给。 */
 const roundReadonlyHtml = () =>

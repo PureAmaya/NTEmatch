@@ -10,8 +10,10 @@
 
 三条边界，本文件逐条钉住：
 
-* 「已完成」= ``status == "done"`` 或已有胜者（与 ``announce.settled`` 同一口径）；
-  **进行中的比赛照旧能录分、能重置**——闸门别做过头；
+* 「已完成」= **已有胜者**（与 ``announce.settled`` 同一口径）；**还没出结果的照旧能录分、
+  能重置**——包括"标了结束但比分还没录"那一场（只是标记，要留着补录的入口）；
+* 一场比赛一旦有结果（有胜者，含记成 ``DRAW`` 的平局）就锁住：比分、对手、名次、
+  弃权留痕、起止时间都改不动了；
 * 改一个数字、抹掉胜者与弃权留痕、把状态退回未开始、换对手（``teamId``）→ 一律拒绝；
 * 队伍改名这类**展示字段**（label / source）刷新不算改成绩，照旧放行。
 """
@@ -137,6 +139,49 @@ async def test_renaming_does_not_trip_the_guard():
     await _seed([_round(done=True)])
     await store.update({"rounds": [{**_round(done=True), "label": "A 组 · 第 1 轮"}]}, actor="test")
     assert store.snapshot().rounds[0].label == "A 组 · 第 1 轮"
+
+
+async def test_marking_it_done_before_the_score_is_in_does_not_lock_it():
+    """点「结束」只是标记：**比分还没录之前照样能补录**（闸门认的是"有没有结果"）。
+
+    这是操作顺序的护栏：管理员顺手点了「结束」，回头再录比分——不该被"已结束只读"
+    挡在门外。录出胜者（真正定局）之后才锁。
+    """
+    await _seed([_round("L-1")])
+
+    await store.update({"rounds": [{**_round("L-1"), "status": "done"}]}, actor="test")
+    assert store.snapshot().rounds[0].status == "done", "先标成结束"
+
+    await store.update({"rounds": [_round("L-1", done=True)]}, actor="test")
+    rnd = store.snapshot().rounds[0]
+    assert (rnd.status, rnd.winner) == ("done", "A"), "回头补录比分照样算数"
+
+    with pytest.raises(FrozenRoundError, match="只读"):
+        await store.update({"rounds": [{**_round("L-1", done=True), "winner": "B"}]}, actor="test")
+
+
+async def test_ending_a_match_still_allows_entering_the_score(admin_client):
+    """端到端：先点「结束」、再录比分这条路必须通。
+
+    否则就是「点一下就再也录不进成绩」——谁都会犯一次的顺序错误，不该由用户承担。
+    """
+    await _seed([_round("L-1")])
+    res = await admin_client.post("/api/rounds/L-1/status", json={"status": "done"})
+    assert res.status_code == 200, res.text
+
+    res = await admin_client.post(
+        "/api/rounds/L-1/result",
+        json={
+            "winner": "B",
+            "sides": [
+                {"playerIds": ["p1"], "score": 1},
+                {"playerIds": ["p2"], "score": 2},
+            ],
+        },
+    )
+    assert res.status_code == 200, res.text
+    rnd = store.snapshot().rounds[0]
+    assert (rnd.status, rnd.winner) == ("done", "B"), "结束之后录的比分要生效"
 
 
 async def test_writing_something_else_leaves_it_alone():
