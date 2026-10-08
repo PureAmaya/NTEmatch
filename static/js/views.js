@@ -761,7 +761,8 @@ function treeBoxHtml(node, ctx) {
   const sides = (m.sides || []).slice(0, MAX_SIDES);
   const ready = sides.length >= 2 && sides.every((side) => side.teamId);
   // 管理端且双方已就位时，整框可点 → 直接录比分（弃权在录分弹窗里）
-  const actionable = canEdit() && ready && m.status !== 'done';
+  // 「打完」用与后端同一口径（含"没标 done 但已有胜者"的老数据），打完之后整框不可点
+  const actionable = canEdit() && ready && !roundFinished(m);
   const act = actionable
     ? ` data-act="round-result" data-code="${esc(m.code)}" role="button" tabindex="0"`
     : '';
@@ -1229,7 +1230,7 @@ function leagueSideClass(side, rnd) {
 
 function leagueMembersHtml(s, rnd, side) {
   const teamSize = Math.max(1, s.rules?.teamSize || 1);
-  const editable = canEdit();
+  const editable = canEdit() && !roundFinished(rnd);
   const items = [];
   for (let i = 0; i < teamSize; i += 1) {
     const p = side.players[i];
@@ -1271,8 +1272,27 @@ function leagueDuoHtml(s, rnd, side) {
 
 const leagueScore = (rnd, side) => (reveal() || rnd.status !== 'done' ? bigScoreText(side, rnd) : '–');
 
+/**
+ * 这场比赛是否**已经打完**（与服务端同一口径：状态是 done，或已经有胜者）。
+ *
+ * 打完之后这场比赛就是**只读**的——服务端那道闸门见 `app/store.py` 的
+ * `_guard_frozen_rounds`：比分、对手、名次、弃权留痕、起止时间、上场名单全锁着。
+ * 所以这里**不再摆那些会写盘的按钮**（开始 / 结束 / 时间 / 录入比分 / 弃权 / 重置 /
+ * 删除本局），选手也不给点（点它是安排替补，同样写盘）——不给按钮，比点了再被拒友好。
+ * 读取、直播入口照旧；召集也不受影响（它只往群里发一条消息，不写配置）。
+ */
+const roundFinished = (rnd) => rnd?.status === 'done' || Boolean(rnd?.winner);
+
+/** 已结束的对局：操作行只留一句「成绩只读」，一个写盘按钮都不给。 */
+const roundReadonlyHtml = () =>
+  `<div class="round__ops round__ops--readonly">` +
+  `<span class="badge badge--done">已完成</span>` +
+  `<span class="panel__hint">成绩只读：比分、对手、名次、时间都已锁定` +
+  `（要改只能整届重新生成赛程，那会清掉成绩）</span></div>`;
+
 function leagueOpsHtml(rnd) {
   if (!canEdit()) return '';
+  if (roundFinished(rnd)) return roundReadonlyHtml();
   const ops = [];
   if (rnd.status === 'pending') {
     ops.push(
@@ -1493,6 +1513,7 @@ function liveBadgeHtml(rnd) {
 
 function matchOpsHtml(rnd) {
   if (!canEdit()) return '';
+  if (roundFinished(rnd)) return roundReadonlyHtml();
   const sides = rnd.sides || [];
   if (!sides.every((side) => side.teamId)) {
     return `<div class="round__ops"><span class="panel__hint">对阵确定后自动出现在这里</span></div>`;

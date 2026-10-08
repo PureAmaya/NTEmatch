@@ -36,7 +36,7 @@ from .defaults import default_config
 from .logging_conf import get_logger
 from .login_guard import DEFAULT_SETTINGS as GUARD_DEFAULTS
 from .login_guard import GUARD_KEYS
-from .models import Channel, Config, LiveBan, Member, Player
+from .models import Channel, Config, LiveBan, Member, Player, Round
 from .qqbot import DEFAULT_SETTINGS as QQBOT_DEFAULTS
 
 log = get_logger("store")
@@ -128,6 +128,14 @@ Mutator = Callable[[dict[str, Any]], dict[str, Any]]
 ChangeHook = Callable[[Config, str], Awaitable[None]]
 # 收尾器：在所有变更与阵容重算都完成之后再过一遍（见 Mutate.final）
 Finalizer = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class FrozenRoundError(ValueError):
+    """试图改动一场**已经打完**的比赛（见 :meth:`Store._guard_frozen_rounds`）。
+
+    这是业务上的拒绝、不是内部故障：往上抛时会被接口层转成一句给人看的 400，
+    并且**不刷错误栈**（见 :meth:`Store.mutate` 的 ``except``）。
+    """
 
 
 def _follow_roster_change(
@@ -1591,6 +1599,47 @@ class ConfigStore:
             return data
         return {**data, "rounds": dumped}
 
+    @staticmethod
+    def _guard_frozen_rounds(before: list[Round], updated: dict[str, Any], scoring: object) -> None:
+        """**已结束的比赛是只读的**：任何写入都不许改动它的成绩记录。
+
+        为什么守在这一层：所有改配置的路径——录分、重置、判弃权、登记时间、替补换人、
+        赛程重排，**以及以后新加的接口**——最后都要过 :meth:`mutate`；连系统自己的上下游
+        重算（:meth:`_resolve`）也在同一段 try 里跑完。于是「以后无论代码怎么改，都不会
+        影响到旧的比赛成绩」是**结构上**被保证的，而不是靠每个调用方记得住。
+
+        读取与 QQ 播报不受影响（它们不写盘）。判「已经打完」与「被改动」的口径见
+        :func:`app.tournament.finished_rounds_changed`。
+        """
+        if not before:
+            return
+        try:
+            after = Config.model_validate(updated).rounds
+        except ValueError:     # 连模型都建不起来：让后面的校验去报错，不在这儿抢话
+            return
+        touched = tournament.finished_rounds_changed(before, after, scoring)
+        if not touched:
+            return
+        # 整场消失（清空 / 重建赛程、重新组队，或删掉某一局）与「改成绩」分开说话：
+        # 前者是批量删，用户看到的是"赛程没了"，指着一场说他改错了并不能解释清楚。
+        remaining = {rnd.code for rnd in after}
+        gone = [code for code in touched if code not in remaining]
+        if gone:
+            if len(touched) == 1:
+                raise FrozenRoundError(
+                    f"对局 {gone[0]} 已经打完，不能删除：已结束的比赛只读（成绩是外部事实）"
+                )
+            finished = sum(1 for rnd in before if tournament.round_finished(rnd))
+            raise FrozenRoundError(
+                f"本届已有 {finished} 场打完的比赛（{gone[0]} 等）会被一起删掉，不能这么做："
+                "已结束的比赛只读——清空 / 重建赛程都不行，想换赛程请新建一届"
+            )
+        extra = f"（另有 {len(touched) - 1} 场也被改到）" if len(touched) > 1 else ""
+        raise FrozenRoundError(
+            f"对局 {touched[0]}{extra} 已经打完，不能再改：已结束的比赛只读"
+            "（比分、对手、名次、弃权留痕、起止时间都锁着）"
+        )
+
     async def mutate(
         self,
         mutator: Mutator,
@@ -1612,6 +1661,11 @@ class ConfigStore:
                     updated = self._resolve(updated)
                 if final is not None:
                     updated = final(updated)
+                # **已结束的比赛只读**：最后一道闸门（系统自己的重算也在上面跑完了）
+                self._guard_frozen_rounds(self._config.rounds, updated, self._config.rules.scoring)
+            except FrozenRoundError:
+                # 给人看的业务拒绝（"这场已经打完了"）：只往上抛，不当内部故障刷错误栈
+                raise
             except Exception:
                 log.exception("配置修改失败 | actor=%s", actor)
                 raise
@@ -1649,6 +1703,8 @@ class ConfigStore:
             updated = mutator(data)
             if resolve:
                 updated = self._resolve(updated)
+            # 同一道闸门：改的虽是别的届，但「已结束的比赛只读」不分哪一届
+            self._guard_frozen_rounds(cfg.rounds, updated, cfg.rules.scoring)
             updated["revision"] = int(data.get("revision", 0)) + 1
             updated["updatedAt"] = now_iso()
             fresh = Config.model_validate(updated)

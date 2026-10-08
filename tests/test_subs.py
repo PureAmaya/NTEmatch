@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from app import logic, subs
+from app import db, logic, subs
 from app.models import Config, Player, Substitution
 from app.store import store
 
@@ -236,10 +236,18 @@ def test_legacy_non_empty_roster_counts_as_explicit():
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 async def league_rounds():
-    """把当前届临时改成「三局积分制 + 6 位选手」，用完还原。"""
+    """**自己建一届**跑（三局积分制 + 6 位选手），用完整届删掉。
+
+    以前是在共用那一届上「临时改一下、用完还原」——现在**已结束的比赛只读**：还原那一步
+    会把用例期间打过的对局删掉 / 改掉，等于让成绩凭空消失，会被闸门当场拦下（业务上
+    也该拦）。所以换成自己的一届：清理就是删掉整届，不碰任何已有成绩。
+    """
+    db.init_db(store._db_path)
     if not store.current_id:
         await store.start()
-    saved = store.snapshot().dump()
+    previous = store.current_id
+    await store.create_event("替补用例届")
+    mine = store.current_id
     data = _data()
     await store.update(
         {
@@ -255,13 +263,9 @@ async def league_rounds():
     try:
         yield
     finally:
-        await store.update(
-            {
-                key: saved[key]
-                for key in ("rules", "players", "participants", "participantsSet", "rounds", "substitutions")
-            },
-            actor="test",
-        )
+        if previous and previous != mine:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
 
 
 async def test_api_substitute_changes_the_lineup(admin_client, league_rounds):

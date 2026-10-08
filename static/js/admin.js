@@ -419,7 +419,8 @@ function lockPanelHtml(s) {
       `<div class="notice" style="margin-top:10px"><b>已冻结</b>：赛制、每队人数、每场同场队伍数、败者组开关、` +
       `参赛名单、重新组队、赛程重建 / 清空、删除选手。<br>` +
       `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补</b>（替上的人不在名单里会自动加入）、录分与重置、` +
-      `时间登记、赛事信息、新增选手档案。</div>` +
+      `时间登记、赛事信息、新增选手档案<br>` +
+      `（都只对<b>还没打完</b>的对局——一场打完就只读了）</div>` +
       `<div class="tool-group" style="margin-top:10px">` +
       `<button class="btn btn--sm btn--danger" type="button" data-act="event-unlock">解除锁定</button></div>`
     : `<div class="etime etime--slim">` +
@@ -726,7 +727,7 @@ function schedulePanelHtml(s) {
         `队伍长期没人或人数不足时，在对局上点「<b>弃权</b>」即可让对方直接晋级。</div>`) +
     (locked
       ? `<div class="notice" style="margin-top:8px">比赛已开始：<b>录分、重置、时间、直播、弃权、队伍换人</b>` +
-        `都照常可用，只有上方的结构性操作被锁定。</div>`
+        `都照常可用（只对<b>还没打完</b>的对局——打完一场就只读了），只有上方的结构性操作被锁定。</div>`
       : '');
   return panelHtml('赛程与系统', league ? '积分制操作' : '锦标赛操作', body);
 }

@@ -593,6 +593,8 @@ img { display: block; max-width: 100%; }
   border-top: 1px dashed rgba(120, 196, 255, .14);
 }
 .round__ops { display: flex; flex-wrap: wrap; gap: 6px; padding: 9px 13px 12px; border-top: 1px solid var(--line); background: rgba(8, 12, 19, .5); }
+/* 已结束的对局：操作行只剩一句「成绩只读」（写盘按钮全收掉了，见 views.js 的 roundFinished） */
+.round__ops--readonly { align-items: center; gap: 8px; }
 
 /* ---------- 12. 选手卡 ---------- */
 .roster-grid { display: grid; gap: var(--gap); grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
@@ -2079,6 +2081,12 @@ img { display: block; max-width: 100%; }
 /* 30.2 弃权弹窗：每一方可弃权一个按钮 */
 .wo-list { display: flex; flex-direction: column; gap: 6px; }
 .wo-list .btn { justify-content: flex-start; text-align: left; }
+/* 判罚范围：只判这一场 / 这一方退赛（退赛要多勾一道确认才给点） */
+.wo-scope { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12.5px; color: var(--txt-dim); cursor: pointer; }
+.wo-scope:has(input:checked) { color: var(--txt); }
+.wo-scope input { accent-color: var(--accent); flex: none; }
+.wo-scope span b { color: var(--bad); }
+.wo-list .btn[disabled] { opacity: .5; }
 
 /* 30.3 推流地址 + 复制按钮 */
 .field__hint--copy { display: flex; align-items: center; gap: 6px; }

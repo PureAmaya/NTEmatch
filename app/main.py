@@ -606,6 +606,8 @@ class RoundWalkoverPayload(NTEModel):
 
     side: str = ""            # A / B / C / D
     reason: str = "弃权"
+    #: ``match`` = 只判这一场；``withdraw`` = 这一方**退赛**（本届剩余未赛场次一并判负）
+    scope: str = "match"
 
 
 class RoundTimesPayload(NTEModel):
@@ -3032,10 +3034,24 @@ async def api_round_walkover(
 ) -> dict[str, Any]:
     """判某一方弃权（长期没人 / 人数不足）：该方垫底，其余各方自动晋级。
 
-    * 2 方对阵：对手直接获胜并进入下一轮（淘汰赛会顺着对阵图继续推进）；
-    * 3~4 方同场：只把弃权方移出名次竞争，其余队伍继续把这场打完；
-    * 会往备注里写一条留痕（谁弃权、谁晋级），重置该场会一并清除。
+    * ``scope="match"``（默认）：只判这一场；
+    * ``scope="withdraw"``：**这一方退赛**——本届里他剩下还没打的对局**一并判负**
+      （对手按胜计）。现实竞赛规则就是这么处理退赛的：已完成的比赛结果有效、未完成的
+      对局全部判负、退赛者名次垫底；淘汰赛只按签表槽位向前推进，**不重排对阵**
+      （见 :func:`app.tournament.withdraw_team`）。
+
+    两方对阵：对手直接获胜并进入下一轮（淘汰赛会顺着对阵图继续推进）；
+    3~4 方同场：只把弃权方移出名次竞争，其余队伍继续把这场打完；
+    会往备注里写一条留痕（谁弃权、谁晋级）。判完这一场它就已经是「已结束」，
+    而**已结束的比赛只读**，所以判罚本身不可撤销（没有「重置撤销」这条路）。
+
+    ``scope="withdraw"`` 还要求这一方**认得出队伍**（``side.team_id``）：认不出来
+    （空席位，或积分制里没有队伍的轮换搭档）时退化成 ``match``，只判这一场。
     """
+    scope = (payload.scope or "match").strip().lower()
+    if scope not in ("match", "withdraw"):
+        raise HTTPException(status_code=400, detail="scope 只能是 match 或 withdraw")
+
     cfg_now = store.snapshot()
     target = _find_round(cfg_now, ref)
     if target is None:
@@ -3044,62 +3060,57 @@ async def api_round_walkover(
     key = (payload.side or "").strip().upper()[:1]
     if key not in keys:
         raise HTTPException(status_code=400, detail=f"side 只能是 {' / '.join(keys)}")
-    index = keys.index(key)
+    if len(target.sides) < 2:
+        raise HTTPException(status_code=400, detail="本场只有一方，无法判定弃权")
     reason = (payload.reason or "").strip() or "弃权"
+    # 退赛得认人：拿这一方的 team_id 去本届里找他剩下还没打的对局。席位还没填的场次
+    # （比如败者组还没推到）当下找不到，所以 withdraw_team 会「判 → 重新推导」反复几轮；
+    # 连一个人都认不出来（空席位）时退化成「只判这一场」。
+    side_now = target.side_by_key(key)
+    team_id = (side_now.team_id if side_now else "") or ""
+    withdraw = scope == "withdraw" and bool(team_id)
+    judged: list[str] = []
 
-    def apply(rnd: dict[str, Any]) -> None:
-        from .store import now_iso
-
-        raw = _raw_sides(rnd)
-        others = [i for i in range(len(raw)) if i != index]
-        if not others:
-            raise HTTPException(status_code=400, detail="本场只有一方，无法判定弃权")
-        raw[index]["forfeit"] = True
-        # 弃权 = 没有成绩（而不是「0 分」：数值型的 0 是合法读数）
-        raw[index]["score"] = metrics.MISSING
-        raw[index]["points"] = 0
-        label = raw[index].get("label") or f"{key} 方"
-        stamp = f"[弃权] {label} {reason}"
-        if len(others) == 1:
-            # 对手直接获胜：进入下一轮 / 败者组由对阵图自动推导
-            other = others[0]
-            raw[index]["rank"] = 2
-            raw[other]["rank"] = 1
-            rnd["winner"] = chr(ord("A") + other)
-            rnd["status"] = "done"
-            rnd["startedAt"] = rnd.get("startedAt") or now_iso()
-            rnd["finishedAt"] = now_iso()
-            advance = raw[other].get("label") or "对方"
-            stamp = f"{stamp} → {advance} 晋级"
+    def apply(data: dict[str, Any]) -> dict[str, Any]:
+        cfg = Config.model_validate(data)
+        rnd = _find_round(cfg, ref)
+        if rnd is None:
+            raise HTTPException(status_code=404, detail=f"对局 {ref} 不存在")
+        at = now_iso()
+        if withdraw:
+            cfg.rounds, codes = tournament.withdraw_team(
+                cfg.teams, cfg.rounds, cfg.rules.scoring, team_id, reason, now=at
+            )
+            judged.extend(codes)
         else:
-            # 多方同场：其余队伍继续比赛，弃权方排到最后
-            raw[index]["rank"] = len(raw)
-            stamp = f"{stamp}（本场其余队伍继续）"
-        existing = (rnd.get("note") or "").strip()
-        if stamp not in existing:
-            rnd["note"] = f"{stamp}｜{existing}" if existing else stamp
+            tournament.apply_walkover(rnd, key, reason, now=at)
+            judged.append(rnd.code or ref)
+        return cfg.dump()
 
     # 判弃权也可能**直接决定冠军**（总决赛对手弃权就是这种情况）：走同一个收尾器，
     # 否则这种届会永远停在「进行中」（与录分那条路一致）
-    cfg = await store.mutate(
-        _round_mutator(ref, apply), actor="web:round-walkover", final=logic.close_on_champion
-    )
+    cfg = await store.mutate(apply, actor="web:round-walkover", final=logic.close_on_champion)
     settled = _find_round(cfg, ref)
     log.warning(
-        "对局 %s 判定弃权 | 方=%s | 原因=%s | winner=%s",
+        "对局 %s 判定弃权 | 方=%s | 原因=%s | 范围=%s | 共判 %d 场 | winner=%s",
         ref,
         key,
         reason,
+        "withdraw" if withdraw else "match",
+        len(judged),
         settled.winner if settled else "",
     )
     # 弃权就是给这一场判了结果（两方对阵直接结算），与录分走同一条自动播报：
-    # 只播**这一场**，且只在判弃权的这一刻（见 app/announce.py）
+    # **只播这一场**，且只在判弃权的这一刻（见 app/announce.py）。退赛时另外那些场次是
+    # 「一并判负」，不逐场播报——一次点下去刷一屏群消息，比不播还糟。
     asyncio.create_task(announce.after_settle(ref, cfg))
     return {
         "ok": True,
         "revision": cfg.revision,
         "side": key,
         "reason": reason,
+        "scope": "withdraw" if withdraw else "match",
+        "judged": judged,
         "winner": settled.winner if settled else "",
         "status": settled.status if settled else "",
         "state": build_public_state(cfg),

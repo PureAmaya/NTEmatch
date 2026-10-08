@@ -423,34 +423,120 @@ def test_knockout_that_already_started_keeps_its_pairing():
     assert (same.sides[0].score, same.sides[1].score) == (3, 2)
 
 
-def test_knockout_not_started_gets_the_fixed_pairing():
-    """还没开打：交叉配对照旧生效（这正是这次要修的那件事），一场都不该丢。"""
+def test_forfeit_does_not_reshape_an_already_generated_bracket():
+    """开打之后判弃权，**已经产生的对阵一个都不许换人**（更不许把成绩作废）。
+
+    这是线上真实踩到的一脚：判弃权会把淘汰赛标成「已开打」，而 :func:`advance_seeds`
+    在那之后就改去按**老算法**（总排名直接当种子）重算种子——可对阵是用新算法
+    （交叉配对）生成的，于是「冻结」实际等于换一批对手；而 :func:`resolve_rounds`
+    一旦发现某个席位换了人，还会把那一场连同下游的成绩一起清掉（已经录好的比分当场没了）。
+    """
     teams, rounds, sc, summary = _played_tournament(9, 2)
-    stored = _legacy_pairing(teams, rounds, sc, summary["size"])
-    assert not tournament.knockout_started(stored)
+    stored = tournament.resolve_tournament(teams, rounds, sc)
+    first = [r for r in stored if r.stage == "wb" and r.bracket_round == 1]
+    pairing = {r.code: [side.team_id for side in r.sides] for r in first}
+    assert first and all(all(ids) for ids in pairing.values()), "首轮应当已经排好对阵"
+
+    # 前提：两套算法在这份赛程上排出来确实不同——不同才有得错，这条测试才挡得住那个 bug
+    tables = tournament.group_tables(teams, stored, sc)
+    assert tournament.bracket_seeds(tables, summary["size"], sc) != (
+        tournament.overall_ranking(tables, sc)[: summary["size"]]
+    )
+
+    # 判其中一场弃权：对手直接晋级（模拟有人没来）
+    target = first[0]
+    target.sides[1].forfeit = True
+    target.sides[0].rank = 1
+    target.sides[1].rank = 2
+    target.winner, target.status = "A", "done"
+    assert tournament.knockout_started(stored), "判了弃权 → 这一届已经是「开打」状态"
 
     after = tournament.resolve_tournament(teams, stored, sc)
-    group_of = {t.id: t.group for t in teams}
+    for rnd in after:
+        if rnd.stage == "wb" and rnd.bracket_round == 1:
+            assert [side.team_id for side in rnd.sides] == pairing[rnd.code], (
+                f"{rnd.code} 的对手被换掉了"
+            )
+    same = next(r for r in after if r.code == target.code)
+    assert (same.status, same.winner) == ("done", "A"), "弃权判罚不能被重算抹掉"
+    assert same.sides[1].forfeit is True, "弃权留痕也不能没"
+
+
+def test_an_already_published_pairing_is_never_reshuffled():
+    """**对阵一经产生就冻结**——哪怕一场都还没打。
+
+    正式竞赛规则里抽签 / 编排**一经公布不再更改**：弃权只判对手获胜、由签表槽位向前推进，
+    不重抽不重排（网球、羽毛球、联赛竞赛规程都这么写）。所以这里不再有「还没开打就按新
+    算法重排」这条后路——那种「重排」正是同一个 bug 的另一面：一次算法迭代、一次成绩
+    改判，已经公布的对手就整片换人。想换对阵只有一条路：重新生成赛程（会清成绩，前端先确认）。
+
+    新排出来的对阵（席位还空着时）仍然走交叉配对，见
+    ``test_knockout_first_round_does_not_park_one_group_against_itself``。
+    """
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    stored = _legacy_pairing(teams, rounds, sc, summary["size"])
+    assert not tournament.knockout_started(stored), "这一届还没开打"
+    before = {
+        r.code: [side.team_id for side in r.sides]
+        for r in stored
+        if r.stage == "wb" and r.bracket_round == 1
+    }
+
+    after = tournament.resolve_tournament(teams, stored, sc)
     first = [r for r in after if r.stage == "wb" and r.bracket_round == 1]
     assert first
     for rnd in first:
-        left, right = (side.team_id for side in rnd.sides)
-        assert group_of[left] != group_of[right], f"{rnd.code} 又让同组两队碰上了"
+        assert [side.team_id for side in rnd.sides] == before[rnd.code], f"{rnd.code} 被重排了"
 
 
-def test_resetting_the_knockout_unfreezes_the_pairing():
-    """把淘汰赛退回未开始：冻结解除，重新按新算法排——想换算法不必重建整届。"""
+def test_resetting_a_result_does_not_re_shuffle_the_bracket():
+    """重置成绩 ≠ 重排签表：签表不因成绩变动而改（正式规则：编排一经公布不再更改）。
+
+    想换对阵就重新生成赛程——「把某一场重置回未开始」只是撤销那一场的成绩，不是换签表。
+    """
     teams, rounds, sc, summary = _played_tournament(9, 2)
     stored = _legacy_pairing(teams, rounds, sc, summary["size"])
     played = next(r for r in stored if r.code == "WB-1-2")
     played.status, played.winner = "done", "A"
-
     assert tournament.knockout_started(stored)
+    seeds_before = tournament.advance_seeds(teams, stored, sc)
+
     tournament.reset_round_result(played)
     assert not tournament.knockout_started(stored), "重置之后这一届不再算「开打」"
-    assert tournament.advance_seeds(teams, stored, sc) == tournament.bracket_seeds(
-        tournament.group_tables(teams, stored, sc), summary["size"], sc
-    ), "冻结解除后按新算法（交叉配对）排"
+    assert tournament.advance_seeds(teams, stored, sc) == seeds_before, "重置成绩不该换签表"
+
+
+def test_changing_a_group_result_does_not_re_shuffle_the_bracket():
+    """改判小组赛（判弃权 / 修正比分）之后，**已经排好的淘汰赛对阵不许变**。
+
+    这是「对阵一经产生就冻结」要挡的另一种走法：淘汰赛一场没打，但席位在小组赛结束那一刻
+    就排好了；此时动小组赛结果会让小组排名变化，按排名重排就会把已公布的淘汰赛对阵整片换人
+    ——也就是「判个弃权，别人的对手全变了」在小组赛一侧的版本。
+    """
+    teams, rounds, sc, summary = _played_tournament(9, 2)
+    published = tournament.resolve_tournament(teams, rounds, sc)
+    first = [r for r in published if r.stage == "wb" and r.bracket_round == 1]
+    pairing = {r.code: [side.team_id for side in r.sides] for r in first}
+    assert first and all(all(ids) for ids in pairing.values()), "首轮应当已经排好对阵"
+
+    # 改一场小组赛：判某方弃权（对手获胜），小组排名随之变化
+    group = next(r for r in published if r.stage == "group")
+    group.sides[0].rank, group.sides[1].rank = 2, 1
+    group.sides[0].forfeit = True
+    group.winner, group.status = "B", "done"
+    # 前提：这次改判**确实**动到了小组排名（否则这条测试挡不住那种「按排名重排」）
+    assert tournament.bracket_seeds(
+        tournament.group_tables(teams, published, sc), summary["size"], sc
+    ) != tournament.bracket_seeds(
+        tournament.group_tables(teams, rounds, sc), summary["size"], sc
+    ), "这次改判没动到小组排名，用例构不成场景"
+
+    after = tournament.resolve_tournament(teams, published, sc)
+    for rnd in after:
+        if rnd.stage == "wb" and rnd.bracket_round == 1:
+            assert [side.team_id for side in rnd.sides] == pairing[rnd.code], (
+                f"{rnd.code} 的对手被换掉了"
+            )
 
 
 # --------------------------------------------------------------------------- #

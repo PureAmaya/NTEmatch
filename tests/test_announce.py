@@ -259,9 +259,17 @@ async def test_posts_once_per_match_and_only_about_that_match(captured):
     assert len(captured) == 1
 
     # 第 2 场录完分：只播第 2 场，第 1 场不会跟着重播
+    # （第 1 场要**原样**写回去：已结束的比赛只读，改它一个字段都会被闸门拦下）
     await _set_rounds(
         [
-            _match("G-A-1-1", "A 组 · 第 1 轮 · 第 1 场", score_a=3, score_b=1),
+            _match(
+                "G-A-1-1",
+                "A 组 · 第 1 轮 · 第 1 场",
+                score_a=3,
+                score_b=1,
+                started_at="2026-10-06T21:05",
+                finished_at="2026-10-06T21:20",
+            ),
             _match("G-A-1-2", "A 组 · 第 1 轮 · 第 2 场", slot=2, score_a=0, score_b=2, winner="B"),
         ]
     )

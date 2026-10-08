@@ -21,7 +21,7 @@ import { installBrowserStub } from './_browser_stub.mjs';
 /* ------------------------------ 浏览器桩 ------------------------------ */
 
 installBrowserStub();
-const { App } = await import('../static/js/core.js');
+const { App, canEdit } = await import('../static/js/core.js');
 const { bracketPanelHtml } = await import('../static/js/views.js');
 
 /* ------------------------------ 断言与工具 ------------------------------ */
@@ -175,6 +175,34 @@ check(
   '画布高度包得住这一框',
   wrapperHeight(html) >= boxH,
   `画布 ${wrapperHeight(html)} ≥ ${boxH}`
+);
+
+console.log('');
+console.log('=== 打完的对局：连整框都不能点（成绩只读，录入入口收掉）===');
+const doneTree = treeState({ members: [], champion: true }); // 决赛：status=done 且已有胜者
+const liveTree = treeState({ members: [], champion: true });
+liveTree.bracket.wb[0].matches[0].status = 'live';
+liveTree.bracket.wb[0].matches[0].winner = '';
+const staleTree = treeState({ members: [], champion: true }); // 老数据：没标 done，但已有胜者
+staleTree.bracket.wb[0].matches[0].status = 'pending';
+// 管理端身份**必须在 treeState 之后**再设：它每次都把 App.me 重置为 null，
+// 否则 canEdit() 为假，下面三条会全变成"本来就不带入口"的空断言。
+App.token = 'test-token';
+App.me = { permission: 'event_admin' };
+check('管理端身份生效（三条断言的前提）', canEdit(), 'canEdit() 为真，入口才可能出现');
+check(
+  '打完的对局不挂「录入比分」入口',
+  !bracketPanelHtml(doneTree).includes('data-act="round-result"')
+);
+check(
+  '没打完的对局仍然可点（入口还在）',
+  bracketPanelHtml(liveTree).includes('data-act="round-result"'),
+  '进行中就该能录分'
+);
+check(
+  '老数据兜底：有胜者就算打完，同样不给点',
+  !bracketPanelHtml(staleTree).includes('data-act="round-result"'),
+  '与后端 round_finished 同口径'
 );
 
 console.log('');

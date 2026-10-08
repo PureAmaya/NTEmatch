@@ -603,13 +603,45 @@ function openResultModal(rnd) {
 }
 
 /**
- * 判某一方弃权（长期没人 / 人数不足）。
+ * 判某一方弃权（长期没人 / 人数不足），或者判**这一方退赛**。
  *
- * 弃权方名次垫底，对手直接晋级；淘汰赛的对阵图会自动往下推进，
- * 备注里留一条痕迹，重置该场即可撤销。
+ * 两种范围，与竞赛规程一致（服务端见 `app.tournament.withdraw_team`）：
+ *
+ * * **只判这一场**：弃权方名次垫底，对手直接晋级；淘汰赛的对阵图自动往下推进；
+ * * **退赛**：本届里他**剩下还没打的对局一并判负**（对手按胜计）。已打完的成绩一概不动
+ *   （结果有效），淘汰赛只按签表槽位向前推进、**不重抽不重排**——别人不会因为有人退赛
+ *   而换对手。席位还没排定的后续场次（比如败者组还没推到）会在判完之后自动往下走，一并判掉。
+ *
+ * 退赛是**公告性**的一次性操作，所以要多勾一道确认（与「开始比赛」同一个做法）。
+ *
+ * 另注：判完这一场它就成了「已结束」，而**已结束的比赛只读**——所以弃权 / 退赛
+ * **判了就不能撤**（重置、改分、换人全被挡）。弹窗里把这话说在前面。
  */
 function openWalkoverModal(rnd) {
   const sides = rnd.sides || [];
+  // 退赛只对「有队伍的对局」有意义：积分制的轮换搭档没有 team_id，那时只能一场一场判
+  const canWithdraw = sides.some((side) => side.teamId);
+  /** 本届里这支队伍还没打完的对局数（现在能看到的那些；尚未排定的后续场次判完会自动推进）。 */
+  const pendingOf = (teamId) =>
+    teamId
+      ? (App.state?.rounds || []).filter(
+          (r) =>
+            (r.sides || []).some((side) => side.teamId === teamId) &&
+            !(r.status === 'done' || r.winner)
+        ).length
+      : 0;
+  const scopeHtml = canWithdraw
+    ? `<div class="field" style="margin-top:10px"><label>判罚范围</label>` +
+      `<label class="wo-scope"><input type="radio" name="woScope" value="match" checked>` +
+      `<span>只判这一场（对手直接晋级）</span></label>` +
+      `<label class="wo-scope"><input type="radio" name="woScope" value="withdraw">` +
+      `<span><b>这一方退赛</b>：本届剩余未打的对局一并判负</span></label></div>` +
+      `<div id="woWithdrawBox" hidden style="margin-top:10px">` +
+      `<div class="notice notice--warn">退赛是公告性的：被判负的对局此后<b>不能再改</b>` +
+      `（两方对阵会直接结算成「已结束」，多队同场只把他移出名次竞争）；要重来只有` +
+      `「重新生成赛程」，那会清掉成绩。</div>` +
+      `${fieldSwitch('woConfirmWithdraw', '我确认按退赛处理（剩余未赛场次一并判负）', false)}</div>`
+    : '';
   Modal.open({
     title: `判弃权 · ${rnd.label || rnd.code}`,
     body:
@@ -618,6 +650,7 @@ function openWalkoverModal(rnd) {
         ? `；本场还有 ${sides.length - 1} 支队，他们继续比赛。`
         : '，淘汰赛对阵图会自动推进。') +
       `</div>` +
+      scopeHtml +
       `<div class="field" style="margin-top:10px"><label for="woReason">原因（会写进备注）</label>` +
       `<input id="woReason" value="长期无人到场" placeholder="例如：人数不足 / 超时未到场"></div>` +
       `<div class="wo-list" style="margin-top:10px">` +
@@ -625,7 +658,8 @@ function openWalkoverModal(rnd) {
         ? sides
             .map(
               (side) =>
-                `<button class="btn btn--block btn--danger" type="button" data-wo="${esc(side.key)}">` +
+                `<button class="btn btn--block btn--danger" type="button" data-wo="${esc(side.key)}" ` +
+                `data-team="${esc(side.teamId || '')}">` +
                 `${esc(side.key)} · ${esc(side.label || side.source || '待定')} 弃权</button>`
             )
             .join('')
@@ -634,7 +668,33 @@ function openWalkoverModal(rnd) {
     footer: `<button class="btn btn--sm btn--ghost" type="button" data-close>取消</button>`,
     onMount(bodyEl, footEl) {
       footEl.querySelector('[data-close]').onclick = () => Modal.close();
-      bodyEl.querySelectorAll('[data-wo]').forEach((btn) => {
+      const withdrawBox = qs('#woWithdrawBox', bodyEl);
+      const confirmBox = qs('#f-woConfirmWithdraw', bodyEl);
+      const btns = [...bodyEl.querySelectorAll('[data-wo]')];
+      const scope = () =>
+        bodyEl.querySelector('input[name="woScope"]:checked')?.value === 'withdraw'
+          ? 'withdraw'
+          : 'match';
+      // 范围一变：露出确认块，按钮改写成「退赛（判 N 场）」，而且**没勾确认不许点**——
+      // 这就是二次确认那一步（服务端也要求 scope，两边都拦一道）
+      const sync = () => {
+        const withdraw = scope() === 'withdraw';
+        if (withdrawBox) withdrawBox.hidden = !withdraw;
+        btns.forEach((btn) => {
+          const side = sides.find((item) => item.key === btn.dataset.wo);
+          const label = side?.label || side?.source || '待定';
+          btn.textContent = withdraw
+            ? `${btn.dataset.wo} · ${label} 退赛（判 ${pendingOf(btn.dataset.team)} 场）`
+            : `${btn.dataset.wo} · ${label} 弃权`;
+          btn.disabled = withdraw && !confirmBox?.checked;
+        });
+      };
+      bodyEl.querySelectorAll('input[name="woScope"]').forEach((el) => {
+        el.onchange = sync;
+      });
+      if (confirmBox) confirmBox.onchange = sync;
+      sync();
+      btns.forEach((btn) => {
         btn.onclick = async () => {
           const key = btn.dataset.wo;
           const label = sides.find((side) => side.key === key)?.label || key;
@@ -643,17 +703,27 @@ function openWalkoverModal(rnd) {
             const res = await api(`/rounds/${encodeURIComponent(rnd.code)}/walkover`, {
               method: 'POST',
               auth: true,
-              body: { side: key, reason },
+              body: { side: key, reason, scope: scope() },
             });
             Modal.close();
-            const winner = (res.state?.rounds || [])
-              .find((r) => r.code === rnd.code)
-              ?.sides.find((side) => side.key === res.winner);
-            toast(
-              winner ? `${label} 弃权 → ${winner.label} 晋级` : `${label} 已判弃权`,
-              'ok',
-              6000
-            );
+            const judged = res.judged || [];
+            if (res.scope === 'withdraw') {
+              toast(
+                `${label} 退赛：本届剩余 ${judged.length} 场一并判负` +
+                  (judged.length ? `（${judged.join('、')}）` : ''),
+                'ok',
+                9000
+              );
+            } else {
+              const winner = (res.state?.rounds || [])
+                .find((r) => r.code === rnd.code)
+                ?.sides.find((side) => side.key === res.winner);
+              toast(
+                winner ? `${label} 弃权 → ${winner.label} 晋级` : `${label} 已判弃权`,
+                'ok',
+                6000
+              );
+            }
             if (res.state) App.state = res.state;
             hooksRenderAdmin();
             renderPublic();
@@ -1068,7 +1138,8 @@ function startEvent() {
       `<div class="notice">开始后 <b>赛制与参赛名单将锁定</b>：赛制、每队人数、每场同场队伍数、` +
       `败者组开关、参与名单、重新组队、赛程重建与清空、删除选手都会被拒绝。<br>` +
       `<b>仍然可用</b>：<b>直播开关</b>、<b>对局替补 / 队伍换人</b>（替上的人不在名单里会自动加入）、` +
-      `录分与重置、时间登记、弃权、赛事信息。</div>` +
+      `录分与重置、时间登记、弃权、赛事信息<br>` +
+      `（都只对<b>还没打完</b>的对局——一场打完就只读了）</div>` +
       readinessHtml(r) +
       `<div style="margin-top:12px">${fieldSwitch(
         'confirmStart',

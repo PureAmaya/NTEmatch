@@ -773,10 +773,9 @@ def bracket_seeds(
 def knockout_started(rounds: list[Round], scoring: object = metrics.INTEGER) -> bool:
     """淘汰赛是否**已经开打**：有场次不是「未开始」，或者已经录过成绩。
 
-    这个标记决定要不要重排配对（见 :func:`advance_seeds`）。种子算法改过一版
-    （从「总排名直接当种子」改成「交叉配对，同组首轮不相遇」），但**已经打下来的
-    届必须保持原样**：对阵是当初生成、并且已经被打过的，拿新算法重排等于把已录的
-    成绩作废（对阵一变，按规矩就得重打）。所以只对「还没开打」的届生效。
+    这**不是**「要不要重排配对」的开关——对阵一经产生就冻结，见 :func:`advance_seeds`。
+    它只在**席位没填齐**的半路数据上兜底：那种状态下宁可沿用老口径
+    （:func:`overall_ranking`），也不要在已经开打之后换掉别人正在打的对手。
     """
     sc = metrics.as_scoring(scoring)
     return any(
@@ -1298,6 +1297,177 @@ def reset_round_result(rnd: Round) -> None:
     rnd.locked = False
 
 
+#: 一场比赛的**成绩记录**：登记之后就再也改不得了（见 :func:`finished_rounds_changed`）。
+#:
+#: 逐字对应 ``Round`` / ``Side`` 的字段名。只收「比赛本身」的字段，**不收** label / color /
+#: source / src_a…src_d 这类由赛程重算顺手刷新的**展示与结构**字段——它们跟着队伍改名变
+#: 是正常的，不该被当成「改了成绩」。
+_ROUND_RECORD_FIELDS = (
+    "status",
+    "winner",
+    "note",
+    "duration_minutes",
+    "scheduled_at",
+    "started_at",
+    "finished_at",
+)
+_SIDE_RECORD_FIELDS = ("team_id", "score", "points", "rank", "forfeit", "extras", "player_ids")
+
+
+def round_finished(rnd: Round) -> bool:
+    """这一场是不是**已经完成**（已结算）：状态是 ``done``，或已经有胜者。
+
+    注意与 :func:`round_has_result` 的分工：那个问的是「**动过没有**」（进行中、只填了
+    一方的分都算，用于锁结构操作与对阵调整）；这里问的是「**打完了没有**」——只有打完的
+    才只读。比赛进行中当然还要能录分、能重置。
+    """
+    return rnd.status == "done" or bool(rnd.winner)
+
+
+def round_record(rnd: Round) -> dict[str, Any]:
+    """一场比赛的**成绩记录**（比对「有没有被动过」用，见 :func:`finished_rounds_changed`）。"""
+    return {
+        **{field: getattr(rnd, field) for field in _ROUND_RECORD_FIELDS},
+        "sets": [(item.a, item.b) for item in rnd.sets],
+        # 对手（team_id）、成绩、名次、弃权、附加数值、上场名单：都在记录里
+        "sides": [{field: getattr(side, field) for field in _SIDE_RECORD_FIELDS} for side in rnd.sides],
+    }
+
+
+def finished_rounds_changed(
+    before: list[Round], after: list[Round], scoring: object = metrics.INTEGER
+) -> list[str]:
+    """比对写入前后的对局，返回**已经打完却被改动**的编号（没动就是空列表）。
+
+    这是「**已结束的比赛只读**」的守门员（挂在 :meth:`app.store.Store.mutate` 上）：
+
+    * 「已经打完」用 :func:`round_finished`（``status == "done"`` 或已有胜者）——与
+      ``announce.settled`` 同一口径；**进行中的比赛照旧可改**（还要录分、还能重置）；
+    * 「被改动」只比 :func:`round_record` 那几个字段：改一个数字、换对手（``team_id``）、
+      抹掉弃权留痕、把状态退回未开始，都算动过；而队伍改名这类展示字段刷新不算；
+    * **整场从列表里消失也算动过**：清空赛程、重建赛程、重新组队都会把对局整批换掉，
+      已打完的成绩正是这样「凭空没了」的——成绩是外部事实，不能因为想重排就顺手删掉。
+      想换赛程请**新建一届**（届次管理里的「复制一届」）。
+
+    纯函数，所以「以后无论代码怎么改，都不许动旧成绩」这条可以被单测直接钉住。
+    """
+    seen = {rnd.code: rnd for rnd in after if rnd.code}
+    touched: list[str] = []
+    for old in before:
+        if not old.code or not round_finished(old):
+            continue                       # 还没打完的：随便改
+        new = seen.get(old.code)
+        if new is None or round_record(old) != round_record(new):
+            touched.append(old.code)       # 成绩记录被动过，或者整场被删掉
+    return touched
+
+
+# --------------------------------------------------------------------------- #
+# 判罚：弃权（这一场）与退赛（剩下的都判负）
+# --------------------------------------------------------------------------- #
+def apply_walkover(rnd: Round, key: str, reason: str = "弃权", *, now: str = "") -> str:
+    """把某一方判为弃权（该场按对手获胜结算）；返回**晋级方的席位字母**（多队同场返回空串）。
+
+    纯函数：只动这一场，不做上下游推导（那是 :func:`resolve_rounds` 的活）。
+
+    * 2 方对阵：对手直接获胜并进入下一轮（淘汰赛顺着签表继续推进）；
+    * 3~4 方同场：只把弃权方移出名次竞争，其余队伍继续把这场打完；
+    * 往备注里留一条痕（谁弃权、谁晋级）。注意判完这一场它就**锁定**了：这一场已经是
+      「已结束」，而**已结束的比赛只读**（见 :func:`finished_rounds_changed`），备注与结果
+      都不能再改，也就没有「重置撤销」这条路。
+    """
+    keys = [chr(ord("A") + i) for i in range(len(rnd.sides))]
+    if key not in keys:
+        raise ValueError(f"side 只能是 {' / '.join(keys) or '（本场还没有对阵）'}")
+    index = keys.index(key)
+    others = [i for i in range(len(rnd.sides)) if i != index]
+    if not others:
+        raise ValueError("本场只有一方，无法判定弃权")
+    side = rnd.sides[index]
+    side.forfeit = True
+    # 弃权 = 没有成绩（而不是「0 分」：数值型的 0 是合法读数）
+    side.score = metrics.MISSING
+    side.points = 0
+    label = side.label or f"{key} 方"
+    stamp = f"[弃权] {label} {reason}"
+    winner = ""
+    if len(others) == 1:
+        # 对手直接获胜：进入下一轮 / 败者组由对阵图自动推导
+        other = others[0]
+        side.rank = 2
+        rnd.sides[other].rank = 1
+        winner = chr(ord("A") + other)
+        rnd.winner = winner
+        rnd.status = "done"
+        rnd.started_at = rnd.started_at or now
+        rnd.finished_at = now
+        advance = rnd.sides[other].label or "对方"
+        stamp = f"{stamp} → {advance} 晋级"
+    else:
+        # 多方同场：其余队伍继续比赛，弃权方排到最后
+        side.rank = len(rnd.sides)
+        stamp = f"{stamp}（本场其余队伍继续）"
+    existing = (rnd.note or "").strip()
+    if stamp not in existing:
+        rnd.note = f"{stamp}｜{existing}" if existing else stamp
+    return winner
+
+
+def side_settled(side: Side, scoring: object = metrics.INTEGER) -> bool:
+    """这一方**已经有结果**了（录过分 / 已判过弃权 / 有名次）：退赛时不再重复判它。
+
+    问的是「他自己这一席动过没有」而不是「这一场动过没有」——多队同场时别人先打完，
+    这一场也是「有痕迹」的，退赛的人照样得被判负。
+    """
+    sc = metrics.as_scoring(scoring)
+    return bool(
+        side.forfeit or side.rank or side.points or side.extras or sc.has_entered(side.score)
+    )
+
+
+def withdraw_team(
+    teams: list[Team],
+    rounds: list[Round],
+    scoring: object,
+    team_id: str,
+    reason: str = "弃权",
+    *,
+    now: str = "",
+    max_passes: int = 8,
+) -> tuple[list[Round], list[str]]:
+    """判某支队伍**退赛**：本届里他剩下还没打的对局**一并判负**（对手按胜计）。
+
+    现实竞赛规则就是这么处理退赛的：**已完成的比赛结果有效，未完成的对局全部判负**
+    （对手按胜局计分），退赛者名次垫底；淘汰赛只按签表槽位向前推进，**不重排对阵**
+    （见 :func:`advance_seeds`）。
+
+    淘汰赛的席位是推导出来的——败者组的席位要等上一场判完才出现——所以这里反复
+    「判 → 重新推导」，直到这个队身上没有未赛对局为止（双败最深再走两轮；``max_passes``
+    只是防呆，不会成为实际限制）。
+
+    返回 ``(新的对局列表, 被判负的对局编号)``。找不到这个队（一场都没占席）时原样返回。
+    """
+    if not team_id:
+        return rounds, []
+    resolved = [r.model_copy(deep=True) for r in rounds]
+    judged: list[str] = []
+    for _ in range(max_passes):
+        pending: list[tuple[Round, str]] = []
+        for rnd in resolved:
+            for idx, side in enumerate(rnd.sides):
+                if side.team_id == team_id and not side_settled(side, scoring):
+                    pending.append((rnd, chr(ord("A") + idx)))
+                    break
+        if not pending:
+            break
+        for rnd, key in pending:
+            apply_walkover(rnd, key, reason, now=now)
+            if rnd.code:
+                judged.append(rnd.code)
+        resolved = resolve_tournament(teams, resolved, scoring)
+    return resolved, judged
+
+
 # --------------------------------------------------------------------------- #
 # 组装
 # --------------------------------------------------------------------------- #
@@ -1415,18 +1585,56 @@ def size_from_rounds(rounds: list[Round]) -> int:
     return sum(len(r.source_refs) for r in wb if r.bracket_round == first)
 
 
+def frozen_seeds(rounds: list[Round], size: int) -> list[str]:
+    """**已经产生的那版对阵里记着的**种子顺序（席位没填齐就返回空列表）。
+
+    淘汰赛首轮的席位出处是 ``seed:K``（K = 1…size，位序见 :func:`bracket_order`），
+    当初填进那一席的是谁就留在 ``side.team_id`` 上——所以「已经产生的对阵」本身就是
+    那份种子顺序的存档，不必另存字段。返回空列表 = 这批席位还没填（对阵还没产生）。
+    """
+    found: dict[int, str] = {}
+    for rnd in rounds:
+        if rnd.stage in ("group", "league"):
+            continue
+        for idx, ref in enumerate(rnd.source_refs):
+            if not ref.startswith("seed:") or idx >= len(rnd.sides):
+                continue
+            try:
+                pos = int(ref[5:])
+            except ValueError:
+                continue
+            team_id = rnd.sides[idx].team_id
+            if team_id and 1 <= pos <= size:
+                found[pos] = team_id
+    if len(found) != size:
+        return []
+    return [found[pos] for pos in range(1, size + 1)]
+
+
 def advance_seeds(
     teams: list[Team], rounds: list[Round], scoring: object = metrics.INTEGER
 ) -> list[str]:
-    """当前晋级淘汰赛的**种子顺序**（小组赛未结束时返回空列表）。
+    """当前晋级淘汰赛的**种子顺序**（对阵还没产生时才是「待定」，返回空列表）。
 
-    * 还没开打：走 :func:`bracket_seeds`（交叉配对，同组首轮不相遇）；
-    * **已经开打**：按小组赛总排名原样排（即当初生成这版对阵时用的老算法）——
-      算法升级不许回溯改写已经打下来的比赛，否则一次普通写入就会把已录的淘汰赛成绩
-      作废。想换算法就把淘汰赛场次重置（冻结随之解除，见 :func:`knockout_started`）；
-    * 没有小组赛（队伍太少，直接淘汰赛）时按队伍顺序排。
+    **对阵一经产生就冻结**：席位上都带着 ``seed:K`` 出处与当初那支队伍，直接读回来即可
+    （见 :func:`frozen_seeds`）。这是正式竞赛规则的通行做法——抽签 / 编排**一经公布不再
+    更改**，弃权只判对手获胜（W.O.）、由签表槽位向前推进，绝不重抽重排（网球、羽毛球、
+    联赛竞赛规程都这么写）。不这么做的话，任何一次成绩变动都会换掉一批人的对手，甚至连带
+    把已录的成绩作废（见 :func:`resolve_rounds`）——判一次弃权就能触发。
+
+    要换对阵只有一条路：**重新生成赛程**。那是明确的操作，会清掉成绩，前端也会先确认。
+
+    只有**席位还没填**（对阵还没排出来）时才现算这一版：
+
+    * 还没开打 → :func:`bracket_seeds`（交叉配对，同组首轮不相遇）；
+    * 没有小组赛（队伍太少，直接淘汰赛）→ 按队伍顺序；
+    * 半路数据兜底（席位只填了一部分却已经开打）→ 沿用 :func:`overall_ranking` 的老口径，
+      宁可保守，也不要在已经开打之后换掉别人正在打的对手。
     """
     size = size_from_rounds(rounds) or bracket_size(len(teams))
+    frozen = frozen_seeds(rounds, size)
+    if frozen:
+        return frozen
     if not any(r.stage == "group" for r in rounds):
         return [t.id for t in teams][:size]
     if not group_stage_done(rounds):

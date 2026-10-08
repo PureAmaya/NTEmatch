@@ -14,12 +14,36 @@ from __future__ import annotations
 
 import pytest
 
-from app import db, outbox, qqbot
+from app import announce, db, outbox, qqbot
 from app.auth import hash_secret
 from app.main import app
 from app.store import store
 
 BOT_TOKEN = "nte_test_bot_token"
+
+
+@pytest.fixture(autouse=True)
+async def _own_event():
+    """每条用例跑在**自己新建的一届**上。
+
+    这组用例的写法是「先存下当前对局 → 铺一场 → 跑完再写回去」。而**已结束的比赛是只读的**
+    （见 ``store`` 的闸门）：共用的那一届里如果已经有打完的场次，铺场景/写回去就会撞上它。
+    自己建一届（空赛程）就跟别人无关了。
+    """
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("推送用例届")
+    mine = store.current_id
+    try:
+        yield
+    finally:
+        for rnd in store.snapshot().rounds:
+            await store.set_meta(announce.mark_of(mine, rnd.code or str(rnd.index)), "")
+        if previous and previous != mine:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
 
 
 def _image_settings() -> dict:

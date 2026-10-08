@@ -8,9 +8,36 @@
 
 from __future__ import annotations
 
-from app import metrics
+import pytest
+
+from app import announce, db, metrics
 from app.models import Player, Round, Side
 from app.store import store
+
+
+@pytest.fixture(autouse=True)
+async def _own_event():
+    """每条用例跑在**自己新建的一届**上。
+
+    这些用例会「铺一场对局再录分」——而**已结束的比赛是只读的**（见 ``store`` 的闸门）：
+    共用的那一届里，上一条用例打完的 L-1 还躺在赛程里，这一条再铺同一编号就是改它的成绩。
+    自己建一届（空赛程）就跟别人无关了，谁来跑都一样。
+    """
+    db.init_db(store._db_path)
+    if not store.current_id:
+        await store.start()
+    previous = store.current_id
+    await store.create_event("计分口径用例届")
+    mine = store.current_id
+    try:
+        yield
+    finally:
+        # 「已播报」标记按届 id 记，而届 id 会被复用：删届前先清干净，别脏了下一条用例
+        for rnd in store.snapshot().rounds:
+            await store.set_meta(announce.mark_of(mine, rnd.code or str(rnd.index)), "")
+        if previous and previous != mine:
+            await store.switch_event(previous)
+        await store.delete_event(mine)
 
 
 async def _seed_league_round(
