@@ -4,6 +4,9 @@ data/
 backups/
 
 # 开发环境与缓存
+# Go 侧车在镜像里现编（见 Dockerfile 的 ntecalc 阶段），本地旧产物不能混进去
+go/bin/
+go/dist/
 .venv/
 .ruff_cache/
 __pycache__/

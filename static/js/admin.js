@@ -769,6 +769,19 @@ export async function refreshDiagnostics() {
           `（通知 / 信息插图与本地头像，同图只存一份）`,
       ],
       ['待升级凭据', d.legacyCredentials ? `${d.legacyCredentials} 位成员仍是旧格式` : '无'],
+      [
+        '赛程引擎',
+        d.calc?.enabled
+          ? `Go 计算侧车（${d.calc.running ? '运行中' : '待启动'}）`
+          : `Python 实现${d.calc?.reason ? `（${d.calc.reason}）` : ''}`,
+      ],
+      [
+        '最慢接口',
+        (d.perf || [])
+          .slice(0, 3)
+          .map((r) => `${r.route} ${r.p95}ms（${r.calls} 次）`)
+          .join(' · ') || '—',
+      ],
       ['赛制状态', scheduleQualityText()],
     ]
       .map(([k, v]) => `<div class="kv__row"><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`)

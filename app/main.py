@@ -40,6 +40,7 @@ from . import (
     bot_api,
     card,
     credits,
+    gocalc,
     helpcard,
     hot,
     hot_api,
@@ -52,6 +53,7 @@ from . import (
     metrics,
     notices_api,
     outbox,
+    perf,
     qqbot_api,
     remind,
     subs,
@@ -73,6 +75,7 @@ from .models import (
     Substitution,
     Team,
 )
+from .perf import TimingMiddleware
 from .security import (
     optional_session,
     require_admin,
@@ -810,6 +813,8 @@ async def lifespan(app: FastAPI):
         await auth.detach()
         await store.stop()
         await avatars.aclose()
+        # Go 计算侧车：显式收掉子进程（它在 stdin EOF 时也会自己退出，这里只是不留等待窗口）
+        await asyncio.to_thread(gocalc.shutdown)
         # 先收掉还没跑完的探测任务，再关连接池：否则它可能在关池的瞬间发起请求
         await live.stop_refresher()
         await live.aclose()
@@ -855,6 +860,8 @@ app.add_middleware(EdgeCacheMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 # 操作日志（只记非 GET 的 /api 请求；见 AuditMiddleware 的取舍说明）
 app.add_middleware(AuditMiddleware)
+# 耗时观测：**最后加 = 最外层**，量到的是客户端实际等到的时间（含压缩与安全头）
+app.add_middleware(TimingMiddleware)
 
 app.include_router(live.router)
 app.include_router(members_api.router)
@@ -1000,6 +1007,10 @@ async def api_diagnostics(_: Session = Depends(require_event)) -> dict[str, Any]
         # 公告图片占用（与头像缓存并列：这两个是唯一会自己长大的数据目录）
         "uploads": media.stats(),
         "live": live.stream_endpoints(),
+        # Go 计算侧车：未启用/熔断时赛程生成走 Python 实现，功能不变、速度慢一些
+        "calc": gocalc.describe(),
+        # 最慢的几个接口（进程启动以来累计，见 app/perf.py）
+        "perf": perf.snapshot(),
         "issues": validate_config(cfg),
         # 还有几位成员的凭据是历史无盐格式（建议轮换）
         "legacyCredentials": len(store.legacy_credential_members()),

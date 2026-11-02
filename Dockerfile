@@ -1,5 +1,14 @@
-# 单阶段就够了：这个项目没有构建步骤——后端是纯 Python，前端是原生 ESM + CSS，
-# 没有打包器也就没有构建产物要拷来拷去。
+# 后端的计算侧车（积分制轮换赛程搜索，见 go/）要编译成静态二进制。
+# 单开一个构建阶段，最终镜像里只有一个二进制，运行时不带 Go 工具链。
+FROM golang:1.23-alpine AS ntecalc
+
+WORKDIR /src
+COPY go/ ./
+# CGO 关掉才能得到完全静态的二进制（slim 镜像里没有 glibc 的编译期依赖）
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.buildTag=docker" \
+    -o /out/ntecalc ./cmd/ntecalc
+
+# 主镜像仍是纯 Python：前端是原生 ESM + CSS，没有打包器也就没有构建产物。
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -26,6 +35,9 @@ RUN pip install --no-cache-dir uv \
 
 COPY app ./app
 COPY static ./static
+# 计算侧车装进 PATH：app/gocalc.py 找不到 go/bin/ntecalc 时会退到 which(ntecalc)。
+# 少这一步就只能跑纯 Python 实现——功能一样，只是赛程生成慢十几倍。
+COPY --from=ntecalc /out/ntecalc /usr/local/bin/ntecalc
 
 # 数据（config / data / backups）统一放 /data：挂一个卷就够，容器重建不丢赛事数据。
 # 见 app/store.py 的 DATA_ROOT（默认在仓库里，这里被挪到卷上）。

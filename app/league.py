@@ -16,7 +16,7 @@ from collections.abc import Iterable, Iterator
 from itertools import combinations
 from typing import Any
 
-from . import metrics
+from . import gocalc, metrics
 from .logging_conf import get_logger
 from .models import Config, Player, Round, Side, SideKey
 
@@ -217,10 +217,57 @@ def _build_rotation_rounds(
                 side_a,
                 side_b,
                 total_rounds,
-                note=("轮空: " + "、".join(p.display_name for p in resting)) if resting else "",
+                note=_rest_note(resting),
             )
         )
     return rounds, total_cost
+
+
+def _rest_note(resting: list[Player]) -> str:
+    """轮空名单的备注文案（Go 侧不生成文案，只回 id，这里统一拼）。"""
+    return ("轮空: " + "、".join(p.display_name for p in resting)) if resting else ""
+
+
+def _rotation_via_python(
+    players: list[Player], team_size: int, total_rounds: int, seed: int | None, fair: bool
+) -> list[Round]:
+    """多起点随机搜索的 Python 实现：Go 侧车不可用时走这里（也是权威语义）。"""
+    base_seed = seed if seed is not None else 20261003
+    best: tuple[float, list[Round]] | None = None
+    for restart in range(_RESTARTS):
+        rng = random.Random(base_seed + restart * 7919)
+        rounds, cost = _build_rotation_rounds(players, team_size, total_rounds, rng, fair)
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, rounds)
+    assert best is not None
+    return best[1]
+
+
+def _rotation_via_gocalc(
+    players: list[Player], team_size: int, total_rounds: int, seed: int | None, fair: bool
+) -> list[Round] | None:
+    """交给 Go 侧车搜索；不可用、超时或结果不合法都返回 ``None``（调用方回退）。
+
+    Go 只回「每局 A/B 双方与轮空名单」的 id，:class:`Round` 的编号、标题与备注
+    仍由 :func:`_make_round` 生成——展示文案只在这一处定义。
+    """
+    decided = gocalc.rotation(
+        [(p.id, p.display_name) for p in players],
+        team_size,
+        total_rounds,
+        seed,
+        fair,
+    )
+    if decided is None:
+        return None
+    by_id = {p.id: p for p in players}
+    rounds: list[Round] = []
+    for index, item in enumerate(decided, start=1):
+        side_a = [by_id[pid] for pid in item["a"]]
+        side_b = [by_id[pid] for pid in item["b"]]
+        resting = [by_id[pid] for pid in item.get("resting") or [] if pid in by_id]
+        rounds.append(_make_round(index, side_a, side_b, total_rounds, note=_rest_note(resting)))
+    return rounds
 
 
 def _max_rest_streak(players: list[Player], rounds: list[Round]) -> int:
@@ -254,15 +301,10 @@ def generate_rotation_rounds(
     if len(players) < need:
         raise ValueError(f"可用选手 {len(players)} 人，少于单场所需的 {need} 人")
 
-    base_seed = seed if seed is not None else 20261003
-    best: tuple[float, list[Round]] | None = None
-    for restart in range(_RESTARTS):
-        rng = random.Random(base_seed + restart * 7919)
-        rounds, cost = _build_rotation_rounds(players, team_size, total_rounds, rng, fair)
-        if best is None or cost < best[0] - 1e-9:
-            best = (cost, rounds)
-    assert best is not None
-    rounds = best[1]
+    rounds = _rotation_via_gocalc(players, team_size, total_rounds, seed, fair)
+    used_go = rounds is not None
+    if rounds is None:
+        rounds = _rotation_via_python(players, team_size, total_rounds, seed, fair)
 
     quality = quality_of_rounds(rounds)
     warnings: list[str] = []
@@ -275,7 +317,8 @@ def generate_rotation_rounds(
     if _max_rest_streak(players, rounds) >= 2:
         warnings.append("存在选手连续两局以上轮空，可增加总轮次或扩大报名池。")
     log.info(
-        "赛程生成完毕 | 模式=动态轮换 | 选手池=%d | 局数=%d | seed=%s | 重复搭档=%d | 重复对手=%d",
+        "赛程生成完毕 | 模式=动态轮换 | 引擎=%s | 选手池=%d | 局数=%d | seed=%s | 重复搭档=%d | 重复对手=%d",
+        "go" if used_go else "python",
         len(players),
         total_rounds,
         seed,
