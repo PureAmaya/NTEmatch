@@ -21,8 +21,6 @@ ROOT = Path(__file__).resolve().parent.parent
 # AGPL-3.0 与它们都兼容：宽松许可 + 弱著佐权（MPL / PSF 属弱或兼容型）。
 ALLOWED = {
     "mit",
-    # Pillow 用的是 MIT-CMU（即 HPND，宽松许可，只是名字不一样）
-    "mit-cmu",
     "bsd-2-clause",
     "bsd-3-clause",
     "apache-2.0",
@@ -118,7 +116,7 @@ def test_payload_is_public_and_complete():
     assert payload["author"]["name"] and payload["author"]["bilibili"]
     assert payload["license"]["url"].startswith("https://")
     titles = [group["title"] for group in payload["groups"]]
-    assert titles == ["运行依赖", "前端资源", "外部程序", "开发与 CI"]
+    assert titles == ["运行依赖", "前端资源", "Go 侧车", "外部程序", "开发与 CI"]
     assert all(group["items"] for group in payload["groups"])
 
 

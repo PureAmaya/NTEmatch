@@ -437,7 +437,7 @@ class NTEMatchPlugin(star.Star):
     # ------------------------------------------------------------------ #
     @property
     def base_url(self) -> str:
-        return str(_conf(self.config, "base_url", "http://127.0.0.1:8000")).rstrip("/")
+        return str(_conf(self.config, "base_url", "http://127.0.0.1:10961")).rstrip("/")
 
     @property
     def token(self) -> str:
@@ -635,7 +635,7 @@ class NTEMatchPlugin(star.Star):
         与 ``("text", 内容)``。**顺序就是服务端给的顺序**（先图后文），别在这里重排——
         「比赛信息」有卡片时，文字部分只省下一行说明（内容都在图里）。
 
-        站点没装 Pillow 时 ``card`` 为 null、文本里也已经带了规则摘要，
+        站点上没有出图侧车时 ``card`` 为 null、文本里也已经带了规则摘要，
         所以这里**不需要**分支：有图就发图，没图就发文本。
         """
         target, error = await self._resolve_event(event_id)

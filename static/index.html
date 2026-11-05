@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b0e1c">
+<meta name="theme-color" content="#070a12">
 <meta name="color-scheme" content="dark">
 <meta name="description" content="NTE 比赛（异环）通用赛事平台：自动分组、积分结算、选手档案与直播推流。">
 <title>NTE 比赛 · 赛事平台</title>
@@ -24,12 +24,14 @@
 <link rel="modulepreload" href="/static/js/events.js">
 <link rel="modulepreload" href="/static/js/teams.js">
 <link rel="modulepreload" href="/static/js/live.js">
+<link rel="modulepreload" href="/static/js/director.js">
 <link rel="modulepreload" href="/static/js/views.js">
 <link rel="modulepreload" href="/static/js/admin.js">
 <link rel="modulepreload" href="/static/js/actions.js">
 <link rel="modulepreload" href="/static/js/members.js">
 <link rel="modulepreload" href="/static/js/mdeditor.js">
 <link rel="modulepreload" href="/static/js/credits.js">
+<link rel="modulepreload" href="/static/js/botlab.js">
 <link rel="modulepreload" href="/static/js/hot.js">
 </head>
 <body>
@@ -146,10 +148,21 @@
 
   <section class="view" id="view-live" data-view="live" hidden>
     <div class="panel panel--stage" id="liveStage"></div>
+    <p class="live-more">
+      <a class="live-more__link" href="/director" data-route
+         title="四宫格同时看多路直播（导播台）">导播台 · 多画面</a>
+    </p>
     <div class="grid grid--2">
       <div class="panel" id="pushPanel"></div>
       <div class="panel" id="liveInfoPanel"></div>
     </div>
+  </section>
+
+  <!-- 导播台（/director）：四宫格同时看多路直播。属于独立页（不带届 ID），
+       骨架由 views.js 渲染一次，之后只换每格挂的机位——元素重建等于四路重连，
+       见 static/js/director.js 顶部的说明。 -->
+  <section class="view" id="view-director" data-view="director" hidden>
+    <div id="directorBody"></div>
   </section>
 
   <section class="view" id="view-channels" data-view="channels" hidden>
@@ -174,6 +187,12 @@
 
   <section class="view" id="view-user" data-view="user" hidden>
     <div id="userBody"></div>
+  </section>
+
+  <!-- 机器人沙盒（/bot）：**调试模式专用**，模拟 QQ 机器人会发出去的文本与卡片图。
+       接口在 NTE_DEBUG 没开时是 404（见 app/botlab_api.py），页面本身也就空着。 -->
+  <section class="view" id="view-bot" data-view="bot" hidden>
+    <div id="botBody"></div>
   </section>
 
   <!-- 开发者页（/developer）：关于作者、联系方式、开源许可与开源组件清单 -->

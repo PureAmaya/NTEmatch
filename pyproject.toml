@@ -11,10 +11,9 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "httpx>=0.27",
     "pydantic>=2.7",
-    # 图片推送（QQ 群里的「比赛信息」发的那张卡片）与机器人帮助图都靠它渲染，
-    # 所以是**正式依赖**，不是可选件——默认装好就有图。
-    # 万一某个环境没装上，渲染会安静退回纯文本（那是兜底，不是常态，见 app/card.py）。
-    "pillow>=10",
+    # 出图（比赛卡片 / 结果卡片 / 帮助图 / 分享图）走 Go 侧车 ``nterender``
+    # （见 go/cmd/nterender 与 app/render.py），Python 侧不再需要图像库。
+    # 二进制缺失时渲染会安静退回纯文本（那是兜底，不是常态，见 app/card.py）。
 ]
 
 [project.urls]

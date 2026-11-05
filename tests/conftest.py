@@ -119,3 +119,40 @@ async def _restore_event_status():
         await store.update(
             {"event": {"status": status, "endTime": end_time}}, actor="test:restore-status"
         )
+
+@pytest.fixture
+def image_size():
+    """读 PNG / JPEG 的文件头拿宽高。
+
+    测试**不再依赖 Pillow**：出图已经移到 Go 侧车，拿图像库只为量个尺寸不值当
+    （也让 `uv sync --no-dev` 的环境能跑完整个测试集）。
+    """
+
+    def _png(data: bytes) -> tuple[int, int]:
+        # PNG：IHDR 紧跟在 8 字节魔数 + 4 字节长度 + 4 字节类型之后
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+    def _jpeg(data: bytes) -> tuple[int, int]:
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            length = int.from_bytes(data[i + 2 : i + 4], "big")
+            # SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15 里带着尺寸
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                height = int.from_bytes(data[i + 5 : i + 7], "big")
+                width = int.from_bytes(data[i + 7 : i + 9], "big")
+                return width, height
+            i += 2 + length
+        raise ValueError("不是可识别的 JPEG")
+
+    def _size(data: bytes) -> tuple[int, int]:
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return _png(data)
+        if data[:2] == b"\xff\xd8":
+            return _jpeg(data)
+        raise ValueError("既不是 PNG 也不是 JPEG")
+
+    return _size

@@ -140,10 +140,16 @@ const CHANNEL_IDS = {
 /**
  * 直播播放控制器（8889 / WebRTC 优先，8888 / HLS 兜底）。
  *
- * 抽成可复用工厂：比赛直播页与成员频道板块各持有一个实例，互不干扰——
+ * 抽成可复用工厂：比赛直播页、成员频道板块与导播台各持有一个实例，互不干扰——
  * 元素 id 不同，实例状态（pc / token / 正在播的机位）也各自独立。
+ *
+ * ``options.manageAudio``（默认 ``true``）：是否由播放器自己套全站音量偏好。
+ * 导播台一格一路、必须各自静音，且**不能**把「我静音了某一格」写回全站偏好
+ * （否则观众回直播页会发现声音没了），所以它传 ``false`` 自己管。
  */
-function makePlayer(ids) {
+export function makePlayer(ids, options = {}) {
+  // 导播台自己管音量：既不套全局偏好，也不把音量变化写回全局
+  const manageAudio = options.manageAudio !== false;
   // 只在本播放器的容器内查找元素，两个板块的同名结构不会互相串到
   const q = (sel) => ((ids.stage && qs(ids.stage)) || document).querySelector(sel);
   return {
@@ -166,6 +172,8 @@ function makePlayer(ids) {
     // 任何「用户自己想看」的动作（选台 / 点播放 / 换线路）都会把它清掉。
     stoppedByUser: false,
     hlsInst: null, // hls.js 实例（非原生 HLS 的浏览器才有）
+    // 调试模式的模拟画面（canvas 流）：{ raf, stream }，停止时要连动画一起收掉
+    mock: null,
 
   el: () => q(ids.video),
 
@@ -202,7 +210,7 @@ function makePlayer(ids) {
    * 就等于把观众刚调好的音量（以及「别静音」这个默认）丢掉。
    */
   applyAudio(video) {
-    if (!video) return;
+    if (!video || !manageAudio) return;
     video.muted = Boolean(App.liveMuted);
     if (Number.isFinite(App.liveVolume) && App.liveVolume > 0) video.volume = App.liveVolume;
   },
@@ -211,6 +219,12 @@ function makePlayer(ids) {
   bindVideo(video) {
     if (!video || video.dataset.nteAudio === '1') return;
     video.dataset.nteAudio = '1';
+    if (!manageAudio) {
+      // 只关心「这一路没了」：音量由调用方按格子决定，不回写全站偏好
+      video.addEventListener('ended', () => this.markDead(video));
+      video.addEventListener('emptied', () => this.markDead(video));
+      return;
+    }
     video.addEventListener('volumechange', () => {
       App.liveMuted = video.muted;
       App.liveVolume = video.volume;
@@ -498,6 +512,61 @@ function makePlayer(ids) {
     log.info('直播使用 WebRTC', url);
   },
 
+  /**
+   * 调试模式的模拟机位：不连任何地址，用 canvas 现画一路画面。
+   *
+   * 为什么放在播放器里而不是导播台：直播页与导播台用的是同一个实例工厂，写在这里
+   * 两边都有；而且「重复调用不重连」「切台要收干净」「音量跟着走」这些语义必须与
+   * 真实机位完全一致——在别处另写一份，迟早会漂。
+   *
+   * 画面故意带一个随时间移动的色块与秒表：静态图看不出「卡住了没」。
+   */
+  playMock(room) {
+    const video = this.el();
+    if (!video) return;
+    this.setCover('调试模拟机位', '没有真实推流，画面由浏览器本地生成');
+    this.setState('模拟画面');
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 360;
+    const ctx = canvas.getContext('2d');
+    const label = room?.key || 'mock';
+    const started = Date.now();
+    const paint = () => {
+      if (!ctx) return;
+      const elapsed = Date.now() - started;
+      const hue = (elapsed / 40) % 360;
+      const { width, height } = canvas;
+      const grad = ctx.createLinearGradient(0, 0, width, height);
+      grad.addColorStop(0, `hsl(${hue}, 60%, 14%)`);
+      grad.addColorStop(1, `hsl(${(hue + 60) % 360}, 55%, 8%)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, width, height);
+      // 来回移动的色块：画面确实在动
+      const x = ((elapsed / 8) % (width - 120)) | 0;
+      ctx.fillStyle = `hsla(${hue}, 90%, 60%, .85)`;
+      ctx.fillRect(x, height - 40, 120, 6);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = 'rgba(235, 245, 255, .92)';
+      ctx.font = 'bold 44px system-ui, sans-serif';
+      ctx.fillText(label, width / 2, height / 2 - 6);
+      ctx.fillStyle = 'rgba(160, 200, 230, .75)';
+      ctx.font = '20px monospace';
+      ctx.fillText(`调试模拟画面 · ${(elapsed / 1000).toFixed(1)}s`, width / 2, height / 2 + 34);
+    };
+    paint();
+    const stream = canvas.captureStream(12);
+    this.mock = { raf: 0, stream };
+    const tick = () => {
+      paint();
+      if (this.mock) this.mock.raf = requestAnimationFrame(tick);
+    };
+    this.mock.raf = requestAnimationFrame(tick);
+    video.srcObject = stream;
+    this.attach(video);
+    log.info('直播使用调试模拟画面', label);
+  },
+
   /** 播放一个机位；room 为 key_endpoints 结果（B站 机位是 ``{bili: true, embed, jump}``）。 */
   async playRoom(room) {
     const target = room && room.key ? room : null;
@@ -514,6 +583,25 @@ function makePlayer(ids) {
       this.room = target;
       this.playing = { key: target.key, mode: 'bili' };
       this.setState('B站直播中');
+      return;
+    }
+    if (target?.mock) {
+      // 调试模式：地址是假的（本地没有媒体服务器），画面由 playMock 现画。
+      // 复用判断与真实机位同一套：还活着就只恢复播放，不重开一条 canvas 流。
+      const mockVideo = this.el();
+      if (
+        this.isAlive(mockVideo) &&
+        this.playing.key === target.key &&
+        this.playing.mode === 'mock'
+      ) {
+        this.hideCover();
+        if (mockVideo && mockVideo.paused) this.playSafely(mockVideo);
+        return;
+      }
+      await this.stop(false);
+      this.room = target;
+      this.playMock(target);
+      this.playing = { key: target.key, mode: 'mock' };
       return;
     }
     const st = App.state?.stream || {};
@@ -611,6 +699,16 @@ function makePlayer(ids) {
     this.playing = { key: '', mode: '' };
     this.pending = '';
     this.destroyHls();
+    // 模拟画面：先停动画再收流（只清 srcObject 的话，raf 还会每秒画 12 次）
+    if (this.mock) {
+      cancelAnimationFrame(this.mock.raf);
+      try {
+        this.mock.stream.getTracks().forEach((track) => track.stop());
+      } catch (err) {
+        log.debug('停止模拟画面异常（忽略）', err);
+      }
+      this.mock = null;
+    }
     if (this.pc) {
       try {
         this.pc.getReceivers().forEach((r) => r.track && r.track.stop());
@@ -916,7 +1014,7 @@ export function installStageDelegation() {
       });
       toast(
         App.liveProto
-          ? `已切换到 ${proto === 'hls' ? 'HLS（TCP，抗抖动）' : 'WebRTC（UDP，低延迟）'} 线路`
+          ? `已切换到 ${proto === 'hls' ? 'HLS' : 'WebRTC'} 线路`
           : '已恢复默认线路',
         'info',
         4000

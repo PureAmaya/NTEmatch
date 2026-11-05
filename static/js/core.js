@@ -1,11 +1,13 @@
 /* 核心层：日志 / 通用工具 / 客户端状态 / REST / 弹窗 / 提示
  * 该模块不依赖任何视图，供上层（views / admin / actions / app）复用。
- * 调试：?debug=1 或 localStorage['nte:debug']='1'
+ * 调试：?debug=1、localStorage['nte:debug']='1'，或后端以 --debug 启动
+ *（首页会注入 <meta name="nte-debug">，不用每次手动加参数）
  */
 
 export const DEBUG =
   new URLSearchParams(location.search).get('debug') === '1' ||
-  localStorage.getItem('nte:debug') === '1';
+  localStorage.getItem('nte:debug') === '1' ||
+  document.querySelector('meta[name="nte-debug"]')?.content === '1';
 
 export const log = {
   debug: (...a) => DEBUG && console.debug('[nte]', ...a),
@@ -487,12 +489,14 @@ export const PAGES = [
   'schedule',
   'roster',
   'live',
+  'director',
   'manage',
   'channels',
   'events',
   'server',
   'user',
   'developer',
+  'bot',
 ];
 /**
  * 不属于任何一届的独立页（地址不带届 ID）。
@@ -503,11 +507,15 @@ export const PAGES = [
  */
 export const STANDALONE_PAGES = [
   'home',
+  // 导播台看的是「此刻谁在推流」，与某一届无关：做成独立页，分享出去的
+  // /director 在谁那里都能直接打开，也不必先切到那一届。
+  'director',
   'channels',
   'events',
   'server',
   'user',
   'developer',
+  'bot',
   'denied',
 ];
 export const PAGE_LABEL = {
@@ -516,6 +524,7 @@ export const PAGE_LABEL = {
   schedule: '赛程',
   roster: '选手',
   live: '直播',
+  director: '导播',
   channels: '频道',
   events: '全部赛事',
   manage: '赛事管理',
@@ -574,6 +583,7 @@ export function routePath(eventId = '', page = 'overview', channelId = '') {
     return channelId ? `/channels/${encodeURIComponent(channelId)}` : '/channels';
   }
   if (p === 'events') return '/events';
+  if (p === 'director') return '/director';
   if (p === 'server') return '/admin';
   if (p === 'user') return '/user';
   if (p === 'developer') return '/developer';

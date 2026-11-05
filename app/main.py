@@ -32,14 +32,17 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
 from . import (
+    DEFAULT_PORT,
     __version__,
     announce,
     avatars,
     backup,
     backup_api,
     bot_api,
+    botlab_api,
     card,
     credits,
+    debug,
     gocalc,
     helpcard,
     hot,
@@ -356,6 +359,8 @@ _STANDALONE_META: dict[str, tuple[str, str]] = {
     "admin": ("服务器管理", "成员、届次、备份、QQ 机器人与直播封禁。"),
     "user": ("我的", "个人资料、直播间名字与凭据轮换。"),
     "developer": ("开发者", "关于作者、联系方式与开源许可。"),
+    # 只在调试模式下真的能打开（路由本身也在 NTE_DEBUG 时才注册，见下）
+    "bot": ("机器人沙盒", "调试模式专用：模拟 QQ 机器人会发出去的文本与卡片图。"),
 }
 _TITLE_RE = re.compile(r"<title>.*?</title>", re.DOTALL)
 _DESC_RE = re.compile(r'<meta name="description" content=".*?">', re.DOTALL)
@@ -456,6 +461,9 @@ def _inject_meta(html: str, meta: dict[str, str]) -> str:
             )
     # summary_large_image 才能把图铺成横向大卡（默认 summary 只有小方图）
     og += '<meta name="twitter:card" content="summary_large_image">'
+    if _DEBUG_ON:
+        # 前端 core.js 读它来决定 log.debug 是否输出（见 --debug 的说明）
+        og += '<meta name="nte-debug" content="1">'
     out = _TITLE_RE.sub(f"<title>{title}</title>", html, count=1)
     out = _DESC_RE.sub(f'<meta name="description" content="{desc}">', out, count=1)
     return out.replace("</head>", f"{og}</head>", 1)
@@ -711,6 +719,9 @@ def build_public_state(cfg: Config) -> dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.start()
+    # 调试模式：**空库**时写一份演示赛事（选手 / 赛程 / 进行中的对局）。
+    # 没有它，所有页面都是空状态，直播与导播台也无从调起；已有数据一律不碰。
+    await debug.ensure_demo(store)
     # 登录会话落库并起一个「写回」巡检：热更新会换掉进程，会话必须活过换代，
     # 否则每更新一次就把所有人踢下线（见 app/auth.py 与 app/hot.py 的说明）。
     await auth.attach(store.path)
@@ -743,7 +754,7 @@ async def lifespan(app: FastAPI):
     # 关停时由 live.stop_refresher() 统一收掉（见下面的 finally）。
     live.start_watcher()
     # QQ 机器人帮助图：启动时重画一份（产物不入库，见 app/helpcard.py）。
-    # 放线程里做（画图 + 存盘约半秒），不拖慢启动；没装 Pillow 就只记一行日志。
+    # 放线程里做（一次出图几十毫秒），不拖慢启动；没有侧车就只记一行日志。
     help_task = asyncio.create_task(asyncio.to_thread(helpcard.refresh))
     # 图片仓库收拢：把「旧布局」里单独存放的本地上传头像并进统一仓库，
     # 顺手删掉历史重复（同一张图以前会在头像 / 公告两个目录各存一份）。
@@ -761,8 +772,8 @@ async def lifespan(app: FastAPI):
     log.info("=" * 68)
     log.info("NTE 比赛平台已启动 | 当前届: %s (%s)", cfg.event.name, store.current_id)
     log.info("数据库: %s", store.path)
-    log.info("本机访问: http://127.0.0.1:%s", os.getenv("NTE_PORT", "8000"))
-    log.info("登录方式：成员密钥（服务器管理员忘记密钥可执行 `uv run python -m app --reset-key`）")
+    log.info("本机访问: http://127.0.0.1:%s", os.getenv("NTE_PORT", str(DEFAULT_PORT)))
+    log.info("登录方式：成员密钥（服务器管理员忘记密钥可执行 `uv run main.py --reset-key`）")
     log.info("=" * 68)
     # 一切就绪（数据库、后台任务、广播中心）——告诉热更新守护「可以停掉旧进程了」。
     # 这一行的位置就是「零中断」的关键：**调它之前**父进程绝不会动旧进程。
@@ -783,7 +794,7 @@ async def lifespan(app: FastAPI):
             "热更新模式 | 事件循环=%s | 会话落库=%s | 卡片渲染=%s | Python=%s",
             report["loop"],
             "开" if report["sessions"] else "关",
-            "开" if report["cards"] else "关（没装 Pillow，推送走纯文本）",
+            "开" if report["cards"] else "关（没有出图侧车，推送走纯文本）",
             report["python"],
         )
     if hot.notify_ready():
@@ -825,6 +836,11 @@ async def lifespan(app: FastAPI):
 # 它们会把全部接口、参数与数据模型摊开给任何访客看——自用站点并不需要，
 # 而「知道有哪些接口」正是扫描器第一步。要对接 / 调试时设 NTE_DOCS=1 打开。
 _DOCS_ON = os.getenv("NTE_DOCS", "").strip().lower() in ("1", "true", "yes", "on")
+
+# 调试模式（``uv run main.py --debug``，见 app/cli.py）：首页注入一个标记，
+# 让前端 log.debug 自动打开——否则得手动在地址后加 ?debug=1，换个页面就忘了。
+# 判定统一走 app.debug.active()，避免这里和 logic / live 各写一份环境变量解析。
+_DEBUG_ON = debug.active()
 
 app = FastAPI(
     title="NTE 比赛",
@@ -868,6 +884,7 @@ app.include_router(members_api.router)
 app.include_router(backup_api.router)
 app.include_router(legacy_api.router)
 app.include_router(qqbot_api.router)
+app.include_router(botlab_api.router)
 app.include_router(bot_api.router)
 app.include_router(notices_api.router)
 app.include_router(hot_api.router)
@@ -1101,9 +1118,12 @@ async def api_auth_local(request: Request) -> dict[str, Any]:
 
     判定见 ``login_guard.is_local``（回环地址 + 无转发头 + Host 为本机名），
     且可在 `/admin → 登录限制` 里用「本机不设防」开关整体关闭。
+
+    **调试模式忽略那个开关**（``force``）：既然是本地调试，就不该先绕去管理端
+    把开关打开才能进；回环 / 转发头 / Host 三条判定一条都没放松。
     """
     settings = store.guard_settings()
-    if not login_guard.is_local(request, settings):
+    if not login_guard.is_local(request, settings, force=_DEBUG_ON):
         raise HTTPException(status_code=403, detail="仅本机（localhost）直连可用")
     session = _server_session("local")
     log.warning("本机直连免登录 | 已签发服务器管理员会话 | 成员=%s", session.uid or "(缺)")

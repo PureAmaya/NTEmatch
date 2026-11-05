@@ -4,7 +4,7 @@
 
 * **内容**：摘要里的赛制 / 人数 / 同场队数 / 晋级全由 ``logic.rulebook`` 现算——
   改了赛制，卡片指纹就必须变（否则群里会一直发着一张写着旧规则的图）；
-* **渲染**：同一份内容只渲染一次（内容定址 + 落盘），没装 Pillow 时安静退回文本；
+* **渲染**：同一份内容只渲染一次（内容定址 + 落盘），没有出图侧车时安静退回文本；
 * **地址**：``/api/cards/<hash>.png`` 只认本站**签发过**的哈希（猜不出来，也拿不到）。
 """
 
@@ -20,17 +20,8 @@ async def _card(cfg, event_id: str = "e001"):
     return await card.card_for_event(cfg, event_id, site="http://nte.test")
 
 
-def _cjk_font():
-    """这台机器上实际用来画卡片的 CJK 字体（没装就跳过字体检查）。"""
-    from app import fonts
-
-    if fonts.resolve("cjk") is None:
-        pytest.skip("这台机器上没装 CJK 字体（Linux 上 apt install fonts-noto-cjk 即可）")
-    return fonts.load("cjk", 26)
-
-
 # --------------------------------------------------------------------------- #
-# 内容（纯函数，不需要 Pillow）
+# 内容（纯函数，不需要渲染器）
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     ("teams", "expect"),
@@ -46,66 +37,16 @@ def test_payload_adapts_to_every_heat_size(make_config, teams, expect):
     assert dict(payload["meta"])["每场"] == expect
     rules = " ".join(item for section in payload["sections"] for item in section["items"])
     assert expect in rules
+def test_digest_follows_the_renderer(make_config, monkeypatch):
+    """指纹要跟着**渲染器**（协议版本 / 构建标记 / 实际字体）走。
 
-
-def test_card_text_has_no_missing_glyphs(make_config):
-    """卡片上的**每一段文字**都要能被实际用的字体画出来——缺字形就是图里的空心方块。
-
-    真踩过：副标题那行（``e902 · 筹备中 · 第 1 届…``）用的是等宽**西文**字体，
-    而它含中文，于是一整行都成了方块。这条用例把「内容 ↔ 字体」对一遍，
-    以后谁把中文塞给西文字体，这里就会红。
+    换二进制、换字体之后，同一份内容必须算出新的哈希——否则缓存里那张旧图
+    （比如中文是方块的那一版）会被一直发出去。
     """
-    from app import fonts
-
-    font = _cjk_font()
-    payload = card.payload_for(make_config(teams=4), "e001")
-    texts = [
-        str(payload.get("title") or ""),
-        str(payload.get("id") or ""),
-        str(payload.get("status") or ""),
-        str(payload.get("headline") or ""),
-        str(payload.get("note") or ""),
-        str(payload.get("noteTitle") or ""),
-        str(payload.get("caption") or ""),
-    ]
-    texts += [f"{key}{value}" for key, value in (payload.get("meta") or [])]
-    for section in payload.get("sections") or []:
-        texts.append(str(section.get("title") or ""))
-        texts += [str(item) for item in (section.get("items") or [])]
-    missing = sorted({ch for text in texts for ch in text if not fonts.has_glyph(font, ch)})
-    assert not missing, f"这些字符画不出来（会变成方块）：{missing}"
-
-
-def test_latin_font_cannot_draw_chinese():
-    """顺带把「为什么会有方块」钉住：西文字体没有中文字形，所以含中文的行必须走 CJK。"""
-    from app import fonts
-
-    if fonts.resolve("latin") in (None, fonts.resolve("cjk")):
-        pytest.skip("这台机器上没有独立的西文字体（latin 兜到了 CJK，测不出差别）")
-    latin = fonts.load("latin", 24)
-    assert fonts.has_glyph(latin, "A")
-    assert not fonts.has_glyph(latin, "筹"), "西文字体居然有中文字形？那这条判断的前提变了"
-    assert fonts.has_glyph(_cjk_font(), "筹")
-
-
-def test_digest_changes_when_the_font_changes(tmp_path, monkeypatch):
-    """换字体 → 指纹必须变。
-
-    不然会一直发着用旧字体画的那张图（真踩过：中文是一排方块的那版；
-    换上中文字体后，内容没变、指纹也没变，群里照旧是方块图）。
-    """
-    from app import fonts
-
-    payload = {"title": "同一份内容"}
+    payload = card.payload_for(make_config(teams=2), "e001")
     before = card.digest(payload)
-    other = tmp_path / "SomeOtherFont.ttf"
-    other.write_bytes(b"x")
-    monkeypatch.setattr(fonts, "CJK_PATHS", (str(other),))
-    fonts.reset()
-    try:
-        assert card.digest(payload) != before
-    finally:
-        fonts.reset()
+    monkeypatch.setattr(card.renderer, "signature", lambda: "r9|other|/font/b.ttc")
+    assert card.digest(payload) != before
 
 
 def test_payload_carries_the_generated_rules(make_config):
@@ -150,73 +91,6 @@ def test_payload_shows_the_brief_and_keeps_its_line_breaks(make_config):
     assert "白尾树盘山公路" in payload["note"] and "禁用改装" in payload["note"]
     assert "\n" in payload["note"], "换行要留着（渲染时按原有换行折行）"
     assert "注意" not in payload["note"], "这一块不再放规则文本"
-
-
-def test_simplified_chinese_fonts_are_recognised():
-    """集合字体里挑「简体那一支」的判断：SC / Simplified 认，JP / KR / TC 不认。
-
-    这条不显眼但很要命：``NotoSansCJK-*.ttc`` 里 JP 排在前面，默认取第 0 个 face 就会把
-    简体中文画成**日文字形**（「直」「骨」「次」的写法一眼能看出来）。单语言文件
-    （微软雅黑 / NotoSansSC）只有一个 face，名字里没有 SC 也照样能用（返回 0）。
-    """
-    from app import fonts
-
-    for name in ("Noto Sans CJK SC", "Source Han Sans SC", "NotoSansCJKsc-Regular.otf", "简体黑体"):
-        assert fonts._looks_simplified(name), name
-    for name in ("Noto Sans CJK JP", "Noto Serif CJK KR", "Source Han Sans TC", "Microsoft YaHei"):
-        assert not fonts._looks_simplified(name), name
-    assert not fonts._looks_simplified("Scaramouche"), "顺带出现的 sc 不算简体"
-
-
-def test_scan_prefers_the_simplified_single_language_file(tmp_path, monkeypatch):
-    """扫目录时优先取简中**单语言**文件：多语言合集要猜 face，容易取到日文那支。"""
-    from app import fonts
-
-    (tmp_path / "NotoSansCJK-Regular.ttc").write_bytes(b"x")
-    (tmp_path / "NotoSansCJKsc-Regular.otf").write_bytes(b"x")
-    monkeypatch.setattr(fonts, "_FONT_DIRS", (str(tmp_path),))
-    picked = fonts._scan(("notosanscjk", "notosanssc"))
-    assert picked is not None and picked.name == "NotoSansCJKsc-Regular.otf"
-
-
-def test_card_digest_follows_the_font_face(make_config, monkeypatch):
-    """**换了 face 也要重画**：多语言合集里 JP / SC 是同一个文件的不同 face。
-
-    指纹里只写路径的话，把「日文那支 face」换成「简体那支」以后，缓存里那张旧图
-    还会被一直发出去——同一条内容、同一个文件名，群里看到的仍是日文字形。
-    """
-    from app import card as card_mod
-
-    payload = card_mod.payload_for(make_config(teams=2), "e001")
-    monkeypatch.setattr(card_mod.fonts, "identity", lambda kind="cjk": f"{kind}:jp")
-    jp = card_mod.digest(payload)
-    monkeypatch.setattr(card_mod.fonts, "identity", lambda kind="cjk": f"{kind}:sc")
-    assert card_mod.digest(payload) != jp
-
-
-def test_font_identity_mentions_file_and_face():
-    """字体标识：至少要说清「哪个文件」（同一台机器上重复调用也要稳定）。"""
-    from app import fonts
-
-    ident = fonts.identity("cjk")
-    path = fonts.resolve("cjk")
-    if path is None:  # 这台机器没装中文字体：标识就是 `-`
-        assert ident == "-"
-        return
-    assert ident.startswith(str(path))
-    assert fonts.identity("cjk") == ident
-
-
-def test_multiline_wrap_keeps_paragraph_breaks():
-    """折行按原有换行分段：空行丢掉，每段各自折（简介是分行写的）。"""
-    from app import fonts
-    from app.card import _wrap_multiline
-
-    font = fonts.load("cjk", 22)
-    lines = _wrap_multiline("地图：白尾树盘山公路\n\n规则：禁用改装\n提前 10 分钟到场", font, 2000)
-    assert lines == ["地图：白尾树盘山公路", "规则：禁用改装", "提前 10 分钟到场"]
-
-
 def test_brief_keeps_line_breaks_but_drops_blank_lines():
     """简介：**保留换行**、行内合并空白、丢掉空行（最多 6 行 / 200 字）。"""
     from app.models import MAX_BRIEF_LINES, EventInfo
@@ -231,6 +105,15 @@ def test_brief_keeps_line_breaks_but_drops_blank_lines():
 # --------------------------------------------------------------------------- #
 # 渲染与缓存
 # --------------------------------------------------------------------------- #
+#: 出图跑在 Go 侧车里（go/cmd/nterender）。没有二进制时这些用例跳过——
+#: 它们验证的是「真画出来了吗」，没有渲染器就无从验证（构建：
+#: ``cd go && go build -o bin/nterender ./cmd/nterender``）。
+needs_render = pytest.mark.skipif(
+    not card.available(), reason="出图侧车不可用（go/bin/nterender 没构建）"
+)
+
+
+@needs_render
 async def test_card_is_rendered_once_and_reused(make_config, monkeypatch):
     """同一份内容只渲染一次：第二次直接吃缓存（这是「别把服务搞卡」的关键一条）。"""
     calls: list[int] = []
@@ -250,7 +133,8 @@ async def test_card_is_rendered_once_and_reused(make_config, monkeypatch):
     assert first["url"] == f"/api/cards/{first['hash']}.png"
 
 
-async def test_card_is_a_real_png(make_config):
+@needs_render
+async def test_card_is_a_real_png(make_config, image_size):
     """渲染出来的得是**能打开的 PNG**（不是空文件、也不是超长画布）。"""
     info = await _card(make_config(teams=4))
     assert info is not None
@@ -258,15 +142,14 @@ async def test_card_is_a_real_png(make_config):
     assert path is not None
     raw = path.read_bytes()
     assert raw[:8] == b"\x89PNG\r\n\x1a\n"
-    from PIL import Image
+    width, height = image_size(raw)
+    # 画布宽度按内容挑（go/internal/render 的 Widths），只会是那两档之一
+    assert width in (760, 1080)
+    assert 400 < height < 6000
 
-    with Image.open(path) as img:
-        assert img.width == card.WIDTH
-        assert 400 < img.height < card.MAX_HEIGHT
 
-
-async def test_no_pillow_falls_back_to_text(make_config, monkeypatch):
-    """没装 Pillow：不报错、也不留文件，推送照走文本（信息一条不少）。"""
+async def test_no_renderer_falls_back_to_text(make_config, monkeypatch):
+    """没有出图侧车：不报错、也不留文件，推送照走文本（信息一条不少）。"""
     monkeypatch.setattr(card, "available", lambda: False)
     assert await card.card_for_event(make_config(teams=2), "e001") is None
 
@@ -293,6 +176,7 @@ def test_resolve_refuses_anything_not_issued():
     assert card.resolve("a" * 32 + ".jpg") is None
 
 
+@needs_render
 async def test_issue_then_serve_then_404(client, make_config):
     """签发过的能拉走（图要发到群里），没签发的 404。"""
     cfg = make_config(teams=2)
@@ -424,8 +308,9 @@ def test_result_tree_links_follow_src_references():
     assert all(link["x2"] > link["x1"] for link in tree["links"]), "连线要从上游指向下游"
 
 
-async def test_result_card_is_a_real_image(make_config):
-    """结果图要是能打开的 PNG，而且**比信息卡片宽**（树状图排下来就是更宽）。"""
+@needs_render
+async def test_result_card_is_a_real_image(make_config, image_size):
+    """结果图要是能打开的 PNG，宽度**至少容得下树状图**（树排下来有多宽就得有多宽）。"""
     cfg = _played_tournament(loser_bracket=True)
     info = await card.card_for_event(
         cfg, "e001", logic.build_state(cfg), site="http://nte.test", kind="result"
@@ -433,11 +318,12 @@ async def test_result_card_is_a_real_image(make_config):
     assert info is not None
     path = card.resolve(f"{info['hash']}.png")
     assert path is not None
-    from PIL import Image
 
-    with Image.open(path) as img:
-        assert img.width >= card.WIDTH
-        assert 400 < img.height < card.MAX_HEIGHT
+    tree = card.payload_for_result(cfg, "e001", logic.build_state(cfg))["tree"]
+    width, height = image_size(path.read_bytes())
+    # 至少容得下树状图（树排下来有多宽就得有多宽；两侧各留 64px 安全边距）
+    assert width >= tree["width"]
+    assert 400 < height < 6000
 
 
 def test_group_stage_not_done_hides_advancing():

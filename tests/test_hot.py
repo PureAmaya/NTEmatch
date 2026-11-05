@@ -366,7 +366,7 @@ def test_default_start_is_the_supervisor(monkeypatch):
     ],
 )
 def test_plain_start_escapes(monkeypatch, argv, env):
-    """四条逃生路都要真的回到单进程启动（尤其最后一条：否则会无限套娃）。"""
+    """三条逃生路都要真的回到单进程启动（尤其最后一条：否则会无限套娃）。"""
     called: dict = {}
 
     def fake_hotrun(args):
@@ -378,13 +378,54 @@ def test_plain_start_escapes(monkeypatch, argv, env):
 
     monkeypatch.setattr("app.hotrun.main", fake_hotrun)
     monkeypatch.setattr(cli, "serve", fake_serve)
-    for name in ("NTE_HOT_READY", "NTE_HOT", "NTE_RELOAD"):
+    # 调试模式会写这几个变量，交给 monkeypatch 兜底还原（否则会漏到别的测试里）
+    for name in ("NTE_HOT_READY", "NTE_HOT", "NTE_RELOAD", "NTE_DEBUG", "NTE_DOCS", "NTE_LOG_LEVEL"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
     assert cli.main(argv) == 0
     assert "serve" in called and "hotrun" not in called
+
+
+def test_debug_flag_turns_on_all_three_switches(monkeypatch):
+    """``--debug`` 一次开三样：后端日志、接口文档、前端调试标记。
+
+    少开一样就会出现「明明加了 --debug 还是看不到东西」：没有 NTE_DEBUG 时
+    前端 log.debug 照样不输出，没有 NTE_DOCS 时 /api/docs 还是 404。
+    """
+    called: dict = {}
+
+    def fake_hotrun(argv):
+        called["hotrun"] = list(argv)
+        return 0
+
+    monkeypatch.setattr("app.hotrun.main", fake_hotrun)
+    monkeypatch.setattr(cli, "serve", lambda **kw: called.setdefault("serve", kw))
+    monkeypatch.setattr(
+        cli,
+        "debug_banner",
+        lambda host, port, **kw: called.setdefault("banner", (host, port, kw)),
+    )
+    for name in ("NTE_HOT_READY", "NTE_HOT", "NTE_RELOAD", "NTE_DEBUG", "NTE_DOCS", "NTE_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert cli.main(["--debug", "--port", "8123"]) == 0
+    assert "hotrun" in called and "serve" not in called, "调试模式照旧走热更新守护"
+    assert called["banner"][1] == 8123, "横幅要按实际端口给地址"
+    assert os.environ["NTE_DEBUG"] == "1"
+    assert os.environ["NTE_DOCS"] == "1"
+    assert os.environ["NTE_LOG_LEVEL"] == "DEBUG"
+
+
+def test_debug_keeps_explicit_log_level(monkeypatch):
+    """显式设了 NTE_LOG_LEVEL 就听他的：`--debug` 只补默认值，不硬压成 DEBUG。"""
+    monkeypatch.delenv("NTE_DEBUG", raising=False)
+    monkeypatch.delenv("NTE_DOCS", raising=False)
+    monkeypatch.setenv("NTE_LOG_LEVEL", "warning")
+    cli.enable_debug()
+    assert os.environ["NTE_LOG_LEVEL"] == "warning"
+    assert os.environ["NTE_DOCS"] == "1"
 
 
 # --------------------------------------------------------------------------- #

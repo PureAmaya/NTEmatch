@@ -221,7 +221,7 @@ AstrBot 唤醒大模型时，插件会把**同样这些查询**挂成函数工�
 > 图上错一个字，群友照着打就是毫无反应）：
 >
 > ```bash
-> uv run --with pillow python tools/make_help_card.py   # → static/help.jpg
+> uv run python tools/make_help_card.py                  # → static/help.jpg（需先构建 go/bin/nterender）
 > ```
 >
 > 文字在 `app/helpcard_content.py`，排版在 `app/helpcard.py`（配色照站点 CSS）。

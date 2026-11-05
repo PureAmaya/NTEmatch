@@ -8,14 +8,15 @@
   并给接任者派发新密钥（界面上做不到：既不能提升别人，也不能降级唯一的管理员）。
 
 另外，``--help`` 末段列出了配套脚本（生成分享图 / **QQ 机器人帮助图**、前端资源自检）——
-那两个图片脚本与运行无关，Pillow 只在生成时需要。
+那两个图片脚本只在手工重新生成静态图时用（跑的是 Go 侧车 nterender）。
 
 ::
 
-    uv run python -m app                     启动服务
-    uv run python -m app --reset-key         重置服务器管理员密钥（随机生成）
-    uv run python -m app --reset-key 新密钥   重置服务器管理员密钥（指定值）
-    uv run python -m app --transfer-admin    交接服务器管理员（交互式；也可带目标与开关）
+    uv run main.py                     启动服务
+    uv run main.py --debug             调试模式（日志 DEBUG / 接口文档 / 前端调试日志 / 机器人沙盒）
+    uv run main.py --reset-key         重置服务器管理员密钥（随机生成）
+    uv run main.py --reset-key 新密钥   重置服务器管理员密钥（指定值）
+    uv run main.py --transfer-admin    交接服务器管理员（交互式；也可带目标与开关）
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import sys
 
 import uvicorn
 
-from . import db, hot
+from . import DEFAULT_PORT, db, gobuild, hot
 from .auth import hash_secret
 from .console import pad, paint, width, wrap
 from .logging_conf import get_logger, setup_logging
@@ -45,7 +46,7 @@ MIN_KEY_LEN = 6
 #
 # 内容**结构化**（分组 + 条目），排版与上色交给 app/console。不写成一个长字符串是
 # 因为：想把「命令名」高亮就得在字符串里塞 ANSI 码，而帮助恰恰是最常被
-# `python -m app --help > help.txt`、贴进聊天框的东西——那样会变成一串乱码。
+# `uv run main.py --help > help.txt`、贴进聊天框的东西——那样会变成一串乱码。
 #
 # 文字里**不出现 Markdown 记号**：终端不会把 `**加粗**` 渲染成粗体，只会原样印出
 # 星号（用户直接提过这一条），所以强调靠用词，高亮靠颜色。
@@ -54,36 +55,47 @@ _HELP: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "启动服务",
         (
-            ("python -m app", "启动服务。默认就是热更新守护：改了代码或 git pull 都能不中断地换上新的"),
-            ("python -m app --port 8123", "换个端口启动"),
-            ("python -m app --host 127.0.0.1 -p 8123", "同时指定监听地址与端口"),
+            ("uv run main.py", "启动服务。默认就是热更新守护：改了代码或 git pull 都能不中断地换上新的"),
+            ("uv run main.py --port 8123", "换个端口启动（默认 10961）"),
+            ("uv run main.py --host 127.0.0.1 -p 8123", "同时指定监听地址与端口"),
             (
-                "python -m app --no-hotrun",
-                "单进程启动，没有热更新能力（调试、或把进程交给外部工具守护时用；也可设 NTE_HOT=0）",
+                "uv run main.py --debug",
+                "调试模式：把日志调到最详细、打开接口文档、让前端调试日志随首页自动打开；"
+                + "启动时一次列出主页、直播、导播台、管理、模拟群与诊断的地址"
+                + "（热更新照旧开着；要保住断点再加 --no-hotrun）",
             ),
             (
-                "python -m app hotrun",
+                "uv run main.py --no-hotrun",
+                "单进程启动，没有热更新能力（要保住断点、或把进程交给外部工具守护时用；也可设 NTE_HOT=0）",
+            ),
+            (
+                "uv run main.py hotrun",
                 "明确指定热更新守护（默认就是它）。守护参数：--interval / --no-watch / "
                 + "--hold-socket / --no-hold-socket / --no-deps-sync",
             ),
-            ("python -m app --help", "显示本帮助"),
+            ("uv run main.py --help", "显示本帮助"),
         ),
     ),
     (
         "启动前自检",
         (
             (
-                "python -m app --check",
+                "uv run main.py --check",
                 "只导入代码、不起服务、不占端口；守护每次换代前也会自动跑一次",
+            ),
+            (
+                "启动前自动编译侧车",
+                "go/bin 下缺 ntecalc / nterender（或它们比 Go 源码旧）时，先编译再启动；"
+                + "没有 Go 工具链就只记一行日志并照常启动（出图退回纯文本）。用 NTE_GO_BUILD=0 关掉",
             ),
         ),
     ),
     (
         "本机维护（凭据 = 能碰到服务器上的数据库文件，所以只能在本机执行）",
         (
-            ("python -m app --reset-key [新密钥]", "重置服务器管理员的登录密钥；省略则随机生成并打印出来"),
+            ("uv run main.py --reset-key [新密钥]", "重置服务器管理员的登录密钥；省略则随机生成并打印出来"),
             (
-                "python -m app --transfer-admin [目标]",
+                "uv run main.py --transfer-admin [目标]",
                 "交接服务器管理员。目标可填 uid / QQ / 名字片段，不给就交互式选择；"
                 + "另有 --delete-old（把旧管理员删号）/ --keep-old（降级，默认）/ "
                 + "--key <新密钥>（指定接任者的密钥）",
@@ -96,14 +108,16 @@ _HELP: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("NTE_HOST / NTE_PORT", "监听地址与端口（命令行参数优先）"),
             ("NTE_DATA_DIR", "数据目录：数据库、备份、上传的图片都在它下面"),
             ("NTE_HOT=0", "退回单进程启动（等价于 --no-hotrun）"),
-            ("NTE_LOG_LEVEL", "日志级别，默认 info"),
+            ("NTE_DEBUG=1", "调试模式（等价于 --debug；日志 / 文档 / 单进程三项一起生效）"),
+            ("NTE_LOG_LEVEL", "日志级别，默认 info；调试模式只在没显式设置时改成 DEBUG"),
+            ("NTE_GO_BUILD=0", "启动时不再自动编译 Go 侧车（二进制由你自己管理）"),
         ),
     ),
     (
         "常见操作",
         (
-            ("忘了管理员密钥", "先停止服务 → python -m app --reset-key → 用打印出来的新密钥登录"),
-            ("要换人", "先停止服务 → python -m app --transfer-admin → 用新管理员的密钥登录"),
+            ("忘了管理员密钥", "先停止服务 → uv run main.py --reset-key → 用打印出来的新密钥登录"),
+            ("要换人", "先停止服务 → uv run main.py --transfer-admin → 用新管理员的密钥登录"),
             (
                 "看热更新的状态",
                 "启动时会打印自检（换代方式 / 端口 / 仓库 / 依赖 / 预检）；"
@@ -181,10 +195,76 @@ def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 调试模式
+# --------------------------------------------------------------------------- #
+def _env_on(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def enable_debug() -> None:
+    """打开调试模式（只改本进程的环境变量，不碰用户的 shell 配置）。
+
+    必须在 ``setup_logging()`` 与导入 :mod:`app.main` **之前**调用：日志级别、
+    接口文档开关、首页里的调试标记都是在模块导入或首次请求时读这些变量的。
+
+    三项各管一件事，缺一项就会出现「打开了调试却还是看不到东西」：
+
+    * ``NTE_DEBUG``：首页注入 ``<meta name="nte-debug">``，前端 ``log.debug`` 自动打开
+      （否则得手动在地址后加 ``?debug=1``，换个页面就忘了）；
+    * ``NTE_DOCS``：``/api/docs`` 等交互式文档，调试接口时比翻 README 快；
+    * ``NTE_LOG_LEVEL``：命令行没显式指定时才改成 DEBUG——显式要安静的人说了算。
+    """
+    os.environ["NTE_DEBUG"] = "1"
+    os.environ["NTE_DOCS"] = "1"
+    os.environ.setdefault("NTE_LOG_LEVEL", "DEBUG")
+
+
+def debug_banner(host: str, port: int, *, hot: bool = False) -> None:
+    """把「该点哪儿」一次列清楚。
+
+    调试时最费时间的往往不是改代码，而是想不起某个功能在哪个地址，
+    以及「为什么改了没生效」——所以热更新被关掉这件事必须写在最显眼的地方。
+    """
+    shown = "127.0.0.1" if host in ("", "0.0.0.0", "::", "[::]") else host
+    base = f"http://{shown}:{port}"
+    line = paint("─" * 62, "rule")
+    rows = (
+        ("主页", f"{base}/"),
+        ("直播（先选比赛）", f"{base}/<届 ID>/live"),
+        ("导播台（四宫格）", f"{base}/director"),
+        ("服务器管理", f"{base}/admin"),
+        ("模拟群（/bot，模拟 QQ 机器人）", f"{base}/bot"),
+        ("接口文档", f"{base}/api/docs"),
+        ("运行诊断（需登录）", f"{base}/api/diagnostics"),
+    )
+    print()
+    print(line)
+    print(paint("  调试模式已开启", "ok", "bold"))
+    print(line)
+    for label, url in rows:
+        print(f"  {paint(pad(label, 24), 'note')}{paint(url, 'cmd')}")
+    print()
+    print(paint("  后端日志 DEBUG；前端调试日志随首页自动打开（控制台按 [nte] 过滤）。", "note"))
+    print(paint("  空库会自动写入演示赛事（8 位选手 / 5 局 / 1 局进行中）。", "note"))
+    print(paint("  没配媒体服务器时，机位画面由浏览器本地生成，四宫格照样能调。", "note"))
+    print(paint("  从回环地址访问即以服务器管理员身份进入（本机不设防开关在调试下强制生效）。", "note"))
+    if hot:
+        print(
+            paint(
+                "  热更新守护已启用：改后端代码会自动换代（断点与内存里的临时状态会丢）。",
+                "warn",
+            )
+        )
+    else:
+        print(paint("  单进程启动：改了后端代码要手动重启（--no-hotrun / NTE_HOT=0）。", "warn"))
+    print(line)
+
+
+# --------------------------------------------------------------------------- #
 # 启动服务
 # --------------------------------------------------------------------------- #
 def check_startup() -> int:
-    """``python -m app --check``：**只体检、不起服务**（热更新换代前跑一次）。
+    """``uv run main.py --check``：**只体检、不起服务**（热更新换代前跑一次）。
 
     它做的事只有一件：把 :mod:`app.main` 导入起来。语法错、依赖没装、模块装配失败
     都会在这一步炸出来，而**它不碰数据库、不占端口、不写任何东西**——所以能在旧进程
@@ -207,7 +287,7 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     setup_logging()
     # 命令行参数优先，其次环境变量，最后默认值
     host = host or os.getenv("NTE_HOST", "0.0.0.0")
-    port = int(port if port is not None else os.getenv("NTE_PORT", "8000"))
+    port = int(port if port is not None else os.getenv("NTE_PORT", str(DEFAULT_PORT)))
     reload_enabled = _reload_requested()
     log_level = (os.getenv("NTE_LOG_LEVEL") or "info").lower()
     workers = 1 if reload_enabled else int(os.getenv("NTE_WORKERS", "1"))
@@ -275,7 +355,7 @@ def reset_admin_key(new_key: str | None = None) -> int:
     """
     if not DB_PATH.exists():
         print(paint(f"未找到数据库：{DB_PATH}", "err"))
-        print("请先执行 " + paint("uv run python -m app", "cmd") + " 启动一次服务，让它初始化数据。")
+        print("请先执行 " + paint("uv run main.py", "cmd") + " 启动一次服务，让它初始化数据。")
         return 1
 
     key = _clean(new_key)
@@ -294,7 +374,7 @@ def reset_admin_key(new_key: str | None = None) -> int:
             print(paint("数据库里还没有服务器管理员成员。", "err"))
             print(
                 "请先执行 "
-                + paint("uv run python -m app", "cmd")
+                + paint("uv run main.py", "cmd")
                 + " 启动一次服务（启动时会自动创建并打印密钥）。"
             )
             return 1
@@ -313,7 +393,7 @@ def reset_admin_key(new_key: str | None = None) -> int:
     print(f"  新密钥（{'随机生成' if generated else '指定'}）：{paint(key, 'key', 'bold')}")
     print(paint("  存储方式：加盐哈希——数据库里不再保留明文", "note"))
     print(line)
-    if _port_in_use(int(os.getenv("NTE_PORT", "8000"))):
+    if _port_in_use(int(os.getenv("NTE_PORT", str(DEFAULT_PORT)))):
         print(paint("  ⚠ 检测到服务仍在运行：请先停止它再重新启动，", "warn"))
         print(paint("    否则内存里的旧成员数据可能在下一次改动时覆盖本次重置。", "warn"))
     print("  下一步：重启服务 → 用上面的密钥登录（/admin 或 /user）")
@@ -331,7 +411,7 @@ _PERMISSION_LABEL = {"server_admin": "服务器管理员", "event_admin": "赛�
 def _clean(text: str) -> str:
     """去掉首尾空白与 BOM。
 
-    为什么要管 BOM：把答案**管道喂给** ``python -m app``（脚本 / ``echo`` / PowerShell
+    为什么要管 BOM：把答案**管道喂给** ``uv run main.py``（脚本 / ``echo`` / PowerShell
     的 ``|``）时，Windows 会在开头塞一个 ``\\ufeff``，``"2"`` 会变成 ``"﻿2"``——
     不清理的话「选第 2 位」会被判成「没找到成员」。
     """
@@ -393,7 +473,7 @@ def transfer_admin(target: str = "", *, mode: str = "", new_key: str | None = No
         return 2
     if not DB_PATH.exists():
         print(paint(f"未找到数据库：{DB_PATH}", "err"))
-        print("请先执行 " + paint("uv run python -m app", "cmd") + " 启动一次服务，让它初始化数据。")
+        print("请先执行 " + paint("uv run main.py", "cmd") + " 启动一次服务，让它初始化数据。")
         return 1
 
     interactive = not (target and mode)
@@ -498,7 +578,7 @@ def transfer_admin(target: str = "", *, mode: str = "", new_key: str | None = No
         else:
             print(f"  旧管理员「{old_name}」已降级为赛事管理员（他创办的届仍归他管）")
     print(line)
-    if _port_in_use(int(os.getenv("NTE_PORT", "8000"))):
+    if _port_in_use(int(os.getenv("NTE_PORT", str(DEFAULT_PORT)))):
         print(paint("  ⚠ 检测到服务仍在运行：请先停止它再重新启动，", "warn"))
         print(paint("    否则内存里的旧成员数据可能在下一次改动时覆盖本次交接。", "warn"))
     print("  下一步：重启服务 → 用上面的新密钥登录（/admin 或 /user）")
@@ -546,11 +626,26 @@ def _drop_flag(args: list[str], *names: str) -> tuple[bool, list[str]]:
     return seen, rest
 
 
+#: 这些命令不该为了「看一眼帮助 / 重置一次密钥」先等一次编译
+_SKIP_BUILD = ("--help", "-h", "--check", "--reset-key", "--transfer-admin")
+
+
+def _skips_go_build(args: list[str]) -> bool:
+    if args and args[0] == "help":
+        return True
+    return any(arg in _SKIP_BUILD for arg in args)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
+    # 起服务之前先确认 Go 侧车在不在（缺就编，编不了只记日志）。
+    # 只在这一处：维护命令与 --check 不该为了它们白等一次编译。
+    if not _skips_go_build(args):
+        gobuild.ensure_ready()
+
     # 热更新守护要在**最前面**分流：它有自己的参数表（--port / --interval / --no-watch…），
-    # 在这里先拆 --port 的话，`hotrun --port 8899` 里的端口会被吃掉、守护退到默认 8000。
+    # 在这里先拆 --port 的话，`hotrun --port 8899` 里的端口会被吃掉、守护退到默认 10961。
     if args and args[0] == "hotrun":
         from .hotrun import main as hotrun_main
 
@@ -559,6 +654,13 @@ def main(argv: list[str] | None = None) -> int:
     if args and args[0] == "--check":
         # 预检：给热更新守护用的（换代前确认新代码起得来），也可以手动跑一下放心
         return check_startup()
+
+    # 帮助放在最前面：`--debug --help`、`--no-hotrun --help` 这类组合很自然，
+    # 只认第一个位置的话会变成「无法识别的参数」（用户只会以为帮助坏了）。
+    # 只有 ``help`` 这一个裸词仍要求在第一位置——它太容易与用户输入的正常值混淆。
+    if "--help" in args or "-h" in args or (args and args[0] == "help"):
+        print(usage_text())
+        return 0
 
     port_raw, args = _take_option(args, "--port", "-p")
     host_raw, args = _take_option(args, "--host")
@@ -573,10 +675,6 @@ def main(argv: list[str] | None = None) -> int:
             print(paint(f"端口超出范围：{port}", "err"))
             return 2
 
-    if args and args[0] in {"-h", "--help", "help"}:
-        print(usage_text())
-        return 0
-
     if args and args[0] == "--reset-key":
         rest = args[1:]
         if "-e" in rest:
@@ -585,7 +683,7 @@ def main(argv: list[str] | None = None) -> int:
             print(paint("--reset-key 现在重置的是「服务器管理员」成员的登录密钥，与届次无关，", "err"))
             print(
                 "不再接受 -e <届次> 参数。直接执行 "
-                + paint("python -m app --reset-key", "cmd")
+                + paint("uv run main.py --reset-key", "cmd")
                 + " 即可。"
             )
             return 2
@@ -613,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         mode = "delete" if delete_old else ("demote" if keep_old else "")
         return transfer_admin(target, mode=mode, new_key=key_raw)
 
+    debug_flag, args = _drop_flag(args, "--debug")
     # ``--no-hotrun`` 是「我要的就是原始那套单进程启动」：调试 / 交给外面管进程时用
     plain, args = _drop_flag(args, "--no-hotrun")
     if args:
@@ -620,12 +719,20 @@ def main(argv: list[str] | None = None) -> int:
         print(usage_text())
         return 2
 
+    # 调试模式：环境变量必须在 setup_logging / 导入 app.main 之前设好（见 enable_debug）
+    debug = debug_flag or _env_on("NTE_DEBUG")
+    if debug:
+        enable_debug()
+
     host = host_raw or os.getenv("NTE_HOST", "0.0.0.0")
-    resolved_port = int(port if port is not None else os.getenv("NTE_PORT", "8000"))
+    resolved_port = int(port if port is not None else os.getenv("NTE_PORT", str(DEFAULT_PORT)))
 
     # **默认就是热更新守护**：不中断服务地换代码是常态需求，不该让人每次多打一个词。
     # 三种情况退回「原始单进程启动」：① 我本身就是守护拉起来的子进程（否则无限递归）；
     # ② 显式 --no-hotrun / NTE_HOT=0；③ 开了 uvicorn 自己的 reloader（两套换代机制会抢端口）。
+    #
+    # 调试模式**照旧走守护**：改一行代码就想看结果，正是热更新最有用的时候。
+    # 代价是断点与内存里的临时状态会随换代丢失——横幅里写清楚，要保住就用 --no-hotrun。
     supervised = hot.supervised()
     hot_off = plain or os.getenv("NTE_HOT", "").strip().lower() in ("0", "false", "no", "off")
     if supervised or hot_off or _reload_requested():
@@ -635,12 +742,16 @@ def main(argv: list[str] | None = None) -> int:
             boot_log.warning("按 --no-hotrun / NTE_HOT=0 直接起服务：没有热更新能力")
         else:
             boot_log.warning("检测到 NTE_RELOAD：用 uvicorn 自己的 reloader（不走热更新守护）")
+        if debug and not supervised:
+            debug_banner(host, resolved_port, hot=False)
         serve(host=host_raw, port=port)
         return 0
 
     from .hotrun import main as hotrun_main
 
     boot_log.info("默认启用热更新守护（要单进程直跑：加 --no-hotrun，或设 NTE_HOT=0）")
+    if debug:
+        debug_banner(host, resolved_port, hot=True)
     return hotrun_main(["--host", host, "--port", str(resolved_port)])
 
 

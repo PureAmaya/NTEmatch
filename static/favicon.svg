@@ -1,14 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
   <!-- 站点图标：与顶栏品牌标记同一套几何（同心环 + 中心点）。
-       颜色写死：favicon 是独立文档，拿不到页面里的主色变量；这里用冷蓝青→荧光紫。 -->
+       颜色写死：favicon 是独立文档，拿不到页面里的主色变量；这里用冷蓝青→荧光品红。 -->
   <defs>
     <linearGradient id="mark" x1="0" y1="1" x2="1" y2="0">
       <stop offset="0%" stop-color="#0ea5c6"/>
       <stop offset="50%" stop-color="#22e0e8"/>
-      <stop offset="100%" stop-color="#7d5cff"/>
+      <stop offset="100%" stop-color="#ff2f8e"/>
     </linearGradient>
   </defs>
-  <rect width="48" height="48" rx="10" fill="#0b0e1c"/>
+  <rect width="48" height="48" rx="10" fill="#04060c"/>
   <circle cx="24" cy="24" r="18" fill="none" stroke="url(#mark)" stroke-width="3"/>
   <circle cx="24" cy="24" r="9.6" fill="none" stroke="url(#mark)" stroke-width="2.2" opacity=".8"/>
   <circle cx="24" cy="24" r="2.6" fill="url(#mark)"/>

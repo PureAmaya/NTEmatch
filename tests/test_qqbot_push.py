@@ -2,7 +2,7 @@
 
 这一组盯的是**推送这条链路本身**（以前没有用例覆盖 ``/api/qqbot/push``），
 而图片是这条链路上最脆的一环：AstrBot 各版本对图片段的字段名不一样、
-没装 Pillow 时压根画不出图——两种情况下群里的消息都**不能少东西**。
+没有出图侧车时压根画不出图——两种情况下群里的消息都**不能少东西**。
 
 所以两条底线：
 
@@ -430,7 +430,7 @@ async def test_test_endpoint_can_send_an_image(admin_client, bot_ready, pushed):
 
 
 async def test_test_endpoint_says_why_when_it_cannot_draw(admin_client, bot_ready, pushed):
-    """画不出卡片（没装 Pillow）时说清原因，而不是回一句「发送失败」。"""
+    """画不出卡片（没有出图侧车）时说清原因，而不是回一句「发送失败」。"""
     from app import card
 
     async def no_card(*args, **kwargs):
@@ -444,7 +444,7 @@ async def test_test_endpoint_says_why_when_it_cannot_draw(admin_client, bot_read
         card.card_for_event = original
     assert res.status_code == 200, res.text
     assert res.json()["ok"] is False
-    assert "Pillow" in res.json()["detail"]
+    assert "nterender" in res.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #

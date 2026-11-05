@@ -4,9 +4,9 @@
 ----
 
 ```bash
-uv run python -m app hotrun            # 守护模式：自己盯着代码变化，变了就换代
-uv run python -m app hotrun --port 8000 --interval 2
-uv run python -m app hotrun --no-watch # 只留「管理端点一下才更新」这条路
+uv run main.py hotrun            # 守护模式：自己盯着代码变化，变了就换代
+uv run main.py hotrun --port 10961 --interval 2
+uv run main.py hotrun --no-watch # 只留「管理端点一下才更新」这条路
 ```
 
 它做什么
@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import hot
+from . import DEFAULT_PORT, hot
 from .logging_conf import get_logger
 
 log = get_logger("hotrun")
@@ -68,6 +68,17 @@ log = get_logger("hotrun")
 #: 子进程日志在内存里留多少行（换代失败时把尾巴写进状态，供管理端看）
 TAIL_LINES = 120
 #: 换代失败时状态里带多少行日志（太长没人看）
+def _entry(*args: str) -> list[str]:
+    """拉起业务进程用哪条命令。
+
+    **优先仓库根的 ``main.py``**：它和用户手敲的入口是同一个文件，开发与发行版
+    走同一条路；没有它（例如只装了包、源码不在）才退回 ``-m app``。
+    """
+    script = Path(__file__).resolve().parent.parent / "main.py"
+    if script.is_file():
+        return [sys.executable, str(script), *args]
+    return [sys.executable, "-m", "app", *args]
+
 TAIL_REPORT = 25
 
 
@@ -106,7 +117,7 @@ class Supervisor:
         self,
         *,
         host: str = "0.0.0.0",
-        port: int = 8000,
+        port: int = DEFAULT_PORT,
         interval: float = 2.0,
         watch: bool = True,
         ready_timeout: float = hot.READY_TIMEOUT,
@@ -377,7 +388,7 @@ class Supervisor:
             self._retire(old, why="被新版本替换")
 
     def _preflight(self) -> bool:
-        """跑一次 ``python -m app --check``：**只导入、不起服务**，看新代码能不能活。
+        """跑一次 ``uv run main.py --check``：**只导入、不起服务**，看新代码能不能活。
 
         换代之前先体检，好处是「坏版本」被挡在**停掉旧进程之前**（顺序换代时尤其关键：
         那时候旧进程一旦停了就没有退路）。体检本身失败（比如超时）不拦更新——
@@ -385,7 +396,7 @@ class Supervisor:
         """
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "app", "--check"],
+                _entry("--check"),
                 cwd=str(hot.repo_root()),
                 env=self._child_env(),
                 capture_output=True,
@@ -529,7 +540,7 @@ class Supervisor:
         add(
             "新代码预检",
             ok,
-            "python -m app --check 通过（每次换代前也会再跑一次）"
+            "uv run main.py --check 通过（每次换代前也会再跑一次）"
             if ok
             else "当前代码就过不了预检，换代会被拦下（旧版本继续服务）",
         )
@@ -656,7 +667,7 @@ class Supervisor:
         # 固定用**当前解释器**跑本站代码（同一个虚拟环境），不做任何 shell 展开。
         # POSIX：另起进程组，收尾时能给整组发信号（子进程自己再 fork 的也一起收掉）。
         proc = subprocess.Popen(
-            [sys.executable, "-m", "app"],
+            _entry(),
             cwd=str(hot.repo_root()),
             env=env,
             stdout=subprocess.PIPE,
@@ -914,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
         description="热更新守护：不中断服务地换上新代码（git pull 也行）",
     )
     parser.add_argument("--host", default=os.getenv("NTE_HOST", "0.0.0.0"), help="监听地址")
-    parser.add_argument("--port", type=int, default=int(os.getenv("NTE_PORT", "8000")), help="监听端口")
+    parser.add_argument("--port", type=int, default=int(os.getenv("NTE_PORT", str(DEFAULT_PORT))), help="监听端口")
     parser.add_argument("--interval", type=float, default=2.0, help="检测代码变化的间隔（秒）")
     parser.add_argument("--ready-timeout", type=float, default=hot.READY_TIMEOUT, help="等新进程就绪的超时")
     parser.add_argument("--drain-timeout", type=float, default=hot.DRAIN_TIMEOUT, help="等旧进程退出的超时")

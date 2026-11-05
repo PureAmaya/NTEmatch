@@ -2,7 +2,7 @@
   "base_url": {
     "description": "NTE 比赛站点地址（不带尾部斜杠）",
     "type": "string",
-    "default": "http://127.0.0.1:8000"
+    "default": "http://127.0.0.1:10961"
   },
   "api_token": {
     "description": "查询 API 令牌（在站点「服务器 → QQ 机器人 → 查询接口令牌」里生成，形如 nte_xxx）",

@@ -72,7 +72,7 @@ async def api_hot_status(_: Session = Depends(require_server)) -> dict[str, Any]
     status["hint"] = (
         ""
         if status.get("supervised")
-        else "当前进程不是由热更新守护启动的：用 `uv run python -m app hotrun` 启动才能热更新"
+        else "当前进程不是由热更新守护启动的：用 `uv run main.py hotrun` 启动才能热更新"
     )
     status["dir"] = str(hot.hot_dir())
     return status
@@ -93,7 +93,7 @@ async def api_hot_update(
             status_code=400,
             detail=(
                 "当前进程不是由热更新守护启动的，无法热更新。"
-                "请改用 `uv run python -m app hotrun` 启动服务（旧进程会优雅退场）。"
+                "请改用 `uv run main.py hotrun` 启动服务（旧进程会优雅退场）。"
             ),
         )
     mode = str((payload.mode if payload else "") or "reload").strip().lower()

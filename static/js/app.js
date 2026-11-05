@@ -31,6 +31,7 @@ import { hydrateIcons } from './icons.js';
 import { checkNotices } from './notices.js';
 import { loadEvents, renderEventsGroups, renderHomeGroups } from './events.js';
 import { installDnD as installTeamDnD } from './teams.js';
+import { stopAll as stopDirector } from './director.js';
 import {
   applyLiveHealth,
   ChannelLive,
@@ -421,6 +422,9 @@ function setView(view, { silent = false } = {}) {
   });
   localStorage.setItem(VIEW_KEY, view);
 
+  // 离开导播台就收掉四路：媒体元素离开 DOM 不会自己停，四路一起解码 / 出声都是浪费。
+  // 进来时**不**在这里启动，交由 renderView 按当前机位分配（见 views.renderDirector）。
+  if (view !== 'director') stopDirector();
   if (view === 'live') {
     ChannelLive.stop(false);
     if (App.state) focusLive(App.state);
@@ -432,11 +436,12 @@ function setView(view, { silent = false } = {}) {
     ChannelLive.stop(false);
     if (App.state) renderView(view, App.state);
   }
-  // 推流检测只在直播 / 频道页运行：进页面开始，离开就停（后端随之不再探测）。
+  // 推流检测只在直播 / 频道 / 导播页运行：进页面开始，离开就停（后端随之不再探测）。
   // 首次初始化时 App.state 还没到手，这里不启动——等路由把状态拉回来后的那次
   // setView 再启动，避免「启动得太早、进直播页反而要等一个轮询周期」。
-  if ((view === 'live' || view === 'channels') && App.state) startLiveHealth();
-  else if (view !== 'live' && view !== 'channels') stopLiveHealth();
+  const wantsLive = view === 'live' || view === 'channels' || view === 'director';
+  if (wantsLive && App.state) startLiveHealth();
+  else if (!wantsLive) stopLiveHealth();
 
   if (view === 'manage') renderAdmin();
   // 记下已渲染的视图与指纹（切页本身就重建过 DOM，避免随后一次推送再重建一遍）

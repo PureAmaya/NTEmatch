@@ -1,40 +1,57 @@
 /* ==========================================================================
    NTE 比赛 · 赛事平台  视觉系统
-   设计语言：靛蓝夜空 + 冷蓝青 / 荧光紫双主色 + 琥珀点缀 + 环
+   设计语言：海报油墨黑底 + 冷蓝青 / 荧光品红双主色 + 海报式硬描边与网点
    （固定一套配色，不再随届次切换）
+
+   三条原则（也是这套视觉的「单一说法」，改动请同步这里）：
+   1. 底色与正文保持中性（黑底 + 白/灰字），彩色只给**标题、数字、状态标记**，
+      避免整屏花花绿绿导致信息层级消失；
+   2. 装饰只用 CSS 渐变与伪元素（网点、警示斜纹、斜切角、双色错位），
+      不加载任何图片与字体，网络与显存成本都接近于零；
+   3. 允许的动效只有「位移 / 透明度 / 颜色」，且全部可被 prefers-reduced-motion 关掉。
    ========================================================================== */
 
 /* ---------- 1. Tokens ---------- */
 :root {
-  --bg: #0b0e1c;
-  --bg-2: #0f1428;
+  --bg: #070a12;
+  --bg-2: #0b1120;
   /* 面板比底色亮一档：原来 --bg 与 --panel 的亮度差太小（ΔL 只有几个点），
      卡片「浮不起来」= 层级看不出来，也是之前觉得「看不清」的一半原因。 */
-  --panel: rgba(19, 25, 45, 0.92);
-  --panel-2: rgba(24, 31, 54, 0.97);
-  --solid: #161d33;
+  --panel: rgba(14, 20, 33, 0.93);
+  --panel-2: rgba(19, 26, 42, 0.97);
+  --solid: #121a2b;
   /* 卡片顶边的一道极淡高光：给平面加一层「受光」的暗示，成本几乎为零 */
-  --panel-hi: rgba(186, 224, 255, 0.07);
+  --panel-hi: rgba(186, 232, 255, 0.08);
 
-  --line: rgba(34, 224, 232, 0.16);
-  --line-2: rgba(34, 224, 232, 0.44);
+  /* 海报黑：描边、贴纸底、硬投影全用它。异环物料里的黑是冷调纯黑，不是灰 */
+  --ink: #04060c;
+  --ink-2: rgba(4, 6, 12, 0.86);
+  /* 高光白：大字号标题与数字的主色——海报里最抓眼的字是「白 + 硬黑边」，
+     而不是每一行都上颜色 */
+  --paper: #f4fdff;
+
+  --line: rgba(34, 224, 232, 0.15);
+  --line-2: rgba(34, 224, 232, 0.42);
 
   --txt: #e6f0ff;
-  --txt-dim: #93a7c1;
+  --txt-dim: #94a8c2;
   /* 第三级文字：深色面板上要看得清，就不能再暗下去。
      原值 #5e7186 在面板上的对比度只有约 3.9:1（低于小字要求的 4.5:1），
      现在约 4.8:1；仍是三级层次里最弱的一档，不至于抢正文。 */
   --txt-mute: #6d8098;
 
-  /* 具名色：冷蓝青（主）/ 荧光紫（主）/ 琥珀（点缀）；品红只作少量艳色 */
+  /* 具名色：冷蓝青（主）/ 荧光品红（主）/ 荧光紫（次）/ 琥珀（点缀） */
   --cyan: #22e0e8;
   --violet: #7d5cff;
   --amber: #ffd83d;
+  /* 品红沿用旧值：全站几十处 rgba(255, 47, 142, α) 的半透明装饰都与它同源，
+     改这个 hex 就会和那些底色对不上——要换色请连那些一起换。 */
   --magenta: #ff2f8e;
 
-  /* 固定主色：不随届次切换（异环的识别靠固定的一套） */
+  /* 固定主色：不随届次切换（异环的识别靠固定的一套）。
+     双主色互相「错位叠印」是这套语言的核心，凡是渐变色条都走 青 → 品红。 */
   --accent: var(--cyan);
-  --accent-2: var(--violet);
+  --accent-2: var(--magenta);
 
   --ok: #2fe08a;
   --warn: #ffd83d;
@@ -43,9 +60,23 @@
   --radius: 2px;
   --cut: 16px;
 
-  --shadow: 7px 7px 0 rgba(0, 0, 0, 0.6);
+  --shadow: 7px 7px 0 var(--ink);
   --glow: 0 0 0 2px rgba(34, 224, 232, 0.4);
-  --glow-2: 0 0 0 2px rgba(125, 92, 255, 0.42);
+  --glow-2: 0 0 0 2px rgba(255, 47, 142, 0.42);
+
+  /* 网点装饰的两个取色（青 / 品红）：所有网点块都从这里取，改一处全局生效 */
+  --dots-a: rgba(34, 224, 232, 0.52);
+  --dots-b: rgba(255, 47, 142, 0.44);
+  /* 警示斜纹（海报里那条 KEEP OUT 胶带）：顶栏、页脚、强调条共用同一条 */
+  --hazard: repeating-linear-gradient(115deg,
+      var(--cyan) 0 12px, var(--ink) 12px 24px,
+      var(--magenta) 24px 36px, var(--ink) 36px 48px);
+  /* 细斜纹底：面板头、表格头这类「一块布」的地方只铺这一条，不再各自写渐变 */
+  --hatch: repeating-linear-gradient(115deg, rgba(34, 232, 255, 0.09) 0 9px, transparent 9px 20px);
+  /* 标题渐变（青 → 白 → 品红）：物料里强调语就是这么填的。
+     **文字不加描边、不加投影**——官方物料里字是直接压在画面上的，
+     没有偏移影；层次只靠字重、字号与这层渐变填充。 */
+  --title-grad: linear-gradient(96deg, var(--cyan) 0%, #ffffff 46%, var(--accent-2) 100%);
 
   /* 卡片 / 按钮的「金属厚度」倒角。带 clip-path 的元素**画不出外侧投影**（clip-path 会把
      box-shadow、outline 这类外侧绘制一并裁掉），offset 投影原先只能靠 `filter: drop-shadow()`
@@ -111,12 +142,13 @@ img { display: block; max-width: 100%; }
   /* inset: 0（原来是 -8%，给位移留余量）：动画去掉后不必再往外扩，
      也就少光栅化约 35% 的像素（全屏纹理直接变小）。 */
   position: absolute; inset: 0;
+  /* 双色网点：青 + 品红错开半格铺，这正是海报里那层「印刷网点」的观感 */
   background-image:
-    radial-gradient(rgba(125, 92, 255, 0.55) 1.6px, transparent 1.7px),
-    radial-gradient(rgba(34, 224, 232, 0.45) 1.6px, transparent 1.7px);
+    radial-gradient(var(--dots-b) 1.6px, transparent 1.7px),
+    radial-gradient(var(--dots-a) 1.6px, transparent 1.7px);
   background-size: 18px 18px, 18px 18px;
   background-position: 0 0, 9px 9px;
-  opacity: 0.55;
+  opacity: 0.42;
   mask-image: radial-gradient(ellipse 92% 72% at 50% 18%, #000 0%, transparent 82%);
   /* **静态**（原来是 30s 无限位移 + `will-change: transform`）。
      那两行会让这块**全屏**图层被永久提升、并永不停歇地走合成——占着一块全屏显存、
@@ -126,12 +158,13 @@ img { display: block; max-width: 100%; }
 
 /* 光斑本身就是柔和径向渐变，再叠 90px 高斯模糊等于额外做一次大范围离屏渲染 */
 .fx__glow { position: absolute; border-radius: 50%; opacity: 0.42; }
-.fx__glow--a { width: 44vw; height: 44vw; top: -12vw; left: -10vw; background: radial-gradient(circle, rgba(34,224,232,.55), transparent 68%); }
-.fx__glow--b { width: 50vw; height: 50vw; bottom: -18vw; right: -12vw; background: radial-gradient(circle, rgba(125,92,255,.5), transparent 68%); }
+.fx__glow--a { width: 44vw; height: 44vw; top: -12vw; left: -10vw; background: radial-gradient(circle, rgba(34,224,232,.48), transparent 68%); }
+/* 右下角那团改成品红：海报的双色结构是「青在上、粉在下」，不再是紫 */
+.fx__glow--b { width: 50vw; height: 50vw; bottom: -18vw; right: -12vw; background: radial-gradient(circle, rgba(255,61,146,.34), transparent 68%); }
 
 .fx__scan {
-  position: absolute; inset: 0; opacity: .22;
-  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .05) 0 10px, transparent 10px 26px);
+  position: absolute; inset: 0; opacity: .18;
+  background: var(--hatch);
 }
 /* ---------- 4. HUD 顶栏 ---------- */
 .hud {
@@ -140,13 +173,14 @@ img { display: block; max-width: 100%; }
   min-height: var(--hud-h);
   padding: 9px max(14px, env(safe-area-inset-left)) 9px max(14px, env(safe-area-inset-right));
   /* 不用 backdrop-filter：吸顶元素每滚动一帧都要重新采样背景，是滚动卡顿的头号来源 */
-  background: linear-gradient(180deg, rgba(11, 14, 28, 0.99), rgba(11, 14, 28, 0.92));
-  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(6, 9, 15, 0.99), rgba(6, 9, 15, 0.9));
+  border-bottom: 2px solid rgba(34, 224, 232, .5);
 }
+/* 顶栏底边那道青→品红的渐光线：海报里两个主色的分界 */
 .hud::after {
-  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
-  background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent);
-  opacity: .65;
+  content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent) 22%, var(--accent-2) 78%, transparent);
+  opacity: .9;
 }
 .hud__brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
 /* 尺寸 / 弹性在这里定，辉光在 21.1（那边会按顶栏配色重写一次 filter） */
@@ -159,14 +193,8 @@ img { display: block; max-width: 100%; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   position: relative;
 }
-.hud__title::before, .hud__title::after {
-  content: attr(data-text); position: absolute; inset: 0; opacity: 0;
-  pointer-events: none;
-}
-.hud__title:hover::before { color: var(--magenta); transform: translate(1.5px, -1px); opacity: .75; animation: glitchA .5s steps(2) 1; }
-.hud__title:hover::after { color: var(--cyan); transform: translate(-1.5px, 1px); opacity: .75; animation: glitchB .5s steps(2) 1; }
-@keyframes glitchA { 0%,100% { clip-path: inset(0 0 0 0); } 40% { clip-path: inset(12% 0 46% 0); } 70% { clip-path: inset(58% 0 16% 0); } }
-@keyframes glitchB { 0%,100% { clip-path: inset(0 0 0 0); } 45% { clip-path: inset(64% 0 8% 0); } 75% { clip-path: inset(22% 0 40% 0); } }
+/* 原先是 hover 时复制两层文字做 glitch（凭空多两份文本节点 + 两条 clip-path 动画）。
+   现在顶栏标题只保留字形本身（斜体压缩 + 渐变填充），不再复制节点。见 21.0b。 */
 
 .hud__sub {
   font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .22em;
@@ -178,13 +206,17 @@ img { display: block; max-width: 100%; }
 /* 顶栏右侧的「当前用户」：头像 + 用户名（点进 /user） */
 .hud__me {
   display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
-  max-width: 200px; padding: 3px 12px 3px 5px;
-  border: 1px solid var(--line-2); border-radius: 999px;
-  background: rgba(6, 10, 16, .72); color: var(--txt);
+  /* 左内边距 ≥ 切角尺寸：否则头像的圆边会被左上角的斜切吃掉 */
+  max-width: 200px; padding: 3px 12px 3px 9px;
+  /* 圆角胶囊改成斜切贴纸：与全站的切角语言一致（文案里的「/」斜向呼应） */
+  border: 2px solid var(--line-2); border-radius: 2px;
+  background: var(--ink-2); color: var(--txt);
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
   font: inherit; font-size: 12.5px; font-weight: 700; letter-spacing: .04em;
   transition: border-color .16s, box-shadow .16s, background .16s;
 }
-.hud__me:hover { border-color: var(--accent); box-shadow: var(--glow); background: rgba(16, 26, 42, .9); }
+/* 注意：.hud__me 现在带 clip-path，外侧 box-shadow 画不出来，反馈只做在边框与底色上 */
+.hud__me:hover { border-color: var(--accent); background: #121a2b; }
 .hud__me[aria-current="true"] { border-color: var(--accent); }
 .hud__me-ava { display: inline-flex; flex: none; }
 .hud__me-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -427,7 +459,7 @@ img { display: block; max-width: 100%; }
 .kpi__label { font-family: var(--font-mono); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: var(--txt-mute); }
 .kpi__value {
   font-family: var(--font-disp); font-size: clamp(24px, 5vw, 32px); font-weight: 700; line-height: 1.1;
-  color: #fff; text-shadow: 0 0 20px color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--paper);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .kpi__value small { font-size: 14px; color: var(--txt-dim); font-weight: 500; }
@@ -467,9 +499,9 @@ img { display: block; max-width: 100%; }
 .board__row--unranked { opacity: .62; }
 .board__row--unranked:hover { opacity: .85; }
 .evt-table__row--unranked { opacity: .62; }
-.rank--1 { color: var(--amber); text-shadow: 0 0 14px rgba(255, 200, 87, .65); }
-.rank--2 { color: #cfe0f5; text-shadow: 0 0 12px rgba(207, 224, 245, .5); }
-.rank--3 { color: #e0a06a; text-shadow: 0 0 12px rgba(224, 160, 106, .5); }
+.rank--1 { color: var(--amber); }
+.rank--2 { color: #cfe0f5; }
+.rank--3 { color: #e0a06a; }
 
 .who { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .who__txt { min-width: 0; }
@@ -493,9 +525,9 @@ img { display: block; max-width: 100%; }
 .score-cell--total { font-size: 13px; font-weight: 600; color: var(--txt); text-align: right; }
 .points-cell {
   text-align: right; font-family: var(--font-disp); font-weight: 700; font-size: 19px;
-  color: #fff; text-shadow: 0 0 16px color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--paper);
 }
-.points-cell small { display: block; font-family: var(--font-mono); font-size: 9.5px; font-weight: 400; color: var(--txt-mute); text-shadow: none; }
+.points-cell small { display: block; font-family: var(--font-mono); font-size: 9.5px; font-weight: 400; color: var(--txt-mute); }
 
 /* ---------- 10. 头像 ---------- */
 .ava {
@@ -574,8 +606,7 @@ img { display: block; max-width: 100%; }
 
 .vs-mid { display: flex; align-items: center; justify-content: center; gap: 14px; }
 .vs-mid__score {
-  font-family: var(--font-disp); font-size: 30px; font-weight: 700; line-height: 1; color: #fff;
-  text-shadow: 0 0 22px color-mix(in srgb, var(--accent) 45%, transparent);
+  font-family: var(--font-disp); font-size: 30px; font-weight: 700; line-height: 1; color: var(--paper);
   min-width: 42px; text-align: center;
 }
 .vs-mid__tag { font-family: var(--font-mono); font-size: 10px; letter-spacing: .2em; color: var(--txt-mute); }
@@ -942,19 +973,44 @@ img { display: block; max-width: 100%; }
 }
 
 /* ==========================================================================
-   21. NTE 主题强化：亮青 + 品红 + 黑描边 + 网点/斜纹（异环视觉语言）
-   仅调整视觉细节，不改动布局与类名。
+   21. 异环平面语言：海报排印 + 印刷装饰
+   --------------------------------------------------------------------------
+   从官方物料里只提炼出四个可复用元件，全站统一用这四个，不再逐处发明：
+     A. 海报排印：压缩斜体 + 纯白字，唯一的「上色」手段是标题级那层
+        青→白→品红渐变填充（--title-grad）。**文字不垫色块、不描边、不投影**：
+        官方物料里的字是直接压在画面上的，只有字本身；
+        底色只出现在按钮、输入框这类控件上，正文一律中性色；
+     B. 网点块：青 / 品红双色错位网点（--dots-a / --dots-b），只出现在角落；
+     C. 警示斜纹：KEEP OUT 胶带（--hazard），只作细条，不铺满；
+     D. 硬贴纸：黑底 + 2px 亮边 + 硬偏移投影 + 斜切角（**仅用于控件与卡片**，
+        不用于文字标签）。
    ========================================================================== */
 
-/* 21.1 顶栏品牌 */
-.hud {
-  border-bottom: 2px solid rgba(34, 224, 232, .55);
-  background: linear-gradient(180deg, rgba(6, 9, 15, .98), rgba(6, 9, 15, .82));
+/* 21.0 标题级文字：白 → 渐变。`.ol-w` 是弹窗标题用的同一套字形（字号小，不上渐变）。 */
+.ol-w {
+  font-family: var(--font-disp); font-style: italic; font-weight: 800;
+  letter-spacing: .04em; color: var(--paper);
 }
-.hud::after { height: 3px; opacity: 1; background: linear-gradient(90deg, var(--cyan), var(--accent-2)); }
+
+/* 21.0b 顶栏标题与主页头版标题共用同一层渐变填充。
+   宽度必须「贴合文字」（fit-content + max-width）——渐变是按元素宽度铺的，
+   块级标题撑满一行时，短标题只会吃到渐变最左边的一小段青色，永远到不了品红。
+   不支持 background-clip:text 的浏览器退回纯白（上面的 color 就是兜底）。 */
+.hud__title,
+.home-hero__title { color: var(--paper); width: -webkit-fit-content; width: fit-content; max-width: 100%; }
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .hud__title,
+  .home-hero__title {
+    background-image: var(--title-grad);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+}
+
+/* 21.1 顶栏品牌 */
 .logo-plate {
   display: grid; place-items: center; width: 42px; height: 42px; flex: none;
-  background: #05080e; border: 2px solid #05080e;
+  background: var(--ink); border: 2px solid var(--ink);
   box-shadow: 3px 3px 0 var(--accent-2);
   clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
 }
@@ -967,42 +1023,51 @@ img { display: block; max-width: 100%; }
 }
 .logo-plate:focus-visible { outline: none; }   /* 用上面那圈边框色当聚焦环 */
 .logo-plate:active { transform: translate(1px, 1px); }
-.hud__title {
-  font-style: italic; font-weight: 800; letter-spacing: .01em; color: #fff;
-  text-shadow: 2px 2px 0 #05080e, 4px 4px 0 rgba(125, 92, 255, .5);
-}
+/* 字形与上色分开：这里只管字形，渐变填充在 21.0b（一处定义） */
+.hud__title { font-style: italic; font-weight: 800; letter-spacing: .01em; }
 .hud__sub { color: var(--cyan); }
+/* 小号英文行前的三道斜杠（海报里最常见的「///」分隔符） */
+.hud__sub::before {
+  content: "///"; margin-right: 7px; letter-spacing: -.08em;
+  color: var(--magenta); font-weight: 700;
+}
 
 /* 顶栏下方的斜纹警示带（复用 .hud__stripes） */
 .hud__stripes {
   position: relative; z-index: 38; height: 6px;
-  background: repeating-linear-gradient(115deg, var(--cyan) 0 12px, #05080e 12px 24px, var(--accent-2) 24px 36px, #05080e 36px 48px);
+  background: var(--hazard);
   border-bottom: 1px solid rgba(0, 0, 0, .6);
 }
 .hud__stripes i { display: none; }
 
-/* 21.2 面板 */
-.panel {
-  border: 2px solid rgba(34, 224, 232, .22);
-  box-shadow: var(--shadow);
-}
+/* 21.2 面板：这里只把边框加到 2px（投影沿用第 7 节那条，别写第二遍） */
+.panel { border: 2px solid rgba(34, 224, 232, .2); }
 .panel::before, .panel::after { width: 14px; height: 14px; border-width: 3px; }
 .panel__head {
-  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .07) 0 9px, transparent 9px 20px);
+  position: relative;
+  background: var(--hatch), linear-gradient(90deg, rgba(34, 224, 232, .15), transparent 48%);
   border-bottom: 2px solid rgba(34, 224, 232, .2);
 }
-.panel__head h2 { font-style: italic; letter-spacing: .14em; }
+/* 面板头右下角那一小截「胶带」：青 → 品红，长度固定，不随文案变长 */
+.panel__head::after {
+  content: ""; position: absolute; right: 14px; bottom: -2px; width: 44px; height: 2px;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+}
+/* 面板标题：**文字直接压在底上**，不垫色块、不描边、不投影——靠压缩斜体
+   与左侧那道斜切渐变条立住。 */
+.panel__head h2 { font-style: italic; letter-spacing: .12em; color: var(--paper); }
 .panel__head h2::before {
-  width: 4px; height: 17px; box-shadow: none;
+  width: 4px; height: 17px; box-shadow: none; transform: skewX(-12deg);
   background: linear-gradient(180deg, var(--cyan), var(--accent-2));
 }
 
 /* 21.3 按钮：实心亮块 + 内侧「键帽」倒角
    注：.btn 自带 clip-path，外侧的 box-shadow / outline 会被一并裁掉，硬偏移投影原先只能
    用 `filter: drop-shadow()` 画；那会让每个按钮单开一张绘制表面（一屏几十个按钮就是几十次
-   离屏合成）。现在换成内侧倒角：裁不到、零额外开销，手感靠位移 + 倒角深浅表达。 */
+   离屏合成）。现在换成内侧倒角：裁不到、零额外开销，手感靠位移 + 倒角深浅表达。
+   主按钮用品红实心 + 黑边：物料里的 CTA（「了解详情」）就是这个形态。 */
 .btn {
-  border-width: 2px; border-color: rgba(34, 224, 232, .45); font-weight: 700;
+  border-width: 2px; border-color: rgba(34, 224, 232, .42); font-weight: 700;
   box-shadow: var(--bevel-sm);
 }
 .btn:hover {
@@ -1014,38 +1079,57 @@ img { display: block; max-width: 100%; }
   transform: translate(1px, 1px);
   box-shadow: inset 2px 2px 0 rgba(0, 0, 0, .45), inset 0 1px 0 rgba(255, 255, 255, .08);
 }
-.btn--primary { background: var(--accent); color: #06121a; border-color: #06121a; }
-.btn--primary:hover { background: #fff; color: #06121a; border-color: #06121a; }
-.btn--danger { background: var(--bad); color: #12040a; border-color: #12040a; }
-.btn--danger:hover { background: #fff; color: #12040a; border-color: #12040a; }
-.btn--ok { background: var(--ok); color: #04140c; border-color: #04140c; }
-.btn--ok:hover { background: #fff; color: #04140c; border-color: #04140c; }
-.btn--ghost { background: rgba(6, 10, 16, .72); }
+.btn--primary {
+  background: linear-gradient(180deg, #ff5aa0, var(--magenta));
+  color: var(--ink); border-color: var(--ink); letter-spacing: .08em;
+}
+.btn--primary:hover {
+  background: linear-gradient(180deg, #ffffff, #d9fdff);
+  color: var(--ink); border-color: var(--ink);
+}
+.btn--danger { background: var(--bad); color: var(--ink); border-color: var(--ink); }
+.btn--danger:hover { background: #fff; color: var(--ink); border-color: var(--ink); }
+.btn--ok { background: var(--ok); color: var(--ink); border-color: var(--ink); }
+.btn--ok:hover { background: #fff; color: var(--ink); border-color: var(--ink); }
+.btn--ghost { background: var(--ink-2); }
 
 /* 21.4 标签 */
 .chip, .badge { border-width: 2px; font-weight: 700; }
 .badge--win { background: rgba(47, 224, 138, .16); }
-.badge--live { background: var(--magenta); color: #12040a; border-color: #12040a; }
-.badge--done { background: var(--cyan); color: #06121a; border-color: #06121a; }
+.badge--live { background: var(--magenta); color: var(--ink); border-color: var(--ink); }
+.badge--done { background: var(--cyan); color: var(--ink); border-color: var(--ink); }
 
-/* 21.5 KPI */
+/* 21.5 KPI：数字是这一屏唯一的「海报大字」，白 + 黑边 + 品红错位影 */
 .kpi__card {
   border: 2px solid rgba(34, 224, 232, .22);
   box-shadow: var(--bevel);
 }
+/* 右上角一团青 / 品红错位网点（像印刷套色没对准）。
+   必须淡出（mask）——直角裁切会在卡片上留下一个硬边的「点阵方块」，
+   比装饰本身更显眼。 */
 .kpi__card::after {
-  width: 96px; height: 96px; right: -14px; top: -14px; filter: none;
-  background: radial-gradient(circle, rgba(255, 47, 142, .34) 1.5px, transparent 1.6px);
-  background-size: 9px 9px;
+  width: 78px; height: 78px; right: -12px; top: -12px; filter: none; opacity: .8;
+  background:
+    radial-gradient(var(--dots-b) 1.4px, transparent 1.5px) 0 0 / 9px 9px,
+    radial-gradient(var(--dots-a) 1.4px, transparent 1.5px) 4.5px 4.5px / 9px 9px;
+  -webkit-mask-image: linear-gradient(215deg, #000 12%, transparent 72%);
+  mask-image: linear-gradient(215deg, #000 12%, transparent 72%);
 }
-.kpi__value { font-style: italic; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6); }
-.kpi__bar { height: 5px; background: rgba(34, 224, 232, .14); }
+.kpi__label { color: var(--cyan); opacity: .82; }
+/* 数值：纯白、无影。此前那层「品红错位影」会在 46/60 这种带分母的数字上糊成一片，
+   物料里的数字也是干净的字面 + 底下的刻度线，不靠影强调。 */
+.kpi__value { font-style: italic; letter-spacing: -.01em; color: var(--paper); }
+/* 数字下面那排「虚线」：海报里数字底部的等宽刻度，纯渐变，零节点 */
+.kpi__card .kpi__bar { background: repeating-linear-gradient(90deg, rgba(34,224,232,.35) 0 6px, transparent 6px 11px); }
+.kpi__bar { height: 5px; }
 .kpi__bar i { background: linear-gradient(90deg, var(--cyan), var(--accent-2)); }
 
 /* 21.6 排行榜 */
 .board__head {
-  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .08) 0 8px, transparent 8px 18px);
+  background: var(--hatch);
   border-bottom: 2px solid rgba(34, 224, 232, .22);
+  /* 斜纹底会把字衬托得更暗，表头文字提亮一档才看得清 */
+  color: var(--txt-dim);
 }
 .board__row { border-bottom: 1px solid rgba(34, 224, 232, .09); }
 .board__row:hover { background: rgba(34, 224, 232, .08); }
@@ -1053,10 +1137,10 @@ img { display: block; max-width: 100%; }
 .board__row--top2 { background: linear-gradient(90deg, rgba(34, 224, 232, .14), transparent 55%); }
 .board__row--top3 { background: linear-gradient(90deg, rgba(255, 47, 142, .14), transparent 55%); }
 .rank { font-style: italic; }
-.rank--1 { color: var(--amber); text-shadow: none; }
-.rank--2 { color: var(--cyan); text-shadow: none; }
-.rank--3 { color: var(--magenta); text-shadow: none; }
-.points-cell { font-style: italic; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6); }
+.rank--1 { color: var(--amber); }
+.rank--2 { color: var(--cyan); }
+.rank--3 { color: var(--magenta); }
+.points-cell { font-style: italic; }
 
 /* 21.7 头像 */
 .ava__ring { box-shadow: inset 0 0 0 2px rgba(34, 224, 232, .7); }
@@ -1066,14 +1150,14 @@ img { display: block; max-width: 100%; }
 .round:hover { border-color: var(--accent); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), inset -4px -4px 0 rgba(0, 0, 0, .5); }
 .round--live { border-color: var(--magenta); box-shadow: inset 0 1px 0 var(--edge-hi), inset -3px -3px 0 rgba(255, 47, 142, .42); }
 .round__head {
-  background: repeating-linear-gradient(115deg, rgba(34, 232, 255, .07) 0 9px, transparent 9px 20px);
+  background: var(--hatch);
   border-bottom: 2px solid rgba(34, 224, 232, .2);
 }
 .round__no b { font-style: italic; }
 .member { border-width: 2px; background: rgba(10, 16, 26, .8); }
 .member--editable:hover { border-color: var(--accent); background: rgba(20, 40, 56, .9); }
 .member--empty { border-style: solid; border-color: rgba(34, 224, 232, .35); }
-.vs-mid__score { font-style: italic; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6); }
+.vs-mid__score { font-style: italic; }
 .duo__label i { width: 10px; height: 10px; }
 .win-tag { border-width: 2px; font-weight: 700; }
 .round__ops { background: rgba(6, 10, 16, .6); }
@@ -1086,11 +1170,19 @@ img { display: block; max-width: 100%; }
 .pcard__rate { height: 5px; }
 .pcard__rate i { background: linear-gradient(90deg, var(--ok), var(--cyan)); }
 
-/* 21.10 导航 */
+/* 21.10 导航：当前页不垫底——文字换成品红，下面压一条斜切「胶带」，
+   与海报里「字压在图/底上、用一道色条标记」的做法一致。管理页用青色区分。 */
 .tabs { border-top: 2px solid rgba(34, 224, 232, .35); background: rgba(5, 8, 14, .98); }
-.tab[aria-current="true"] { color: #06121a; background: var(--accent); }
-.tab[aria-current="true"]::after { display: none; }
-.tab--admin[aria-current="true"] { background: var(--magenta); }
+.tab[aria-current="true"] { color: var(--accent-2); background: transparent; }
+.tab[aria-current="true"]::after {
+  content: ""; display: block; position: absolute;
+  left: 22%; right: 22%; top: auto; bottom: 4px; height: 3px;
+  background: var(--accent-2);
+  transform: skewX(-16deg);
+  box-shadow: none;   /* 第 6 节那条给旧横条配过青色辉光，这里必须显式撤掉 */
+}
+.tab--admin[aria-current="true"] { color: var(--accent); }
+.tab--admin[aria-current="true"]::after { background: var(--accent); }
 
 /* 21.11 表单 */
 .field input, .field select, .field textarea { border-width: 2px; background: rgba(6, 10, 16, .92); }
@@ -1100,7 +1192,7 @@ img { display: block; max-width: 100%; }
 /* 21.12 直播 */
 .stage-frame { border-bottom: 2px solid rgba(34, 224, 232, .25); }
 .stage-cover { background: radial-gradient(circle at 50% 40%, rgba(10, 24, 34, .92), rgba(3, 6, 10, .98)); }
-.stage-cover__title { font-style: italic; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6); }
+.stage-cover__title { font-style: italic; }
 .url-row { border-width: 2px; }
 
 /* 21.13 提示 / 弹窗 */
@@ -1570,7 +1662,7 @@ img { display: block; max-width: 100%; }
 }
 .champion__name {
   margin-top: 6px; font-family: var(--font-disp); font-style: italic; font-size: 26px; font-weight: 800;
-  color: #fff; text-shadow: 2px 2px 0 rgba(0, 0, 0, .6);
+  color: var(--paper);
 }
 .champion__members { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
 .champion__member { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--txt-dim); }
@@ -2215,7 +2307,6 @@ img { display: block; max-width: 100%; }
   font-family: var(--font-disp); font-size: clamp(44px, 12vw, 84px); font-weight: 700;
   line-height: 1; letter-spacing: .06em; color: transparent;
   -webkit-text-stroke: 1.5px color-mix(in srgb, var(--accent) 62%, transparent);
-  text-shadow: 0 0 28px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 .deny__title { margin-top: 10px; font-size: clamp(17px, 3.4vw, 22px); font-weight: 700; color: #fff; }
 .deny__desc { margin: 8px auto 0; max-width: 56ch; font-size: 13px; line-height: 1.7; color: var(--txt-dim); }
@@ -2233,41 +2324,75 @@ img { display: block; max-width: 100%; }
   html[data-view="home"] body { padding-bottom: 28px; }
 }
 
-/* 35.1 头部：站点名 + 一句说明 + 三个统计 */
+/* 35.1 头部：站点名 + 一句说明 + 三个统计
+   这里是全站唯一的「海报头版」：封条（警示带）+ 贴纸 kicker + 描边大字。
+   其余页面最多只用其中一件，避免每屏都像是活动主视觉。 */
 .home-hero {
   position: relative; overflow: hidden;
-  padding: 20px 18px; border: 1px solid var(--line); border-radius: 2px;
+  padding: 26px 18px 20px;
+  border: 2px solid rgba(34, 224, 232, .24); border-radius: 2px;
   background:
-    radial-gradient(120% 150% at 10% 0%, rgba(34, 224, 232, .13), transparent 62%),
-    rgba(13, 19, 30, .9);
+    radial-gradient(120% 150% at 8% 0%, rgba(34, 224, 232, .16), transparent 60%),
+    radial-gradient(90% 120% at 100% 100%, rgba(255, 47, 142, .13), transparent 62%),
+    var(--panel);
+  box-shadow: var(--shadow);
 }
-/* 一道斜向条纹，呼应 HUD 的切角语言；纯装饰、不吃事件 */
+/* 顶边那道「封条」：整块卡片的剪彩胶带 */
+.home-hero::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 5px;
+  background: var(--hazard); opacity: .92; pointer-events: none;
+}
+/* 右上角一团双色网点（青 / 品红错位半格），纯装饰、不吃事件 */
 .home-hero::after {
-  content: ""; position: absolute; right: -40px; top: -30px; width: 220px; height: 160px;
-  background: repeating-linear-gradient(115deg, rgba(34, 224, 232, .16) 0 8px, transparent 8px 18px);
-  transform: rotate(8deg); pointer-events: none; opacity: .5;
+  content: ""; position: absolute; right: -30px; top: -26px; width: 210px; height: 150px;
+  background:
+    radial-gradient(var(--dots-b) 1.6px, transparent 1.7px) 0 0 / 10px 10px,
+    radial-gradient(var(--dots-a) 1.6px, transparent 1.7px) 5px 5px / 10px 10px;
+  transform: rotate(8deg); pointer-events: none; opacity: .55;
+  -webkit-mask-image: linear-gradient(215deg, #000 18%, transparent 76%);
+  mask-image: linear-gradient(215deg, #000 18%, transparent 76%);
 }
-.home-hero--slim { padding: 16px 18px; }
+.home-hero--slim { padding: 20px 18px 16px; }
+/* kicker 不垫底：直接用「青 → 品红」渐变字（物料里第二行强调语就是这么处理的）。
+   渐变字靠 background-clip:text 实现，不支持该属性的浏览器退回纯青色。 */
 .home-hero__kicker {
-  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .22em;
-  text-transform: uppercase; color: var(--accent);
+  display: inline-block; margin: 0;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 700; letter-spacing: .22em;
+  text-transform: uppercase; color: var(--cyan);
 }
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .home-hero__kicker {
+    background: linear-gradient(90deg, var(--cyan), var(--accent-2) 92%);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+}
+/* 这里只管字号与排布；上色（青→白→品红渐变）在 21.0b，一处定义 */
 .home-hero__title {
-  margin-top: 3px;
-  font-family: var(--font-disp); font-size: clamp(23px, 4.6vw, 34px); font-weight: 700;
-  letter-spacing: .03em; line-height: 1.15; color: #fff;
-  text-shadow: 0 0 22px color-mix(in srgb, var(--accent) 38%, transparent);
+  margin-top: 10px;
+  font-family: var(--font-disp); font-size: clamp(24px, 5.2vw, 38px); font-weight: 800;
+  font-style: italic; letter-spacing: .01em; line-height: 1.12;
 }
-.home-hero__desc { margin-top: 6px; max-width: 62ch; font-size: 12.5px; color: var(--txt-dim); }
-.home-hero__stats { margin-top: 13px; display: flex; flex-wrap: wrap; gap: 8px; }
+/* 标题下面一小截斜切胶带：标题的「美术落点」，也让头版有个收口 */
+.home-hero__title::after {
+  content: ""; display: block; width: 96px; height: 4px; margin-top: 12px;
+  background: linear-gradient(90deg, var(--cyan), var(--accent-2));
+  transform: skewX(-16deg);
+}
+.home-hero__desc { margin-top: 8px; max-width: 62ch; font-size: 12.5px; color: var(--txt-dim); }
+.home-hero__stats { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 18px; }
+/* 统计项不垫底：一根竖线分栏（版式上更像物料里的数据角标） */
 .home-stat {
   display: inline-flex; align-items: baseline; gap: 6px;
-  padding: 5px 12px; border: 1px solid var(--line-2); border-radius: 2px;
-  background: rgba(6, 10, 16, .62);
+  padding: 0 0 0 9px; border-left: 2px solid var(--line-2);
 }
-.home-stat b { font-family: var(--font-disp); font-size: 19px; font-weight: 700; color: #fff; }
+.home-stat b {
+  font-family: var(--font-disp); font-style: italic; font-size: 20px; font-weight: 800;
+  color: var(--paper);
+}
 .home-stat span { font-size: 11.5px; color: var(--txt-dim); }
-.home-stat--live b { color: var(--magenta); text-shadow: 0 0 16px rgba(255, 47, 142, .5); }
+.home-stat--live { border-left-color: var(--magenta); }
+.home-stat--live b { color: var(--magenta); }
 
 /* 35.2 入口卡：频道 +（有权限时的）管理赛事 */
 /* 「三步开赛」引导卡（见 events.js 的 setupGuideHtml）：只给有权限的人看，
@@ -2307,14 +2432,18 @@ img { display: block; max-width: 100%; }
 @media (min-width: 700px) { .home-entries { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .home-entry {
   display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; cursor: pointer;
-  padding: 13px 15px; border: 1px solid var(--line-2); border-radius: 2px;
-  background: rgba(13, 19, 30, .9); color: var(--txt); font: inherit; text-decoration: none;
-  transition: transform .18s ease, border-color .18s, box-shadow .18s, background .18s;
+  padding: 13px 15px; border: 2px solid var(--line-2); border-radius: 2px;
+  background: var(--panel); color: var(--txt); font: inherit; text-decoration: none;
+  clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+  transition: transform .18s ease, border-color .18s, background .18s;
 }
-.home-entry:hover {
-  transform: translateY(-2px); border-color: var(--accent);
-  background: rgba(17, 27, 42, .95); box-shadow: var(--glow);
+/* 左侧一道品红引脚：贴纸被「贴上」的那条边，hover 时点亮 */
+.home-entry::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+  background: var(--accent-2); opacity: .55; transition: opacity .18s, background .18s;
 }
+.home-entry:hover { transform: translateY(-2px); border-color: var(--accent); background: #121a2b; }
+.home-entry:hover::before { opacity: 1; background: var(--accent); }
 .home-entry__icon { display: inline-flex; flex: none; color: var(--accent); }
 .home-entry__icon svg { width: 25px; height: 25px; }
 .home-entry__text { display: grid; gap: 2px; min-width: 0; }
@@ -2521,16 +2650,12 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
   box-shadow: var(--shadow), inset 0 1px 0 var(--panel-hi);
   font-size: 12px; color: var(--txt-mute);
 }
-/* 顶边一道「中间亮、两端隐」的主题色细线——比再来一条实线边框轻 */
+/* 顶边一条「两端隐去」的警示带：与顶栏下方那条同源，收尾呼应又不喧宾夺主 */
 .foot::before {
-  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in srgb, var(--accent) 70%, transparent) 20%,
-    color-mix(in srgb, var(--accent) 70%, transparent) 80%,
-    transparent
-  );
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  background: var(--hazard); opacity: .55;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
 }
 .foot__links { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 .foot__link {
@@ -2906,7 +3031,6 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 .clock.is-on { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
 .clock.is-on .clock__time {
   color: var(--accent);
-  text-shadow: 0 0 14px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 /* 走秒时前面点一盏呼吸灯：一眼就能看出「它在跑」 */
 .clock.is-on .clock__time::before {
@@ -2952,11 +3076,9 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
 .btn--sm .ic { width: 14px; height: 14px; }
 .btn--icon .ic { width: 18px; height: 18px; }
 
-/* 底栏页签：当前页的图标带一点辉光，与文字一起被点亮 */
+/* 底栏页签：当前页整块是实心贴纸（见 21.10），图标不再走辉光——
+   墨色图标压在亮底上，再加青色辉光会糊成一团。 */
 .tab .ic { width: 20px; height: 20px; }
-.tab[aria-current="true"] .ic {
-  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 65%, transparent));
-}
 @media (max-width: 400px) { .tab .ic { width: 18px; height: 18px; } }
 
 /* 面板头：标题前那枚图标用主题色，与左侧那道竖条呼应 */
@@ -3003,3 +3125,169 @@ a, button, summary, label, .tab, .home-entry, .evt-card, .pcard, .round {
     animation: none !important;
   }
 }
+
+/* ---------- 导播台（/director）：四宫格多画面 ----------
+ *
+ * 每格内部复用 .stage-frame（16:9 + 绝对定位的 video），只把封面字号收小，
+ * 这样直播页那套播放器样式不用改一行就能直接用在格子里。
+ *
+ * 两个刻意的取舍：
+ *   * 按钮条默认半透明、鼠标进来才实心（触屏没有 hover，窄屏下直接常显）；
+ *   * 「放大」纯样式实现（is-solo），不销毁 / 重建任何 <video>——
+ *     网格里重建元素等于让那一路重新协商。
+ */
+.dg {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.dg-cell {
+  position: relative; min-width: 0;
+  border: 1px solid var(--line); background: #04070c;
+  transition: border-color .18s ease;
+}
+.dg-cell:hover, .dg-cell:focus-within { border-color: var(--line-2); }
+/* 主音那一格点亮边框：一眼看出「声音在这一路」 */
+.dg-cell.is-audio {
+  border-color: rgba(56, 232, 255, .75);
+  box-shadow: inset 0 0 0 1px rgba(56, 232, 255, .35);
+}
+
+.dg-cell .stage-cover { padding: 10px; gap: 6px; }
+.dg-cell .stage-cover__title { font-size: 14px; letter-spacing: .1em; }
+.dg-cell .stage-cover__msg { font-size: 10.5px; }
+
+.dg-cell__name {
+  position: absolute; top: 8px; left: 8px; z-index: 3;
+  max-width: calc(100% - 92px); padding: 2px 7px;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .08em; color: var(--txt);
+  background: rgba(4, 8, 14, .72); border: 1px solid var(--line);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dg-cell__name:empty { display: none; }
+.dg-cell__state {
+  position: absolute; top: 8px; right: 8px; z-index: 3;
+  padding: 1px 5px; background: rgba(4, 8, 14, .6);
+  font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .1em; color: var(--txt-dim);
+}
+.dg-cell__acts {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+  display: flex; gap: 5px; justify-content: flex-end; padding: 6px 8px;
+  background: linear-gradient(180deg, rgba(4, 7, 12, 0), rgba(4, 7, 12, .82));
+  opacity: .35; transition: opacity .18s ease;
+}
+.dg-cell:hover .dg-cell__acts, .dg-cell:focus-within .dg-cell__acts { opacity: 1; }
+
+/* 放大一格：其余收起。网格行高由 16:9 决定，放大后自动占满整块 */
+.dg.is-solo-mode .dg-cell:not(.is-solo) { display: none; }
+.dg-cell.is-solo { grid-column: 1 / -1; grid-row: 1 / -1; }
+
+.dg-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dg-bar__round { font-weight: 700; }
+.dg-bar__meta { font-family: var(--font-mono); font-size: 10.5px; color: var(--txt-mute); }
+.dg-bar__gap { flex: 1; }
+
+/* 直播页里通往导播台的入口 */
+.live-more { margin: 0; display: flex; justify-content: flex-end; }
+.live-more__link {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em;
+  color: var(--txt-dim); text-decoration: none; border-bottom: 1px dashed var(--line-2);
+}
+.live-more__link:hover { color: var(--accent); border-color: var(--accent); }
+
+/* 窄屏：一格一行（四分之一宽度在手机上根本看不清画面），按钮常显 */
+@media (max-width: 760px) {
+  .dg { grid-template-columns: 1fr; }
+  .dg-cell__acts { opacity: 1; }
+}
+
+/* ==========================================================================
+   45. 模拟群（/bot，调试模式专用）
+   --------------------------------------------------------------------------
+   一个「假 QQ 群」：左边机器人、右边你自己，回复里带卡片图。
+   视觉仍守第 21 节那几条：文字不垫色块、只用一道色条/边框区分角色。
+   ========================================================================== */
+.bot__room { display: flex; flex-direction: column; overflow: hidden; }
+.bot__bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 14px; border-bottom: 2px solid rgba(34, 224, 232, .22);
+  background: var(--hatch);
+}
+.bot__roomname {
+  font-family: var(--font-disp); font-style: italic; font-weight: 800;
+  font-size: 15px; letter-spacing: .04em; color: var(--paper);
+}
+.bot__roomname span { font-family: var(--font-mono); font-size: 11px; color: var(--txt-mute); font-style: normal; }
+.bot__roomhint { font-size: 11.5px; color: var(--txt-mute); }
+.bot__bar .btn { margin-left: auto; }
+
+.bot__msgs {
+  flex: 1; display: flex; flex-direction: column; gap: 14px;
+  padding: 16px 14px; min-height: 320px; max-height: 62vh; overflow: auto;
+  overscroll-behavior: contain; background: rgba(6, 9, 15, .5);
+}
+
+/* 一条消息：头像 + 内容。自己发的靠右（--me） */
+.bot__msg { display: flex; gap: 10px; align-items: flex-start; }
+.bot__msg--me { flex-direction: row-reverse; }
+.bot__ava {
+  flex: none; width: 30px; height: 30px; display: grid; place-items: center;
+  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+  color: var(--ink); background: var(--cyan);
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+}
+.bot__msg--me .bot__ava { background: var(--accent-2); }
+.bot__side { display: flex; flex-direction: column; gap: 6px; max-width: min(78%, 620px); }
+.bot__msg--me .bot__side { align-items: flex-end; }
+.bot__head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; color: var(--txt-mute); font-family: var(--font-mono);
+}
+.bot__head b { font-family: var(--font-ui); font-size: 11.5px; color: var(--txt-dim); font-weight: 700; }
+.bot__tag { padding: 0 5px; border: 1px solid var(--line-2); }
+.bot__tag--push { border-color: var(--accent-2); color: var(--accent-2); }
+
+/* 气泡：只用边框与一条左边色条区分角色，不铺大色块 */
+.bot__bubble {
+  position: relative; padding: 9px 12px;
+  border: 2px solid rgba(34, 224, 232, .22); border-left: 3px solid var(--accent);
+  background: var(--panel-2);
+  font-size: 13px; line-height: 1.65; color: var(--txt);
+}
+.bot__bubble--me {
+  border-color: rgba(255, 47, 142, .32); border-right: 3px solid var(--accent-2); border-left: 2px solid rgba(255, 47, 142, .32);
+  background: rgba(255, 47, 142, .07); color: var(--paper);
+}
+.bot__bubble--typing { color: var(--txt-mute); font-style: italic; }
+.bot__text { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+.bot__text + .bot__text { margin-top: 10px; }
+.bot__empty { color: var(--txt-mute); font-size: 12px; }
+.bot__imgwrap { display: block; }
+/* 卡片原图是 1080 宽：显示得太小就看不清字，太大会把聊天窗口撑爆 */
+.bot__img {
+  display: block; width: 100%; max-width: 380px; height: auto;
+  border: 2px solid var(--line-2); background: var(--bg-2);
+}
+.bot__meta { margin-top: 6px; font-family: var(--font-mono); font-size: 11px; color: var(--amber); }
+
+.bot__sys {
+  margin: auto; padding: 18px; max-width: 46ch; text-align: center;
+  font-size: 12.5px; line-height: 1.7; color: var(--txt-mute);
+}
+.bot__sys b { display: block; margin-bottom: 6px; color: var(--txt-dim); }
+
+.bot__chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px 0; }
+.bot__chip {
+  padding: 3px 10px; cursor: pointer; font: inherit; font-size: 12px;
+  color: var(--txt-dim); background: transparent;
+  border: 1px solid var(--line-2); border-radius: 2px;
+}
+.bot__chip:hover { color: var(--primary-ink, #06121a); background: var(--cyan); border-color: var(--cyan); }
+
+.bot__composer { display: flex; gap: 8px; padding: 10px 14px 14px; }
+.bot__input {
+  flex: 1; min-width: 0; padding: 9px 12px;
+  border: 2px solid var(--line); border-radius: 2px;
+  background: rgba(6, 10, 16, .92); color: var(--txt);
+  font-family: var(--font-ui); font-size: 13px;
+}
+.bot__input:focus { outline: none; border-color: var(--accent); }

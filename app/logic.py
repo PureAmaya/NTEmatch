@@ -16,7 +16,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
-from . import league, markdown, metrics
+from . import debug, league, markdown, metrics
 from . import tournament as T
 from .defaults import SPORT_WORDS
 from .logging_conf import get_logger
@@ -1481,6 +1481,11 @@ def build_stream_map(cfg: Config) -> dict[str, dict[str, Any]]:
             continue
         rnd = current_round_of(cfg, player.id)
         room = play_endpoints(cfg.stream, key)
+        if debug.active() and not (cfg.stream.base_url or "").strip():
+            # 调试模式 + **没配媒体服务器**：打个标记，前端改用本地生成的画面
+            # （见 live.js 的 playMock）。配了地址就照常走真实推流——调试日志与
+            # 真实直播可以同时要，不该被模拟画面顶掉。
+            room["mock"] = True
         room["roundCode"] = rnd.code if rnd is not None else ""
         room["roundLabel"] = (rnd.label or rnd.code) if rnd is not None else ""
         rooms[player.id] = room

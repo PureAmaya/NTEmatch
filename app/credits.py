@@ -65,12 +65,6 @@ RUNTIME: list[tuple[str, str, str, str]] = [
     ("Certifi", "MPL-2.0", "https://github.com/certifi/python-certifi", "CA 根证书（弱著佐权，可自由组合）"),
     ("IDNA", "BSD-3-Clause", "https://github.com/kjd/idna", "国际化域名支持"),
     ("opentelemetry-api", "Apache-2.0", "https://github.com/open-telemetry/opentelemetry-python", "遥测接口（Starlette 依赖）"),
-    (
-        "Pillow",
-        "MIT-CMU",
-        "https://github.com/python-pillow/Pillow",
-        "图片推送的渲染器：比赛卡片图与机器人帮助图都由它画",
-    ),
 ]
 
 FRONTEND: list[tuple[str, str, str, str]] = [
@@ -79,6 +73,16 @@ FRONTEND: list[tuple[str, str, str, str]] = [
         "MIT",
         "https://github.com/feathericons/feather",
         "编辑器工具栏的 SVG 图标（内联，跟随主色；本站不使用图标字体）",
+    ),
+]
+
+#: 随镜像一起分发的 **Go 二进制**（编译产物，不是 Python 包，所以不参与 uv.lock 对齐）
+SIDECAR: list[tuple[str, str, str, str]] = [
+    (
+        "Go 标准库 + golang.org/x/image",
+        "BSD-3-Clause",
+        "https://pkg.go.dev/golang.org/x/image",
+        "出图侧车 nterender：比赛卡片 / 结果卡片 / 帮助图 / 分享图的排版与栅格化",
     ),
 ]
 
@@ -125,6 +129,12 @@ def groups() -> list[dict[str, Any]]:
             "items": _rows(FRONTEND),
         },
         {
+            "key": "sidecar",
+            "title": "Go 侧车",
+            "note": "随镜像分发的静态二进制（ntecalc / nterender）",
+            "items": _rows(SIDECAR),
+        },
+        {
             "key": "program",
             "title": "外部程序",
             "note": "独立运行，需自行部署（本站只与它对接）",
@@ -140,7 +150,7 @@ def component_names() -> set[str]:
     ``tests/test_credits.py`` 用它对齐 ``pyproject.toml`` 的依赖声明——
     加了依赖却忘了写进清单，测试会提醒（这正是「别忘了那个 M 开头的」的机器版本）。
     """
-    names = {name.lower() for name, *_ in RUNTIME + FRONTEND + PROGRAM + DEV}
+    names = {name.lower() for name, *_ in RUNTIME + FRONTEND + SIDECAR + PROGRAM + DEV}
     # pydantic-core / typing-extensions 这类名字在 pyproject 里不会出现，
     # 对齐时按「声明名」统一一下大小写与连字符即可
     return names

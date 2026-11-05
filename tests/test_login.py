@@ -200,7 +200,7 @@ def test_cli_help_is_grouped(capsys):
     for title in ("启动服务", "启动前自检", "本机维护", "环境变量", "常见操作", "配套脚本"):
         assert title in out, f"帮助里少了分组：{title}"
     # 同一条命令不许出现两次（曾经 hotrun 写了两遍）
-    assert out.count("python -m app hotrun") == 1, "同一命令别在帮助里重复"
+    assert out.count("uv run main.py hotrun") == 1, "同一命令别在帮助里重复"
 
 
 def test_config_no_longer_carries_an_admin_key():

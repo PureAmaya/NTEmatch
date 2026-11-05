@@ -4,7 +4,7 @@
 
 ```bash
 uv run python tools/make_help_card.py
-# → static/help.jpg（1080×宽，按内容自适应高度；Pillow 只在生成时需要，不进运行依赖）
+# → static/help.jpg（760 或 1080 宽，按内容自适应高度；由 Go 侧车 nterender 生成）
 ```
 
 出图后**什么都不用配**：站点会在 `/help.jpg` 提供它，插件 `比赛帮助` 会先探一下这张图

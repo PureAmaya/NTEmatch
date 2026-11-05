@@ -16,10 +16,12 @@
 2. **渲染在线程里、并发受限**：:func:`asyncio.to_thread` + 信号量 + 超时，事件循环一秒都
    不等；同一份内容的并发请求还会合并成一次渲染（单飞锁），不会出现「十个人同时点预览，
    十次全量渲染」；
-3. **Pillow 是正式依赖**（``pyproject.toml`` 的 ``dependencies`` 里）：图片推送就是靠它
-   渲染，默认装好就有图。万一某个环境没装上（自建镜像漏了依赖、装了坏版本），
-   :func:`available` 是 ``False``、:func:`card_for_event` 回 ``None``，调用方
-   **自动退回纯文本**（信息一条不少，只是排版朴素）——那是**兜底**，不是常态。
+3. **出图在 Go 侧车**（``go/cmd/nterender``，见 :mod:`app.render`）：这里只组内容
+   （:func:`payload_for` / :func:`payload_for_result`），画成什么样全由
+   ``go/internal/render`` 决定——配色与排版只有那一份实现，不会出现「网页一套、
+   图一套」。万一这台机器上没有那个二进制，:func:`available` 是 ``False``、
+   :func:`card_for_event` 回 ``None``，调用方**自动退回纯文本**（信息一条不少，
+   只是排版朴素）——那是**兜底**，不是常态。
 
 安全性
 ------
@@ -40,15 +42,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
-import importlib.util
 import json
 import re
 import time
 from pathlib import Path
 from typing import Any
 
-from . import fonts, logic, markdown, metrics
+from . import logic, markdown, metrics
+from . import render as renderer
 from .logging_conf import get_logger
 from .models import MAX_SIDES, Config
 from .store import DATA_ROOT
@@ -58,35 +59,15 @@ log = get_logger("card")
 #: 卡片落盘目录（与备份、公告图片分开存放）
 CARD_ROOT = DATA_ROOT / "cards"
 
-#: 画布宽度（与帮助图同一档，手机上缩放后仍清晰）
-WIDTH = 1080
-PAD = 64
-#: 高度上限：规则再多也不至于出一张几万像素的图（超出部分写到「见站点」）
-MAX_HEIGHT = 6000
 #: 一张卡片最多几张（内容定址的目录会攒文件，按 mtime 清最旧的）
 MAX_FILES = 240
 #: 渲染超时：超了就当作「这次没图」，退回文本推送（总比把请求挂在这儿强）
 RENDER_TIMEOUT = 20.0
-#: 同时渲染数（Pillow 是纯 CPU，放开跑会把核占满，界面就卡了）
+#: 同时渲染数（出图是纯 CPU：子进程 + PNG 编码，放开跑会把核占满）
 MAX_CONCURRENT = 2
 #: 卡片文件名的白名单：只认我们自己写出去的形态
 _NAME_RE = re.compile(r"^[0-9a-f]{16,64}\.png$")
 
-# 站点配色（与 static/css/nte.css 的变量一致，图与网页是一套观感）
-INK = (4, 7, 12)
-PANEL = (16, 23, 37)
-ACCENT = (34, 224, 232)
-ACCENT_2 = (125, 92, 255)
-DIM = (147, 167, 193)
-TXT = (230, 240, 255)
-LINE = (34, 224, 232, 60)
-WARN = (255, 196, 92)
-#: 结果卡片的对阵框（比面板略亮一点，衬出「一个一个方框」）
-BOX_FILL = (23, 32, 50, 255)
-BOX_EDGE = (48, 63, 92, 255)
-
-# 字体不在本模块里写死：中文必须是 CJK 字体，而「它装在哪」各发行版都不一样，
-# 统一由 app/fonts.py 分四层去找（环境变量 → 常见路径 → 扫字体目录 → 内置兜底）。
 
 #: 已签发的卡片（哈希 → 签发信息）。只读内存，见模块说明。
 _ISSUED: dict[str, dict[str, Any]] = {}
@@ -95,32 +76,19 @@ _semaphore: asyncio.Semaphore | None = None
 
 
 # --------------------------------------------------------------------------- #
-# Pillow（图片推送的渲染器）
+# 出图（Go 侧车，见 app/render.py）
 # --------------------------------------------------------------------------- #
 def available() -> bool:
-    """这台机器上能不能画图（Pillow 装没装）。
+    """这台机器上能不能出图（``nterender`` 二进制在不在、版本对不对）。
 
-    Pillow 是正式依赖，正常情况下这里一直是 ``True``；留着这道判断是为了
-    **兜底**：环境没装全 / 装坏了时，与其整个推送报错，不如安静退回纯文本。
-
-    只探「装没装」（``find_spec``），**不导入**：这条判断每次推送都会问一次，
-    没必要为它真把 Pillow 拉进来（真装坏了也由 :func:`render` 兜住，同样退回文本）。
+    没有二进制就安静退回纯文本：文案里本来就带规则摘要与逐场比分，信息不缺，
+    只是没有图——比整条推送报错强。
     """
-    try:
-        return importlib.util.find_spec("PIL") is not None
-    except (ImportError, ValueError):  # 包元数据坏掉之类：当作没有
-        return False
-
-
-def _pil():
-    """延迟导入 Pillow（导入失败由调用方兜住，退回纯文本）。"""
-    from PIL import Image, ImageDraw, ImageFilter, ImageFont
-
-    return Image, ImageDraw, ImageFilter, ImageFont
+    return renderer.available()
 
 
 # --------------------------------------------------------------------------- #
-# 内容：**纯函数**（不碰 Pillow、不碰网络），所以卡片内容本身能直接单测
+# 内容：**纯函数**（不碰渲染器、不碰网络），所以卡片内容本身能直接单测
 # --------------------------------------------------------------------------- #
 def _clean_text(text: str, limit: int) -> str:
     """压平空白、去掉 Markdown 记号、按字符截断。
@@ -249,10 +217,8 @@ def payload_for(cfg: Config, event_id: str = "", state: dict[str, Any] | None = 
 # 渲染只负责把方框与折线画上去。父子关系以对局自带的 ``srcA`` / ``srcB`` 为准，
 # 所以单败 / 双败、4 强到 32 强都是同一套代码。
 # --------------------------------------------------------------------------- #
-#: 结果卡片最多画多宽（树再宽也不至于出一张几万像素的图）
-MAX_RESULT_WIDTH = 5200
-
-#: 树状图布局常量：它们**进指纹**（改了布局就是另一张图）
+#: 树状图布局常量：坐标全在这里算好，渲染器只按坐标画。
+#: **这些值会随 payload 一起交给 Go**（``tree.box``），所以「方框多大」只有这一处定义。
 _TREE_BOX = 250
 _TREE_BOX_H = 96
 _TREE_GAP_X = 40
@@ -416,7 +382,7 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
             node["kids"].append(kid)
 
     pitch = _TREE_BOX + _TREE_GAP_X
-    gap = max([_TREE_BOX_H, *[n["h"] for n in nodes.values()]] or [_TREE_BOX_H]) + 10
+    gap = max([_TREE_BOX_H, *[n["h"] for n in nodes.values()]]) + 10
     bands = ["main"] if single else ["wb", "lb", "gf"]
     band_boxes: list[dict[str, Any]] = []
     band_tops: dict[str, int] = {}
@@ -490,6 +456,8 @@ def _tree_section(cfg: Config, state: dict[str, Any], sc: Any) -> dict[str, Any]
     height = max([node["y"] + node["h"] for node in all_nodes] or [0]) + _TREE_PAD
     return {
         "single": single,
+        # 画方框要用到的尺寸：跟着坐标一起交给渲染器，免得两边各写一套常量
+        "box": {"w": _TREE_BOX, "h": _TREE_BOX_H, "sideRow": _TREE_SIDE_ROW, "champW": _TREE_CHAMP_W},
         "bands": band_boxes,
         "columns": [{"x": col["x"], "y": col["labelY"], "title": col["title"]} for col in cols],
         "nodes": [
@@ -609,529 +577,40 @@ def digest(payload: dict[str, Any]) -> str:
     ``sort_keys`` + ``ensure_ascii=False``：两边算出来的必须一模一样，
     否则「同样的内容」会被当成两份，缓存也就白做了。
 
-    **字体也算进指纹**：图是拿当时的字体画出来的——换了字体（或者这台机器从
-    「没装中文字体」变成「装了」），同一份内容画出来就是另一张图。不算进去的话
-    会一直发着旧那张（真踩过：中文是一排方块的那版）。
+    **画法与字体也算进指纹**：图是拿当时的渲染器与字体画出来的——换了二进制、
+    换了字体（或者这台机器从「没装中文字体」变成「装了」），同一份内容画出来就是
+    另一张图。不算进去的话会一直发着旧那张（真踩过：中文是一排方块的那版）。
     """
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256((blob + _font_signature()).encode("utf-8")).hexdigest()
+    return hashlib.sha256((blob + _render_signature()).encode("utf-8")).hexdigest()
 
 
-def _font_signature() -> str:
-    """画这张图用的字体（找不到就是 ``-``）：并入指纹，换字体就自动重画。
+def _render_signature() -> str:
+    """「画法」的指纹：侧车的协议版本 / 构建标记 / 实际字体（见 :func:`app.render.signature`）。
 
-    用 :func:`app.fonts.identity` 而不是裸路径：多语言合集里 JP / SC 是**同一个文件的不同
-    face**——只认路径的话，把日文那支换成简体那支以后，缓存里那些「日文字形」的卡片
-    还会被一直发出去。
+    缓存是内容定址的，指纹里少一项，旧图就会一直躺在 ``data/cards`` 里被反复发出去
+    （真踩过：换了字体重启，群里还是旧那张）。
     """
-    return "|" + "|".join(fonts.identity(kind) for kind in ("cjk", "latin", "mono"))
+    return "|" + renderer.signature()
 
 
 # --------------------------------------------------------------------------- #
-# 渲染（Pillow）—— 所有函数都在线程里跑，见 card_for_event
+# 渲染：交给 Go 侧车（排版、配色、取景全在 go/internal/render 里）
 # --------------------------------------------------------------------------- #
-#: 不该出现在**行首**的标点：折行时它们要跟着前一个字走（「。」独占一行很难看）
-_TRAILING_PUNCT = "。，、；：？！）】》」』”’…%,.;:?!)]}"
-
-
-def _tokens(text: str) -> list[str]:
-    """按「中文逐字、西文成串」切词——中文没有空格，只能逐字折行。"""
-    out: list[str] = []
-    buf = ""
-    for ch in text:
-        if ch.isascii() and (ch.isalnum() or ch in "-_/+.:%()"):
-            buf += ch
-            continue
-        if buf:
-            out.append(buf)
-            buf = ""
-        out.append(ch)
-    if buf:
-        out.append(buf)
-    # 收尾标点并进前一个词：否则折行时会出现「……跟谁打」+「。」的孤行
-    merged: list[str] = []
-    for token in out:
-        if merged and token and all(ch in _TRAILING_PUNCT for ch in token):
-            merged[-1] += token
-        else:
-            merged.append(token)
-    return merged or [""]
-
-
-def _wrap_multiline(text: str, font, width: int) -> list[str]:
-    """折行，且**尊重原文里的换行**。
-
-    简介是**可以换行**的（地图 / 规则 / 注意事项分行写），所以先按 ``\\n`` 分段、
-    每段各自折行；空行直接跳过（免得白占一行高度）。以前一律当成一整段，
-    用户敲的回车全被吃掉了。
-    """
-    out: list[str] = []
-    for paragraph in str(text or "").replace("\r\n", "\n").split("\n"):
-        if not paragraph.strip():
-            continue
-        out.extend(_wrap(paragraph, font, width))
-    return out
-
-
-def _wrap(text: str, font, width: int) -> list[str]:
-    """把一段文字折成若干行；**单个词比整行还宽**时硬切，避免溢出画布。"""
-    lines: list[str] = []
-    cur = ""
-    for token in _tokens(text):
-        probe = cur + token
-        if font.getlength(probe) <= width or not cur:
-            while font.getlength(probe) > width and len(probe) > 1:
-                # 单个长词（一长串英文 / 数字）：按宽度硬切
-                cut = max(1, len(probe) // 2)
-                while cut > 1 and font.getlength(probe[:cut]) > width:
-                    cut -= 1
-                lines.append(probe[:cut])
-                probe = probe[cut:]
-            cur = probe
-            continue
-        lines.append(cur)
-        cur = token
-    if cur:
-        lines.append(cur)
-    return lines or [""]
-
-
-def _brand_bar(img, x: int, y: int, width: int, *, height: int = 4, step: int = 26) -> int:
-    """画品牌渐变小条（与站点品牌线同色），返回**下一行的 y**。"""
-    Image, ImageDraw, _Filter, _ImageFont = _pil()
-    bar = Image.new("RGBA", (max(1, width), height), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(bar)
-    for i in range(max(1, width)):
-        t = i / max(1, width - 1)
-        bd.line(
-            [(i, 0), (i, height)],
-            fill=(
-                round(ACCENT[0] + (ACCENT_2[0] - ACCENT[0]) * t),
-                round(ACCENT[1] + (ACCENT_2[1] - ACCENT[1]) * t),
-                round(ACCENT[2] + (ACCENT_2[2] - ACCENT[2]) * t),
-                235,
-            ),
-        )
-    img.alpha_composite(bar, (x, y))
-    return y + step
-
-
 def render(payload: dict[str, Any], *, site: str = "") -> bytes | None:
     """把 :func:`payload_for` 的内容画成 PNG（**阻塞**，调用方负责放进线程）。
 
-    画法：先画到一张够高的画布上，最后按实际用掉的高度裁掉——省掉一堆高度预估，
-    也让「规则条目多一条」这种事不需要改任何布局常量。
+    画法（警示胶带 + 渐变标题 + 切角面板 + 双色网点）由 ``go/internal/render`` 决定，
+    这里只负责把内容递过去。画不出来（没二进制 / 超时 / 出错）返回 ``None``。
     """
-    try:
-        Image, ImageDraw, _Filter, _ImageFont = _pil()
-    except Exception as exc:  # noqa: BLE001  (Pillow 装坏了 / 缺依赖：这次没图，退回文本)
-        log.info("没有装 Pillow，卡片渲染跳过 | %s", exc)
-        return None
-    try:
-        img = Image.new("RGBA", (WIDTH, MAX_HEIGHT), (*PANEL, 255))
-        draw = ImageDraw.Draw(img)
-        f_title = fonts.load("cjk", 56)
-        # 副标题那行是「编号 · 状态 · 一句话」，**含中文**（「筹备中」「第 1 届」…）：
-        # 必须用 CJK 字体。曾经这里用等宽西文字体（bahnschrift），中文全成了空心方块。
-        f_sub = fonts.load("cjk", 24)
-        f_key = fonts.load("cjk", 24)
-        f_val = fonts.load("cjk", 26)
-        f_body = fonts.load("cjk", 26)
-        f_tab = fonts.load("cjk", 26)
-        f_note = fonts.load("cjk", 22)
-        inner = WIDTH - PAD * 2
-
-        y = PAD
-        # ---- 标题区 ----
-        for line in _wrap(str(payload.get("title") or "比赛"), f_title, inner)[:2]:
-            draw.text((PAD, y), line, font=f_title, fill=TXT)
-            y += int(f_title.size * 1.25)
-        sub_bits = [b for b in (payload.get("id"), payload.get("status"), payload.get("headline")) if b]
-        if sub_bits:
-            draw.text((PAD, y), " · ".join(str(b) for b in sub_bits), font=f_sub, fill=ACCENT)
-            y += int(f_sub.size * 1.6)
-        # 渐变小条：与站点品牌线同色
-        y = _brand_bar(img, PAD, y, inner)
-
-        def panel_lines(pairs: list[tuple[str, str]], *, label: str = "") -> int:
-            """画一块「键：值」面板，返回新的 y。
-
-            「键」在左边（暗色），值的第一行跟它**同一行**，长值折行时缩进对齐到值那一列。
-            """
-            nonlocal y
-            if not pairs:
-                return y
-            if label:
-                draw.text((PAD + 18, y), label, font=f_key, fill=ACCENT)
-                y += int(f_key.size * 1.9)
-            for key, value in pairs:
-                key_span = int(f_key.getlength(key) + 18)
-                lines = _wrap(str(value), f_val, inner - key_span - 36) or [""]
-                draw.text((PAD + 8, y), key, font=f_key, fill=DIM)
-                for index, line in enumerate(lines):
-                    draw.text((PAD + 8 + key_span, y), line, font=f_val, fill=TXT)
-                    if index < len(lines) - 1:
-                        y += 44
-                y += 44
-            draw.line([(PAD, y - 14), (WIDTH - PAD, y - 14)], fill=LINE, width=1)
-            y += 10
-            return y
-
-        y = panel_lines(list(payload.get("meta") or []))
-        y = panel_lines(list(payload.get("groups") or []), label="分组名单")
-
-        # ---- 比赛规则（就是「规则」面板那一份，自动跟着赛制变）----
-        for section in payload.get("sections") or []:
-            items = [item for item in (section.get("items") or []) if item]
-            if not items:
-                continue
-            title = str(section.get("title") or "")
-            if title:
-                tab_w = int(f_tab.getlength(title)) + 40
-                tab = Image.new("RGBA", (tab_w, f_tab.size + 20), (*ACCENT, 235))
-                img.alpha_composite(tab, (PAD, y))
-                ImageDraw.Draw(img).text(
-                    (PAD + 20, y + 9), title, font=f_tab, fill=INK
-                )
-                y += f_tab.size + 34
-            for item in items:
-                wrapped = _wrap(str(item), f_body, inner - 26)
-                for index, line in enumerate(wrapped):
-                    if index == 0:
-                        draw.text((PAD + 6, y), "·", font=f_body, fill=ACCENT)
-                    draw.text((PAD + 26, y), line, font=f_body, fill=TXT)
-                    y += int(f_body.size * 1.42)
-            y += 14
-            if y > MAX_HEIGHT - 400:
-                draw.text((PAD + 26, y), "…（还有更多规则，见站点「比赛规则」）", font=f_note, fill=WARN)
-                y += 40
-                break
-
-        # ---- 比赛简介（原文照排，**尊重用户敲的换行**）----
-        note = str(payload.get("note") or "").strip()
-        if note and y < MAX_HEIGHT - 260:
-            title = str(payload.get("noteTitle") or "比赛简介")
-            tab_w = int(f_tab.getlength(title)) + 40
-            tab = Image.new("RGBA", (tab_w, f_tab.size + 20), (*DIM, 60))
-            img.alpha_composite(tab, (PAD, y))
-            ImageDraw.Draw(img).text((PAD + 20, y + 9), title, font=f_tab, fill=TXT)
-            y += f_tab.size + 34
-            for line in _wrap_multiline(note, f_note, inner):
-                if y > MAX_HEIGHT - 140:
-                    break
-                draw.text((PAD + 6, y), line, font=f_note, fill=DIM)
-                y += int(f_note.size * 1.5)
-            y += 16
-
-        # ---- 页脚 ----
-        y = min(y, MAX_HEIGHT - 110)
-        draw.line([(PAD, y), (WIDTH - PAD, y)], fill=LINE, width=1)
-        y += 26
-        draw.text((PAD, y), str(payload.get("caption") or ""), font=f_note, fill=DIM)
-        if site:
-            draw.text((PAD, y + 34), f"{site} · 规则随赛制自动生成", font=f_note, fill=ACCENT)
-            y += 34
-        cropped = img.crop((0, 0, WIDTH, min(MAX_HEIGHT, y + PAD)))
-
-        import io
-
-        buf = io.BytesIO()
-        # 转 RGB 再存：截图类内容用不着 alpha，JPEG 化也小得多
-        cropped.convert("RGB").save(buf, format="PNG", optimize=True)
-        return buf.getvalue()
-    except Exception:
-        log.warning("卡片渲染失败（本次退回纯文本推送）", exc_info=True)
-        return None
-
-
-def _hex_color(raw: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
-    """``#rrggbb`` / ``#rgb`` → RGB；认不出来就退回给定颜色（队伍没配色时用）。"""
-    text = str(raw or "").strip().lstrip("#")
-    if len(text) == 3:
-        text = "".join(ch * 2 for ch in text)
-    if len(text) != 6:
-        return fallback
-    try:
-        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
-    except ValueError:
-        return fallback
-
-
-def _clip(text: str, font, width: int) -> str:
-    """把一段文字截到给定宽度（放不下就加省略号）——方框里没有滚动条。"""
-    if font.getlength(text) <= width:
-        return text
-    trimmed = text
-    while trimmed and font.getlength(trimmed + "…") > width:
-        trimmed = trimmed[:-1]
-    return (trimmed + "…") if trimmed else ""
+    result = renderer.render("event", payload, site=site)
+    return result[0] if result else None
 
 
 def render_result(payload: dict[str, Any], *, site: str = "") -> bytes | None:
-    """把 :func:`payload_for_result` 的内容画成 PNG（**阻塞**，调用方负责放进线程）。
-
-    画法：小组赛逐组列出（积分表 + **每一场**比分），淘汰赛画成树状图（方框 + 折线 +
-    冠军框）——就是站点「对阵总览」的那张图。先画到一张够大（也够宽）的画布上，
-    最后按实际用掉的高度裁掉。
-    """
-    try:
-        Image, ImageDraw, _Filter, _ImageFont = _pil()
-    except Exception as exc:  # noqa: BLE001  (Pillow 装坏了：这次没图，退回文本)
-        log.info("没有装 Pillow，结果卡片渲染跳过 | %s", exc)
-        return None
-    try:
-        tree = dict(payload.get("tree") or {})
-        width = min(MAX_RESULT_WIDTH, max(WIDTH, int(tree.get("width") or 0) + PAD * 2))
-        img = Image.new("RGBA", (width, MAX_HEIGHT), (*PANEL, 255))
-        draw = ImageDraw.Draw(img)
-        f_title = fonts.load("cjk", 56)
-        f_sub = fonts.load("cjk", 24)
-        f_sec = fonts.load("cjk", 30)
-        f_key = fonts.load("cjk", 22)
-        f_body = fonts.load("cjk", 24)
-        f_small = fonts.load("cjk", 20)
-        f_note = fonts.load("cjk", 22)
-        f_box = fonts.load("cjk", 21)
-        f_code = fonts.load("cjk", 17)
-        inner = width - PAD * 2
-        right = PAD + inner
-
-        y = PAD
-        for line in _wrap(str(payload.get("title") or "比赛"), f_title, inner)[:2]:
-            draw.text((PAD, y), line, font=f_title, fill=TXT)
-            y += int(f_title.size * 1.25)
-        sub_bits = [
-            b for b in (payload.get("id"), payload.get("statusLabel"), payload.get("headline")) if b
-        ]
-        if sub_bits:
-            draw.text((PAD, y), " · ".join(str(b) for b in sub_bits), font=f_sub, fill=ACCENT)
-            y += int(f_sub.size * 1.6)
-        y = _brand_bar(img, PAD, y, inner)
-
-        def section(title: str, note: str = "") -> None:
-            """区块标题：强调色底板 + 右边一句说明。"""
-            nonlocal y
-            tab = Image.new(
-                "RGBA", (int(f_sec.getlength(title)) + 40, f_sec.size + 18), (*ACCENT, 235)
-            )
-            img.alpha_composite(tab, (PAD, y))
-            ImageDraw.Draw(img).text((PAD + 20, y + 8), title, font=f_sec, fill=INK)
-            if note:
-                draw.text((PAD + int(f_sec.getlength(title)) + 58, y + 12), note, font=f_key, fill=DIM)
-            y += f_sec.size + 34
-
-        def gap(px: int = 18) -> None:
-            nonlocal y
-            y += px
-
-        # ---- 小组赛：每组一张积分表 + 逐场比分 ----
-        for group in payload.get("groups") or []:
-            if y > MAX_HEIGHT - 320:
-                break
-            section(f"{group.get('key')} 组", str(group.get("note") or ""))
-            rows = group.get("rows") or []
-            if rows:
-                heads = [("#", 8, "left"), ("队伍", 62, "left"), ("场次", 230, "right"),
-                         ("胜", 170, "right"), ("负", 110, "right"), ("名次分", 0, "right")]
-                for text, offset, align in heads:
-                    x = (right - offset) if align == "right" else (PAD + offset)
-                    if align == "right":
-                        x -= int(f_small.getlength(text))
-                    draw.text((x, y), text, font=f_small, fill=DIM)
-                y += int(f_small.size * 1.6)
-                draw.line([(PAD, y - 6), (right, y - 6)], fill=LINE, width=1)
-                for row in rows:
-                    seed = int(row.get("seed") or 0)
-                    cells = [
-                        (str(row.get("rank") or "—"), 8, "left", ACCENT),
-                        (_clip(str(row.get("name") or ""), f_body, 300), 62, "left", TXT),
-                        (str(row.get("played") or 0), 230, "right", TXT),
-                        (str(row.get("win") or 0), 170, "right", TXT),
-                        (str(row.get("lose") or 0), 110, "right", TXT),
-                        (str(row.get("placement") or 0), 0, "right", ACCENT),
-                    ]
-                    for text, offset, align, color in cells:
-                        x = (right - offset) if align == "right" else (PAD + offset)
-                        if align == "right":
-                            x -= int(f_body.getlength(text))
-                        draw.text((x, y), text, font=f_body, fill=color)
-                    if seed:
-                        tag = f"晋级 #{seed}"
-                        draw.text(
-                            (PAD + 62 + int(f_body.getlength(_clip(str(row.get('name') or ''), f_body, 300))) + 14, y + 4),
-                            tag, font=f_small, fill=WARN,
-                        )
-                    y += int(f_body.size * 1.5)
-                gap(10)
-            for match in group.get("matches") or []:
-                if y > MAX_HEIGHT - 200:
-                    break
-                head = str(match.get("round") or "")
-                draw.text((PAD + 6, y), head, font=f_small, fill=DIM)
-                draw.text(
-                    (PAD + 6 + int(f_small.getlength(head)) + 14, y + 2),
-                    str(match.get("line") or ""),
-                    font=f_body,
-                    fill=TXT if match.get("done") else DIM,
-                )
-                y += int(f_body.size * 1.45)
-            gap(14)
-
-        # ---- 积分制：均分榜 + 逐局比分（没有小组赛 / 淘汰赛之分）----
-        standings = payload.get("standings") or []
-        if standings:
-            section("积分榜", "均分排名 · 满场次才参与名次")
-            draw.text((PAD + 8, y), "#", font=f_small, fill=DIM)
-            draw.text((PAD + 62, y), "队伍", font=f_small, fill=DIM)
-            for text, edge in (("场次", right - 230), ("均分", right - 120), ("总分", right)):
-                draw.text((edge - int(f_small.getlength(text)), y), text, font=f_small, fill=DIM)
-            y += int(f_small.size * 1.6)
-            draw.line([(PAD, y - 6), (right, y - 6)], fill=LINE, width=1)
-            for row in standings:
-                numbers = [
-                    (str(row.get("played") or 0), right - 230, TXT),
-                    (str(row.get("average") or ""), right - 120, TXT),
-                    (str(row.get("points") or 0), right, ACCENT),
-                ]
-                draw.text((PAD + 8, y), str(row.get("rank") or "—"), font=f_body, fill=ACCENT)
-                draw.text(
-                    (PAD + 62, y),
-                    _clip(str(row.get("name") or ""), f_body, 320),
-                    font=f_body,
-                    fill=TXT,
-                )
-                for text, x, color in numbers:
-                    draw.text((x - int(f_body.getlength(text)), y), text, font=f_body, fill=color)
-                y += int(f_body.size * 1.5)
-            gap(14)
-        matches = payload.get("matches") or []
-        if matches:
-            section("逐局比分", f"共 {len(matches)} 局")
-            for match in matches:
-                if y > MAX_HEIGHT - 200:
-                    break
-                head = str(match.get("round") or "")
-                draw.text((PAD + 6, y), head, font=f_small, fill=DIM)
-                draw.text(
-                    (PAD + 6 + int(f_small.getlength(head)) + 14, y + 2),
-                    str(match.get("line") or ""),
-                    font=f_body,
-                    fill=TXT if match.get("done") else DIM,
-                )
-                y += int(f_body.size * 1.45)
-            gap(14)
-
-        # ---- 淘汰赛：树状图（坐标已在 payload 里算好，这里只负责画）----
-        if tree:
-            single = bool(tree.get("single"))
-            section(
-                "淘汰赛",
-                "单败淘汰 · 输一场即淘汰" if single else "双败淘汰 · 胜者组落败者进败者组",
-            )
-            ox, oy = PAD, y
-            for band in tree.get("bands") or []:
-                bw, bh = max(1, int(band.get("w") or 1)), max(1, int(band.get("h") or 1))
-                img.alpha_composite(
-                    Image.new("RGBA", (bw, bh), (*ACCENT, 12)),
-                    (ox + int(band.get("x") or 0), oy + int(band.get("y") or 0)),
-                )
-                draw.text(
-                    (ox + int(band.get("x") or 0) + 12, oy + int(band.get("titleY") or 0)),
-                    str(band.get("title") or ""),
-                    font=f_key,
-                    fill=ACCENT,
-                )
-            for col in tree.get("columns") or []:
-                draw.text(
-                    (ox + int(col.get("x") or 0), oy + int(col.get("y") or 0)),
-                    _clip(str(col.get("title") or ""), f_small, _TREE_BOX),
-                    font=f_small,
-                    fill=DIM,
-                )
-            for link in tree.get("links") or []:
-                x1, y1 = ox + int(link.get("x1") or 0), oy + int(link.get("y1") or 0)
-                x2, y2 = ox + int(link.get("x2") or 0), oy + int(link.get("y2") or 0)
-                mx = x2 - _TREE_GAP_X // 2
-                color = (*ACCENT, 200) if link.get("done") else (70, 92, 124, 200)
-                draw.line([(x1, y1), (mx, y1), (mx, y2), (x2, y2)], fill=color, width=2)
-            for node in tree.get("nodes") or []:
-                nx, ny = ox + int(node.get("x") or 0), oy + int(node.get("y") or 0)
-                node_h = int(node.get("h") or _TREE_BOX_H)
-                live = node.get("status") == "live"
-                draw.rounded_rectangle(
-                    [nx, ny, nx + _TREE_BOX, ny + node_h],
-                    radius=10,
-                    fill=BOX_FILL,
-                    outline=WARN if live else BOX_EDGE,
-                    width=2,
-                )
-                draw.text((nx + 12, ny + 7), str(node.get("code") or ""), font=f_code, fill=DIM)
-                tag = str(node.get("statusLabel") or "")
-                if tag:
-                    draw.text(
-                        (nx + _TREE_BOX - 12 - int(f_code.getlength(tag)), ny + 7),
-                        tag,
-                        font=f_code,
-                        fill=WARN if live else DIM,
-                    )
-                sides = (node.get("sides") or [])[:MAX_SIDES]
-                row_h = _TREE_SIDE_ROW
-                for index, side in enumerate(sides):
-                    sy = ny + 30 + index * row_h
-                    dot = _hex_color(str(side.get("color") or ""), ACCENT)
-                    draw.ellipse([nx + 12, sy + 5, nx + 24, sy + 17], fill=dot)
-                    name = _clip(str(side.get("name") or ""), f_box, _TREE_BOX - 96)
-                    draw.text(
-                        (nx + 32, sy),
-                        name,
-                        font=f_box,
-                        fill=TXT if (side.get("win") or node.get("status") != "done") else DIM,
-                    )
-                    score = str(side.get("score") or "")
-                    if score:
-                        draw.text(
-                            (nx + _TREE_BOX - 12 - int(f_box.getlength(score)), sy),
-                            score,
-                            font=f_box,
-                            fill=ACCENT if side.get("win") else DIM,
-                        )
-            champ = tree.get("champ") or {}
-            cx, cy = ox + int(champ.get("x") or 0), oy + int(champ.get("y") or 0)
-            draw.rounded_rectangle(
-                [cx, cy, cx + _TREE_CHAMP_W, cy + _TREE_BOX_H],
-                radius=10,
-                fill=(26, 40, 62, 255),
-                outline=ACCENT,
-                width=2,
-            )
-            draw.text((cx + 14, cy + 8), "CHAMPION", font=f_code, fill=ACCENT)
-            name = str(champ.get("name") or "")
-            draw.text(
-                (cx + 14, cy + 40),
-                _clip(name or "—", f_box, _TREE_CHAMP_W - 28),
-                font=f_box,
-                fill=TXT if name else DIM,
-            )
-            y = oy + int(tree.get("height") or 0) + 26
-
-        # ---- 页脚 ----
-        y = min(y, MAX_HEIGHT - 110)
-        draw.line([(PAD, y), (right, y)], fill=LINE, width=1)
-        y += 26
-        draw.text((PAD, y), str(payload.get("caption") or ""), font=f_note, fill=DIM)
-        if site:
-            draw.text((PAD, y + 34), f"{site} · 逐场结果与对阵自动生成", font=f_note, fill=ACCENT)
-            y += 34
-        cropped = img.crop((0, 0, width, min(MAX_HEIGHT, y + PAD)))
-
-        import io
-
-        buf = io.BytesIO()
-        cropped.convert("RGB").save(buf, format="PNG", optimize=True)
-        return buf.getvalue()
-    except Exception:
-        log.warning("结果卡片渲染失败（本次退回纯文本推送）", exc_info=True)
-        return None
+    """把 :func:`payload_for_result` 的内容画成 PNG（同上）。"""
+    result = renderer.render("result", payload, site=site)
+    return result[0] if result else None
 
 
 # --------------------------------------------------------------------------- #

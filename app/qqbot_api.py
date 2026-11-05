@@ -24,7 +24,7 @@
 
 **图片推送**：``event`` / ``detail``（不带 ``ref``）会顺带生成一张比赛卡片
 （信息 + 规则），``result`` 生成结果卡片（逐场比分 + 淘汰赛树状图），见 :mod:`app.card`；
-一律先发图、再发文本；图发不出去（没装 Pillow、AstrBot 不收图片段、拉不到图）
+一律先发图、再发文本；图发不出去（出图侧车不可用、AstrBot 不收图片段、拉不到图）
 就**退回纯文本**，信息一条不少。
 
 **@ 只能由插件发**：AstrBot 的 OpenAPI **没有 at 消息段**（段解析只认
@@ -43,7 +43,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
-from . import card, live, logic, outbox, qqbot
+from . import botlab, card, live, logic, outbox, qqbot
 from .auth import Session, hash_secret
 from .logging_conf import get_logger
 from .security import require_event, require_event_owned, require_server
@@ -226,8 +226,9 @@ async def api_qqbot_test(
         if not info:
             return {
                 "ok": False,
-                "detail": "画不出比赛卡片：这台机器上没装 Pillow（图片推送靠它渲染；"
-                "正常情况下 uv sync / 镜像里就带着，缺了说明环境没装全）",
+                "detail": "画不出比赛卡片：这台机器上没装出图侧车 nterender"
+                "（构建：cd go && go build -o bin/nterender ./cmd/nterender；"
+                "镜像里自带）",
                 "image": True,
             }
         # 图片字节一并带上：新版 AstrBot 要先把图传上去换 attachment_id，
@@ -317,6 +318,60 @@ async def _build(
     return result, args["eventId"], card_info
 
 
+def _record_push(
+    *,
+    kind: str,
+    parts: list[str],
+    card: dict[str, Any] | None,
+    mentions: list[str],
+    event_id: str,
+) -> None:
+    """调试模式下把**真正发出去**的这一条记进沙盒（记录失败绝不影响推送）。"""
+    if not botlab.active():
+        return
+    try:
+        botlab.record(
+            kind=kind,
+            parts=parts,
+            image=({"url": card.get("url"), "hash": card.get("hash")} if card else None),
+            mentions=mentions,
+            source="push",
+            scene="group",
+        )
+    except Exception:  # 沙盒是附加功能，坏了也不能拖累推送
+        log.debug("沙盒记录失败（不影响推送）", exc_info=True)
+
+
+async def build_message(
+    request: Request,
+    *,
+    kind: str = "event",
+    event_id: str = "",
+    ref: str = "",
+    page: int = 1,
+) -> dict[str, Any]:
+    """组装「这次要发出去的东西」（**不发送**）。
+
+    预览接口、调试沙盒、真实推送都走这一份——三处各写一段拼装，早晚会不一样，
+    而「预览和实际发出去的不一致」正是最难发现的那类问题。
+    """
+    args = {"kind": kind, "eventId": event_id, "ref": ref, "page": page}
+    result, target, card_info = await _build(args, request)
+    return {
+        "kind": str(args["kind"]),
+        "eventId": target or event_id,
+        # parts 是**完整文本**；cardText 才是「图发成功时」要配的那几行
+        "parts": result["parts"],
+        "cardText": qqbot.card_parts(str(args["kind"]), card_info, result["parts"]),
+        "card": card_info,
+        "pages": result["pages"],
+        "page": result["page"],
+        # 召集：要 @ 的 QQ、退回时用的文本写法
+        "mentions": list(result.get("mentions") or []),
+        "mentionText": str(result.get("mentionText") or ""),
+    }
+
+
 @router.get("/qqbot/preview")
 async def api_qqbot_preview(
     request: Request,
@@ -328,21 +383,18 @@ async def api_qqbot_preview(
 ) -> dict[str, Any]:
     """预览要发出去的内容（**不发送**），管理员可以先看再决定（含卡片图）。"""
     await _require_push(session, event_id)
-    args = {"kind": kind, "eventId": event_id, "ref": ref, "page": page}
-    result, _target, card_info = await _build(args, request)
+    data = await build_message(request, kind=kind, event_id=event_id, ref=ref, page=page)
     return {
         "ok": True,
-        # parts 是**完整文本**；cardText 才是「图发成功时」要配的那几行
-        "parts": result["parts"],
-        "cardText": qqbot.card_parts(kind, card_info, result["parts"]),
-        "card": card_info,
-        "pages": result["pages"],
-        "page": result["page"],
+        "parts": data["parts"],
+        "cardText": data["cardText"],
+        "card": data["card"],
+        "pages": data["pages"],
+        "page": data["page"],
         "imageAvailable": card.available(),
         "settings": qqbot.public_settings(store.qqbot_settings()),
-        # 召集：要 @ 的 QQ、退回时用的文本写法，以及「真 @ 通道（插件）在不在线」
-        "mentions": list(result.get("mentions") or []),
-        "mentionText": str(result.get("mentionText") or ""),
+        "mentions": data["mentions"],
+        "mentionText": data["mentionText"],
         "pluginAlive": await outbox.plugin_alive(),
         "pluginSeenAt": await outbox.seen_at(),
     }
@@ -419,6 +471,13 @@ async def api_qqbot_push(
                 status_code=502,
                 detail=f"召集发送失败：{delivered.get('detail') or '未知原因'}",
             )
+        _record_push(
+            kind=str(payload.get("kind") or ""),
+            parts=parts,
+            card=None,
+            mentions=mentions,
+            event_id=target or store.current_id,
+        )
         log.warning(
             "已推送召集 | 届=%s | 通道=%s | @%d 人 | 操作者=%s",
             target or store.current_id,
@@ -444,6 +503,13 @@ async def api_qqbot_push(
             status_code=502,
             detail=f"发送失败（已发出 {sent.get('sent', 0)}/{sent.get('total', 1)} 条）：{sent['detail']}",
         )
+    _record_push(
+        kind=str(payload.get("kind") or ""),
+        parts=parts,
+        card=card_info if image_sent else None,
+        mentions=mentions,
+        event_id=target or store.current_id,
+    )
     log.warning(
         "已向群推送 | 类型=%s | 届=%s | 图片=%s | 文本段=%d | 分页=%d/%d | 操作者=%s",
         payload.get("kind"),

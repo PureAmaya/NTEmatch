@@ -28,7 +28,7 @@ async def test_help_image_is_regenerated_before_serving(client):
     from app import helpcard
 
     if not helpcard.available():
-        pytest.skip("没装 Pillow：帮助图本来就不生成（插件退回文字说明）")
+        pytest.skip("没有出图侧车：帮助图本来就不生成（插件退回文字说明）")
     target = helpcard.default_path()
     stamp = helpcard.stamp_path(target)
     stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +37,7 @@ async def test_help_image_is_regenerated_before_serving(client):
     res = await client.get("/help.jpg")
     assert res.status_code == 200, res.text
     assert target.exists(), "发过这张图之后本地就该有一份"
-    assert stamp.read_text(encoding="utf-8").strip() == helpcard.source_digest(), (
+    assert stamp.read_text(encoding="utf-8").strip() == helpcard.stamp_text(), (
         "发图之前应当重画并更新指纹"
     )
 
@@ -554,3 +554,30 @@ async def test_partial_stream_patch_keeps_the_rest(admin_client):
         assert stream["pushToken"] == "tk-live"
     finally:
         await store.update({"stream": saved})
+
+
+# --------------------------------------------------------------------------- #
+# 导播台：独立只读页
+# --------------------------------------------------------------------------- #
+async def test_director_page_is_served(client):
+    """``/director`` 是独立页（不属于任何一届），直接打开就该拿到首页骨架。
+
+    钉这一条是因为它走的是 SPA 兜底路由：以后若给兜底加白名单，新页面很容易被漏掉，
+    表现就是「分享出去的链接 404」。
+    """
+    res = await client.get("/director")
+    assert res.status_code == 200, res.text
+    # 骨架里得有这个视图容器，否则页面打开是空白（路由认得、DOM 没有）
+    assert 'id="view-director"' in res.text
+
+
+async def test_debug_mode_injects_frontend_flag(client, monkeypatch):
+    """``--debug`` 启动时首页要带上前端调试标记（否则还得手动加 ``?debug=1``）。"""
+    monkeypatch.setattr("app.main._DEBUG_ON", True)
+    res = await client.get("/")
+    assert res.status_code == 200
+    assert 'name="nte-debug"' in res.text
+
+    monkeypatch.setattr("app.main._DEBUG_ON", False)
+    res = await client.get("/")
+    assert 'name="nte-debug"' not in res.text, "非调试模式不许把这个标记漏给线上"

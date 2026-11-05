@@ -58,8 +58,10 @@ import {
 } from './ui.js';
 import { renderEventsView, renderHome } from './events.js';
 import { ChannelLive, Live } from './live.js';
+import { assign as assignDirector, installDelegation as installDirectorDelegation } from './director.js';
 import { renderServerPage, renderUserPage } from './members.js';
 import { renderDeveloperPage } from './credits.js';
+import { renderBotPage } from './botlab.js';
 import { clockHtml } from './clock.js';
 import { renderNoticeBoard } from './notices.js';
 
@@ -83,7 +85,6 @@ const STATUS_FILTERS = [
   ['live', '进行中'],
   ['done', '已结束'],
 ];
-const STREAM_MODE_LABEL = { auto: '自动', webrtc: 'WebRTC', hls: 'HLS' };
 
 const LEAGUE_FILTERS = [
   ['all', '全部'],
@@ -1974,7 +1975,7 @@ export function renderLive(s) {
   let rebuilt = false;
   if (stage.dataset.sig !== sig) {
     stage.dataset.sig = sig;
-    stage.innerHTML = stageHtml(s);
+    stage.innerHTML = stageHtml();
     rebuilt = true;
   }
   // 有人在推流就直接开播——**每次重绘都试一次**，不只是舞台重建时：对方刚好在你打开
@@ -2001,6 +2002,96 @@ export function focusLive(s) {
   const rebuilt = renderLive(s);
   if (!rebuilt) Live.playSelected(s);
   return rebuilt;
+}
+
+/* --------------------------- 导播台（4 宫格） ---------------------------
+ *
+ * 与直播页共用同一份机位候选（livePool）与「谁在播」（App.liveNow），
+ * 区别只在**怎么摆**：直播页一次只看一路、舞台整体重建；导播台四格常驻、
+ * 只换每格挂的机位。**元素永不重建**——照抄直播页的 innerHTML 重建，
+ * 任何一路开播 / 下播都会让四路同时重新协商 WHEP，表现就是反复黑屏。
+ *
+ * B站 机位不进网格：外站 iframe 缩成四分之一格既看不清，也没法和本站的
+ * 音量 / 重连逻辑统一，需要时回直播页单看。
+ */
+function directorCellsHtml() {
+  let html = '';
+  // 这里的 <video> **写死 muted**，是直播页那条「默认不静音」规则的刻意例外：
+  // 四路一起出声只是噪音，而且带声音的自动播放会被浏览器直接拦下（四格全黑）。
+  // 观众点某一格的「声音」是一次用户手势，那时才开声音（见 director.js 的 applyAudio）。
+  for (let index = 0; index < 4; index += 1) {
+    html +=
+      `<div class="dg-cell" id="dgCell${index}" data-cell="${index}">` +
+      `<div class="stage-frame" id="dgStage${index}">` +
+      `<video id="dgVideo${index}" playsinline autoplay muted></video>` +
+      `<div class="stage-cover" id="dgCover${index}" hidden></div>` +
+      `<div class="dg-cell__name" id="dgName${index}"></div>` +
+      `<div class="dg-cell__state" id="dgState${index}">等待</div>` +
+      `<div class="dg-cell__acts">` +
+      `<button class="btn btn--sm" type="button" data-act="dg-audio" data-cell="${index}" ` +
+      `title="只听这一路">声音</button>` +
+      `<button class="btn btn--sm" type="button" data-act="dg-focus" data-cell="${index}" ` +
+      `title="放大这一格">放大</button>` +
+      `<button class="btn btn--sm" type="button" data-act="dg-reconnect" data-cell="${index}" ` +
+      `title="重新连接这一路">重连</button>` +
+      `</div></div></div>`;
+  }
+  return html;
+}
+
+/** 导播台骨架：只在第一次进页面时写一次（见 director.js 顶部「骨架只建一次」）。 */
+function directorShellHtml() {
+  return (
+    `<div class="panel panel--toolbar dg-bar" id="directorBar"></div>` +
+    `<div class="dg" id="directorGrid">${directorCellsHtml()}</div>`
+  );
+}
+
+/** 导播台顶部：跟的是哪一场、几路在播、线路与刷新。 */
+function directorBarHtml(s) {
+  const round = (s.rounds || []).find((r) => r.status === 'live');
+  const label = round ? round.label || round.code : '当前没有进行中的比赛';
+  const live = App.liveNow instanceof Set ? App.liveNow.size : 0;
+  return (
+    `<span class="live-pick__label">导播</span>` +
+    `<span class="dg-bar__round">${esc(label)}</span>` +
+    `<span class="dg-bar__meta">${live} 路机位在播</span>` +
+    `<span class="dg-bar__gap"></span>` +
+    `<span class="stage-bar__label">线路</span>` +
+    `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
+    `data-act="dg-proto" data-proto="webrtc" title="延迟最低的线路">WebRTC</button>` +
+    `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
+    `data-act="dg-proto" data-proto="hls" title="更稳的线路，延迟略高">HLS</button>` +
+    `<button class="btn btn--sm" type="button" data-act="dg-refresh">刷新信号</button>`
+  );
+}
+
+/**
+ * 导播台的机位顺序：**跟随进行中的那一场**，按后端给的出场顺序（A 方先、B 方后）
+ * 排，主直播间这类不属于任何一场的机位排最后。
+ *
+ * 为什么按 ``cast`` 而不是选手列表：那是后端算好的「这场谁上场」，与赛程卡、
+ * 结果卡同源，导播看到的顺序才对得上比分。
+ */
+function directorPool(s) {
+  const all = livePool(s).filter((c) => !c.bili);
+  const round = (s.rounds || []).find((r) => r.status === 'live');
+  const cast = (round?.streams?.cast || []).map((item) => item.playerId);
+  if (!cast.length) return all;
+  const rank = new Map(cast.map((pid, index) => [pid, index]));
+  return all.slice().sort((a, b) => (rank.get(a.id) ?? 999) - (rank.get(b.id) ?? 999));
+}
+
+/** 导播台：只更新「每格挂谁」，骨架与 video 元素一律不动。 */
+export function renderDirector(s) {
+  const body = qs('#directorBody');
+  if (!body) return false;
+  if (!qs('#directorGrid')) body.innerHTML = directorShellHtml();
+  installDirectorDelegation();
+  const bar = qs('#directorBar');
+  if (bar) bar.innerHTML = directorBarHtml(s);
+  assignDirector(directorPool(s));
+  return false;
 }
 
 function liveChipHtml(c, picked) {
@@ -2070,8 +2161,7 @@ function vsLineHtml(picked) {
   );
 }
 
-function stageHtml(s) {
-  const st = s.stream || {};
+function stageHtml() {
   // 选中的是 B站 机位时，画面直接嵌 B站 官方播放器（**不经本站**），
   // 于是这里没有 <video>、也没有本站的播放线路/播放按钮。
   const bili = App.livePicked?.bili ? App.livePicked.room || {} : null;
@@ -2097,9 +2187,9 @@ function stageHtml(s) {
       `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
       `<span class="stage-bar__label">线路</span>` +
       `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-      `data-act="live-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
+      `data-act="live-proto" data-proto="webrtc" title="延迟最低的线路">WebRTC<sup>优先</sup></button>` +
       `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-      `data-act="live-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
+      `data-act="live-proto" data-proto="hls" title="更稳的线路，延迟略高">HLS</button>` +
       `</div>` +
       `<div class="stage-bar__right">` +
       `<button class="btn btn--sm" type="button" data-act="live-open">打开源页</button>` +
@@ -2113,11 +2203,8 @@ function stageHtml(s) {
       `</div></div>`;
   return (
     `<div class="panel__head"><h2>赛事直播</h2>` +
-    `<span class="panel__hint">${
-      bili
-        ? `B站直播 · 源站直嵌 · 直播间 ${esc(String(bili.roomId || bili.room || ''))}`
-        : `${esc(st.provider || 'mediamtx')} · 多机位 · ${esc(STREAM_MODE_LABEL[st.mode] || st.mode || 'auto')}`
-    }</span></div>` +
+    (bili ? `<span class="panel__hint">直播间 ${esc(String(bili.roomId || bili.room || ''))}</span>` : '') +
+    `</div>` +
     `<div class="live-pick live-pick--rounds" id="liveRounds"></div>` +
     `<div class="live-pick" id="livePick"></div>` +
     `<div class="stage-frame${bili ? ' stage-frame--bili' : ''}" id="stageFrame">` +
@@ -2186,67 +2273,31 @@ function pushPanelHtml(s, picked) {
       }</div>`;
   const note = [
     st.note ? `<div class="notice" style="margin-top:10px">${esc(st.note)}</div>` : '',
-    picked?.bili
-      ? `<div class="panel__hint" style="margin-top:8px">画面由 <b>B站 官方播放器直嵌</b>：` +
-        `视频流走 B站 的源地址，不经本站中继 / 转码。要弹幕、送礼这些完整功能请点「在 B站打开」。</div>`
-      : admin
-        ? `<div class="panel__hint" style="margin-top:8px">推流<b>只有 WHIP</b>（WebRTC，UDP，延迟最低）。${
-            main
-              ? `主直播间推的是直播配置里的<b>默认流名</b>（这里 …/${esc(room.key || '<流名>')}）。`
-              : `每位选手只要推自己的流名（这里 …/${esc(room.key || '<流名>')}），` +
-                `整届赛事都用同一个地址，换比赛不用改。`
-          }仅管理员可见。</div>` +
-          pushTipsHtml()
-        : // 观众侧不再解释「WebRTC / HLS / 加密 / 证书」这些实现细节：线路切换本身
-          // 就在播放器上方，看得见、点得到，用不着一段说明书。
-          '',
+    // 推流建议只给管理端；观众侧不解释链路怎么走
+    admin ? pushTipsHtml() : '',
   ].join('');
   return (
-    `<div class="panel__head"><h2>${admin ? '推流 / 播放地址' : '播放地址'}</h2>` +
-    `<span class="panel__hint">${
-      picked?.bili ? 'B站直播 · 源站直嵌' : admin ? '选手自行推流 · 观众拉流' : '观众拉流 · 源站直连'
-    }</span></div>` +
+    `<div class="panel__head"><h2>${admin ? '推流 / 播放地址' : '播放地址'}</h2></div>` +
     `<div class="panel__body">${body}${note}</div>`
   );
 }
 
 export function liveInfoHtml(s, picked = null) {
-  const e = App.liveInfo || {};
-  const health = App.liveHealth;
   const liveRounds = (s.rounds || []).filter((r) => r.status === 'live');
   // 配了流名的机位数（能不能播要看媒体服务器上报，见下面的「正在推流」）
   const configured = (s.players || []).filter((p) => p.hasStream).length;
-  // 两个端口分开回报：MediaMTX 的 WebRTC(8889) 与 HLS(8888) 是独立监听，
-  // 地址写错时能一眼看出是哪一条要改
-  const probes = health?.probes || {};
-  const probeText = (name) => {
-    const probe = probes[name];
-    // 冷启动时服务端把探测放在后台，这里先显示「检测中」而不是一个像是失败的空值
-    if (!probe) return health?.pending ? '检测中…' : '—';
-    if (probe.ok) {
-      return probe.status === 404 ? '端口通（当前无此流）' : `就绪（HTTP ${probe.status}）`;
-    }
-    return `异常：${probe.reason || '不可达'}`;
-  };
   // 「正在推流」以媒体服务器上报为准：拿不到就直说，别给假的直播标记
   const live = s.liveStatus || {};
   // 在播 = 在推流的选手 + 主直播间（整数字）
   const nowCount = livePlayers().size + (isMainLive() ? 1 : 0);
-  const streamingText = !health
-    ? `${nowCount} 路（未探测）`
-    : live.known
-      ? `${nowCount} 路 · 媒体服务器上报`
-      : `无法判断 · ${live.reason || '媒体服务器 API 不可达'}（只影响「直播中」标记，不影响播放）`;
+  const streamingText = live.known === false ? '无法判断' : `${nowCount} 路`;
   const biliItems = biliLiveItems();
-  // B站 是另一条链路（直嵌 B站 官方播放器）：单独一行说清楚，别和「正在推流」混在一起
   const biliText = !biliKnown()
-    ? '无法判断 · B站 接口不可达（不影响 B站 机位的跳转链接）'
+    ? '无法判断'
     : biliItems.length
       ? `${biliItems.length} 路 · ${biliItems.map((item) => item.name).join('、')}`
       : '无';
   const kv = [
-    ['WebRTC 端口', health ? probeText('webrtc') : '未探测'],
-    ['HLS 端口', health ? probeText('hls') : '未探测'],
     ['进行中', `${liveRounds.length} 场`],
     ['已配置机位', `${configured} 路`],
     ['正在推流', streamingText],
@@ -2255,11 +2306,10 @@ export function liveInfoHtml(s, picked = null) {
       '当前机位',
       picked
         ? picked.bili
-          ? `${picked.name} · B站 ${picked.room.roomId || picked.room.room || '—'}（源站直嵌）`
+          ? `${picked.name} · B站 ${picked.room.roomId || picked.room.room || '—'}`
           : `${picked.name} · ${picked.room.key || '—'}`
         : '没人直播',
     ],
-    ['源地址', e.origin || s.stream?.baseUrl || '—'],
   ];
   // 选中的是 B站 机位：把同步过来的直播信息单列出来（标题 / 分区 / 在线 / 开播）
   if (picked?.bili) {
@@ -2274,7 +2324,7 @@ export function liveInfoHtml(s, picked = null) {
     );
   }
   return (
-    `<div class="panel__head"><h2>直播信息</h2><span class="panel__hint">源站直连（不做反代）</span></div>` +
+    `<div class="panel__head"><h2>直播信息</h2></div>` +
     `<div class="panel__body"><dl class="kv">` +
     kv.map(([k, v]) => `<div class="kv__row"><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('') +
     `</dl></div>`
@@ -2414,9 +2464,9 @@ function channelStageHtml(s, picked) {
       `<div class="stage-bar__mid" role="group" aria-label="播放线路">` +
       `<span class="stage-bar__label">线路</span>` +
       `<button class="btn btn--sm${App.liveProto === 'webrtc' ? ' btn--primary' : ''}" type="button" ` +
-      `data-act="channel-proto" data-proto="webrtc" title="优先：走 8889（UDP），延迟最低">WebRTC<sup>优先</sup></button>` +
+      `data-act="channel-proto" data-proto="webrtc" title="延迟最低的线路">WebRTC<sup>优先</sup></button>` +
       `<button class="btn btn--sm${App.liveProto === 'hls' ? ' btn--primary' : ''}" type="button" ` +
-      `data-act="channel-proto" data-proto="hls" title="备选：走 8888（TCP），抗抖动，延迟略高">HLS</button>` +
+      `data-act="channel-proto" data-proto="hls" title="更稳的线路，延迟略高">HLS</button>` +
       `</div>` +
       `<div class="stage-bar__right">` +
       `<button class="btn btn--sm" type="button" data-act="channel-open">打开源页</button>` +
@@ -2425,9 +2475,7 @@ function channelStageHtml(s, picked) {
       `</div></div>`;
   return (
     `<div class="panel__head"><h2>成员直播</h2>` +
-    `<span class="panel__hint">${
-      bili ? 'B站直播 · 源站直嵌' : '异环 · 日常播台 · 与比赛无关'
-    }</span></div>` +
+    `<span class="panel__hint">${bili ? 'B站直播' : '日常直播'}</span></div>` +
     `<div class="live-pick" id="channelPick"></div>` +
     `<div class="stage-frame" id="channelFrame">${frame}</div>` +
     `<div class="stage-meta" id="channelMeta"></div>` +
@@ -2663,7 +2711,7 @@ export function renderChannels(s) {
         ? liveFailHtml(App.liveHealth?.reason)
         : App.liveHealthState === 'ok'
           ? `<div class="live-pick__empty live-pick__empty--none"><b>当前没有人在播</b>` +
-            `成员（本站推流或 B站 直播）开播后会自动出现在这里。</div>`
+            `成员开播后会自动出现在这里。</div>`
           : liveLoadingHtml();
   }
   const metaEl = qs('#channelMeta');
@@ -2737,11 +2785,13 @@ const VIEW_RENDERERS = {
   schedule: renderSchedule,
   roster: renderRoster,
   live: renderLive,
+  director: renderDirector,
   channels: renderChannels,
   events: renderEventsView,
   server: renderServerPage,
   user: renderUserPage,
   developer: renderDeveloperPage,
+  bot: renderBotPage,
   denied: renderDenied,
 };
 

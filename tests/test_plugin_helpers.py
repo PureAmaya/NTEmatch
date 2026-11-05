@@ -138,7 +138,7 @@ def test_config_is_read_lazily(plugin_module):
     """实例化时没有配置也不该崩；框架后注入配置要能立刻生效。"""
     plugin = plugin_module.NTEMatchPlugin(context=None)
     assert plugin.token == ""
-    assert plugin.base_url == "http://127.0.0.1:8000"
+    assert plugin.base_url == "http://127.0.0.1:10961"
 
     plugin.config = {"api_token": "nte_abc", "base_url": "https://match.test/"}
     assert plugin.token == "nte_abc"
@@ -718,82 +718,40 @@ def test_help_card_artifact_matches_when_present():
     重画」必须有人喊出来——出图时把源文件指纹写进 ``static/help.jpg.src.sha256``，
     这里比对（``tools/check_assets.py`` 查的是同一条）。干净检出（没有图）是**正常状态**。
     """
-    card = _load_help_card_content()
     root = Path(__file__).resolve().parent.parent
     art = root / "static" / "help.jpg"
     if not art.exists():
         pytest.skip("帮助图不入库：服务启动时会自动生成一份")
+    from app import helpcard as helpcard_mod
+
     stamp = art.with_name(art.name + ".src.sha256")
     assert stamp.exists(), "图在、指纹不在：重启一次服务，或跑 tools/make_help_card.py 重画"
-    assert stamp.read_text(encoding="utf-8").strip() == card.source_digest(), (
-        "帮助图比文案旧：重启一次服务会自动重画，或跑 tools/make_help_card.py"
+    assert stamp.read_text(encoding="utf-8").strip() == helpcard_mod.stamp_text(), (
+        "帮助图比文案 / 渲染器旧：重启一次服务会自动重画，或跑 tools/make_help_card.py"
     )
 
 
-def test_help_card_renderer_builds_a_real_jpeg():
+def test_help_card_renderer_builds_a_real_jpeg(image_size):
     """出图这条路径本身要能跑——图不再入库之后，它是产物的**唯一**来源。"""
-    import io
-
-    from PIL import Image
-
     from app import helpcard
 
     if not helpcard.available():
-        pytest.skip("没装 Pillow（可选依赖）：站点会退回文字说明，不影响功能")
+        pytest.skip("没有出图侧车（go/bin/nterender 没构建）：站点会退回文字说明，不影响功能")
     data = helpcard.build()
     assert data[:2] == b"\xff\xd8", "JPEG 的 SOI 记号（画出来得是一张真图）"
-    with Image.open(io.BytesIO(data)) as img:
-        assert img.width == helpcard.W
-        assert 1200 < img.height < helpcard.CANVAS_H
+    width, height = image_size(data)
+    # 画布宽度按内容挑（go/internal/render 的 Widths），只会是那两档之一
+    assert width in (760, 1080)
+    assert 1200 < height < 6000
 
 
-def test_help_card_text_never_overlaps_or_overflows(monkeypatch):
-    """图上的字**不许互相压**，也不许冲出安全边距。
-
-    补这条的原因：以前只查「有没有画到图片外」，而卡片的说明被画在了**排版循环残留**的
-    横坐标上——同一行带里两笔字压在一起，右边缘一点没越界：检查全绿，眼睛一眼看得出来。
-    """
-    from PIL import ImageDraw
-
+def test_help_card_stamp_covers_the_renderer():
+    """指纹必须把**渲染器**也算进去：只盯文案的话，换了画法图还是旧的。"""
     from app import helpcard
 
-    if not helpcard.available():
-        pytest.skip("没装 Pillow：帮助图本身就不生成")
-
-    draws: list[tuple[float, float, float, float, str, tuple]] = []
-    real = ImageDraw.ImageDraw.text
-
-    def spy(self, xy, text, *args, **kwargs):
-        font = kwargs.get("font")
-        width = float(font.getlength(text)) if font is not None else 0.0
-        size = float(getattr(font, "size", 0) or 0)
-        fill = kwargs.get("fill") or ()
-        draws.append((float(xy[0]), float(xy[1]), width, size, str(text), tuple(fill)))
-        return real(self, xy, text, *args, **kwargs)
-
-    monkeypatch.setattr(ImageDraw.ImageDraw, "text", spy)
-    helpcard.render()
-
-    # ① 不许冲出安全边距（右边刚好留出 PAD）
-    limit = helpcard.W - helpcard.PAD + 1
-    over = [text for x, _y, w, _s, text, _f in draws if x + w > limit]
-    assert not over, f"有文字冲出安全边距：{over[:3]}"
-
-    # ② 同一行带里，说明必须**从命令右边**起画（不是压在命令上）
-    accent, dim = helpcard.ACCENT, helpcard.DIM
-    problems: list[str] = []
-    inline_rows = 0
-    for x, y, _w, _size, text, fill in draws:
-        if not text.startswith("——") or fill[:3] != dim:
-            continue
-        for cx, cy, cw, _cs, ctext, cfill in draws:
-            if cfill[:3] != accent or abs(cy - y) > 18:
-                continue  # 换行到下一行起画的说明：这一行带里没有它的命令，正常
-            inline_rows += 1
-            if x < cx + cw:
-                problems.append(f"「{ctext}」的说明压在命令上（x={x:.0f} < {cx + cw:.0f}）：{text[:20]}")
-    assert not problems, "；".join(problems[:3])
-    assert inline_rows >= 5, "一条「同行说明」都没量到：检查本身失效了（排版改了要同步这里）"
+    stamp = helpcard.stamp_text()
+    assert helpcard.source_digest() in stamp
+    assert stamp != helpcard.source_digest(), "指纹里少了渲染器签名：换了二进制不会重画"
 
 
 def test_help_card_lists_exactly_the_same_commands(plugin_module):

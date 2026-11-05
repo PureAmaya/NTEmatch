@@ -321,9 +321,11 @@ def check_help_card_freshness() -> list[str]:
         return problems
     if module is None:  # pragma: no cover - 见上
         return problems
+    from app import helpcard
+
     stamp = art.with_name(art.name + ".src.sha256")
     got = stamp.read_text(encoding="utf-8").strip() if stamp.exists() else ""
-    if got != str(module.source_digest()):
+    if got != helpcard.stamp_text():
         problems.append(
             "static/help.jpg 比它的文案旧（或指纹缺失）：重启一次服务会自动重画，"
             "也可以跑 `uv run python tools/make_help_card.py`"

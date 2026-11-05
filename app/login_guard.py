@@ -88,7 +88,7 @@ def _in_nets(ip: str, nets: list[Any]) -> bool:
     return any(addr in net for net in nets)
 
 
-def is_local(request: Request, settings: dict[str, Any]) -> bool:
+def is_local(request: Request, settings: dict[str, Any], *, force: bool = False) -> bool:
     """是否为「本机直连」访问（本地不设防的判定）。
 
     三个条件**同时**满足才算本机，避免反向代理把 127.0.0.1 当成所有访客：
@@ -99,8 +99,11 @@ def is_local(request: Request, settings: dict[str, Any]) -> bool:
 
     只要有人把反向代理架在本机且不设转发头，第 3 条通常仍能挡住（浏览器访问
     公网域名时 Host 是域名）；这也是为什么必须三条齐备。
+
+    ``force``：忽略「本机不设防」这个开关本身（调试模式用，见 app/main.py 的
+    ``api_auth_local``）。**上面三条一条都不放过**——它只让开关失效，不改判定。
     """
-    if not settings.get("localTrust", True):
+    if not force and not settings.get("localTrust", True):
         return False
     peer = request.client.host if request.client else ""
     if not _is_loopback(peer):

@@ -4,7 +4,7 @@
 ``tools/`` 根本不存在，而热更新是**运行期功能**（管理端那个「立即更新」按钮要用它），
 所以它必须住在 ``app/`` 里。这个文件只是给习惯 ``tools/xxx.py`` 的人一个入口。
 
-    uv run python tools/hotrun.py --port 8000
+    uv run python tools/hotrun.py --port 10961
 """
 
 from __future__ import annotations

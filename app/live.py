@@ -30,7 +30,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import model_validator
 
-from . import logic
+from . import debug, logic
 from .auth import verify_secret
 from .logging_conf import get_logger
 from .models import Config, LiveBan, NTEModel, StreamConfig
@@ -254,7 +254,14 @@ async def streaming_player_ids(cfg: Config) -> list[str]:
 
     只读后台缓存，因此**不会拖慢调用方**；查不到（API 未配置 / 不可达）时返回
     空列表——宁可少显示「直播中」，也不要给观众一个假的直播标记。
+
+    **调试模式 + 没配媒体服务器**是唯一的例外：本地通常没有推流环境，不把配了
+    流名的人算作在播，直播页与导播台就永远是空的，多画面根本没得调。此时画面由
+    前端本地生成（地址里带 ``mock`` 标记，见 app/logic.py 的 ``build_stream_map``）。
+    配了媒体服务器就照常按真实探测走。
     """
+    if debug.active() and not (cfg.stream.base_url or "").strip():
+        return [p.id for p in cfg.players if logic.clean_key(p.stream_key)]
     ready = ready_paths_snapshot()
     if not ready:
         return []

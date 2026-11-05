@@ -8,14 +8,14 @@ services:
     image: nte-match
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "10961:10961"
     volumes:
       - nte-data:/data
     environment:
       # 前端与 API 同域时留空即可；前端单独部署在别的域名时才需要填（逗号分隔）
       NTE_CORS_ORIGINS: ""
       # 想换端口就一并改上面的映射（容器内外要一致）
-      NTE_PORT: "8000"
+      NTE_PORT: "10961"
       NTE_LOG_LEVEL: "info"
 
   # ---------------------------------------------------------------------------
